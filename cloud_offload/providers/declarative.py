@@ -1422,7 +1422,10 @@ def _settings_schema_for(spec: dict) -> list[dict]:
 
 
 def register_declarative_providers(
-    directory: str | Path | None = None, *, include_builtin: bool = True
+    directory: str | Path | None = None,
+    *,
+    include_builtin: bool = True,
+    include_user: bool = True,
 ) -> dict:
     """Validate and register every declarative provider spec.
 
@@ -1450,9 +1453,10 @@ def register_declarative_providers(
             builtin, builtin_failures = _read_spec_files(BUILTIN_SPEC_DIR)
             failed.extend(builtin_failures)
             specs.extend((spec, True) for spec in builtin)
-        user, user_failures = _read_spec_files(spec_directory(directory))
-        failed.extend(user_failures)
-        specs.extend((spec, False) for spec in user)
+        if include_user:
+            user, user_failures = _read_spec_files(spec_directory(directory))
+            failed.extend(user_failures)
+            specs.extend((spec, False) for spec in user)
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "loaded": [],

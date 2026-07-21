@@ -1,7 +1,18 @@
-"""Vast.ai cloud connector.
+"""Frozen reference implementation of the retired coded Vast.ai connector.
 
-Vast.ai is the worked example of "adding a provider" alongside the default
-RunPod connector.
+This is NOT shipped or registered. Vast.ai is served in production by the
+declarative spec ``cloud_offload/providers/specs/vast.json``; this file is kept
+only as the oracle for the differential tests in ``test_declarative.py``, which
+assert the spec reproduces this implementation's behaviour on identical
+payloads. That comparison is what justified deleting it from the package, and
+keeping it here means a future change to the declarative engine cannot silently
+regress Vast.ai.
+
+Deliberately frozen: do not fix or extend it. Two known divergences are pinned
+by tests, in both cases because the engine is stricter than this code was — an
+explicit JSON ``null`` reaches ``dict.get(key, default)`` here as ``None``
+(raising ``TypeError`` for a null ``gpu_ram``), and status matching here is
+case-sensitive.
 """
 
 import json

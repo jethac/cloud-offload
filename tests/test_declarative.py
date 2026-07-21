@@ -30,7 +30,7 @@ from cloud_offload.providers.declarative import (
     resolve_path,
     validate_spec,
 )
-from cloud_offload.providers.vast import VastConnector
+from reference_vast_connector import VastConnector
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -762,22 +762,18 @@ def test_builtin_specs_are_shipped_and_registered_by_default(tmp_path, registry_
     names = [spec["name"] for spec in builtin_provider_specs()]
     assert "vast.ai" in names
 
-    # While the coded Vast connector is still registered the built-in spec stands
-    # down rather than silently taking over: it is reported as skipped.
-    result = register_declarative_providers(tmp_path)
-    assert [entry["name"] for entry in result["skipped"]] == ["vast.ai"]
-
-    # Simulate the cutover: drop the coded registration, re-run, and Vast.ai is
-    # served declaratively under the same canonical name and alias.
-    for key in ("vast.ai", "vast"):
-        registry_sandbox._CONNECTORS.pop(key, None)
-        registry_sandbox._CANONICAL_NAMES.pop(key, None)
-    registry_sandbox._METADATA.pop("vast.ai", None)
-
-    result = register_declarative_providers(tmp_path)
-    assert result["loaded"] == ["vast.ai"]
-    assert result["skipped"] == []
+    # The coded Vast connector has been retired, so importing the package is
+    # enough: the bundled spec serves Vast.ai under the same canonical name and
+    # "vast" alias, with no plugin loader run and no user spec directory read.
+    assert connector_metadata("vast.ai")["kind"] == "declarative"
     assert connector_metadata("vast")["kind"] == "declarative"
+
+    # Re-registering is idempotent rather than a duplicate-name error.
+    result = register_declarative_providers(tmp_path)
+    assert result["failed"] == []
+    assert "vast.ai" in result["loaded"] or any(
+        entry["name"] == "vast.ai" for entry in result["skipped"]
+    )
 
     config = CloudConfig(vast_api_key="legacy-vast-key", vast_api_url="https://mirror.vast/api/v0")
     connector = create_connector("vast", config)

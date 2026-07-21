@@ -4,13 +4,14 @@ import pytest
 
 from cloud_offload.config import CloudConfig
 from cloud_offload.providers import (
+    connector_metadata,
     connector_names,
     create_connector,
     register_connector,
 )
 from cloud_offload.providers.base import CloudConnector
 from cloud_offload.providers.runpod import RunPodConnector
-from cloud_offload.providers.vast import VastConnector, VastProvider
+from reference_vast_connector import VastConnector, VastProvider
 
 
 class FakeResponse:
@@ -43,14 +44,20 @@ class FakeHttp:
 
 
 def test_builtin_connector_registry_and_vast_compatibility():
+    from cloud_offload.providers.declarative import DeclarativeRestConnector
+
     assert connector_names() == ("runpod", "vast.ai")
-    assert VastProvider is VastConnector
+    assert VastProvider is VastConnector  # frozen reference, no longer shipped
 
     config = CloudConfig(vast_api_key="vast-secret")
     connector = create_connector("vast", config)
 
-    assert isinstance(connector, VastConnector)
+    # Vast.ai is served by the bundled declarative spec now, but the canonical
+    # name, the "vast" alias and the legacy credential field are unchanged, so
+    # existing provider_order and VAST_API_KEY configuration keep working.
+    assert isinstance(connector, DeclarativeRestConnector)
     assert connector.name == "vast.ai"
+    assert connector_metadata("vast.ai")["kind"] == "declarative"
 
 
 def test_runpod_is_the_default_provider():

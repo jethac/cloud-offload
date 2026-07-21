@@ -91,12 +91,6 @@ def connector_names() -> tuple[str, ...]:
     return tuple(sorted(set(_CANONICAL_NAMES.values())))
 
 
-def _create_vast(config: "CloudConfig") -> CloudConnector:
-    from cloud_offload.providers.vast import VastConnector
-
-    return VastConnector(api_key=config.vast_api_key, base_url=config.vast_api_url)
-
-
 def _create_runpod(config: "CloudConfig") -> CloudConnector:
     from cloud_offload.providers.runpod import RunPodConnector
 
@@ -124,16 +118,34 @@ register_connector(
          "help": "Required only for private container images"},
     ],
 )
-register_connector(
-    "vast.ai",
-    _create_vast,
-    aliases=("vast",),
-    display_name="Vast.ai",
-    settings_schema=[
-        {"key": "api_url", "label": "API base URL", "type": "string",
-         "default": "https://console.vast.ai/api/v0"},
-    ],
-)
+
+def _register_builtin_specs() -> None:
+    """Register the declarative specs we ship, at import time.
+
+    Vast.ai is served by ``specs/vast.json`` rather than a coded connector: its
+    API is plain REST, so the declarative engine covers it, and running a shipped
+    provider through that engine keeps it honest instead of letting it rot as a
+    demo. RunPod stays coded because its offers, pod creation and balance are
+    GraphQL, which no REST spec can express.
+
+    Only built-in specs load here. User specs in ``CONFIG_DIR/providers`` are
+    third-party input and load through ``plugins.load_connector_plugins()``
+    alongside connector plugins, so importing this package never reads user
+    files.
+    """
+    try:
+        from cloud_offload.providers.declarative import register_declarative_providers
+
+        register_declarative_providers(include_builtin=True, include_user=False)
+    except Exception as exc:  # noqa: BLE001 - a bad spec must not break imports
+        import logging
+
+        logging.getLogger("cloud-offload").warning(
+            f"Built-in provider specs unavailable: {exc}"
+        )
+
+
+_register_builtin_specs()
 
 __all__ = [
     "CloudConnector",
