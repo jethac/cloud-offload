@@ -111,6 +111,38 @@ class Dispatcher:
         self.next_launch_at: dict[tuple[str, str], float] = {}
         self.worker_token = _load_or_create_worker_token(self.config)
         self.queue.set_worker_token(self.worker_token)
+        self._tunnel = None  # opened lazily when ingress == "cloudflared"
+
+    def _resolve_coordinator_url(self) -> str | None:
+        """The URL a worker uses to reach the coordinator.
+
+        An explicit ``coordinator_url`` always wins. Otherwise, when ingress is
+        ``cloudflared``, open (once) an ephemeral tunnel to the local coordinator
+        and return its public URL. With ingress ``none`` and no URL, there is no
+        way for a worker to call home, so a launch is refused.
+        """
+        if self.config.coordinator_url:
+            return self.config.coordinator_url
+        if self.config.ingress != "cloudflared":
+            return None
+
+        from cloud_offload.ingress import CloudflaredTunnel, IngressError
+        from cloud_offload.service_config import read_service_info
+
+        if self._tunnel is not None and self._tunnel.running:
+            return self._tunnel.url
+
+        info = read_service_info()
+        if not info or not info.get("port"):
+            logger.error("Cannot open ingress: coordinator discovery file missing")
+            return None
+        try:
+            self._tunnel = CloudflaredTunnel()
+            return self._tunnel.open(int(info["port"]))
+        except IngressError as exc:
+            logger.error("Ingress failed: %s", exc)
+            self._tunnel = None
+            return None
 
     def run(self, once: bool = False):
         """
@@ -215,8 +247,12 @@ class Dispatcher:
         queued_jobs: list | None = None,
     ) -> Instance | None:
         """Launch a new cloud worker."""
-        if not self.config.coordinator_url:
-            logger.error("Cloud launch requires CLOUD_OFFLOAD_COORDINATOR_URL")
+        coordinator_url = self._resolve_coordinator_url()
+        if not coordinator_url:
+            logger.error(
+                "Cloud launch needs a reachable coordinator: set coordinator_url "
+                "or ingress=cloudflared"
+            )
             return None
         provider_name = provider_name or self.config.provider
         connector = self.connectors[provider_name]
@@ -299,7 +335,7 @@ class Dispatcher:
         env_vars = {
             "CLOUD_OFFLOAD_WORKER_MODE": "true",
             "CLOUD_OFFLOAD_WORKER_TOKEN": self.worker_token,
-            "CLOUD_OFFLOAD_COORDINATOR_URL": self.config.coordinator_url,
+            "CLOUD_OFFLOAD_COORDINATOR_URL": coordinator_url,
             "CLOUD_OFFLOAD_PROVIDER": provider_name,
             "CLOUD_OFFLOAD_IDLE_SHUTDOWN": str(worker_idle_seconds),
             "CLOUD_OFFLOAD_KEEP_WARM": str(self.config.keep_warm).lower(),
@@ -481,6 +517,9 @@ cloud-offload worker --poll 10
         logger.info("Dispatcher shutting down, terminating workers...")
         for instance_id in list(self.active_instances.keys()):
             self._terminate_worker(instance_id)
+        if self._tunnel is not None:
+            self._tunnel.close()
+            self._tunnel = None
 
     def status(self) -> dict:
         """Get dispatcher status."""

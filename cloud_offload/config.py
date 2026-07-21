@@ -99,6 +99,15 @@ class CloudConfig:
     coordinator_url: str = field(
         default_factory=lambda: os.environ.get("CLOUD_OFFLOAD_COORDINATOR_URL", "")
     )
+    # Public ingress a rented worker uses to reach this coordinator.
+    #   "none"        -- require an explicit coordinator_url (safe default; a
+    #                    launch is refused if none is set, so nothing is exposed)
+    #   "cloudflared" -- the dispatcher opens an ephemeral Cloudflare quick
+    #                    tunnel and hands workers its URL. Exposes the
+    #                    coordinator publicly, gated by the bearer token.
+    ingress: Literal["none", "cloudflared"] = field(
+        default_factory=lambda: os.environ.get("CLOUD_OFFLOAD_INGRESS", "none")
+    )
 
     # Storage settings
     storage_type: Literal["local", "gcs", "s3"] = "local"
@@ -152,6 +161,8 @@ class CloudConfig:
             self.provider_order.insert(0, self.provider)
         if self.routing_policy not in {"preferred", "cheapest"}:
             raise ValueError("routing_policy must be preferred or cheapest")
+        if self.ingress not in {"none", "cloudflared"}:
+            raise ValueError("ingress must be none or cloudflared")
         self.runpod_cloud_type = self.runpod_cloud_type.upper()
         if self.runpod_cloud_type not in {"SECURE", "COMMUNITY"}:
             raise ValueError("runpod_cloud_type must be SECURE or COMMUNITY")
@@ -216,6 +227,7 @@ class CloudConfig:
                 "CLOUD_OFFLOAD_WORKER_MANIFEST", DEFAULT_WORKER_MANIFEST
             ),
             coordinator_url=os.environ.get("CLOUD_OFFLOAD_COORDINATOR_URL", ""),
+            ingress=os.environ.get("CLOUD_OFFLOAD_INGRESS", "none"),
             storage_type=os.environ.get("CLOUD_OFFLOAD_STORAGE_TYPE", "local"),
             storage_path=os.environ.get("CLOUD_OFFLOAD_STORAGE_PATH", ""),
             vast_api_key=os.environ.get("VAST_API_KEY", ""),
@@ -270,6 +282,7 @@ class CloudConfig:
             ),
             "CLOUD_OFFLOAD_WORKER_MANIFEST": ("worker_manifest_path", str),
             "CLOUD_OFFLOAD_COORDINATOR_URL": ("coordinator_url", str),
+            "CLOUD_OFFLOAD_INGRESS": ("ingress", str),
             "CLOUD_OFFLOAD_STORAGE_TYPE": ("storage_type", str),
             "CLOUD_OFFLOAD_STORAGE_PATH": ("storage_path", str),
             "CLOUD_OFFLOAD_QUEUE_DB": ("queue_db_path", str),
@@ -311,6 +324,7 @@ class CloudConfig:
             "worker_models": self.worker_models,
             "worker_manifest_path": self.worker_manifest_path,
             "coordinator_configured": bool(self.coordinator_url),
+            "ingress": self.ingress,
             "storage_type": self.storage_type,
             "storage_path": self.storage_path,
             "queue_db_path": self.queue_db_path,
