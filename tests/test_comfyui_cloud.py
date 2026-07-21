@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -569,3 +570,32 @@ def test_config_route_still_refuses_provider_credentials():
     )
     assert response.status_code == 400
     assert "provider_credentials" in response.json()["error"]["message"]
+
+
+def test_provider_settings_route_persists_and_rejects_secrets(monkeypatch, tmp_path):
+    from cloud_offload import config as config_module
+
+    monkeypatch.setattr(config_module, "CONFIG_DIR", tmp_path)
+    client = TestClient(server.app)
+
+    ok = client.post("/api/providers/runpod/settings", json={"settings": {"cloud_type": "COMMUNITY"}})
+    assert ok.status_code == 200
+    assert ok.json()["settings"]["cloud_type"] == "COMMUNITY"
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["cloud"]["connector_options"]["runpod"]["cloud_type"] == "COMMUNITY"
+
+    # Secrets must go through the credentials route, not the settings blob.
+    leak = client.post("/api/providers/runpod/settings", json={"settings": {"runpod_api_key": "x"}})
+    assert leak.status_code == 400
+
+
+def test_provider_test_route_reports_failure_without_credentials(monkeypatch, tmp_path):
+    config = profile_config(tmp_path)
+    config.runpod_api_key = ""
+    config.provider_credentials = {}
+    monkeypatch.delenv("CLOUD_OFFLOAD_RUNPOD_API_KEY", raising=False)
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+
+    payload = TestClient(server.app).post("/api/providers/runpod/test").json()
+
+    assert payload == {"provider": "runpod", "ok": False, "error": "No credentials configured"}

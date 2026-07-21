@@ -465,6 +465,60 @@ async def set_provider_credentials(provider: str, body: dict[str, Any] = Body(..
     return {"provider": name, "configured": bool(api_key.strip())}
 
 
+@app.post("/api/providers/{provider}/settings")
+async def set_provider_settings(provider: str, body: dict[str, Any] = Body(...)):
+    """Persist non-secret per-connector settings into ``connector_options``."""
+    from cloud_offload.config import CONFIG_DIR, normalize_provider_name
+    from cloud_offload.providers import connector_names
+
+    name = normalize_provider_name(provider)
+    if name not in connector_names():
+        raise HTTPException(status_code=404, detail=f"Unknown cloud connector: {provider}")
+    settings = body.get("settings", body)
+    if not isinstance(settings, dict):
+        raise HTTPException(status_code=400, detail="settings must be a JSON object")
+    if any(key.endswith("api_key") or key == "token" for key in settings):
+        raise HTTPException(
+            status_code=400,
+            detail="Credentials belong to /api/providers/{provider}/credentials",
+        )
+
+    config_path = CONFIG_DIR / "config.json"
+    data = json.loads(config_path.read_text()) if config_path.exists() else {}
+    cloud = data.setdefault("cloud", {})
+    options = cloud.setdefault("connector_options", {})
+    options[name] = {**options.get(name, {}), **settings}
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+    return {"provider": name, "settings": options[name]}
+
+
+@app.post("/api/providers/{provider}/test")
+async def test_provider(provider: str):
+    """Check a connector's credentials without provisioning anything."""
+    from cloud_offload.config import normalize_provider_name
+    from cloud_offload.providers import connector_names, create_connector
+
+    name = normalize_provider_name(provider)
+    if name not in connector_names():
+        raise HTTPException(status_code=404, detail=f"Unknown cloud connector: {provider}")
+    config = _config()
+    if not config.api_key_for(name):
+        return {"provider": name, "ok": False, "error": "No credentials configured"}
+
+    def _probe() -> dict[str, Any]:
+        connector = create_connector(name, config)
+        balance = connector.account_balance()
+        offers = connector.list_available(min_gpu_ram=1)
+        return {"balance": balance, "offer_count": len(offers)}
+
+    try:
+        result = await asyncio.to_thread(_probe)
+    except Exception as exc:
+        return {"provider": name, "ok": False, "error": str(exc)}
+    return {"provider": name, "ok": True, **result}
+
+
 @app.get("/api/jobs")
 async def list_jobs(status: Optional[str] = None, limit: int = 50):
     """List jobs in the queue (convenience endpoint)."""
