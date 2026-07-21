@@ -149,6 +149,23 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
     )
 
 
+def _resolve_auth_required(host: str, require_auth: bool = False) -> bool:
+    """Decide whether the global bearer token is enforced.
+
+    Enforced automatically for non-loopback binds. Also enforced whenever
+    ``require_auth`` or the ``CLOUD_OFFLOAD_REQUIRE_AUTH`` env var is set — a
+    loopback bind is otherwise treated as private, which is unsafe when the
+    service is fronted by a tunnel and thus publicly reachable.
+    """
+    env_force = os.environ.get("CLOUD_OFFLOAD_REQUIRE_AUTH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    return require_auth or env_force or not is_local_host(host)
+
+
 @app.middleware("http")
 async def require_bearer_when_enabled(request: Request, call_next):
     # The worker channel carries its own ``Bearer <worker_token>`` credential and
@@ -724,13 +741,26 @@ async def worker_fail(job_id: str, request: Request, payload: dict[str, Any] = B
 
 # === Main ===
 
-def serve(host: str = "127.0.0.1", port: int | None = None, allow_lan: bool = False):
-    """Start the Cloud Offload coordinator."""
+def serve(
+    host: str = "127.0.0.1",
+    port: int | None = None,
+    allow_lan: bool = False,
+    require_auth: bool = False,
+):
+    """Start the Cloud Offload coordinator.
+
+    Bearer auth is enforced automatically for non-loopback binds. A loopback
+    bind is treated as private, but that assumption breaks when the loopback
+    service is fronted by a tunnel (e.g. Cloudflare) — the routes are then
+    publicly reachable yet unauthenticated. Set ``require_auth`` (or the
+    ``CLOUD_OFFLOAD_REQUIRE_AUTH`` env var) to force a bearer token regardless
+    of bind host, so a tunneled deployment stays authenticated.
+    """
     validate_bind_host(host, allow_lan=allow_lan)
     port = choose_service_port(host, port)
     service_url = local_service_url(host, port)
     global auth_required, auth_token
-    auth_required = not is_local_host(host)
+    auth_required = _resolve_auth_required(host, require_auth)
     token_path = None
     if auth_required:
         auth_token, token_path = get_or_create_service_token()
@@ -742,7 +772,8 @@ def serve(host: str = "127.0.0.1", port: int | None = None, allow_lan: bool = Fa
     logger.info("Cloud Offload coordinator listening on %s", service_url)
     logger.info("Service discovery written to %s", service_file)
     if auth_required:
-        logger.info("LAN bind: bearer token required (token at %s)", token_path)
+        reason = "LAN bind" if not is_local_host(host) else "require_auth"
+        logger.info("%s: bearer token required (token at %s)", reason, token_path)
     uvicorn.run(app, host=host, port=port)
 
 
@@ -753,8 +784,13 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, help="Port to bind. Omit or pass 0 to auto-select.")
     parser.add_argument("--allow-lan", action="store_true", help="Allow binding to a non-localhost address")
+    parser.add_argument(
+        "--require-auth",
+        action="store_true",
+        help="Force a bearer token even on a loopback bind (use when tunneling)",
+    )
     args = parser.parse_args()
     try:
-        serve(args.host, args.port, allow_lan=args.allow_lan)
+        serve(args.host, args.port, allow_lan=args.allow_lan, require_auth=args.require_auth)
     except ServiceConfigError as exc:
         raise SystemExit(str(exc)) from exc

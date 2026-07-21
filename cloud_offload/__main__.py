@@ -52,6 +52,11 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument(
         "--allow-lan", action="store_true", help="Allow binding to a non-localhost address"
     )
+    serve_parser.add_argument(
+        "--require-auth",
+        action="store_true",
+        help="Force a bearer token even on a loopback bind (use when tunneling)",
+    )
 
     worker_parser = subparsers.add_parser("worker", help="Run as a cloud worker")
     worker_parser.add_argument("--config", help="Path to config file")
@@ -87,7 +92,12 @@ def main():
         from cloud_offload.server import serve
 
         try:
-            serve(args.host, args.port, allow_lan=args.allow_lan)
+            serve(
+                args.host,
+                args.port,
+                allow_lan=args.allow_lan,
+                require_auth=args.require_auth,
+            )
         except ServiceConfigError as exc:
             logger.error(str(exc))
             raise SystemExit(2) from exc

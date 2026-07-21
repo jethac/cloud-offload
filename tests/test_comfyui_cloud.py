@@ -390,3 +390,83 @@ def test_worker_partition_stages_bridges_and_publishes_outputs(tmp_path):
         "partition_uploading",
     ]
     assert queue.get(job.id).progress > 10
+
+
+# === Auth: tunneled loopback must be able to require a bearer token ===
+
+def test_loopback_bind_does_not_require_auth_by_default(monkeypatch):
+    monkeypatch.delenv("CLOUD_OFFLOAD_REQUIRE_AUTH", raising=False)
+    assert server._resolve_auth_required("127.0.0.1", require_auth=False) is False
+
+
+def test_require_auth_flag_forces_bearer_on_loopback(monkeypatch):
+    monkeypatch.delenv("CLOUD_OFFLOAD_REQUIRE_AUTH", raising=False)
+    # A tunneled loopback service is publicly reachable; the flag closes the gap.
+    assert server._resolve_auth_required("127.0.0.1", require_auth=True) is True
+
+
+def test_require_auth_env_forces_bearer_on_loopback(monkeypatch):
+    monkeypatch.setenv("CLOUD_OFFLOAD_REQUIRE_AUTH", "true")
+    assert server._resolve_auth_required("127.0.0.1", require_auth=False) is True
+
+
+def test_non_loopback_bind_always_requires_auth(monkeypatch):
+    monkeypatch.delenv("CLOUD_OFFLOAD_REQUIRE_AUTH", raising=False)
+    assert server._resolve_auth_required("0.0.0.0", require_auth=False) is True
+
+
+def test_bearer_middleware_rejects_and_admits_and_exempts_worker(monkeypatch):
+    monkeypatch.setattr(server, "auth_required", True)
+    monkeypatch.setattr(server, "auth_token", "sekret")
+    client = TestClient(server.app)
+    # No credential -> rejected on a normal route.
+    assert client.get("/api/status").status_code == 401
+    # Correct bearer -> admitted (health needs no queue).
+    assert client.get("/api/health", headers={"Authorization": "Bearer sekret"}).status_code == 200
+    # Worker channel carries its own token and is exempt from the global bearer.
+    worker = client.get(f"{server.WORKER_PATH_PREFIX}/policy")
+    assert worker.status_code != 401
+
+
+# === Output collection: 3D/mesh outputs must not be dropped ===
+
+def test_executor_returns_mesh_outputs_under_files():
+    http = HTTP(
+        [
+            Response({"prompt_id": "prompt-9"}),
+            Response(
+                {
+                    "prompt-9": {
+                        "status": {"status_str": "success", "completed": True},
+                        "outputs": {
+                            "12": {
+                                "3d": [
+                                    {
+                                        "filename": "mesh_00001_.glb",
+                                        "subfolder": "",
+                                        "type": "output",
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                }
+            ),
+            Response(
+                content=b"glb-bytes",
+                headers={"Content-Type": "model/gltf-binary"},
+            ),
+        ]
+    )
+    executor = ComfyUIWorkflowExecutor("http://comfy.invalid", http)
+
+    result = executor.execute(
+        {"1": {"class_type": "SaveGLB", "inputs": {"mesh": ["0", 0]}}},
+    )
+
+    assert result["images"] == []
+    assert len(result["files"]) == 1
+    entry = result["files"][0]
+    assert entry["filename"] == "mesh_00001_.glb"
+    assert entry["output_kind"] == "3d"
+    assert base64.b64decode(entry["data"]) == b"glb-bytes"

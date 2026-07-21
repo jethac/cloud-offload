@@ -13,6 +13,11 @@ import uuid
 from typing import Any
 
 
+# ComfyUI UI output keys that carry retrievable file artifacts other than
+# images. Core's 3D save nodes emit meshes under "3d"; extend as needed.
+FILE_OUTPUT_KEYS = ("3d",)
+
+
 class ComfyUIWorkflowError(RuntimeError):
     """Raised when the internal ComfyUI service rejects or fails a workflow."""
 
@@ -146,29 +151,40 @@ class ComfyUIWorkflowExecutor:
 
         outputs = history.get("outputs") or {}
         images = []
+        files = []
         for node_id, node_output in outputs.items():
             for descriptor in node_output.get("images") or []:
-                params = {
-                    "filename": descriptor["filename"],
-                    "subfolder": descriptor.get("subfolder", ""),
-                    "type": descriptor.get("type", "output"),
-                }
-                response = self._request("GET", "/view", params=params, timeout=120)
-                images.append(
-                    {
-                        "node_id": str(node_id),
-                        **params,
-                        "mime_type": response.headers.get(
-                            "Content-Type", "application/octet-stream"
-                        ),
-                        "data": base64.b64encode(response.content).decode("ascii"),
-                    }
-                )
+                images.append(self._fetch_output_file(str(node_id), descriptor, "output"))
+            # Non-image file outputs live under other UI keys. Core's 3D save
+            # nodes (SaveGLB, etc.) emit their meshes under "3d", so a mesh
+            # workflow would return nothing if we only read "images".
+            for key in FILE_OUTPUT_KEYS:
+                for descriptor in node_output.get(key) or []:
+                    entry = self._fetch_output_file(str(node_id), descriptor, "output")
+                    entry["output_kind"] = key
+                    files.append(entry)
         return {
             "prompt_id": prompt_id,
             "uploaded_inputs": uploaded,
             "outputs": outputs,
             "images": images,
+            "files": files,
+        }
+
+    def _fetch_output_file(
+        self, node_id: str, descriptor: dict[str, Any], default_type: str
+    ) -> dict[str, Any]:
+        params = {
+            "filename": descriptor["filename"],
+            "subfolder": descriptor.get("subfolder", ""),
+            "type": descriptor.get("type", default_type),
+        }
+        response = self._request("GET", "/view", params=params, timeout=120)
+        return {
+            "node_id": node_id,
+            **params,
+            "mime_type": response.headers.get("Content-Type", "application/octet-stream"),
+            "data": base64.b64encode(response.content).decode("ascii"),
         }
 
     @staticmethod
