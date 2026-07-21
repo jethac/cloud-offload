@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloud-offload"
+version = "0.1.0"
+description = "Provider-neutral cloud offload coordinator for ComfyUI workflows and partitions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "jethac" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2",
+    "python-multipart>=0.0.9",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+# Extras needed inside a runner image (torch is supplied by the base image).
+cloud = [
+    "aiohttp>=3.9",
+    "safetensors>=0.4",
+]
+gcs = ["google-cloud-storage>=2.10"]
+s3 = ["boto3>=1.28"]
+dev = ["pytest>=7", "httpx>=0.27"]
+
+[project.scripts]
+cloud-offload = "cloud_offload.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/jethac/cloud-offload"
+
+[tool.setuptools.packages.find]
+include = ["cloud_offload*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

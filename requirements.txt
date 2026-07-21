@@ -1,0 +1,13 @@
+# Coordinator service (core) runtime dependencies.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2
+python-multipart>=0.0.9
+requests>=2.31
+
+# Runner-only extras (installed inside worker images alongside the base torch):
+#   aiohttp>=3.9          # websocket event relay in ComfyUIWorkflowExecutor
+#   safetensors>=0.4      # partition bundle tensor transport (needs torch)
+# Optional storage backends:
+#   google-cloud-storage  # storage_type = gcs
+#   boto3                 # storage_type = s3

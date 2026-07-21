@@ -1,0 +1,12 @@
+{
+  "profile": "comfyui",
+  "version": "0.1.0",
+  "models": [
+    "comfyui-workflow",
+    "comfyui-partition-v1"
+  ],
+  "partition_protocol": "comfy.partition.bundle.v1",
+  "custom_nodes": {
+    "ComfyUI-Cloud-Offload-Runtime": "comfy.partition.job.v1"
+  }
+}
