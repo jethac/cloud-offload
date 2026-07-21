@@ -37,5 +37,10 @@ Homepage = "https://github.com/jethac/cloud-offload"
 [tool.setuptools.packages.find]
 include = ["cloud_offload*"]
 
+# Declarative provider specs ship with the package: without this they would be
+# missing from wheels and providers served declaratively would silently vanish.
+[tool.setuptools.package-data]
+"cloud_offload.providers.specs" = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

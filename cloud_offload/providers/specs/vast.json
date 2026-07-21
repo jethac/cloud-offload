@@ -1,0 +1,260 @@
+{
+  "spec_version": 1,
+  "name": "vast.ai",
+  "aliases": [
+    "vast"
+  ],
+  "display_name": "Vast.ai",
+  "base_url": "https://console.vast.ai/api/v0",
+  "base_url_config_field": "vast_api_url",
+  "auth": {
+    "type": "bearer"
+  },
+  "timeout": 30,
+  "include_raw": true,
+  "client_filter": false,
+  "status_map": {
+    "running": "running",
+    "loading": "pending",
+    "exited": "stopped"
+  },
+  "default_status": "unknown",
+  "settings_schema": [
+    {
+      "key": "base_url",
+      "label": "API base URL",
+      "type": "string",
+      "default": "https://console.vast.ai/api/v0"
+    }
+  ],
+  "endpoints": {
+    "offers": {
+      "method": "GET",
+      "on_error": "empty",
+      "path": "bundles",
+      "query": {
+        "q": {
+          "$json": {
+            "verified": {
+              "eq": true
+            },
+            "rentable": {
+              "eq": true
+            },
+            "rented": {
+              "eq": false
+            },
+            "type": "on-demand",
+            "gpu_name": {
+              "$when": "gpu_type",
+              "eq": "{{gpu_type}}"
+            },
+            "gpu_ram": {
+              "$when": "min_gpu_ram",
+              "gte": {
+                "$value": "min_gpu_ram",
+                "scale": 1024
+              }
+            },
+            "dph_total": {
+              "$when": "max_hourly_rate",
+              "lte": {
+                "$value": "max_hourly_rate"
+              }
+            }
+          }
+        }
+      },
+      "items": {
+        "path": "$.offers",
+        "default": []
+      },
+      "map": {
+        "id": {
+          "path": "$.id",
+          "type": "str",
+          "required": true
+        },
+        "gpu_type": {
+          "path": "$.gpu_name",
+          "default": "unknown"
+        },
+        "gpu_count": {
+          "path": "$.num_gpus",
+          "default": 1
+        },
+        "gpu_ram_gb": {
+          "path": "$.gpu_ram",
+          "unit": "MB->GB",
+          "default": 0
+        },
+        "hourly_rate": {
+          "path": "$.dph_total",
+          "default": 0
+        },
+        "cpu_cores": {
+          "path": "$.cpu_cores",
+          "default": 0
+        },
+        "ram_gb": {
+          "path": "$.cpu_ram",
+          "unit": "MB->GB",
+          "default": 0
+        },
+        "disk_gb": {
+          "path": "$.disk_space",
+          "default": 0
+        },
+        "reliability": {
+          "path": "$.reliability",
+          "default": 0
+        },
+        "location": {
+          "path": "$.geolocation",
+          "default": "unknown"
+        }
+      }
+    },
+    "launch": {
+      "method": "PUT",
+      "path": "asks/{{offer_id}}/",
+      "body": {
+        "client_id": "me",
+        "image": "{{docker_image}}",
+        "disk": 20,
+        "runtype": "ssh",
+        "env": {
+          "$value": "env_vars",
+          "omit_if": "empty"
+        },
+        "onstart": {
+          "$value": "startup_script",
+          "omit_if": "empty"
+        }
+      },
+      "map": {
+        "id": {
+          "path": "$.new_contract",
+          "type": "str",
+          "required": true
+        }
+      },
+      "wait_for": {
+        "status": "running",
+        "timeout_seconds": 300,
+        "interval_seconds": 5
+      }
+    },
+    "get": {
+      "method": "GET",
+      "on_error": "null",
+      "path": "instances",
+      "query": {
+        "owner": "me"
+      },
+      "items": {
+        "path": "$.instances",
+        "default": []
+      },
+      "select": {
+        "where": "$.id",
+        "equals": "{{instance_id}}",
+        "type": "str"
+      },
+      "map": {
+        "id": {
+          "path": "$.id",
+          "type": "str",
+          "required": true
+        },
+        "gpu_type": {
+          "path": "$.gpu_name",
+          "default": "unknown"
+        },
+        "gpu_count": {
+          "path": "$.num_gpus",
+          "default": 1
+        },
+        "hourly_rate": {
+          "path": "$.dph_total",
+          "default": 0
+        },
+        "status": "$.actual_status",
+        "ip_address": "$.public_ipaddr",
+        "ssh_port": "$.ssh_port",
+        "metadata": {
+          "ssh_host": "$.ssh_host",
+          "machine_id": "$.machine_id",
+          "start_date": "$.start_date"
+        }
+      }
+    },
+    "list": {
+      "method": "GET",
+      "on_error": "empty",
+      "path": "instances",
+      "query": {
+        "owner": "me"
+      },
+      "items": {
+        "path": "$.instances",
+        "default": []
+      },
+      "select": {
+        "where": "$.actual_status",
+        "in": [
+          "running",
+          "loading"
+        ]
+      },
+      "map": {
+        "id": {
+          "path": "$.id",
+          "type": "str",
+          "required": true
+        },
+        "gpu_type": {
+          "path": "$.gpu_name",
+          "default": "unknown"
+        },
+        "gpu_count": {
+          "path": "$.num_gpus",
+          "default": 1
+        },
+        "hourly_rate": {
+          "path": "$.dph_total",
+          "default": 0
+        },
+        "status": "$.actual_status",
+        "ip_address": "$.public_ipaddr",
+        "ssh_port": "$.ssh_port",
+        "metadata": {
+          "ssh_host": "$.ssh_host",
+          "machine_id": "$.machine_id",
+          "start_date": "$.start_date"
+        }
+      }
+    },
+    "terminate": {
+      "method": "DELETE",
+      "path": "instances/{{instance_id}}/"
+    },
+    "balance": {
+      "method": "GET",
+      "path": "users/current/",
+      "currency": "USD",
+      "map": {
+        "balance": {
+          "path": "$.balance",
+          "type": "float",
+          "default": 0.0
+        },
+        "credit": {
+          "path": "$.credit",
+          "type": "float",
+          "default": 0.0
+        }
+      }
+    }
+  }
+}
