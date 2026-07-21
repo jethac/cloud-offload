@@ -95,7 +95,9 @@ def _create_runpod(config: "CloudConfig") -> CloudConnector:
     from cloud_offload.providers.runpod import RunPodConnector
 
     return RunPodConnector(
-        api_key=config.runpod_api_key,
+        # Through api_key_for, not the raw field: the credential may live in the
+        # OS keychain or a generic env var rather than on the dataclass.
+        api_key=config.api_key_for("runpod"),
         graphql_url=config.runpod_graphql_url,
         rest_url=config.runpod_rest_url,
         cloud_type=config.runpod_cloud_type,
