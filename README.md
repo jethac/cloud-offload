@@ -66,13 +66,34 @@ Requires Python 3.10+.
 ```bash
 cloud-offload serve                 # binds 127.0.0.1, auto-selects a port
 cloud-offload serve --port 11435    # explicit port (11434 is refused: Ollama)
-cloud-offload serve --allow-lan --host 0.0.0.0   # LAN bind requires a bearer token
+cloud-offload serve --allow-lan --host 0.0.0.0            # reachable on the LAN
+cloud-offload serve --tls-cert cert.pem --tls-key key.pem # terminate TLS here
 ```
 
 On startup it writes a discovery file to `~/.cloud-offload/service.json` (the
-port scan skips Ollama's 11434). When bound to a LAN address it requires
-`Authorization: Bearer <token>` on every non-worker route; the token is created
-under `~/.cloud-offload/token`.
+port scan skips Ollama's 11434), recording the URL, whether auth is required,
+and where the token lives. Clients read that file, so authentication is
+transparent to them.
+
+### Security model
+
+**Every non-worker route requires `Authorization: Bearer <token>`, including on
+loopback.** Binding to `127.0.0.1` keeps other *hosts* out but says nothing
+about other *processes* on this machine, any of which could otherwise drive the
+coordinator and spend money on rented GPUs. The token is created under
+`~/.cloud-offload/token`. A single-user desktop can opt out with
+`--allow-anonymous-loopback`; that flag is ignored for network-reachable binds.
+
+Workers authenticate separately with their own `Bearer <worker_token>` on
+`/api/workers/*`, issued by the coordinator when the worker is launched.
+
+TLS is not terminated by default. Pass `--tls-cert`/`--tls-key` (or
+`CLOUD_OFFLOAD_TLS_CERT`/`_KEY`), or put a tunnel or reverse proxy in front. A
+non-loopback bind without either warns at startup, because worker and client
+tokens would otherwise cross the network in the clear.
+
+Provider API keys are never stored here: they live in the OS keychain (see
+[Provider setup](#provider-setup)).
 
 Other commands:
 

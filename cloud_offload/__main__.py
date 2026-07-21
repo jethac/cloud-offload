@@ -11,6 +11,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -77,8 +78,15 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument(
         "--require-auth",
         action="store_true",
-        help="Force a bearer token even on a loopback bind (use when tunneling)",
+        help="Force a bearer token (already the default; kept for explicitness)",
     )
+    serve_parser.add_argument(
+        "--allow-anonymous-loopback",
+        action="store_true",
+        help="Serve loopback without a bearer token (single-user desktop only)",
+    )
+    serve_parser.add_argument("--tls-cert", help="TLS certificate for HTTPS")
+    serve_parser.add_argument("--tls-key", help="TLS private key for HTTPS")
 
     worker_parser = subparsers.add_parser("worker", help="Run as a cloud worker")
     worker_parser.add_argument("--config", help="Path to config file")
@@ -115,11 +123,15 @@ def main():
         from cloud_offload.server import serve
 
         try:
+            if args.allow_anonymous_loopback:
+                os.environ["CLOUD_OFFLOAD_ALLOW_ANONYMOUS_LOOPBACK"] = "true"
             serve(
                 args.host,
                 args.port,
                 allow_lan=args.allow_lan,
                 require_auth=args.require_auth,
+                tls_cert=args.tls_cert,
+                tls_key=args.tls_key,
             )
         except ServiceConfigError as exc:
             logger.error(str(exc))

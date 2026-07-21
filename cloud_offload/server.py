@@ -149,21 +149,29 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
     )
 
 
-def _resolve_auth_required(host: str, require_auth: bool = False) -> bool:
-    """Decide whether the global bearer token is enforced.
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
-    Enforced automatically for non-loopback binds. Also enforced whenever
-    ``require_auth`` or the ``CLOUD_OFFLOAD_REQUIRE_AUTH`` env var is set — a
-    loopback bind is otherwise treated as private, which is unsafe when the
-    service is fronted by a tunnel and thus publicly reachable.
+
+def _resolve_auth_required(host: str, require_auth: bool = False) -> bool:
+    """Decide whether the global bearer token is enforced. Default: yes.
+
+    The bearer token is required everywhere, including loopback. Binding to
+    127.0.0.1 keeps other *hosts* out, but says nothing about other *processes*
+    on this machine — any of which can open a socket to the port and drive the
+    coordinator, spending money on rented GPUs. TLS would not help there;
+    authentication does. It is also what makes tunneling the service safe by
+    default rather than by remembering a flag.
+
+    ``CLOUD_OFFLOAD_ALLOW_ANONYMOUS_LOOPBACK`` opts a loopback bind back out,
+    for a single-user desktop that would rather not manage a token. It is
+    ignored for non-loopback binds, which are never anonymous.
     """
-    env_force = os.environ.get("CLOUD_OFFLOAD_REQUIRE_AUTH", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    return require_auth or env_force or not is_local_host(host)
+    if not is_local_host(host):
+        return True
+    if require_auth or _env_flag("CLOUD_OFFLOAD_REQUIRE_AUTH"):
+        return True
+    return not _env_flag("CLOUD_OFFLOAD_ALLOW_ANONYMOUS_LOOPBACK")
 
 
 @app.middleware("http")
@@ -1125,24 +1133,45 @@ async def worker_fail(job_id: str, request: Request, payload: dict[str, Any] = B
 
 # === Main ===
 
+def _resolve_tls(
+    tls_cert: str | None, tls_key: str | None
+) -> tuple[str | None, str | None]:
+    """Resolve and check the TLS material, falling back to the environment."""
+    cert = tls_cert or os.environ.get("CLOUD_OFFLOAD_TLS_CERT", "").strip() or None
+    key = tls_key or os.environ.get("CLOUD_OFFLOAD_TLS_KEY", "").strip() or None
+    if bool(cert) != bool(key):
+        raise ServiceConfigError("TLS needs both a certificate and a private key")
+    for label, path in (("certificate", cert), ("private key", key)):
+        if path and not Path(path).is_file():
+            raise ServiceConfigError(f"TLS {label} not found: {path}")
+    return cert, key
+
+
 def serve(
     host: str = "127.0.0.1",
     port: int | None = None,
     allow_lan: bool = False,
     require_auth: bool = False,
+    tls_cert: str | None = None,
+    tls_key: str | None = None,
 ):
     """Start the Cloud Offload coordinator.
 
-    Bearer auth is enforced automatically for non-loopback binds. A loopback
-    bind is treated as private, but that assumption breaks when the loopback
-    service is fronted by a tunnel (e.g. Cloudflare) — the routes are then
-    publicly reachable yet unauthenticated. Set ``require_auth`` (or the
-    ``CLOUD_OFFLOAD_REQUIRE_AUTH`` env var) to force a bearer token regardless
-    of bind host, so a tunneled deployment stays authenticated.
+    The bearer token is required by default, including on loopback: the local
+    threat is another process on this machine, not another host, and a token is
+    what addresses that. Pass ``--allow-anonymous-loopback`` to opt out on a
+    single-user desktop.
+
+    Supply ``tls_cert``/``tls_key`` (or ``CLOUD_OFFLOAD_TLS_CERT``/``_KEY``) to
+    terminate TLS here. A non-loopback bind without TLS warns loudly: workers
+    and clients then send their bearer tokens in the clear unless something in
+    front — a tunnel or reverse proxy — is terminating TLS for you.
     """
     validate_bind_host(host, allow_lan=allow_lan)
+    cert, key = _resolve_tls(tls_cert, tls_key)
     port = choose_service_port(host, port)
-    service_url = local_service_url(host, port)
+    scheme = "https" if cert else "http"
+    service_url = local_service_url(host, port).replace("http://", f"{scheme}://", 1)
     global auth_required, auth_token
     auth_required = _resolve_auth_required(host, require_auth)
     token_path = None
@@ -1151,14 +1180,24 @@ def serve(
     else:
         auth_token = None
     service_file = write_service_info(
-        host, port, auth_required=auth_required, token_path=token_path
+        host, port, auth_required=auth_required, token_path=token_path, scheme=scheme
     )
     logger.info("Cloud Offload coordinator listening on %s", service_url)
     logger.info("Service discovery written to %s", service_file)
     if auth_required:
-        reason = "LAN bind" if not is_local_host(host) else "require_auth"
-        logger.info("%s: bearer token required (token at %s)", reason, token_path)
-    uvicorn.run(app, host=host, port=port)
+        logger.info("Bearer token required (token at %s)", token_path)
+    else:
+        logger.warning(
+            "Anonymous loopback enabled: any local process can drive this "
+            "coordinator and spend money on rented GPUs"
+        )
+    if not cert and not is_local_host(host):
+        logger.warning(
+            "Serving %s without TLS. Bearer tokens will cross the network in "
+            "the clear unless a tunnel or reverse proxy terminates TLS.",
+            host,
+        )
+    uvicorn.run(app, host=host, port=port, ssl_certfile=cert, ssl_keyfile=key)
 
 
 if __name__ == "__main__":

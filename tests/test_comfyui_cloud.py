@@ -395,9 +395,20 @@ def test_worker_partition_stages_bridges_and_publishes_outputs(tmp_path):
 
 # === Auth: tunneled loopback must be able to require a bearer token ===
 
-def test_loopback_bind_does_not_require_auth_by_default(monkeypatch):
+def test_loopback_requires_auth_by_default(monkeypatch):
+    """Binding to loopback keeps other hosts out, not other local processes."""
     monkeypatch.delenv("CLOUD_OFFLOAD_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("CLOUD_OFFLOAD_ALLOW_ANONYMOUS_LOOPBACK", raising=False)
+    assert server._resolve_auth_required("127.0.0.1", require_auth=False) is True
+
+
+def test_anonymous_loopback_is_opt_in(monkeypatch):
+    monkeypatch.delenv("CLOUD_OFFLOAD_REQUIRE_AUTH", raising=False)
+    monkeypatch.setenv("CLOUD_OFFLOAD_ALLOW_ANONYMOUS_LOOPBACK", "true")
     assert server._resolve_auth_required("127.0.0.1", require_auth=False) is False
+
+    # ...and never applies to a bind that is reachable from the network.
+    assert server._resolve_auth_required("0.0.0.0", require_auth=False) is True
 
 
 def test_require_auth_flag_forces_bearer_on_loopback(monkeypatch):
@@ -619,3 +630,42 @@ def test_provider_test_route_reports_failure_without_credentials(monkeypatch, tm
     payload = TestClient(server.app).post("/api/providers/runpod/test").json()
 
     assert payload == {"provider": "runpod", "ok": False, "error": "No credentials configured"}
+
+
+# === TLS ===
+
+def test_tls_requires_both_cert_and_key(monkeypatch, tmp_path):
+    from cloud_offload.service_config import ServiceConfigError
+
+    monkeypatch.delenv("CLOUD_OFFLOAD_TLS_CERT", raising=False)
+    monkeypatch.delenv("CLOUD_OFFLOAD_TLS_KEY", raising=False)
+    cert = tmp_path / "cert.pem"
+    cert.write_text("x", encoding="utf-8")
+
+    assert server._resolve_tls(None, None) == (None, None)
+    with pytest.raises(ServiceConfigError, match="both"):
+        server._resolve_tls(str(cert), None)
+
+    key = tmp_path / "key.pem"
+    key.write_text("x", encoding="utf-8")
+    assert server._resolve_tls(str(cert), str(key)) == (str(cert), str(key))
+
+
+def test_tls_material_must_exist(monkeypatch, tmp_path):
+    from cloud_offload.service_config import ServiceConfigError
+
+    monkeypatch.delenv("CLOUD_OFFLOAD_TLS_CERT", raising=False)
+    monkeypatch.delenv("CLOUD_OFFLOAD_TLS_KEY", raising=False)
+    with pytest.raises(ServiceConfigError, match="certificate not found"):
+        server._resolve_tls(str(tmp_path / "missing.pem"), str(tmp_path / "k.pem"))
+
+
+def test_service_file_records_the_https_scheme(tmp_path):
+    from cloud_offload.service_config import write_service_info
+
+    path = write_service_info(
+        "127.0.0.1", 11599, tmp_path / "service.json", scheme="https"
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    # A client discovering a TLS coordinator must not try plaintext http.
+    assert payload["url"] == "https://127.0.0.1:11599"

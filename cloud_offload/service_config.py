@@ -169,11 +169,11 @@ def choose_service_port(host: str, requested_port: int | None = None) -> int:
     )
 
 
-def local_service_url(host: str, port: int) -> str:
+def local_service_url(host: str, port: int, scheme: str = "http") -> str:
     display_host = host
     if host in {"0.0.0.0", "::", ""}:
         display_host = "127.0.0.1"
-    return f"http://{display_host}:{port}"
+    return f"{scheme}://{display_host}:{port}"
 
 
 def is_healthy_service_url(url: str, token: str | None = None) -> bool:
@@ -197,12 +197,15 @@ def write_service_info(
     *,
     auth_required: bool = False,
     token_path: Path | None = None,
+    scheme: str = "http",
 ) -> Path:
     reject_ollama_port(port, "Cloud Offload service")
     service_path = path or default_service_file()
     service_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "url": local_service_url(host, port),
+        # Carries the scheme so a client discovering a TLS coordinator does not
+        # try to reach it over plaintext http.
+        "url": local_service_url(host, port, scheme),
         "host": host,
         "port": port,
         "pid": os.getpid(),
