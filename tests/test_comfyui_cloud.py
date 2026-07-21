@@ -470,3 +470,102 @@ def test_executor_returns_mesh_outputs_under_files():
     assert entry["filename"] == "mesh_00001_.glb"
     assert entry["output_kind"] == "3d"
     assert base64.b64decode(entry["data"]) == b"glb-bytes"
+
+
+# === Pluggable provider discovery and credentials ===
+
+def test_providers_endpoint_lists_registered_connectors(monkeypatch, tmp_path):
+    from cloud_offload.providers import register_connector
+    from cloud_offload.providers.base import CloudConnector, Instance
+
+    class PluginConnector(CloudConnector):
+        @property
+        def name(self):
+            return "acme"
+
+        def list_available(self, **kwargs):
+            return []
+
+        def launch(self, *args, **kwargs):
+            return Instance("i-1", "acme", "L4", 1, 0.5, "running")
+
+        def get_instance(self, instance_id):
+            return None
+
+        def terminate(self, instance_id):
+            return True
+
+        def list_instances(self):
+            return []
+
+    register_connector(
+        "acme",
+        lambda config: PluginConnector(),
+        replace=True,
+        display_name="Acme GPU",
+        kind="plugin",
+        settings_schema=[{"key": "region", "type": "string"}],
+    )
+
+    config = profile_config(tmp_path)
+    # The user's order does not mention the plugin at all.
+    config.provider_order = ["runpod"]
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+
+    payload = TestClient(server.app).get("/api/providers").json()
+    names = {entry["provider"] for entry in payload["providers"]}
+
+    assert payload["default_provider"] == "runpod"
+    assert {"runpod", "vast.ai", "acme"} <= names
+    acme = next(entry for entry in payload["providers"] if entry["provider"] == "acme")
+    assert acme["kind"] == "plugin"
+    assert acme["display_name"] == "Acme GPU"
+    assert acme["in_provider_order"] is False
+    assert acme["settings_schema"] == [{"key": "region", "type": "string"}]
+
+
+def test_generic_credential_resolution_for_plugin_provider(monkeypatch, tmp_path):
+    from cloud_offload.config import CloudConfig, provider_env_var
+
+    assert provider_env_var("acme") == "CLOUD_OFFLOAD_ACME_API_KEY"
+    assert provider_env_var("vast.ai") == "CLOUD_OFFLOAD_VAST_AI_API_KEY"
+
+    config = CloudConfig(queue_db_path=str(tmp_path / "q.db"))
+    config.provider_credentials = {}
+    monkeypatch.delenv("CLOUD_OFFLOAD_ACME_API_KEY", raising=False)
+    assert config.api_key_for("acme") == ""
+
+    # Env var wins.
+    monkeypatch.setenv("CLOUD_OFFLOAD_ACME_API_KEY", "env-key")
+    assert config.api_key_for("acme") == "env-key"
+
+    # Credential file is the fallback.
+    monkeypatch.delenv("CLOUD_OFFLOAD_ACME_API_KEY", raising=False)
+    config.provider_credentials = {"acme": "file-key"}
+    assert config.api_key_for("acme") == "file-key"
+
+
+def test_credentials_route_stores_secret_outside_config(monkeypatch, tmp_path):
+    from cloud_offload import config as config_module
+
+    monkeypatch.setattr(config_module, "CREDENTIALS_FILE", tmp_path / "credentials.json")
+    monkeypatch.delenv("CLOUD_OFFLOAD_RUNPOD_API_KEY", raising=False)
+    client = TestClient(server.app)
+
+    response = client.post("/api/providers/runpod/credentials", json={"api_key": "secret-key"})
+    assert response.status_code == 200
+    assert response.json() == {"provider": "runpod", "configured": True}
+    # Stored in the credential file, never echoed back.
+    assert config_module.load_provider_credentials()["runpod"] == "secret-key"
+    assert "secret-key" not in response.text
+
+    # Unknown connectors are rejected rather than silently stored.
+    assert client.post("/api/providers/nope/credentials", json={"api_key": "x"}).status_code == 404
+
+
+def test_config_route_still_refuses_provider_credentials():
+    response = TestClient(server.app).post(
+        "/api/config", json={"provider_credentials": {"runpod": "leak"}}
+    )
+    assert response.status_code == 400
+    assert "provider_credentials" in response.json()["error"]["message"]

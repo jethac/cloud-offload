@@ -17,6 +17,7 @@ ConnectorFactory = Callable[["CloudConfig"], CloudConnector]
 
 _CONNECTORS: dict[str, ConnectorFactory] = {}
 _CANONICAL_NAMES: dict[str, str] = {}
+_METADATA: dict[str, dict] = {}
 
 
 def _normalize(name: str) -> str:
@@ -29,8 +30,16 @@ def register_connector(
     *,
     aliases: tuple[str, ...] = (),
     replace: bool = False,
+    display_name: str | None = None,
+    kind: str = "builtin",
+    settings_schema: list[dict] | None = None,
 ) -> None:
-    """Register a connector factory under a canonical name and aliases."""
+    """Register a connector factory under a canonical name and aliases.
+
+    ``display_name``, ``kind`` (``builtin`` | ``plugin`` | ``declarative``) and
+    ``settings_schema`` are presentation metadata: they let a settings UI render
+    fields for a connector it has never heard of.
+    """
     canonical = _normalize(name)
     if not canonical:
         raise ValueError("Connector name cannot be empty")
@@ -45,6 +54,20 @@ def register_connector(
     for candidate in names:
         _CONNECTORS[candidate] = factory
         _CANONICAL_NAMES[candidate] = canonical
+    _METADATA[canonical] = {
+        "display_name": display_name or canonical,
+        "kind": kind,
+        "settings_schema": list(settings_schema or []),
+    }
+
+
+def connector_metadata(name: str) -> dict:
+    """Return presentation metadata for a connector name."""
+    canonical = _CANONICAL_NAMES.get(_normalize(name))
+    if canonical is None:
+        return {"display_name": name, "kind": "unknown", "registered": False,
+                "settings_schema": []}
+    return {**_METADATA.get(canonical, {}), "registered": True}
 
 
 def create_connector(name: str, config: "CloudConfig") -> CloudConnector:
@@ -88,14 +111,36 @@ def _create_runpod(config: "CloudConfig") -> CloudConnector:
     )
 
 
-register_connector("runpod", _create_runpod)
-register_connector("vast.ai", _create_vast, aliases=("vast",))
+register_connector(
+    "runpod",
+    _create_runpod,
+    display_name="RunPod",
+    settings_schema=[
+        {"key": "cloud_type", "label": "Cloud type", "type": "enum",
+         "options": ["SECURE", "COMMUNITY"], "default": "SECURE"},
+        {"key": "container_disk_gb", "label": "Container disk (GB)", "type": "int",
+         "default": 20},
+        {"key": "registry_auth_id", "label": "Registry credential ID", "type": "string",
+         "help": "Required only for private container images"},
+    ],
+)
+register_connector(
+    "vast.ai",
+    _create_vast,
+    aliases=("vast",),
+    display_name="Vast.ai",
+    settings_schema=[
+        {"key": "api_url", "label": "API base URL", "type": "string",
+         "default": "https://console.vast.ai/api/v0"},
+    ],
+)
 
 __all__ = [
     "CloudConnector",
     "CloudProvider",
     "ConnectorFactory",
     "Instance",
+    "connector_metadata",
     "connector_names",
     "create_connector",
     "register_connector",

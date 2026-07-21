@@ -280,16 +280,28 @@ def _partition_artifact_response(digest: str):
 
 
 def _provider_statuses(config) -> list[dict[str, Any]]:
-    from cloud_offload.providers import create_connector
+    from cloud_offload.providers import connector_names, create_connector, connector_metadata
     from cloud_offload.profiles import configured_worker_profiles
 
     profiles = configured_worker_profiles(config)
+    # Union the user's ordered list with every registered connector, so a newly
+    # registered plugin is visible before it has been added to provider_order.
+    ordered = list(config.provider_order)
+    known = ordered + [name for name in connector_names() if name not in ordered]
     providers = []
-    for position, name in enumerate(config.provider_order):
+    for name in known:
+        position = ordered.index(name) if name in ordered else len(ordered)
         configured = bool(config.api_key_for(name))
+        metadata = connector_metadata(name)
         entry: dict[str, Any] = {
             "provider": name,
+            "display_name": metadata.get("display_name") or name,
+            "kind": metadata.get("kind", "builtin"),
+            "registered": metadata.get("registered", False),
+            "settings_schema": metadata.get("settings_schema", []),
+            "settings": config.settings_for(name),
             "priority": position,
+            "in_provider_order": name in ordered,
             "configured": configured,
             "balance": {"available": False, "currency": "USD"},
             "runtime_profiles": [
@@ -367,7 +379,15 @@ async def update_config(updates: dict[str, Any] = Body(...)):
     """Persist non-secret configuration. Secrets come from the environment only."""
     from cloud_offload.config import CONFIG_DIR
 
-    secret_fields = {"vast_api_key", "runpod_api_key", "worker_token", "gcs_credentials"}
+    secret_fields = {
+        "vast_api_key",
+        "runpod_api_key",
+        "worker_token",
+        "gcs_credentials",
+        # Connector credentials are written through /api/providers/{name}/credentials,
+        # which stores them outside config.json.
+        "provider_credentials",
+    }
     payload = updates.get("cloud", updates) if isinstance(updates, dict) else {}
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Config body must be a JSON object")
@@ -398,13 +418,51 @@ async def update_config(updates: dict[str, Any] = Body(...)):
 
 @app.get("/api/providers")
 async def get_providers():
-    """Return configured routing choices and live provider balances."""
+    """Return selectable providers, routing choices and live balances."""
     config = _config()
     return {
         "enabled": config.enabled,
         "routing_policy": config.routing_policy,
+        "default_provider": config.provider,
         "providers": await asyncio.to_thread(_provider_statuses, config),
     }
+
+
+@app.post("/api/providers/{provider}/credentials")
+async def set_provider_credentials(provider: str, body: dict[str, Any] = Body(...)):
+    """Store one connector credential outside config.json.
+
+    The key is written to the credential file with owner-only permissions and is
+    never echoed back. Send an empty ``api_key`` to clear it.
+    """
+    from cloud_offload.config import (
+        normalize_provider_name,
+        provider_env_var,
+        save_provider_credential,
+    )
+    from cloud_offload.providers import connector_names
+
+    name = normalize_provider_name(provider)
+    if name not in connector_names():
+        raise HTTPException(
+            status_code=404, detail=f"Unknown cloud connector: {provider}"
+        )
+    api_key = body.get("api_key")
+    if not isinstance(api_key, str):
+        raise HTTPException(status_code=400, detail="api_key must be a string")
+    if os.environ.get(provider_env_var(name), "").strip():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{name} credentials come from {provider_env_var(name)}; "
+                "unset it to manage the credential here"
+            ),
+        )
+    try:
+        await asyncio.to_thread(save_provider_credential, name, api_key)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"provider": name, "configured": bool(api_key.strip())}
 
 
 @app.get("/api/jobs")

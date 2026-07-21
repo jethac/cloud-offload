@@ -17,6 +17,61 @@ CONFIG_DIR = Path(
 )
 DEFAULT_WORKER_MANIFEST = "/opt/cloud-offload/runtime-profile.json"
 
+# Credentials for connectors that have no typed field on ``CloudConfig`` live
+# here rather than in config.json, so secrets never round-trip through the
+# config API.
+CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
+
+
+def normalize_provider_name(provider: str) -> str:
+    """Canonicalize a provider name (``vast`` is an alias of ``vast.ai``)."""
+    normalized = str(provider or "").strip().lower()
+    return "vast.ai" if normalized == "vast" else normalized
+
+
+def provider_env_var(provider: str) -> str:
+    """Environment variable holding a generic connector credential."""
+    slug = "".join(
+        character if character.isalnum() else "_"
+        for character in normalize_provider_name(provider)
+    ).strip("_")
+    return f"CLOUD_OFFLOAD_{slug.upper()}_API_KEY"
+
+
+def load_provider_credentials() -> dict[str, str]:
+    """Read the credential file, tolerating absence or corruption."""
+    try:
+        payload = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        normalize_provider_name(name): str(value)
+        for name, value in payload.items()
+        if isinstance(name, str) and isinstance(value, str) and value.strip()
+    }
+
+
+def save_provider_credential(provider: str, api_key: str) -> None:
+    """Persist (or clear) one connector credential with owner-only permissions."""
+    provider = normalize_provider_name(provider)
+    if not provider:
+        raise ValueError("Provider name is required")
+    credentials = load_provider_credentials()
+    if api_key.strip():
+        credentials[provider] = api_key.strip()
+    else:
+        credentials.pop(provider, None)
+    CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CREDENTIALS_FILE.write_text(
+        json.dumps(credentials, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    try:
+        CREDENTIALS_FILE.chmod(0o600)
+    except OSError:  # pragma: no cover - best effort on platforms without POSIX modes
+        pass
+
 
 @dataclass
 class CloudConfig:
@@ -96,7 +151,12 @@ class CloudConfig:
     # Opaque RunPod credential record ID. The registry password/token remains
     # stored by RunPod and is never persisted in configuration.
     runpod_registry_auth_id: str = ""
+    # Non-secret per-provider settings, keyed by connector name. Lets a plugin
+    # carry its own knobs without adding fields to this dataclass.
     connector_options: dict[str, Any] = field(default_factory=dict)
+    # Credentials for connectors without a typed field, loaded from the
+    # credential file. Never serialized by ``to_dict``.
+    provider_credentials: dict[str, str] = field(default_factory=load_provider_credentials)
     bws_secrets: bool = False
     gcs_credentials: str = field(
         default_factory=lambda: os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
@@ -323,22 +383,32 @@ class CloudConfig:
             "vast_api_url": self.vast_api_url,
             "runpod_graphql_url": self.runpod_graphql_url,
             "runpod_rest_url": self.runpod_rest_url,
+            "connector_options": self.connector_options,
         }
 
     @property
     def provider_auth_configured(self) -> bool:
-        """Whether the selected built-in connector has credentials."""
-        if self.provider in {"vast", "vast.ai"}:
-            return bool(self.vast_api_key)
-        if self.provider == "runpod":
-            return bool(self.runpod_api_key)
-        return False
+        """Whether the selected connector has credentials."""
+        return bool(self.api_key_for(self.provider))
 
     def api_key_for(self, provider: str) -> str:
-        """Return a built-in connector credential without serializing it."""
-        provider = provider.strip().lower()
-        if provider in {"vast", "vast.ai"}:
+        """Return a connector credential without serializing it.
+
+        Resolution order, so that third-party connectors work without editing
+        this class: the legacy typed fields for the two built-ins, then the
+        generic ``CLOUD_OFFLOAD_<PROVIDER>_API_KEY`` environment variable, then
+        the credential file written by the settings API.
+        """
+        provider = normalize_provider_name(provider)
+        if provider == "vast.ai" and self.vast_api_key:
             return self.vast_api_key
-        if provider == "runpod":
+        if provider == "runpod" and self.runpod_api_key:
             return self.runpod_api_key
-        return ""
+        env_key = os.environ.get(provider_env_var(provider), "").strip()
+        if env_key:
+            return env_key
+        return str(self.provider_credentials.get(provider, "")).strip()
+
+    def settings_for(self, provider: str) -> dict:
+        """Return non-secret per-provider settings for a connector."""
+        return dict(self.connector_options.get(normalize_provider_name(provider), {}))
