@@ -554,9 +554,20 @@ def test_generic_credential_resolution_for_plugin_provider(monkeypatch, tmp_path
     assert config.api_key_for("acme") == "file-key"
 
 
-def test_credentials_route_stores_secret_outside_config(monkeypatch, tmp_path):
+def test_credentials_route_stores_secret_in_the_keychain(monkeypatch, tmp_path):
     from cloud_offload import config as config_module
+    from cloud_offload import credentials as creds
 
+    vault: dict[str, str] = {}
+    monkeypatch.setattr(
+        creds,
+        "_keyring",
+        lambda: SimpleNamespace(
+            get_password=lambda service, user: vault.get(user),
+            set_password=lambda service, user, secret: vault.__setitem__(user, secret),
+            delete_password=lambda service, user: vault.pop(user, None),
+        ),
+    )
     monkeypatch.setattr(config_module, "CREDENTIALS_FILE", tmp_path / "credentials.json")
     monkeypatch.delenv("CLOUD_OFFLOAD_RUNPOD_API_KEY", raising=False)
     client = TestClient(server.app)
@@ -564,9 +575,10 @@ def test_credentials_route_stores_secret_outside_config(monkeypatch, tmp_path):
     response = client.post("/api/providers/runpod/credentials", json={"api_key": "secret-key"})
     assert response.status_code == 200
     assert response.json() == {"provider": "runpod", "configured": True}
-    # Stored in the credential file, never echoed back.
-    assert config_module.load_provider_credentials()["runpod"] == "secret-key"
+    # Stored in the OS keychain, never echoed back and never written to disk.
+    assert vault["runpod"] == "secret-key"
     assert "secret-key" not in response.text
+    assert not (tmp_path / "credentials.json").exists()
 
     # Unknown connectors are rejected rather than silently stored.
     assert client.post("/api/providers/nope/credentials", json={"api_key": "x"}).status_code == 404

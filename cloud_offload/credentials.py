@@ -65,10 +65,14 @@ def provider_env_var(provider: str) -> str:
 
 
 def legacy_credentials_file() -> Path:
-    """The plaintext file earlier versions wrote, if it still exists."""
-    from cloud_offload.config import CONFIG_DIR
+    """The plaintext file earlier versions wrote, if it still exists.
 
-    return CONFIG_DIR / "credentials.json"
+    Read through the config module rather than recomputed, so redirecting
+    ``config.CREDENTIALS_FILE`` in a test redirects this too.
+    """
+    from cloud_offload import config
+
+    return Path(config.CREDENTIALS_FILE)
 
 
 def _keyring():

@@ -80,48 +80,55 @@ def test_keep_warm_config_round_trips_and_supports_environment(monkeypatch, tmp_
     assert config.to_dict()["keep_warm"] is True
 
 
-def test_config_can_resolve_provider_credentials_from_bws(monkeypatch, tmp_path):
+def test_config_resolves_provider_credentials_from_the_keychain(monkeypatch, tmp_path):
+    """Credentials come from the OS keychain, never from config.json."""
+    from cloud_offload import credentials as creds
+
     config_path = tmp_path / "config.json"
-    config_path.write_text('{"cloud":{"bws_secrets":true}}', encoding="utf-8")
+    config_path.write_text('{"cloud":{"enabled":true}}', encoding="utf-8")
     monkeypatch.delenv("VAST_API_KEY", raising=False)
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.setattr("cloud_offload.config._BWS_CREDENTIAL_CACHE", None)
+    monkeypatch.delenv("CLOUD_OFFLOAD_RUNPOD_API_KEY", raising=False)
+
+    vault = {}
     monkeypatch.setattr(
-        "cloud_offload.config.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            stdout=json.dumps(
-                [
-                    {"key": "VAST_API_KEY", "value": "vast-secret"},
-                    {"key": "RUNPOD_API_KEY", "value": "runpod-secret"},
-                    {"key": "UNRELATED", "value": "ignored"},
-                ]
-            )
+        creds,
+        "_keyring",
+        lambda: SimpleNamespace(
+            get_password=lambda service, user: vault.get(user),
+            set_password=lambda service, user, secret: vault.__setitem__(user, secret),
+            delete_password=lambda service, user: vault.pop(user, None),
         ),
     )
+    monkeypatch.setattr(creds, "legacy_credentials_file", lambda: tmp_path / "none.json")
+    vault["runpod"] = "runpod-secret"
 
     config = CloudConfig.load(config_path)
 
-    assert config.vast_api_key == "vast-secret"
-    assert config.runpod_api_key == "runpod-secret"
-    assert "vast-secret" not in repr(config.to_dict())
+    assert config.api_key_for("runpod") == "runpod-secret"
+    assert config.api_key_for("vast.ai") == ""
+    # A credential must never reach the serialized config.
+    assert "runpod-secret" not in repr(config.to_dict())
 
 
-def test_config_can_defer_bws_for_read_only_catalog(monkeypatch, tmp_path):
-    config_path = tmp_path / "config.json"
-    config_path.write_text('{"cloud":{"bws_secrets":true}}', encoding="utf-8")
-    monkeypatch.delenv("VAST_API_KEY", raising=False)
+def test_env_var_overrides_the_keychain_for_headless_workers(monkeypatch, tmp_path):
+    """A rented worker has no keychain, so the env var has to win."""
+    from cloud_offload import credentials as creds
+
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setenv("CLOUD_OFFLOAD_RUNPOD_API_KEY", "from-env")
+    monkeypatch.setattr(
+        creds,
+        "_keyring",
+        lambda: SimpleNamespace(
+            get_password=lambda service, user: "from-keychain",
+            set_password=lambda *a: None,
+            delete_password=lambda *a: None,
+        ),
+    )
+    monkeypatch.setattr(creds, "legacy_credentials_file", lambda: tmp_path / "none.json")
 
-    def must_not_run(*args, **kwargs):
-        raise AssertionError("read-only discovery must not invoke bws")
-
-    monkeypatch.setattr("cloud_offload.config.subprocess.run", must_not_run)
-
-    config = CloudConfig.load(config_path, resolve_secrets=False)
-
-    assert config.vast_api_key == ""
-    assert config.runpod_api_key == ""
-    assert config._bws_resolution_deferred is True
+    assert CloudConfig().api_key_for("runpod") == "from-env"
 
 
 def test_cheapest_router_compares_configured_connectors(monkeypatch):

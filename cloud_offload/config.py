@@ -2,13 +2,10 @@
 
 import json
 import os
-import subprocess
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
 
-
-_BWS_CREDENTIAL_CACHE: dict[str, str] | None = None
 
 # Directory that holds the persisted config, queue database, tokens and the
 # service-discovery file. Overridable through CLOUD_OFFLOAD_HOME.
@@ -17,60 +14,39 @@ CONFIG_DIR = Path(
 )
 DEFAULT_WORKER_MANIFEST = "/opt/cloud-offload/runtime-profile.json"
 
-# Credentials for connectors that have no typed field on ``CloudConfig`` live
-# here rather than in config.json, so secrets never round-trip through the
-# config API.
+# Plaintext credential file written by versions before keychain storage. Kept
+# only so existing keys can be migrated out of it; nothing writes it now. The
+# credentials module reads this attribute, so tests can redirect it.
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 
 
-def normalize_provider_name(provider: str) -> str:
-    """Canonicalize a provider name (``vast`` is an alias of ``vast.ai``)."""
-    normalized = str(provider or "").strip().lower()
-    return "vast.ai" if normalized == "vast" else normalized
-
-
-def provider_env_var(provider: str) -> str:
-    """Environment variable holding a generic connector credential."""
-    slug = "".join(
-        character if character.isalnum() else "_"
-        for character in normalize_provider_name(provider)
-    ).strip("_")
-    return f"CLOUD_OFFLOAD_{slug.upper()}_API_KEY"
-
-
-def load_provider_credentials() -> dict[str, str]:
-    """Read the credential file, tolerating absence or corruption."""
-    try:
-        payload = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    return {
-        normalize_provider_name(name): str(value)
-        for name, value in payload.items()
-        if isinstance(name, str) and isinstance(value, str) and value.strip()
-    }
+# Credential naming and storage live in cloud_offload.credentials, which keeps
+# keys in the OS keychain. These names are re-exported so callers keep one
+# import site.
+from cloud_offload.credentials import (  # noqa: E402
+    KeychainUnavailable,
+    normalize_provider_name,
+    provider_env_var,
+)
 
 
 def save_provider_credential(provider: str, api_key: str) -> None:
-    """Persist (or clear) one connector credential with owner-only permissions."""
-    provider = normalize_provider_name(provider)
-    if not provider:
-        raise ValueError("Provider name is required")
-    credentials = load_provider_credentials()
-    if api_key.strip():
-        credentials[provider] = api_key.strip()
-    else:
-        credentials.pop(provider, None)
-    CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CREDENTIALS_FILE.write_text(
-        json.dumps(credentials, indent=2, sort_keys=True), encoding="utf-8"
-    )
-    try:
-        CREDENTIALS_FILE.chmod(0o600)
-    except OSError:  # pragma: no cover - best effort on platforms without POSIX modes
-        pass
+    """Store (or clear) one connector credential in the OS keychain."""
+    from cloud_offload.credentials import set_credential
+
+    set_credential(provider, api_key)
+
+
+def load_provider_credentials() -> dict[str, str]:
+    """Credentials still sitting in the legacy plaintext file.
+
+    Nothing writes this file any more; it exists so a pre-keychain install can
+    be migrated, and so callers can assert that a secret was *not* persisted to
+    disk. Live credentials come from ``CloudConfig.api_key_for``.
+    """
+    from cloud_offload.credentials import _read_legacy_file
+
+    return _read_legacy_file()
 
 
 @dataclass
@@ -154,10 +130,10 @@ class CloudConfig:
     # Non-secret per-provider settings, keyed by connector name. Lets a plugin
     # carry its own knobs without adding fields to this dataclass.
     connector_options: dict[str, Any] = field(default_factory=dict)
-    # Credentials for connectors without a typed field, loaded from the
-    # credential file. Never serialized by ``to_dict``.
-    provider_credentials: dict[str, str] = field(default_factory=load_provider_credentials)
-    bws_secrets: bool = False
+    # In-process credential overrides, mainly for tests. Real credentials come
+    # from the environment or the OS keychain via ``api_key_for``; this is never
+    # serialized by ``to_dict`` and never persisted.
+    provider_credentials: dict[str, str] = field(default_factory=dict)
     gcs_credentials: str = field(
         default_factory=lambda: os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
     )
@@ -253,7 +229,6 @@ class CloudConfig:
             runpod_container_disk_gb=int(os.environ.get("RUNPOD_CONTAINER_DISK_GB", "20")),
             runpod_volume_gb=int(os.environ.get("RUNPOD_VOLUME_GB", "0")),
             runpod_registry_auth_id=os.environ.get("RUNPOD_REGISTRY_AUTH_ID", ""),
-            bws_secrets=os.environ.get("CLOUD_OFFLOAD_BWS_SECRETS", "").lower() == "true",
         )
 
     @classmethod
@@ -307,48 +282,12 @@ class CloudConfig:
             "RUNPOD_CONTAINER_DISK_GB": ("runpod_container_disk_gb", int),
             "RUNPOD_VOLUME_GB": ("runpod_volume_gb", int),
             "RUNPOD_REGISTRY_AUTH_ID": ("runpod_registry_auth_id", str),
-            "CLOUD_OFFLOAD_BWS_SECRETS": (
-                "bws_secrets",
-                lambda value: value.lower() == "true",
-            ),
         }
         for env_name, (field_name, converter) in env_map.items():
             if env_name in os.environ:
                 setattr(config, field_name, converter(os.environ[env_name]))
         config.__post_init__()
-        config._bws_resolution_deferred = bool(config.bws_secrets and not resolve_secrets)
-        if resolve_secrets:
-            config._load_bws_credentials()
         return config
-
-    def _load_bws_credentials(self) -> None:
-        """Resolve provider keys from Bitwarden Secrets Manager when enabled."""
-        global _BWS_CREDENTIAL_CACHE
-        if not self.bws_secrets or (self.vast_api_key and self.runpod_api_key):
-            return
-        if _BWS_CREDENTIAL_CACHE is None:
-            try:
-                completed = subprocess.run(
-                    ["bws", "secret", "list", "--output", "json"],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=15,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                _BWS_CREDENTIAL_CACHE = {
-                    item.get("key"): item.get("value", "")
-                    for item in json.loads(completed.stdout)
-                    if isinstance(item, dict)
-                    and item.get("key") in {"VAST_API_KEY", "RUNPOD_API_KEY"}
-                }
-            except (OSError, ValueError, subprocess.SubprocessError):
-                return
-        secrets = _BWS_CREDENTIAL_CACHE
-        if not self.vast_api_key:
-            self.vast_api_key = secrets.get("VAST_API_KEY", "")
-        if not self.runpod_api_key:
-            self.runpod_api_key = secrets.get("RUNPOD_API_KEY", "")
 
     def to_dict(self) -> dict:
         """Convert to dictionary (excludes secrets)."""
@@ -359,7 +298,6 @@ class CloudConfig:
             "provider_order": self.provider_order,
             "routing_policy": self.routing_policy,
             "provider_auth_configured": self.provider_auth_configured,
-            "bws_secrets": self.bws_secrets,
             "gpu_type": self.gpu_type,
             "max_hourly_rate": self.max_hourly_rate,
             "idle_shutdown_seconds": self.idle_shutdown_seconds,
@@ -394,20 +332,22 @@ class CloudConfig:
     def api_key_for(self, provider: str) -> str:
         """Return a connector credential without serializing it.
 
-        Resolution order, so that third-party connectors work without editing
-        this class: the legacy typed fields for the two built-ins, then the
-        generic ``CLOUD_OFFLOAD_<PROVIDER>_API_KEY`` environment variable, then
-        the credential file written by the settings API.
+        Delegates to :mod:`cloud_offload.credentials`, which resolves the
+        generic ``CLOUD_OFFLOAD_<PROVIDER>_API_KEY`` environment variable first
+        (the only option on a headless worker), then the OS keychain, then the
+        legacy plaintext file. The two legacy typed fields are still honoured so
+        existing ``VAST_API_KEY`` / ``RUNPOD_API_KEY`` setups keep working.
         """
+        from cloud_offload.credentials import get_credential
+
         provider = normalize_provider_name(provider)
         if provider == "vast.ai" and self.vast_api_key:
             return self.vast_api_key
         if provider == "runpod" and self.runpod_api_key:
             return self.runpod_api_key
-        env_key = os.environ.get(provider_env_var(provider), "").strip()
-        if env_key:
-            return env_key
-        return str(self.provider_credentials.get(provider, "")).strip()
+        # An explicit in-process override beats ambient sources.
+        override = str(self.provider_credentials.get(provider, "")).strip()
+        return override or get_credential(provider)
 
     def settings_for(self, provider: str) -> dict:
         """Return non-secret per-provider settings for a connector."""
