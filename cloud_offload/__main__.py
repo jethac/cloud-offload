@@ -38,6 +38,28 @@ def setup_logging(name: str = "cloud-offload", level=logging.INFO):
     return log_file
 
 
+def load_plugins(logger: logging.Logger | None = None) -> dict:
+    """Discover third-party connectors before anything reads the registry.
+
+    Never fatal: a broken plugin (or a broken plugin *system*) must not stop the
+    coordinator from starting, so failures are logged and execution continues.
+    """
+    logger = logger or logging.getLogger("cloud-offload")
+    try:
+        from cloud_offload.plugins import load_connector_plugins
+
+        summary = load_connector_plugins()
+    except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+        logger.warning(f"Connector plugin discovery failed: {exc}")
+        return {"loaded": [], "failed": [{"source": "discovery", "error": str(exc)}]}
+
+    # Individual failures are already logged as warnings by the loader.
+    loaded = summary.get("loaded", [])
+    failed = summary.get("failed", [])
+    logger.info(f"connector plugins: loaded={len(loaded)} failed={len(failed)}")
+    return summary
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cloud-offload", description="Provider-neutral cloud offload coordinator"
@@ -88,6 +110,7 @@ def main():
         port_label = args.port if args.port not in {None, 0} else "auto"
         logger.info(f"Starting Cloud Offload coordinator on {args.host}:{port_label}")
         logger.info(f"Log file: {log_file}")
+        load_plugins(logger)
         from cloud_offload.service_config import ServiceConfigError
         from cloud_offload.server import serve
 
@@ -104,6 +127,7 @@ def main():
 
     elif args.command == "worker":
         setup_logging("worker")
+        load_plugins()
         from cloud_offload.config import CloudConfig
         from cloud_offload.worker import Worker
 
@@ -113,6 +137,7 @@ def main():
 
     elif args.command == "dispatch":
         setup_logging("dispatcher")
+        load_plugins()
         from cloud_offload.config import CloudConfig
         from cloud_offload.dispatcher import Dispatcher
 
@@ -124,6 +149,7 @@ def main():
             dispatcher.shutdown()
 
     elif args.command == "queue":
+        load_plugins()
         from cloud_offload.config import CloudConfig
         from cloud_offload.queue import JobQueue, JobStatus
 

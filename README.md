@@ -110,6 +110,80 @@ The connector registry is pluggable (`register_connector(name, factory,
 aliases=...)`), so Comfy Cloud or any other backend can be added the same way
 without touching the coordinator.
 
+### Connector plugins
+
+You can add a provider **without editing this repository**. At startup the
+coordinator discovers connectors from two places, in order:
+
+1. **Entry points** in the `cloud_offload.connectors` group — for a connector
+   shipped as an installable package:
+
+   ```toml
+   # your-package/pyproject.toml
+   [project.entry-points."cloud_offload.connectors"]
+   nimbus = "nimbus_connector:NimbusConnector"
+   ```
+
+   The target may be a `CloudConnector` subclass (registered under the entry
+   point name), a factory taking a `CloudConfig`, or a zero-argument callable
+   that calls `register_connector()` itself.
+
+2. **Loose `*.py` files** in `~/.cloud-offload/connectors/` — for a single-file
+   connector you drop in by hand. Each file is executed on startup, so its
+   module-level `register_connector()` call runs. Files beginning with `_` are
+   skipped, so helpers can live alongside plugins.
+
+A registered connector is immediately visible to `GET /api/providers`, routable
+via `provider_order`, and reads its credential from
+`CLOUD_OFFLOAD_<NAME>_API_KEY` or the credential file — no code changes here.
+
+**Trust model.** Connector plugins are *code you chose to install*, and they run
+with the coordinator's privileges: the same trust model as ComfyUI custom nodes.
+Install connectors only from sources you trust. What the coordinator does
+guarantee is containment — a plugin that raises, fails to import, or claims a
+name already taken is logged and skipped, never fatal. One bad plugin cannot
+stop the coordinator or the other plugins from starting.
+
+A minimal plugin, saved as `~/.cloud-offload/connectors/nimbus.py`:
+
+```python
+from cloud_offload.providers import register_connector
+from cloud_offload.providers.base import CloudConnector, Instance
+
+
+class NimbusConnector(CloudConnector):
+    def __init__(self, api_key=""):
+        self.api_key = api_key
+
+    @property
+    def name(self):
+        return "nimbus"
+
+    def list_available(self, gpu_type=None, min_gpu_ram=None, max_hourly_rate=None):
+        return [{"id": "offer-1", "provider": "nimbus", "gpu_type": "RTX_4090",
+                 "gpu_ram_gb": 24, "hourly_rate": 0.25, "location": "eu-west"}]
+
+    def launch(self, offer_id, docker_image, env_vars=None, startup_script=None):
+        return Instance(id="i-1", provider="nimbus", gpu_type="RTX_4090",
+                        gpu_count=1, hourly_rate=0.25, status="pending")
+
+    def get_instance(self, instance_id): ...
+    def terminate(self, instance_id): ...
+    def list_instances(self): ...
+
+
+register_connector(
+    "nimbus",
+    lambda config: NimbusConnector(api_key=config.api_key_for("nimbus")),
+    display_name="Nimbus GPU",
+    kind="plugin",
+    settings_schema=[{"key": "region", "label": "Region", "type": "string"}],
+)
+```
+
+`settings_schema` is optional presentation metadata: it lets the settings UI
+render fields for a provider it has never heard of.
+
 ### Worker profiles
 
 A profile pins a runner image **by digest** and declares which providers can run
