@@ -499,6 +499,14 @@ def test_providers_endpoint_lists_registered_connectors(monkeypatch, tmp_path):
         def list_instances(self):
             return []
 
+    # Restore the registry afterwards: a leaked global registration changes what
+    # every later test sees from connector_names().
+    import cloud_offload.providers as providers_module
+
+    for attribute in ("_CONNECTORS", "_CANONICAL_NAMES", "_METADATA"):
+        snapshot = dict(getattr(providers_module, attribute))
+        monkeypatch.setattr(providers_module, attribute, snapshot)
+
     register_connector(
         "acme",
         lambda config: PluginConnector(),
