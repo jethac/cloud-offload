@@ -11,7 +11,6 @@ from cloud_offload.providers import (
 )
 from cloud_offload.providers.base import CloudConnector
 from cloud_offload.providers.runpod import RunPodConnector
-from reference_vast_connector import VastConnector, VastProvider
 
 
 class FakeResponse:
@@ -47,7 +46,6 @@ def test_builtin_connector_registry_and_vast_compatibility():
     from cloud_offload.providers.declarative import DeclarativeRestConnector
 
     assert connector_names() == ("runpod", "vast.ai")
-    assert VastProvider is VastConnector  # frozen reference, no longer shipped
 
     config = CloudConfig(vast_api_key="vast-secret")
     connector = create_connector("vast", config)
@@ -281,8 +279,9 @@ def test_connectors_normalize_account_balances():
         )
     )
 
-    vast_connector = VastConnector(api_key="secret")
-    vast_connector.requests = vast_http
+    config = CloudConfig(vast_api_key="secret")
+    vast_connector = create_connector("vast.ai", config)
+    vast_connector.http = vast_http
     vast = vast_connector.account_balance()
     runpod = RunPodConnector(api_key="secret", http_client=runpod_http).account_balance()
 

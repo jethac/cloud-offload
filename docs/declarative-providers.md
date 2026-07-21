@@ -6,9 +6,11 @@ Python. You describe the provider's REST API in a JSON **spec**; the built-in
 responses onto the two shapes the rest of the system understands — the offer
 dict and the `Instance` dataclass.
 
-Vast.ai is the proof this is real, not a toy: `cloud_offload/providers/specs/vast.json`
-is a spec, and `tests/test_declarative.py` asserts it reproduces the hand-written
-`VastConnector` request for request and field for field.
+Vast.ai is the proof this is real, not a toy: it is served entirely by
+`cloud_offload/providers/specs/vast.json`. It used to have a hand-written
+connector; that was deleted, and `tests/test_declarative.py` asserts the spec
+still reproduces its output request for request and field for field, against
+golden values captured from it at cutover.
 
 ## Where specs live
 
@@ -204,13 +206,14 @@ debug a spec without renting a GPU. Pass `http=` to inject a client in tests.
 
 ## Worked example
 
-`examples/providers/vast-declarative.json` is the shipped Vast.ai spec under a
-non-colliding name. Copy it to `~/.cloud-offload/providers/`, store a credential
-for the provider name, and it becomes routable:
+The shipped Vast.ai spec is the worked example. To start a new provider from
+it, copy it under your own name and edit — a spec may not shadow a provider
+that already exists, so rename it first:
 
 ```bash
-cp examples/providers/vast-declarative.json ~/.cloud-offload/providers/
-export CLOUD_OFFLOAD_VAST_DECLARATIVE_API_KEY=…
+cp cloud_offload/providers/specs/vast.json ~/.cloud-offload/providers/acme.json
+# edit: set "name": "acme", drop "aliases", point base_url at your provider
+export CLOUD_OFFLOAD_ACME_API_KEY=…
 ```
 
 It exercises every primitive at once: bearer auth, a JSON-encoded query

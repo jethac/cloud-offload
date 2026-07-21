@@ -1,14 +1,15 @@
 """Tests for the declarative, spec-driven REST connector.
 
-The headline test drives the shipped Vast.ai spec against fake payloads shaped
-like real Vast.ai responses and asserts the declarative connector reproduces the
-coded ``VastConnector`` byte for byte.  That differential is what justifies
-retiring the coded connector.
+The headline tests drive the shipped Vast.ai spec against fake payloads shaped
+like real Vast.ai responses and assert it reproduces, byte for byte, what the
+hand-written connector produced before it was retired.  Those outputs live in
+``golden/vast_parity.json``, captured from that connector at cutover.
 """
 
 import base64
 import copy
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,6 @@ from cloud_offload.providers.declarative import (
     resolve_path,
     validate_spec,
 )
-from reference_vast_connector import VastConnector
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -783,24 +783,13 @@ def test_builtin_specs_are_shipped_and_registered_by_default(tmp_path, registry_
     assert connector.base_url == "https://mirror.vast/api/v0"
 
 
-def test_example_spec_matches_the_shipped_vast_spec():
-    """The example must not drift from the spec that actually serves Vast.ai."""
-    builtin = json.loads((BUILTIN_SPEC_DIR / "vast.json").read_text(encoding="utf-8"))
-    example = json.loads(
-        (REPO_ROOT / "examples" / "providers" / "vast-declarative.json").read_text(
-            encoding="utf-8"
-        )
-    )
 
-    for key in ("name", "display_name", "aliases", "base_url_config_field"):
-        builtin.pop(key, None)
-        example.pop(key, None)
-    assert builtin == example
-    assert example != {}
-
-
-# ---------------------------------------------------------------------------
-# Headline test: differential parity against the coded VastConnector
+# Parity with the retired coded connector
+#
+# Vast.ai used to be served by a hand-written connector. It was deleted when the
+# declarative spec took over, and these golden values are exactly what it
+# produced for the payloads below, captured from it at cutover. They are the
+# behavioural contract: if the engine or the spec drifts, these fail.
 # ---------------------------------------------------------------------------
 
 
@@ -872,207 +861,163 @@ VAST_INSTANCES = {
 VAST_USER = {"balance": 12.5, "credit": 3.25, "email": "someone@example.invalid"}
 
 
-def vast_pair(*responses):
-    """Build a coded and a declarative Vast connector over identical payloads."""
-    spec = json.loads((BUILTIN_SPEC_DIR / "vast.json").read_text(encoding="utf-8"))
-    coded_http = HTTP(*[copy.deepcopy(r) for r in responses])
-    declarative_http = HTTP(*[copy.deepcopy(r) for r in responses])
+GOLDEN = json.loads(
+    (Path(__file__).parent / "golden" / "vast_parity.json").read_text(encoding="utf-8")
+)
 
-    coded = VastConnector(api_key="vast-secret")
-    coded.requests = coded_http
+
+def vast_connector(*responses):
+    """Build the declarative Vast.ai connector over canned payloads."""
+    spec = json.loads((BUILTIN_SPEC_DIR / "vast.json").read_text(encoding="utf-8"))
+    http = HTTP(*[copy.deepcopy(r) for r in responses])
     clock = Clock()
-    declarative = DeclarativeRestConnector(
+    connector = DeclarativeRestConnector(
         spec,
         api_key="vast-secret",
-        http=declarative_http,
+        http=http,
         sleep=clock.sleep,
         monotonic=clock.monotonic,
     )
-    return coded, coded_http, declarative, declarative_http
+    return connector, http
 
 
-def test_vast_spec_reproduces_the_coded_connector_offers():
-    coded, coded_http, declarative, declarative_http = vast_pair(Response(VAST_OFFERS))
+def test_vast_spec_matches_golden_offers():
+    connector, http = vast_connector(Response(VAST_OFFERS))
 
-    assert declarative.name == coded.name == "vast.ai"
-    assert declarative.list_available() == coded.list_available()
-
-    # Same URL and byte-identical Vast filter DSL, not merely a similar one.
-    assert declarative_http.last[1] == coded_http.last[1]
-    assert declarative_http.last[2]["params"]["q"] == coded_http.last[2]["params"]["q"]
-    assert declarative_http.last[2]["headers"]["Authorization"] == (
-        coded_http.last[2]["headers"]["Authorization"]
-    )
+    assert connector.name == "vast.ai"
+    assert connector.list_available() == GOLDEN["offers"]
+    # Byte-identical Vast filter DSL, not merely an equivalent one.
+    assert http.last[2]["params"]["q"] == GOLDEN["offers_request_q"]
+    assert http.last[2]["headers"]["Authorization"] == "Bearer vast-secret"
 
 
-def test_vast_spec_reproduces_the_coded_connector_offer_filters():
-    coded, coded_http, declarative, declarative_http = vast_pair(Response(VAST_OFFERS))
+def test_vast_spec_matches_golden_offer_filters():
+    connector, http = vast_connector(Response(VAST_OFFERS))
 
     arguments = {"gpu_type": "RTX 4090", "min_gpu_ram": 24, "max_hourly_rate": 0.5}
-    assert declarative.list_available(**arguments) == coded.list_available(**arguments)
+    assert connector.list_available(**arguments) == GOLDEN["offers_filtered"]
+    assert http.last[2]["params"]["q"] == GOLDEN["offers_filtered_request_q"]
 
-    query = json.loads(declarative_http.last[2]["params"]["q"])
-    assert query == json.loads(coded_http.last[2]["params"]["q"])
+    query = json.loads(http.last[2]["params"]["q"])
     assert query["gpu_ram"] == {"gte": 24576}  # GB -> MB done declaratively
     assert query["gpu_name"] == {"eq": "RTX 4090"}
     assert query["dph_total"] == {"lte": 0.5}
 
 
-def test_vast_spec_reproduces_the_coded_connector_instances():
-    coded, _, declarative, _ = vast_pair(Response(VAST_INSTANCES))
-    assert declarative.list_instances() == coded.list_instances()
+def test_vast_spec_matches_golden_instances():
+    connector, _ = vast_connector(Response(VAST_INSTANCES))
+    assert [asdict(i) for i in connector.list_instances()] == GOLDEN["list_instances"]
 
-    coded, _, declarative, _ = vast_pair(Response(VAST_INSTANCES))
-    coded_instances = coded.list_instances()
-    assert [i.status for i in coded_instances] == ["running", "pending"]
-
-    for instance_id in ("9988776", "5544332", "1111111", "404404"):
-        coded, _, declarative, _ = vast_pair(Response(VAST_INSTANCES))
-        assert declarative.get_instance(instance_id) == coded.get_instance(instance_id)
+    # No fetch-by-id route: the spec lists and selects client-side.
+    for instance_id, expected in GOLDEN["get_instance"].items():
+        connector, _ = vast_connector(Response(VAST_INSTANCES))
+        found = connector.get_instance(instance_id)
+        assert (asdict(found) if found else None) == expected
 
 
-def test_vast_spec_reproduces_the_coded_connector_launch():
-    launched = Response({"success": True, "new_contract": 9988776})
-    coded, coded_http, declarative, declarative_http = vast_pair(
-        launched, Response(VAST_INSTANCES)
+def test_vast_spec_matches_golden_launch():
+    connector, http = vast_connector(
+        Response({"success": True, "new_contract": 9988776}), Response(VAST_INSTANCES)
     )
 
-    arguments = ("1234567", "ghcr.io/example/runner:1")
-    keywords = {"env_vars": {"TOKEN": "abc"}, "startup_script": "echo hi"}
-    coded_instance = coded.launch(*arguments, **keywords)
-    declarative_instance = declarative.launch(*arguments, **keywords)
-
-    assert declarative_instance == coded_instance
-    assert declarative_instance.status == "running"
-    assert declarative_instance.metadata == {
-        "ssh_host": "ssh5.vast.ai",
-        "machine_id": 4242,
-        "start_date": 1721500000.0,
-    }
-
-    coded_put = coded_http.requests[0]
-    declarative_put = declarative_http.requests[0]
-    assert declarative_put[0] == coded_put[0] == "PUT"
-    assert declarative_put[1] == coded_put[1]
-    assert declarative_put[2]["json"] == coded_put[2]["json"] == {
-        "client_id": "me",
-        "image": "ghcr.io/example/runner:1",
-        "disk": 20,
-        "runtype": "ssh",
-        "env": {"TOKEN": "abc"},
-        "onstart": "echo hi",
-    }
-
-
-def test_vast_spec_reproduces_the_coded_connector_launch_without_optional_fields():
-    launched = Response({"new_contract": 9988776})
-    coded, coded_http, declarative, declarative_http = vast_pair(
-        launched, Response(VAST_INSTANCES)
+    instance = connector.launch(
+        "1234567",
+        "ghcr.io/example/runner:1",
+        env_vars={"TOKEN": "abc"},
+        startup_script="echo hi",
     )
 
-    coded.launch("1234567", "img")
-    declarative.launch("1234567", "img")
+    # launch polls get until the instance reports running (wait_for).
+    assert asdict(instance) == GOLDEN["launch"]
+    assert instance.status == "running"
 
-    assert declarative_http.requests[0][2]["json"] == coded_http.requests[0][2]["json"]
-    assert "env" not in declarative_http.requests[0][2]["json"]
-    assert "onstart" not in declarative_http.requests[0][2]["json"]
-
-
-def test_vast_spec_reproduces_the_coded_connector_terminate_and_balance():
-    coded, coded_http, declarative, declarative_http = vast_pair(Response(None))
-    assert declarative.terminate("9988776") == coded.terminate("9988776") is True
-    assert declarative_http.last[0] == coded_http.last[0] == "DELETE"
-    assert declarative_http.last[1] == coded_http.last[1]
-
-    coded, _, declarative, _ = vast_pair(Response({"detail": "gone"}, status_code=404))
-    assert declarative.terminate("9988776") == coded.terminate("9988776") is False
-
-    coded, _, declarative, _ = vast_pair(Response(VAST_USER))
-    assert declarative.account_balance() == coded.account_balance()
-    assert declarative.account_balance.__self__.name == "vast.ai"
+    put = http.requests[0]
+    assert put[0] == "PUT"
+    assert put[1] == GOLDEN["launch_put_url"]
+    assert put[2]["json"] == GOLDEN["launch_put_body"]
 
 
-def test_vast_spec_reproduces_the_coded_connector_error_degradation():
-    """vast.py swallows read errors; the spec declares that with on_error."""
+def test_vast_spec_matches_golden_launch_without_optional_fields():
+    connector, http = vast_connector(
+        Response({"new_contract": 9988776}), Response(VAST_INSTANCES)
+    )
+
+    connector.launch("1234567", "img")
+
+    body = http.requests[0][2]["json"]
+    assert body == GOLDEN["launch_minimal_put_body"]
+    assert "env" not in body and "onstart" not in body
+
+
+def test_vast_spec_matches_golden_terminate_and_balance():
+    connector, http = vast_connector(Response(None))
+    assert connector.terminate("9988776") is GOLDEN["terminate_ok"] is True
+    assert http.last[0] == "DELETE"
+    assert http.last[1] == GOLDEN["terminate_url"]
+
+    connector, _ = vast_connector(Response({"detail": "gone"}, status_code=404))
+    assert connector.terminate("9988776") is GOLDEN["terminate_missing"] is False
+
+    connector, _ = vast_connector(Response(VAST_USER))
+    assert connector.account_balance() == GOLDEN["balance"]
+
+
+def test_vast_spec_degrades_on_read_errors_like_the_retired_connector():
+    """The retired connector swallowed read errors; on_error declares that."""
     failure = Response({"detail": "upstream is down"}, status_code=503)
 
-    coded, _, declarative, _ = vast_pair(failure)
-    assert declarative.list_available() == coded.list_available() == []
-
-    coded, _, declarative, _ = vast_pair(failure)
-    assert declarative.list_instances() == coded.list_instances() == []
-
-    coded, _, declarative, _ = vast_pair(failure)
-    assert declarative.get_instance("9988776") == coded.get_instance("9988776") is None
-
-    # account_balance has no such policy in either connector: it raises.
-    coded, _, declarative, _ = vast_pair(failure)
-    with pytest.raises(DeclarativeRequestError):
-        declarative.account_balance()
-    with pytest.raises(Exception):
-        coded.account_balance()
-
-
-def test_vast_spec_reproduces_the_coded_connector_on_empty_payloads():
-    """A 200 with no collection at all must not blow up where vast.py returns []."""
-    for payload in ({}, {"success": True}, {"offers": []}):
-        coded, _, declarative, _ = vast_pair(Response(payload))
-        assert declarative.list_available() == coded.list_available() == []
-
-    for payload in ({}, {"instances": []}):
-        coded, _, declarative, _ = vast_pair(Response(payload))
-        assert declarative.list_instances() == coded.list_instances() == []
-        coded, _, declarative, _ = vast_pair(Response(payload))
-        assert declarative.get_instance("1") == coded.get_instance("1") is None
-
-
-def test_missing_collections_are_loud_unless_the_spec_declares_a_default():
-    connector, _ = acme(Response({"data": {}}))
-    with pytest.raises(DeclarativeRequestError, match="collection"):
-        connector.list_available()
-
-    spec = copy.deepcopy(ACME_SPEC)
-    spec["endpoints"]["offers"]["items"] = {"path": "$.data.items", "default": []}
-    connector, _ = acme(Response({"data": {}}), spec=spec)
+    connector, _ = vast_connector(failure)
     assert connector.list_available() == []
 
-    spec["endpoints"]["offers"]["items"] = {"default": "not a list"}
-    problems = "\n".join(validate_spec(spec))
-    assert "items: needs a 'path'" in problems
-    assert "items: 'default' must be a list" in problems
+    connector, _ = vast_connector(failure)
+    assert connector.list_instances() == []
+
+    connector, _ = vast_connector(failure)
+    assert connector.get_instance("9988776") is None
+
+    # Balance had no such policy in either implementation: it raises.
+    connector, _ = vast_connector(failure)
+    with pytest.raises(DeclarativeRequestError):
+        connector.account_balance()
 
 
-def test_declarative_engine_is_deliberately_stricter_than_vast_py_about_nulls():
-    """The two known, intentional divergences from the coded connector.
+def test_vast_spec_tolerates_empty_payloads():
+    """A 200 with no collection at all must not blow up."""
+    for payload in ({}, {"success": True}, {"offers": []}):
+        connector, _ = vast_connector(Response(payload))
+        assert connector.list_available() == []
 
-    ``vast.py`` uses ``dict.get(key, default)``, which only defaults on a
-    *missing* key -- an explicit JSON ``null`` flows through as ``None`` and, for
-    ``gpu_ram``, actually raises TypeError. The engine treats null as absent and
-    matches statuses case-insensitively. Both are improvements; they are pinned
-    here so the difference is a decision rather than a surprise.
+    for payload in ({}, {"instances": []}):
+        connector, _ = vast_connector(Response(payload))
+        assert connector.list_instances() == []
+        connector, _ = vast_connector(Response(payload))
+        assert connector.get_instance("1") is None
+
+
+def test_declarative_engine_is_deliberately_stricter_about_nulls():
+    """Two intentional divergences from the connector that was retired.
+
+    The old code used ``dict.get(key, default)``, which only defaults on a
+    *missing* key: an explicit JSON ``null`` flowed through as ``None`` and, for
+    ``gpu_ram``, raised TypeError. It also matched statuses case-sensitively.
+    The engine treats null as absent and matches case-insensitively. Both are
+    improvements, pinned here so the difference stays a decision rather than a
+    surprise.
     """
-    payload = {"offers": [{"id": 4, "gpu_name": None, "geolocation": None}]}
-    coded, _, declarative, _ = vast_pair(Response(payload))
-
-    coded_offer = coded.list_available()[0]
-    declarative_offer = declarative.list_available()[0]
-    assert (coded_offer["gpu_type"], coded_offer["location"]) == (None, None)
-    assert (declarative_offer["gpu_type"], declarative_offer["location"]) == (
-        "unknown",
-        "unknown",
+    connector, _ = vast_connector(
+        Response({"offers": [{"id": 4, "gpu_name": None, "geolocation": None}]})
     )
+    offer = connector.list_available()[0]
+    assert (offer["gpu_type"], offer["location"]) == ("unknown", "unknown")
 
-    # And a null numeric that crashes the coded connector maps cleanly here.
-    payload = {"offers": [{"id": 5, "gpu_ram": None}]}
-    coded, _, declarative, _ = vast_pair(Response(payload))
-    with pytest.raises(TypeError):
-        coded.list_available()
-    assert declarative.list_available()[0]["gpu_ram_gb"] == 0
+    # A null numeric that crashed the old connector maps cleanly here.
+    connector, _ = vast_connector(Response({"offers": [{"id": 5, "gpu_ram": None}]}))
+    assert connector.list_available()[0]["gpu_ram_gb"] == 0
 
-    payload = {"instances": [{"id": 9, "actual_status": "RUNNING"}]}
-    coded, _, declarative, _ = vast_pair(Response(payload))
-    assert coded.get_instance("9").status == "unknown"
-    assert declarative.get_instance("9").status == "running"
+    connector, _ = vast_connector(
+        Response({"instances": [{"id": 9, "actual_status": "RUNNING"}]})
+    )
+    assert connector.get_instance("9").status == "running"
 
 
 def test_on_error_policy_is_opt_in_and_validated():

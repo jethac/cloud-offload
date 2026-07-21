@@ -1,0 +1,229 @@
+{
+  "balance": {
+    "available": true,
+    "balance": 12.5,
+    "credit": 3.25,
+    "currency": "USD"
+  },
+  "get_instance": {
+    "1111111": {
+      "gpu_count": 1,
+      "gpu_type": "T4",
+      "hourly_rate": 0.09,
+      "id": "1111111",
+      "ip_address": null,
+      "metadata": {
+        "machine_id": 33,
+        "ssh_host": null,
+        "start_date": null
+      },
+      "provider": "vast.ai",
+      "ssh_port": null,
+      "status": "stopped"
+    },
+    "404404": null,
+    "5544332": {
+      "gpu_count": 4,
+      "gpu_type": "A100 SXM4",
+      "hourly_rate": 3.204,
+      "id": "5544332",
+      "ip_address": null,
+      "metadata": {
+        "machine_id": 1717,
+        "ssh_host": "ssh9.vast.ai",
+        "start_date": 1721500900.0
+      },
+      "provider": "vast.ai",
+      "ssh_port": null,
+      "status": "pending"
+    },
+    "9988776": {
+      "gpu_count": 1,
+      "gpu_type": "RTX 4090",
+      "hourly_rate": 0.412,
+      "id": "9988776",
+      "ip_address": "203.0.113.7",
+      "metadata": {
+        "machine_id": 4242,
+        "ssh_host": "ssh5.vast.ai",
+        "start_date": 1721500000.0
+      },
+      "provider": "vast.ai",
+      "ssh_port": 41022,
+      "status": "running"
+    }
+  },
+  "launch": {
+    "gpu_count": 1,
+    "gpu_type": "RTX 4090",
+    "hourly_rate": 0.412,
+    "id": "9988776",
+    "ip_address": "203.0.113.7",
+    "metadata": {
+      "machine_id": 4242,
+      "ssh_host": "ssh5.vast.ai",
+      "start_date": 1721500000.0
+    },
+    "provider": "vast.ai",
+    "ssh_port": 41022,
+    "status": "running"
+  },
+  "launch_minimal_put_body": {
+    "client_id": "me",
+    "disk": 20,
+    "image": "img",
+    "runtype": "ssh"
+  },
+  "launch_put_body": {
+    "client_id": "me",
+    "disk": 20,
+    "env": {
+      "TOKEN": "abc"
+    },
+    "image": "ghcr.io/example/runner:1",
+    "onstart": "echo hi",
+    "runtype": "ssh"
+  },
+  "launch_put_url": "https://console.vast.ai/api/v0/asks/1234567/",
+  "list_instances": [
+    {
+      "gpu_count": 1,
+      "gpu_type": "RTX 4090",
+      "hourly_rate": 0.412,
+      "id": "9988776",
+      "ip_address": "203.0.113.7",
+      "metadata": {
+        "machine_id": 4242,
+        "ssh_host": "ssh5.vast.ai",
+        "start_date": 1721500000.0
+      },
+      "provider": "vast.ai",
+      "ssh_port": 41022,
+      "status": "running"
+    },
+    {
+      "gpu_count": 4,
+      "gpu_type": "A100 SXM4",
+      "hourly_rate": 3.204,
+      "id": "5544332",
+      "ip_address": null,
+      "metadata": {
+        "machine_id": 1717,
+        "ssh_host": "ssh9.vast.ai",
+        "start_date": 1721500900.0
+      },
+      "provider": "vast.ai",
+      "ssh_port": null,
+      "status": "pending"
+    }
+  ],
+  "offers": [
+    {
+      "cpu_cores": 16,
+      "disk_gb": 512.5,
+      "gpu_count": 1,
+      "gpu_ram_gb": 23.98828125,
+      "gpu_type": "RTX 4090",
+      "hourly_rate": 0.412,
+      "id": "1234567",
+      "location": "Warsaw, PL",
+      "provider": "vast.ai",
+      "ram_gb": 62.82421875,
+      "raw": {
+        "cpu_cores": 16,
+        "cpu_ram": 64332,
+        "disk_space": 512.5,
+        "dph_total": 0.412,
+        "geolocation": "Warsaw, PL",
+        "gpu_name": "RTX 4090",
+        "gpu_ram": 24564,
+        "id": 1234567,
+        "num_gpus": 1,
+        "reliability": 0.9932,
+        "verified": true
+      },
+      "reliability": 0.9932
+    },
+    {
+      "cpu_cores": 64,
+      "disk_gb": 2048,
+      "gpu_count": 4,
+      "gpu_ram_gb": 80.0,
+      "gpu_type": "A100 SXM4",
+      "hourly_rate": 3.204,
+      "id": "7654321",
+      "location": "unknown",
+      "provider": "vast.ai",
+      "ram_gb": 252.0,
+      "raw": {
+        "cpu_cores": 64,
+        "cpu_ram": 258048,
+        "disk_space": 2048,
+        "dph_total": 3.204,
+        "gpu_name": "A100 SXM4",
+        "gpu_ram": 81920,
+        "id": 7654321,
+        "num_gpus": 4,
+        "reliability": 0.9781
+      },
+      "reliability": 0.9781
+    }
+  ],
+  "offers_filtered": [
+    {
+      "cpu_cores": 16,
+      "disk_gb": 512.5,
+      "gpu_count": 1,
+      "gpu_ram_gb": 23.98828125,
+      "gpu_type": "RTX 4090",
+      "hourly_rate": 0.412,
+      "id": "1234567",
+      "location": "Warsaw, PL",
+      "provider": "vast.ai",
+      "ram_gb": 62.82421875,
+      "raw": {
+        "cpu_cores": 16,
+        "cpu_ram": 64332,
+        "disk_space": 512.5,
+        "dph_total": 0.412,
+        "geolocation": "Warsaw, PL",
+        "gpu_name": "RTX 4090",
+        "gpu_ram": 24564,
+        "id": 1234567,
+        "num_gpus": 1,
+        "reliability": 0.9932,
+        "verified": true
+      },
+      "reliability": 0.9932
+    },
+    {
+      "cpu_cores": 64,
+      "disk_gb": 2048,
+      "gpu_count": 4,
+      "gpu_ram_gb": 80.0,
+      "gpu_type": "A100 SXM4",
+      "hourly_rate": 3.204,
+      "id": "7654321",
+      "location": "unknown",
+      "provider": "vast.ai",
+      "ram_gb": 252.0,
+      "raw": {
+        "cpu_cores": 64,
+        "cpu_ram": 258048,
+        "disk_space": 2048,
+        "dph_total": 3.204,
+        "gpu_name": "A100 SXM4",
+        "gpu_ram": 81920,
+        "id": 7654321,
+        "num_gpus": 4,
+        "reliability": 0.9781
+      },
+      "reliability": 0.9781
+    }
+  ],
+  "offers_filtered_request_q": "{\"verified\": {\"eq\": true}, \"rentable\": {\"eq\": true}, \"rented\": {\"eq\": false}, \"type\": \"on-demand\", \"gpu_name\": {\"eq\": \"RTX 4090\"}, \"gpu_ram\": {\"gte\": 24576}, \"dph_total\": {\"lte\": 0.5}}",
+  "offers_request_q": "{\"verified\": {\"eq\": true}, \"rentable\": {\"eq\": true}, \"rented\": {\"eq\": false}, \"type\": \"on-demand\"}",
+  "terminate_missing": false,
+  "terminate_ok": true,
+  "terminate_url": "https://console.vast.ai/api/v0/instances/9988776/"
+}
