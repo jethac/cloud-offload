@@ -136,6 +136,7 @@ import json
 import logging
 import re
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -148,10 +149,16 @@ __all__ = [
     "DeclarativeRestConnector",
     "DeclarativeRequestError",
     "DeclarativeSpecError",
+    "builtin_provider_spec",
     "builtin_provider_specs",
+    "credential_like_keys",
+    "describe_spec_files",
     "dry_run_spec",
     "load_provider_specs",
     "register_declarative_providers",
+    "shadow_conflict",
+    "spec_directory",
+    "spec_file_path",
     "validate_spec",
 ]
 
@@ -1103,11 +1110,51 @@ def _validate_select(select: Any, where: str, problems: list[str]) -> None:
             _validate_template(select[key], f"{where}.{key}", problems)
 
 
+#: Key names that would mean a spec is carrying a secret it has no business
+#: carrying.  A spec is shareable *because* it holds none: the connector takes
+#: its credential from ``config.api_key_for()`` and no template variable exposes
+#: it, so a key shaped like one is a spec error, not a style preference.
+CREDENTIAL_KEY_HINTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "passwd",
+    "password",
+    "secret",
+    "token",
+)
+
+
+def credential_like_keys(value: Any, where: str = "spec") -> list[str]:
+    """Return the paths of any keys in a spec that look like a credential."""
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{where}.{key}"
+            if isinstance(key, str) and any(
+                hint in key.lower() for hint in CREDENTIAL_KEY_HINTS
+            ):
+                found.append(child)
+            found.extend(credential_like_keys(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(credential_like_keys(item, f"{where}[{index}]"))
+    return found
+
+
 def validate_spec(spec: Any) -> list[str]:
     """Return human-readable problems with a provider spec (empty = valid)."""
     problems: list[str] = []
     if not isinstance(spec, dict):
         return [f"spec must be a JSON object, got {type(spec).__name__}"]
+
+    problems.extend(
+        f"{key} looks like a credential; specs hold none — store the API key "
+        f"through POST /api/providers/{{provider}}/credentials or "
+        f"{_config.provider_env_var(str(spec.get('name') or 'provider'))}"
+        for key in credential_like_keys(spec)
+    )
 
     name = spec.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -1326,11 +1373,80 @@ def dry_run_spec(spec: Any, api_key: str | None = None, *, http: Any = None) -> 
 BUILTIN_SPEC_DIR = Path(__file__).resolve().parent / "specs"
 
 
+#: A spec name doubles as a file stem, so it is restricted to characters that
+#: cannot escape the spec directory or mean something to a shell.
+SPEC_NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+#: Longest accepted spec name, so a name can never exceed a filesystem limit.
+MAX_SPEC_NAME_LENGTH = 64
+
+
 def spec_directory(directory: str | Path | None = None) -> Path:
     """Return the user directory provider specs are read from."""
     if directory is not None:
         return Path(directory)
     return _config.CONFIG_DIR / "providers"
+
+
+def spec_file_path(name: str, directory: str | Path | None = None) -> Path:
+    """Return the file a user spec named ``name`` is stored in.
+
+    Raises ``ValueError`` for any name that is not a bare file stem, so a name
+    arriving from an HTTP route can never traverse out of the spec directory or
+    address a file the caller did not mean to name.
+    """
+    candidate = str(name or "").strip().lower()
+    if not candidate:
+        raise ValueError("A provider spec name is required")
+    if len(candidate) > MAX_SPEC_NAME_LENGTH:
+        raise ValueError(
+            f"Provider spec name is too long "
+            f"({MAX_SPEC_NAME_LENGTH} characters maximum)"
+        )
+    if any(separator in candidate for separator in ("/", "\\", ":")):
+        raise ValueError(
+            f"Invalid provider spec name {name!r}: path separators are not allowed"
+        )
+    if not SPEC_NAME_PATTERN.fullmatch(candidate):
+        # The pattern is what actually contains the name: it admits no separator,
+        # no leading dot and no space, so the result cannot leave the directory.
+        raise ValueError(
+            f"Invalid provider spec name {name!r}: use lowercase letters, digits, "
+            "'.', '-' and '_', starting with a letter or digit"
+        )
+    return spec_directory(directory) / f"{candidate}.json"
+
+
+def describe_spec_files(directory: str | Path | None = None) -> list[dict]:
+    """Describe every spec file in a directory, valid or not.
+
+    Returns ``{"name", "display_name", "source", "valid", "problems"}`` per file.
+    Specs never carry credentials — they cannot, because the connector takes its
+    API key from ``config.api_key_for()`` and no template variable exposes it —
+    so a description is safe to hand to a UI verbatim.
+    """
+    specs, failures = _read_spec_files(spec_directory(directory))
+    described = [
+        {
+            "name": str(spec["name"]).strip().lower(),
+            "display_name": str(spec.get("display_name") or spec["name"]),
+            "source": spec.get("_source"),
+            "valid": True,
+            "problems": [],
+        }
+        for spec in specs
+    ]
+    described.extend(
+        {
+            "name": failure.get("name"),
+            "display_name": failure.get("name"),
+            "source": failure.get("source"),
+            "valid": False,
+            "problems": list(failure.get("errors") or []),
+        }
+        for failure in failures
+    )
+    return sorted(described, key=lambda entry: (entry["name"] or "", entry["source"] or ""))
 
 
 def _read_spec_files(directory: str | Path) -> tuple[list[dict], list[dict]]:
@@ -1371,9 +1487,27 @@ def _read_spec_files(directory: str | Path) -> tuple[list[dict], list[dict]]:
     return specs, failures
 
 
+@lru_cache(maxsize=1)
+def _builtin_spec_cache() -> tuple[dict, ...]:
+    """Parse the in-package specs once. They are package data: they cannot change."""
+    return tuple(_read_spec_files(BUILTIN_SPEC_DIR)[0])
+
+
 def builtin_provider_specs() -> list[dict]:
-    """Return the validated specs shipped inside the package."""
-    return _read_spec_files(BUILTIN_SPEC_DIR)[0]
+    """Return the validated specs shipped inside the package.
+
+    Copies, so a caller that edits what it gets back cannot corrupt the cache.
+    """
+    return [copy.deepcopy(spec) for spec in _builtin_spec_cache()]
+
+
+def builtin_provider_spec(name: str) -> dict | None:
+    """Return the in-package spec registered under ``name``, if there is one."""
+    wanted = str(name or "").strip().lower()
+    for spec in _builtin_spec_cache():
+        if str(spec["name"]).strip().lower() == wanted:
+            return copy.deepcopy(spec)
+    return None
 
 
 def load_provider_specs(directory: str | Path | None = None) -> list[dict]:
@@ -1512,3 +1646,20 @@ def _shadow_conflict(metadata_of, name: str, aliases: tuple[str, ...]):
         if metadata.get("registered") and metadata.get("kind") != "declarative":
             return candidate, metadata.get("kind")
     return None
+
+
+def shadow_conflict(name: str, aliases: tuple[str, ...] = ()) -> tuple | None:
+    """Return ``(name, kind)`` when a spec would shadow a coded connector.
+
+    This is the rule ``register_declarative_providers`` already applies at load
+    time, exposed so a caller that wants to refuse a spec *before* writing it —
+    an HTTP route, say — gets the identical answer rather than a second copy of
+    the rule that can drift from this one.
+    """
+    from cloud_offload.providers import connector_metadata
+
+    return _shadow_conflict(
+        connector_metadata,
+        str(name or "").strip().lower(),
+        tuple(str(alias).strip().lower() for alias in aliases if str(alias).strip()),
+    )

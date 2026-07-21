@@ -204,6 +204,74 @@ dry_run_spec(spec, api_key="…")           # issues ONE read-only offers reques
 It never provisions anything and never spends money — it is there so you can
 debug a spec without renting a GPU. Pass `http=` to inject a client in tests.
 
+## Authoring a spec over HTTP
+
+Everything above is also reachable through the coordinator, so a spec can be
+written, checked and installed without hand-editing files or restarting.
+
+| Route | Does |
+| --- | --- |
+| `GET /api/providers/specs` | List user specs: `name`, `display_name`, `source`, `valid`, `problems`, `registered`, plus the `directory` they live in and the `auth_types` the engine supports. |
+| `GET /api/providers/specs/{name}` | Return one spec's JSON. Falls back to the built-in spec of that name, marked `"builtin": true, "editable": false`. |
+| `PUT /api/providers/specs/{name}` | Create or replace a user spec, then re-register it. |
+| `DELETE /api/providers/specs/{name}` | Remove a user spec. |
+| `POST /api/providers/specs/validate` | `{"valid": bool, "problems": [...]}`. Writes nothing, contacts nobody. |
+| `POST /api/providers/specs/dry-run` | `{"spec": {...}, "api_key": "…"}` → the `dry_run_spec` result. |
+
+The write route is deliberately unforgiving, in this order:
+
+1. The name is canonicalized with `normalize_provider_name` — the same call the
+   credentials, settings and test routes use, so `vast` means `vast.ai` here too
+   — and must then be a bare file stem: lowercase alphanumerics plus `.`, `-`
+   and `_`, 64 characters at most. Anything with a path separator, a leading dot
+   or a space is a **400**, so a name off the wire can never address a file
+   outside the spec directory.
+2. The spec's own `name` must match the one in the URL.
+3. `validate_spec` runs **before** anything touches disk, so an invalid spec is a
+   **400** carrying `error.details.problems` and is never persisted to be
+   rediscovered at next startup. That includes carrying a credential-shaped key
+   (`api_key`, `token`, `Authorization`, …) anywhere in the spec: specs are
+   shareable *because* they hold no secrets, and the API key belongs in
+   `POST /api/providers/{provider}/credentials`. Because the rule lives in
+   `validate_spec` rather than in the route, validate, save and the startup
+   loader all give the same answer.
+4. A spec that would shadow a coded connector is a **409** — the same rule
+   `register_declarative_providers` applies at load time, exposed as
+   `shadow_conflict()` so there is one copy of it rather than two.
+
+On success the spec is written and `register_declarative_providers()` runs, so
+the provider is routable through `create_connector()` immediately; the response
+says whether it `registered`. Deletion is the asymmetric case: the registry has
+no unregister, so a deleted spec keeps serving from memory and the response sets
+`restart_required` rather than pretending the provider vanished. Built-in specs
+are readable but not deletable (**409**).
+
+`api_key` on the dry-run route is used for that one read-only probe. It is never
+written to the credential file and never echoed back — if it appears in a
+transport error message it is replaced with `***`. Omit it to reuse whatever
+`config.api_key_for(<spec name>)` already resolves to.
+
+## Authoring a spec from ComfyUI
+
+The node pack's **Cloud Offload: Manage providers** command (command palette, or
+the Cloud Offload settings category) lists the specs already installed and
+carries an **Add REST provider** form: name, display name, base URL, auth type,
+and a JSON textarea for the endpoint table and field mapping, prefilled from the
+shipped Vast.ai spec so you start from a provider that actually works rather than
+an empty box. The prefill is fetched live from `GET /api/providers/specs/vast.ai`
+and the auth-type list from `GET /api/providers/specs`, so neither can drift from
+what the engine actually supports.
+
+**Validate** shows the problem list inline, **Dry run** reports the offer count
+and the mapped sample, and **Save** writes the spec. The browser never talks to
+the coordinator directly: ComfyUI proxies these under `/cloud_offload/providers/specs`
+so the bearer token stays server-side, and nothing — credential or probe key — is
+written to `comfy.settings.json`.
+
+The form states, and means, that this covers REST/JSON providers only. A GraphQL
+API, request signing or multi-step provisioning needs a connector plugin instead;
+see the limits above.
+
 ## Worked example
 
 The shipped Vast.ai spec is the worked example. To start a new provider from

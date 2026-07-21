@@ -519,6 +519,278 @@ async def test_provider(provider: str):
     return {"provider": name, "ok": True, **result}
 
 
+# === Declarative provider specs ===
+#
+# A REST/JSON provider can be added without writing Python by dropping a spec
+# into the user spec directory. These routes make that directory editable over
+# HTTP so the settings UI can author a spec, validate it, dry-run it against the
+# provider's offers endpoint, and save it — without a coordinator restart.
+#
+# Specs never contain credentials: the declarative connector takes its API key
+# from ``config.api_key_for()`` and no template variable exposes it. ``validate_spec``
+# enforces that, so validate, save and load all give the same answer; the dry-run
+# route treats the key it is handed as probe-only — never stored, never echoed.
+#
+# Names arrive from the wire, so they go through ``normalize_provider_name`` (the
+# same canonicalization the credentials/settings/test routes use, which folds the
+# ``vast`` alias) and then ``spec_file_path``, which refuses anything that is not
+# a bare file stem.
+
+def _spec_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Accept either a bare spec or ``{"spec": {...}}`` as a request body."""
+    return body["spec"] if isinstance(body.get("spec"), dict) else body
+
+
+def _dry_run(spec: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """Probe a spec's offers endpoint. Seam for injecting a fake client in tests."""
+    from cloud_offload.providers.declarative import dry_run_spec
+
+    return dry_run_spec(spec, api_key=api_key)
+
+
+@app.get("/api/providers/specs")
+async def list_provider_specs():
+    """List the declarative provider specs in the user spec directory."""
+    from cloud_offload.providers import connector_metadata
+    from cloud_offload.providers.declarative import (
+        AUTH_TYPES,
+        describe_spec_files,
+        spec_directory,
+    )
+
+    specs = await asyncio.to_thread(describe_spec_files)
+    for entry in specs:
+        metadata = connector_metadata(entry["name"] or "")
+        entry["registered"] = bool(metadata.get("registered")) and (
+            metadata.get("kind") == "declarative"
+        )
+    return {
+        "directory": str(spec_directory()),
+        "specs": specs,
+        # The engine owns which auth styles exist; an authoring UI that hardcoded
+        # them would drift the moment a new one is supported.
+        "auth_types": list(AUTH_TYPES),
+    }
+
+
+@app.post("/api/providers/specs/validate")
+async def validate_provider_spec(body: dict[str, Any] = Body(...)):
+    """Check a spec without writing anything or contacting the provider."""
+    from cloud_offload.providers.declarative import validate_spec
+
+    spec = _spec_body(body)
+    problems = validate_spec(spec)
+    return {"valid": not problems, "problems": problems}
+
+
+@app.post("/api/providers/specs/dry-run")
+async def dry_run_provider_spec(body: dict[str, Any] = Body(...)):
+    """Exercise a spec's offers endpoint so it can be debugged before saving.
+
+    Read-only: nothing is provisioned and no money is spent. ``api_key`` is used
+    for this probe alone — it is never persisted and never echoed back. Omit it
+    to reuse whatever credential the provider name already resolves to.
+    """
+    from cloud_offload.config import normalize_provider_name
+
+    spec = _spec_body(body)
+    api_key = body.get("api_key")
+    if api_key is not None and not isinstance(api_key, str):
+        raise HTTPException(status_code=400, detail="api_key must be a string")
+    api_key = (api_key or "").strip()
+    if not api_key:
+        name = normalize_provider_name(spec.get("name") or "")
+        api_key = _config().api_key_for(name) if name else ""
+
+    result = await asyncio.to_thread(_dry_run, spec, api_key)
+    if api_key and isinstance(result.get("error"), str):
+        # A transport error can quote the request it failed to send; make sure a
+        # credential cannot ride back out through the message.
+        result["error"] = result["error"].replace(api_key, "***")
+    return result
+
+
+def _spec_response(name: str, spec: dict, path: Path | None, problems: list) -> dict:
+    """One response shape for a spec, whether it came from the user dir or the package."""
+    spec.pop("_source", None)
+    return {
+        "name": name,
+        "source": str(path) if path else None,
+        "builtin": path is None,
+        "editable": path is not None,
+        "valid": not problems,
+        "problems": problems,
+        "spec": spec,
+    }
+
+
+@app.get("/api/providers/specs/{name}")
+async def get_provider_spec(name: str):
+    """Return one user spec's JSON, or the built-in spec of that name."""
+    from cloud_offload.config import normalize_provider_name
+    from cloud_offload.providers.declarative import (
+        builtin_provider_spec,
+        spec_file_path,
+        validate_spec,
+    )
+
+    normalized = normalize_provider_name(name)
+    try:
+        path = spec_file_path(normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not path.exists():
+        builtin = builtin_provider_spec(normalized)
+        if builtin is None:
+            raise HTTPException(
+                status_code=404, detail=f"No provider spec named {name!r}"
+            )
+        return _spec_response(normalized, builtin, None, [])
+
+    try:
+        spec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"{path.name} could not be read as JSON: {exc}"
+        ) from exc
+    return _spec_response(normalized, spec, path, validate_spec(spec))
+
+
+@app.put("/api/providers/specs/{name}")
+async def put_provider_spec(name: str, body: dict[str, Any] = Body(...)):
+    """Create or replace a user provider spec, then register it.
+
+    The spec is validated *before* anything touches disk, so an invalid spec can
+    never be persisted, and refused outright if it would shadow a connector that
+    already exists in code. On success the provider is re-registered, which makes
+    it routable immediately rather than after a restart.
+    """
+    from cloud_offload.config import normalize_provider_name
+    from cloud_offload.providers import connector_metadata
+    from cloud_offload.providers.declarative import (
+        register_declarative_providers,
+        shadow_conflict,
+        spec_file_path,
+        validate_spec,
+    )
+
+    spec = _spec_body(body)
+    try:
+        path = spec_file_path(normalize_provider_name(name))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    stem = path.stem
+    declared = normalize_provider_name(spec.get("name") or "")
+    if not declared:
+        spec = {**spec, "name": stem}
+    elif declared != stem:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Spec 'name' is {declared!r} but the URL names {stem!r}",
+        )
+    spec.pop("_source", None)
+
+    # validate_spec also rejects credential-shaped keys, so this is the same
+    # answer /validate gives and the same one the loader gives at startup.
+    problems = validate_spec(spec)
+    if problems:
+        return error_response(
+            400,
+            "cloud_offload.invalid_provider_spec",
+            f"Provider spec {stem!r} is invalid",
+            {"problems": problems},
+        )
+
+    conflict = shadow_conflict(stem, spec.get("aliases") or ())
+    if conflict is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{conflict[0]!r} is already served by a {conflict[1]} connector; "
+                "rename the spec"
+            ),
+        )
+
+    existed = path.exists()
+
+    def _write_and_register() -> dict:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(spec, indent=2, sort_keys=True), encoding="utf-8")
+        # User specs only: writing one cannot change what the in-package specs
+        # register, and rescanning them would double the work for nothing.
+        return register_declarative_providers(include_builtin=False)
+
+    try:
+        report = await asyncio.to_thread(_write_and_register)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not write {path.name}: {exc}"
+        ) from exc
+
+    metadata = connector_metadata(stem)
+    return {
+        "name": stem,
+        "display_name": str(spec.get("display_name") or stem),
+        "source": str(path),
+        "created": not existed,
+        "registered": bool(metadata.get("registered"))
+        and metadata.get("kind") == "declarative",
+        "errors": [
+            problem
+            for entry in report.get("failed", []) + report.get("skipped", [])
+            if entry.get("name") == stem
+            for problem in entry.get("errors", [])
+        ],
+    }
+
+
+@app.delete("/api/providers/specs/{name}")
+async def delete_provider_spec(name: str):
+    """Delete a user provider spec. Built-in specs are not deletable."""
+    from cloud_offload.config import normalize_provider_name
+    from cloud_offload.providers import connector_metadata
+    from cloud_offload.providers.declarative import builtin_provider_spec, spec_file_path
+
+    normalized = normalize_provider_name(name)
+    try:
+        path = spec_file_path(normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    builtin = builtin_provider_spec(normalized) is not None
+    if not path.exists():
+        if builtin:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{normalized!r} is a built-in spec shipped with Cloud Offload "
+                    "and cannot be deleted"
+                ),
+            )
+        raise HTTPException(status_code=404, detail=f"No provider spec named {name!r}")
+
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not delete {path.name}: {exc}"
+        ) from exc
+
+    metadata = connector_metadata(normalized)
+    still_registered = bool(metadata.get("registered"))
+    return {
+        "name": normalized,
+        "deleted": True,
+        "source": str(path),
+        # The registry has no unregister: a deleted spec keeps serving from
+        # memory until the coordinator restarts. Say so rather than imply the
+        # provider vanished.
+        "restart_required": still_registered and not builtin,
+    }
+
+
 @app.get("/api/jobs")
 async def list_jobs(status: Optional[str] = None, limit: int = 50):
     """List jobs in the queue (convenience endpoint)."""
