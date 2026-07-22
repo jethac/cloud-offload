@@ -231,6 +231,36 @@ it. Persist non-secret config via `POST /api/config` or `~/.cloud-offload/config
 }
 ```
 
+A profile may also declare **pinned weights** to stage at boot. The worker
+downloads them from Hugging Face before its first job — progress streams as
+`weights_staging` events on that job — into the given subdirectory of the
+runner's ComfyUI `models/` directory. `revision` is required and should be a
+commit hash: a floating branch would let the "same" profile drift between
+launches. `files: null` mirrors the whole snapshot; files already on disk are
+skipped, so a re-used volume never re-downloads.
+
+```json
+"weights": [
+  {
+    "repo_id": "stabilityai/stable-diffusion-xl-base-1.0",
+    "revision": "462165984030d82259a11f4367a4eed129e94a7b",
+    "files": ["sd_xl_base_1.0.safetensors"],
+    "dest": "checkpoints"
+  }
+]
+```
+
+Public repos need no credential. For gated or private repos, store a Hugging
+Face token under the name `huggingface` — the node pack's provider dialog does
+this, or `POST /api/providers/huggingface/credentials` directly — or export
+`HF_TOKEN`, which is canonical and outranks the keychain (then
+`CLOUD_OFFLOAD_HUGGINGFACE_API_KEY`, then the keychain entry). The dispatcher
+passes the token to the pod as `HF_TOKEN` only when the launching profile
+declares weights. Use a **fine-grained, read-only** token: a pod's environment
+is visible to whoever controls the provider account, so a token scoped to just
+the repos you need limits the blast radius. Like provider keys, it is never
+written to `config.json` and never returned by the API.
+
 See [`deploy/runtime-profiles/`](deploy/runtime-profiles/) for the model-agnostic
 runner image (plain ComfyUI + the `CloudPartition{Input,Output}` bridge nodes +
 the baked capability manifest).
