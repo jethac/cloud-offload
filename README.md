@@ -106,13 +106,19 @@ cloud-offload queue status  # inspect the local job queue
 ## Provider setup
 
 RunPod is the **default** provider (`provider="runpod"`, order
-`["runpod","vast.ai"]`). Credentials come from the environment only — they are
-never written to `config.json` and never returned by the API.
+`["runpod","vast.ai"]`). Credentials resolve in a fixed order: the
+`CLOUD_OFFLOAD_<PROVIDER>_API_KEY` environment variable (the headless/CI
+escape hatch), then the **OS keychain** (Windows Credential Manager, macOS
+Keychain, Secret Service), then the legacy plaintext `credentials.json`, which
+is migrated into the keychain and deleted on first read. Keys are never
+written to `config.json` and never returned by the API. Store them with
+`POST /api/providers/{name}/credentials` — the node pack's provider dialog
+does exactly that — or export the env var.
 
 ### RunPod (default)
 
 ```bash
-export RUNPOD_API_KEY=...             # required
+export RUNPOD_API_KEY=...             # legacy variable, still honoured; or use the keychain
 export RUNPOD_CLOUD_TYPE=SECURE       # or COMMUNITY
 export RUNPOD_REGISTRY_AUTH_ID=...    # required to pull a private GHCR runner image
 ```
@@ -156,7 +162,7 @@ coordinator discovers connectors from two places, in order:
 
 A registered connector is immediately visible to `GET /api/providers`, routable
 via `provider_order`, and reads its credential from
-`CLOUD_OFFLOAD_<NAME>_API_KEY` or the credential file — no code changes here.
+`CLOUD_OFFLOAD_<NAME>_API_KEY` or the OS keychain — no code changes here.
 
 **Trust model.** Connector plugins are *code you chose to install*, and they run
 with the coordinator's privileges: the same trust model as ComfyUI custom nodes.
