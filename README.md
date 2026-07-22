@@ -260,6 +260,19 @@ Every error uses the stable envelope `{"error":{"code","message","details"}}`.
 python -m pytest
 ```
 
+## Roadmap
+
+Two load balancers are designed and queued behind the current release:
+
+- **[Fleet provider](docs/fleet-provider.md)** — your own machines (a studio's
+  workstations, a home user's second PC) as a zero-cost provider, with lease
+  scheduling and idle-yield so the fleet never fights the human at the
+  keyboard. Studios with an existing farm scheduler can front it with a
+  [declarative spec](docs/declarative-providers.md) instead.
+- **[Compute pool](docs/compute-pool.md)** — the fleet protocol over the
+  internet, so indie teams and friend groups can pool GPUs: trust-tiered
+  enrollment, transfer budgets, and a contributed-vs-consumed ledger.
+
 ## License
 
 Apache-2.0
