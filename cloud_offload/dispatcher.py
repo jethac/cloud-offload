@@ -5,6 +5,7 @@ Runs locally, monitors the job queue, and launches cloud instances
 when enough jobs are waiting.
 """
 
+import json
 import logging
 import os
 import secrets
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from cloud_offload.config import CloudConfig
+from cloud_offload.credentials import huggingface_token
 from cloud_offload.providers import create_connector
 from cloud_offload.providers.base import CloudConnector, CloudProvider, Instance
 from cloud_offload.queue import JobQueue, JobStatus
@@ -353,6 +355,16 @@ class Dispatcher:
             "CLOUD_OFFLOAD_WORKER_PROFILE": profile_name,
             "CLOUD_OFFLOAD_WORKER_MODELS": ",".join(profile["models"]),
         }
+        if profile.get("weights"):
+            # The worker stages these before its first job. The Hub token rides
+            # along only when one exists, so a profile of public weights puts no
+            # secret into the pod environment.
+            env_vars["CLOUD_OFFLOAD_WEIGHTS"] = json.dumps(
+                profile["weights"], separators=(",", ":")
+            )
+            hub_token = huggingface_token()
+            if hub_token:
+                env_vars["HF_TOKEN"] = hub_token
 
         try:
             instance = connector.launch(

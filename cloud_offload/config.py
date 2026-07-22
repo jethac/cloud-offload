@@ -178,6 +178,13 @@ class CloudConfig:
             self.queue_db_path = str(CONFIG_DIR / "jobs.db")
         if not self.storage_path:
             self.storage_path = str(CONFIG_DIR / "job_files")
+        # Malformed pinned weights fail here, at load, not at dispatch time when
+        # a worker is already being paid for.
+        from cloud_offload.profiles import normalized_profile_weights
+
+        for profile_name, profile in (self.worker_profiles or {}).items():
+            if isinstance(profile, dict):
+                normalized_profile_weights(str(profile_name), profile.get("weights"))
 
     @classmethod
     def from_file(cls, path: str | Path) -> "CloudConfig":

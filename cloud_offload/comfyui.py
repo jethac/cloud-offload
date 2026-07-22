@@ -10,12 +10,28 @@ import os
 import struct
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 
 # ComfyUI UI output keys that carry retrievable file artifacts other than
 # images. Core's 3D save nodes emit meshes under "3d"; extend as needed.
 FILE_OUTPUT_KEYS = ("3d",)
+
+# Where the runner image checks ComfyUI out. Weight staging drops files under
+# its ``models`` directory (checkpoints/, vae/, ...).
+DEFAULT_COMFYUI_ROOT = "/opt/ComfyUI"
+
+
+def comfyui_models_dir() -> Path:
+    """The colocated ComfyUI's models directory.
+
+    Resolved from ``CLOUD_OFFLOAD_COMFYUI_ROOT`` the same way the executor
+    resolves ``CLOUD_OFFLOAD_COMFYUI_URL``, so a nonstandard checkout (or a
+    test) can redirect it without touching the code.
+    """
+    root = os.environ.get("CLOUD_OFFLOAD_COMFYUI_ROOT", DEFAULT_COMFYUI_ROOT)
+    return Path(root) / "models"
 
 
 class ComfyUIWorkflowError(RuntimeError):

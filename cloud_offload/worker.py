@@ -72,6 +72,10 @@ class Worker:
         self._apply_image_manifest()
         self.capabilities = self._validated_capabilities()
         self.gpu_name, self.gpu_vram_gb = self._detect_gpu()
+        # Pinned weights the launching profile wants on disk. Staged lazily at
+        # the first claimed job so the progress is visible in that job's events.
+        self.weights = self._load_weights_env()
+        self._weights_staged = False
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -99,6 +103,23 @@ class Worker:
             and "comfyui-partition-v1" in manifest_models
         ):
             self.declared_capabilities.append("comfyui-partition-v1")
+
+    @staticmethod
+    def _load_weights_env() -> list[dict]:
+        """Weight downloads requested by the launching profile, if any."""
+        import json
+        import os
+
+        raw = os.environ.get("CLOUD_OFFLOAD_WEIGHTS", "").strip()
+        if not raw:
+            return []
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"CLOUD_OFFLOAD_WEIGHTS is not valid JSON: {exc}") from exc
+        if not isinstance(entries, list):
+            raise RuntimeError("CLOUD_OFFLOAD_WEIGHTS must be a JSON list")
+        return entries
 
     def _validated_capabilities(self) -> list[str]:
         """Only claim workflow capabilities this ComfyUI runner actually offers."""
@@ -252,12 +273,116 @@ class Worker:
         if job.model not in WORKFLOW_CAPABILITIES:
             raise RuntimeError(f"Unsupported job model: {job.model}")
 
+        # The first claimed job pays the weight download; later jobs skip it.
+        self._stage_profile_weights(job)
+
         # Mark as running
         self.queue.update_status(job.id, JobStatus.RUNNING)
 
         result = self._run_comfyui_workflow(job)
         self.queue.update_status(job.id, JobStatus.COMPLETED, result=result)
         logger.info(f"Job {job.id} completed")
+
+    def _stage_profile_weights(self, job: Job) -> None:
+        """Download the profile's pinned weights before the first job executes.
+
+        Progress rides the job's event stream as ``weights_staging`` events in
+        the 3..9 band, after the dispatcher's ``runner_starting`` (2) and under
+        the 10 that marks the job running. A failed download raises, which
+        fails the job through the normal path in ``run``.
+        """
+        if self._weights_staged:
+            return
+        if not self.weights:
+            self._weights_staged = True
+            return
+
+        # Imported here, not at module top: huggingface_hub is a runner-side
+        # extra ("cloud"), like aiohttp in the streaming executor.
+        import huggingface_hub
+
+        from cloud_offload.comfyui import comfyui_models_dir
+        from cloud_offload.credentials import huggingface_token
+
+        models_dir = comfyui_models_dir().resolve()
+        token = huggingface_token() or None
+        event_writer = getattr(self.queue, "append_event", None)
+        progress_setter = getattr(self.queue, "set_progress", None)
+        total_files = sum(
+            len(entry["files"]) if entry.get("files") else 1 for entry in self.weights
+        )
+        downloaded = 0
+
+        def publish(repo_id: str | None, filename: str | None) -> None:
+            progress = 3 + round(6 * downloaded / max(1, total_files))
+            if callable(progress_setter):
+                progress_setter(job.id, progress)
+            if callable(event_writer):
+                event_writer(
+                    job.id,
+                    {
+                        "type": "weights_staging",
+                        "repo_id": repo_id,
+                        "file": filename,
+                        "downloaded_files": downloaded,
+                        "total_files": total_files,
+                        "overall_progress": progress,
+                    },
+                )
+
+        for entry in self.weights:
+            repo_id = str(entry.get("repo_id") or "")
+            revision = str(entry.get("revision") or "")
+            target_dir = (models_dir / str(entry.get("dest") or "")).resolve()
+            try:
+                target_dir.relative_to(models_dir)
+            except ValueError:
+                # The dispatcher validated dest at config load; re-check anyway.
+                raise RuntimeError(
+                    f"Weights dest escapes the models directory: {entry.get('dest')!r}"
+                )
+            files = entry.get("files")
+            if files:
+                for filename in files:
+                    target = target_dir / filename
+                    if target.is_file() and target.stat().st_size > 0:
+                        logger.info(
+                            "Weights already staged, skipping %s (%s)", filename, repo_id
+                        )
+                        downloaded += 1
+                        continue
+                    publish(repo_id, filename)
+                    try:
+                        huggingface_hub.hf_hub_download(
+                            repo_id=repo_id,
+                            filename=filename,
+                            revision=revision,
+                            local_dir=str(target_dir),
+                            token=token,
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Weights staging failed for {repo_id} ({filename}@{revision}): {exc}"
+                        ) from exc
+                    downloaded += 1
+            else:
+                publish(repo_id, None)
+                try:
+                    huggingface_hub.snapshot_download(
+                        repo_id=repo_id,
+                        revision=revision,
+                        local_dir=str(target_dir),
+                        token=token,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Weights staging failed for {repo_id}@{revision}: {exc}"
+                    ) from exc
+                downloaded += 1
+
+        publish(None, None)
+        self._weights_staged = True
+        logger.info("Staged %d weight file(s) into %s", total_files, models_dir)
 
     def _run_comfyui_workflow(self, job: Job) -> dict:
         """Execute an arbitrary API-format workflow in the colocated ComfyUI."""

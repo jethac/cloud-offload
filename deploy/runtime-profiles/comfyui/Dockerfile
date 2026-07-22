@@ -17,6 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     CLOUD_OFFLOAD_WORKER_MANIFEST=/opt/cloud-offload/runtime-profile.json \
     CLOUD_OFFLOAD_COMFYUI_URL=http://127.0.0.1:8188 \
+    CLOUD_OFFLOAD_COMFYUI_ROOT=/opt/ComfyUI \
     COMFY_PARTITION_ROOT=/opt/cloud-offload/partitions \
     HF_HUB_ENABLE_HF_TRANSFER=1
 

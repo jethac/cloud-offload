@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 # The capabilities a ComfyUI runner can claim. ``comfyui-workflow`` runs an
@@ -51,8 +51,71 @@ def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
             "min_gpu_ram_gb": float(value.get("min_gpu_ram_gb") or 0),
             "wheelhouse_url": str(value.get("wheelhouse_url") or ""),
             "wheelhouse_sha256": str(value.get("wheelhouse_sha256") or ""),
+            "weights": normalized_profile_weights(str(name), value.get("weights")),
         }
     return result
+
+
+def _require_models_relative(label: str, field: str, value: str) -> None:
+    """Reject absolute paths and upward traversal in a models-relative path."""
+    # PureWindowsPath also parses forward slashes and catches drive letters, so
+    # one check covers both separator styles regardless of the host OS.
+    pure = PureWindowsPath(value)
+    if pure.is_absolute() or pure.drive or value.startswith(("/", "\\")):
+        raise ValueError(f"{label}: {field} must be a relative path, got {value!r}")
+    if ".." in pure.parts:
+        raise ValueError(f"{label}: {field} must not traverse upward, got {value!r}")
+
+
+def normalized_profile_weights(name: str, entries: Any) -> list[dict[str, Any]]:
+    """Validate and normalize a profile's optional pinned ``weights`` list.
+
+    Every entry names a Hugging Face repo at a pinned revision and a destination
+    under the runner's ComfyUI models directory; ``files: null`` means the whole
+    snapshot. Invalid entries raise instead of being dropped: a profile that
+    believes it stages weights but silently does not would fail every job at
+    runtime with a far less useful error.
+    """
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise ValueError(f"Worker profile {name!r}: weights must be a list")
+    normalized: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        label = f"Worker profile {name!r} weights[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label} must be an object")
+        repo_id = str(entry.get("repo_id") or "").strip()
+        if not repo_id:
+            raise ValueError(f"{label}: repo_id is required")
+        revision = str(entry.get("revision") or "").strip()
+        if not revision:
+            raise ValueError(
+                f"{label}: revision is required; pin a commit hash, not a branch"
+            )
+        files = entry.get("files")
+        if files is not None:
+            if (
+                not isinstance(files, list)
+                or not files
+                or not all(isinstance(item, str) and item.strip() for item in files)
+            ):
+                raise ValueError(
+                    f"{label}: files must be null (whole snapshot) or a list of file paths"
+                )
+            files = [item.strip() for item in files]
+            for item in files:
+                _require_models_relative(label, "files entry", item)
+        dest = str(entry.get("dest") or "").strip()
+        if not dest:
+            raise ValueError(
+                f"{label}: dest is required (a subdirectory of the ComfyUI models dir)"
+            )
+        _require_models_relative(label, "dest", dest)
+        normalized.append(
+            {"repo_id": repo_id, "revision": revision, "files": files, "dest": dest}
+        )
+    return normalized
 
 
 def worker_profile_gpu_type(profile: dict[str, Any], default: str | None = None) -> str | None:
