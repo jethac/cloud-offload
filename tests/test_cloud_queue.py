@@ -677,3 +677,88 @@ def test_profile_startup_assumes_dependencies_are_baked_into_image(tmp_path):
     script = dispatcher._build_startup_script(profile)
 
     assert script is None
+
+
+# === Offer cooldown after failed launches ===
+
+class TwoOfferProvider(DummyProvider):
+    """Cheapest offer's host refuses to launch; the pricier one works."""
+
+    def __init__(self):
+        self.launch_attempts = []
+
+    @property
+    def name(self) -> str:
+        return "runpod"
+
+    def list_available(self, *args, **kwargs):
+        return [
+            {"id": "offer-dead", "gpu_type": "RTX 4000 Ada", "hourly_rate": 0.28},
+            {"id": "offer-good", "gpu_type": "RTX 2000 Ada", "hourly_rate": 0.30},
+        ]
+
+    def launch(self, offer_id, *args, **kwargs):
+        self.launch_attempts.append(offer_id)
+        if offer_id == "offer-dead":
+            raise RuntimeError("This machine does not have the resources")
+        return SimpleNamespace(
+            id="pod-1",
+            provider="runpod",
+            gpu_type="RTX 2000 Ada",
+            hourly_rate=0.30,
+            status="pending",
+        )
+
+
+def _cooldown_dispatcher(tmp_path, provider):
+    config = CloudConfig(
+        provider="runpod",
+        provider_order=["runpod"],
+        queue_db_path=str(tmp_path / "queue.db"),
+        coordinator_url="https://coordinator.invalid",
+        worker_profiles={
+            "comfyui": {
+                "image": "registry.invalid/comfyui@sha256:" + "a" * 64,
+                "models": ["comfyui-partition-v1"],
+                "providers": ["runpod"],
+            }
+        },
+    )
+    return Dispatcher(config, provider=provider)
+
+
+def test_failed_offer_cools_down_and_next_launch_routes_around_it(tmp_path):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+
+    assert dispatcher._launch_worker("runpod", "comfyui") is None
+    assert ("runpod", "offer-dead") in dispatcher.offer_cooldowns
+
+    instance = dispatcher._launch_worker("runpod", "comfyui")
+    assert instance is not None and instance.id == "pod-1"
+    assert provider.launch_attempts == ["offer-dead", "offer-good"]
+
+
+def test_offer_cooldown_expires_and_is_pruned(tmp_path):
+    import time as time_module
+
+    dispatcher = _cooldown_dispatcher(tmp_path, TwoOfferProvider())
+    dispatcher.offer_cooldowns[("runpod", "offer-dead")] = time_module.monotonic() - 1
+    assert dispatcher._offers_on_cooldown("runpod") == set()
+    assert dispatcher.offer_cooldowns == {}
+
+
+def test_cooldown_is_scoped_to_its_provider(tmp_path):
+    import time as time_module
+
+    dispatcher = _cooldown_dispatcher(tmp_path, TwoOfferProvider())
+    dispatcher.offer_cooldowns[("vast.ai", "offer-dead")] = time_module.monotonic() + 60
+    assert dispatcher._offers_on_cooldown("runpod") == set()
+    assert dispatcher._offers_on_cooldown("vast.ai") == {"offer-dead"}
+
+
+def test_find_cheapest_exclude_filters_offers(tmp_path):
+    provider = TwoOfferProvider()
+    assert provider.find_cheapest()["id"] == "offer-dead"
+    assert provider.find_cheapest(exclude={"offer-dead"})["id"] == "offer-good"
+    assert provider.find_cheapest(exclude={"offer-dead", "offer-good"}) is None

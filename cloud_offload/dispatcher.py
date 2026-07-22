@@ -24,6 +24,9 @@ from cloud_offload.profiles import (
 
 logger = logging.getLogger(__name__)
 
+# How long a specific offer sits out after its host refuses a launch.
+OFFER_COOLDOWN_SECONDS = 600
+
 
 def _load_or_create_worker_token(config: CloudConfig) -> str:
     """Return a stable coordinator credential for workers across restarts.
@@ -109,6 +112,10 @@ class Dispatcher:
         self.last_activity: dict[str, datetime] = {}
         self.launch_failures: dict[tuple[str, str], int] = {}
         self.next_launch_at: dict[tuple[str, str], float] = {}
+        # (provider, offer_id) -> monotonic expiry. A host that refuses a launch
+        # keeps being the cheapest offer, so without this the dispatcher retries
+        # the same dead machine forever.
+        self.offer_cooldowns: dict[tuple[str, str], float] = {}
         self.worker_token = _load_or_create_worker_token(self.config)
         self.queue.set_worker_token(self.worker_token)
         self._tunnel = None  # opened lazily when ingress == "cloudflared"
@@ -282,24 +289,25 @@ class Dispatcher:
             if requested_gpu_types
             else worker_profile_gpu_type(profile, self.config.gpu_type)
         )
-        # Find cheapest available GPU
+        # Find cheapest available GPU, routing around recently failed hosts
+        cooling = self._offers_on_cooldown(provider_name)
         offer = connector.find_cheapest(
             gpu_type=gpu_type,
             min_gpu_ram=minimum_vram,
             max_hourly_rate=self.config.max_hourly_rate,
+            exclude=cooling,
         )
 
         if not offer:
+            detail = "No available GPU matched the partition constraints"
+            if cooling:
+                detail += f" ({len(cooling)} offer(s) on launch-failure cooldown)"
             logger.warning(
                 f"No available GPUs matching criteria "
-                f"(type={self.config.gpu_type}, max_rate=${self.config.max_hourly_rate}/hr)"
+                f"(type={self.config.gpu_type}, max_rate=${self.config.max_hourly_rate}/hr"
+                + (f", {len(cooling)} on cooldown)" if cooling else ")")
             )
-            self._record_launch_failure(
-                provider_name,
-                profile_name,
-                queued_jobs,
-                "No available GPU matched the partition constraints",
-            )
+            self._record_launch_failure(provider_name, profile_name, queued_jobs, detail)
             return None
 
         logger.info(
@@ -378,10 +386,29 @@ class Dispatcher:
 
         except Exception as e:
             logger.error(f"Failed to launch worker: {e}")
+            self.offer_cooldowns[(provider_name, str(offer["id"]))] = (
+                time.monotonic() + OFFER_COOLDOWN_SECONDS
+            )
+            logger.info(
+                "Offer %s on cooldown for %ss after launch failure",
+                offer["id"],
+                OFFER_COOLDOWN_SECONDS,
+            )
             self._record_launch_failure(
                 provider_name, profile_name, queued_jobs, str(e)
             )
             return None
+
+    def _offers_on_cooldown(self, provider_name: str) -> set[str]:
+        """Offer ids currently sitting out after a failed launch on this provider."""
+        now = time.monotonic()
+        for key in [k for k, until in self.offer_cooldowns.items() if until <= now]:
+            del self.offer_cooldowns[key]
+        return {
+            offer_id
+            for (name, offer_id) in self.offer_cooldowns
+            if name == provider_name
+        }
 
     def _publish_launch_event(self, jobs: list | None, event: dict) -> None:
         for job in jobs or []:

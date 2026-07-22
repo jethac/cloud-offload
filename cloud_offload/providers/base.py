@@ -1,6 +1,7 @@
 """Base interface for pluggable cloud compute connectors."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from dataclasses import dataclass
 
 
@@ -67,13 +68,21 @@ class CloudConnector(ABC):
         gpu_type: str | None = None,
         min_gpu_ram: int = 24,
         max_hourly_rate: float = 1.0,
+        exclude: Collection[str] | None = None,
     ) -> dict | None:
-        """Find the cheapest available offer matching criteria."""
+        """Find the cheapest available offer matching criteria.
+
+        ``exclude`` drops offers by id; the dispatcher uses it to route around
+        hosts that recently refused a launch instead of retrying them forever.
+        """
         offers = self.list_available(
             gpu_type=gpu_type,
             min_gpu_ram=min_gpu_ram,
             max_hourly_rate=max_hourly_rate,
         )
+        if exclude:
+            excluded = {str(item) for item in exclude}
+            offers = [o for o in offers if str(o.get("id")) not in excluded]
         if not offers:
             return None
         return min(offers, key=lambda x: x.get("hourly_rate", float("inf")))
