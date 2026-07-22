@@ -21,6 +21,9 @@ SDXL_WEIGHTS = [
         "dest": "checkpoints",
     }
 ]
+# What normalization adds to the raw entry above.
+SDXL_NORMALIZED = [{**SDXL_WEIGHTS[0], "gated": False}]
+SDXL_GATED = [{**SDXL_WEIGHTS[0], "gated": True}]
 
 
 def weights_config(tmp_path, weights=SDXL_WEIGHTS):
@@ -47,7 +50,7 @@ def test_weights_are_normalized_into_the_profile(tmp_path):
 
     profile = configured_worker_profiles(config)["comfyui"]
 
-    assert profile["weights"] == SDXL_WEIGHTS
+    assert profile["weights"] == SDXL_NORMALIZED
 
 
 def test_profile_without_weights_gets_an_empty_list(tmp_path):
@@ -169,20 +172,35 @@ class LaunchProvider(CloudProvider):
         return []
 
 
-def test_dispatcher_passes_weights_and_token_to_the_worker(isolate_credentials, tmp_path):
+def test_dispatcher_passes_the_token_for_gated_weights(isolate_credentials, tmp_path):
+    isolate_credentials.store["huggingface"] = "hf-secret"
+    provider = LaunchProvider()
+    dispatcher = Dispatcher(weights_config(tmp_path, weights=SDXL_GATED), provider=provider)
+
+    dispatcher._launch_worker("runpod", "comfyui")
+
+    assert json.loads(provider.env_vars["CLOUD_OFFLOAD_WEIGHTS"]) == SDXL_GATED
+    assert provider.env_vars["HF_TOKEN"] == "hf-secret"
+
+
+def test_dispatcher_keeps_the_token_out_of_public_weight_launches(
+    isolate_credentials, tmp_path
+):
+    # The operator's shell may carry HF_TOKEN globally; public weights must not
+    # copy it into a rented pod's environment.
     isolate_credentials.store["huggingface"] = "hf-secret"
     provider = LaunchProvider()
     dispatcher = Dispatcher(weights_config(tmp_path), provider=provider)
 
     dispatcher._launch_worker("runpod", "comfyui")
 
-    assert json.loads(provider.env_vars["CLOUD_OFFLOAD_WEIGHTS"]) == SDXL_WEIGHTS
-    assert provider.env_vars["HF_TOKEN"] == "hf-secret"
+    assert json.loads(provider.env_vars["CLOUD_OFFLOAD_WEIGHTS"]) == SDXL_NORMALIZED
+    assert "HF_TOKEN" not in provider.env_vars
 
 
 def test_dispatcher_omits_the_token_when_none_resolves(tmp_path):
     provider = LaunchProvider()
-    dispatcher = Dispatcher(weights_config(tmp_path), provider=provider)
+    dispatcher = Dispatcher(weights_config(tmp_path, weights=SDXL_GATED), provider=provider)
 
     dispatcher._launch_worker("runpod", "comfyui")
 

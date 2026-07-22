@@ -113,7 +113,13 @@ def normalized_profile_weights(name: str, entries: Any) -> list[dict[str, Any]]:
             )
         _require_models_relative(label, "dest", dest)
         normalized.append(
-            {"repo_id": repo_id, "revision": revision, "files": files, "dest": dest}
+            {
+                "repo_id": repo_id,
+                "revision": revision,
+                "files": files,
+                "dest": dest,
+                "gated": bool(entry.get("gated", False)),
+            }
         )
     return normalized
 

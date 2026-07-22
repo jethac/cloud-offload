@@ -250,13 +250,15 @@ skipped, so a re-used volume never re-downloads.
 ]
 ```
 
-Public repos need no credential. For gated or private repos, store a Hugging
-Face token under the name `huggingface` — the node pack's provider dialog does
-this, or `POST /api/providers/huggingface/credentials` directly — or export
-`HF_TOKEN`, which is canonical and outranks the keychain (then
+Public repos need no credential. For gated or private repos, mark the entry
+`"gated": true` and store a Hugging Face token under the name `huggingface` —
+the node pack's provider dialog does this, or
+`POST /api/providers/huggingface/credentials` directly — or export `HF_TOKEN`,
+which is canonical and outranks the keychain (then
 `CLOUD_OFFLOAD_HUGGINGFACE_API_KEY`, then the keychain entry). The dispatcher
-passes the token to the pod as `HF_TOKEN` only when the launching profile
-declares weights. Use a **fine-grained, read-only** token: a pod's environment
+passes the token to the pod as `HF_TOKEN` only when the launching profile has
+an entry marked gated — public-weights profiles put no secret in the pod
+environment even if your shell exports `HF_TOKEN` globally. Use a **fine-grained, read-only** token: a pod's environment
 is visible to whoever controls the provider account, so a token scoped to just
 the repos you need limits the blast radius. Like provider keys, it is never
 written to `config.json` and never returned by the API.

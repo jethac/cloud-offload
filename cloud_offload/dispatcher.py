@@ -357,14 +357,23 @@ class Dispatcher:
         }
         if profile.get("weights"):
             # The worker stages these before its first job. The Hub token rides
-            # along only when one exists, so a profile of public weights puts no
-            # secret into the pod environment.
+            # along only when an entry is marked gated, so a profile of public
+            # weights puts no secret into the pod environment even when the
+            # operator's own shell has HF_TOKEN set.
             env_vars["CLOUD_OFFLOAD_WEIGHTS"] = json.dumps(
                 profile["weights"], separators=(",", ":")
             )
-            hub_token = huggingface_token()
-            if hub_token:
-                env_vars["HF_TOKEN"] = hub_token
+            if any(entry.get("gated") for entry in profile["weights"]):
+                hub_token = huggingface_token()
+                if hub_token:
+                    env_vars["HF_TOKEN"] = hub_token
+                else:
+                    logger.warning(
+                        "Profile %s has gated weights but no Hugging Face token "
+                        "is configured; the download will run anonymously and "
+                        "likely fail",
+                        profile_name,
+                    )
 
         try:
             instance = connector.launch(
