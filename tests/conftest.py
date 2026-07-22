@@ -45,6 +45,8 @@ def isolate_credentials(monkeypatch, tmp_path):
         "RUNPOD_API_KEY",
         "CLOUD_OFFLOAD_RUNPOD_API_KEY",
         "CLOUD_OFFLOAD_VAST_AI_API_KEY",
+        "HF_TOKEN",
+        "CLOUD_OFFLOAD_HUGGINGFACE_API_KEY",
     ):
         monkeypatch.delenv(variable, raising=False)
     return vault

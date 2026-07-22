@@ -30,11 +30,17 @@ logger = logging.getLogger(__name__)
 #: Keychain service name. Entries appear under this in Credential Manager.
 KEYCHAIN_SERVICE = "cloud-offload"
 
+#: Named credential (not a connector) holding the Hugging Face Hub token that
+#: workers use to download gated profile weights.
+HUGGINGFACE_CREDENTIAL = "huggingface"
+
 __all__ = [
+    "HUGGINGFACE_CREDENTIAL",
     "KEYCHAIN_SERVICE",
     "KeychainUnavailable",
     "delete_credential",
     "get_credential",
+    "huggingface_token",
     "keychain_status",
     "legacy_credentials_file",
     "list_credentialed_providers",
@@ -155,6 +161,20 @@ def get_credential(provider: str) -> str:
             "into the OS keychain"
         )
     return legacy
+
+
+def huggingface_token() -> str:
+    """Resolve the Hugging Face Hub token. Returns "" when there is none.
+
+    ``HF_TOKEN`` stays first: it is the variable ``huggingface_hub`` itself
+    reads, the same way the legacy ``RUNPOD_API_KEY`` stays authoritative for
+    its connector. Then the generic ``CLOUD_OFFLOAD_HUGGINGFACE_API_KEY``, then
+    the keychain entry named ``huggingface``.
+    """
+    from_env = os.environ.get("HF_TOKEN", "").strip()
+    if from_env:
+        return from_env
+    return get_credential(HUGGINGFACE_CREDENTIAL)
 
 
 def set_credential(provider: str, api_key: str) -> None:

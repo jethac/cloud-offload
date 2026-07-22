@@ -311,6 +311,7 @@ class CloudConfig:
             "provider_order": self.provider_order,
             "routing_policy": self.routing_policy,
             "provider_auth_configured": self.provider_auth_configured,
+            "huggingface_configured": self.huggingface_configured,
             "gpu_type": self.gpu_type,
             "max_hourly_rate": self.max_hourly_rate,
             "idle_shutdown_seconds": self.idle_shutdown_seconds,
@@ -342,6 +343,13 @@ class CloudConfig:
     def provider_auth_configured(self) -> bool:
         """Whether the selected connector has credentials."""
         return bool(self.api_key_for(self.provider))
+
+    @property
+    def huggingface_configured(self) -> bool:
+        """Whether a Hugging Face token resolves, without exposing it."""
+        from cloud_offload.credentials import huggingface_token
+
+        return bool(huggingface_token())
 
     def api_key_for(self, provider: str) -> str:
         """Return a connector credential without serializing it.

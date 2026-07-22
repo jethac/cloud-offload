@@ -442,30 +442,39 @@ async def set_provider_credentials(provider: str, body: dict[str, Any] = Body(..
 
     The key is written to the credential file with owner-only permissions and is
     never echoed back. Send an empty ``api_key`` to clear it.
+
+    ``huggingface`` is accepted alongside the connectors: it is not a provider,
+    but the Hub token workers use for gated weight downloads rides the same
+    keychain storage.
     """
     from cloud_offload.config import (
         normalize_provider_name,
         provider_env_var,
         save_provider_credential,
     )
+    from cloud_offload.credentials import HUGGINGFACE_CREDENTIAL
     from cloud_offload.providers import connector_names
 
     name = normalize_provider_name(provider)
-    if name not in connector_names():
+    if name not in connector_names() and name != HUGGINGFACE_CREDENTIAL:
         raise HTTPException(
             status_code=404, detail=f"Unknown cloud connector: {provider}"
         )
     api_key = body.get("api_key")
     if not isinstance(api_key, str):
         raise HTTPException(status_code=400, detail="api_key must be a string")
-    if os.environ.get(provider_env_var(name), "").strip():
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"{name} credentials come from {provider_env_var(name)}; "
-                "unset it to manage the credential here"
-            ),
-        )
+    # HF_TOKEN is the canonical Hugging Face variable and outranks the keychain.
+    env_names = ["HF_TOKEN"] if name == HUGGINGFACE_CREDENTIAL else []
+    env_names.append(provider_env_var(name))
+    for env_name in env_names:
+        if os.environ.get(env_name, "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{name} credentials come from {env_name}; "
+                    "unset it to manage the credential here"
+                ),
+            )
     try:
         await asyncio.to_thread(save_provider_credential, name, api_key)
     except (OSError, ValueError) as exc:

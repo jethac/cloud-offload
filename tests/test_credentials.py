@@ -115,6 +115,30 @@ def test_missing_backend_degrades_to_env_only(monkeypatch, tmp_path):
     assert status["available"] is False and status["reason"]
 
 
+# === Hugging Face token (named credential, not a connector) ===
+
+def test_huggingface_token_resolution_order(keychain, monkeypatch):
+    creds.set_credential("huggingface", "from-keychain")
+    monkeypatch.setenv("CLOUD_OFFLOAD_HUGGINGFACE_API_KEY", "from-generic-env")
+    monkeypatch.setenv("HF_TOKEN", "from-hf-token")
+
+    # HF_TOKEN is what huggingface_hub itself reads, so it must stay canonical.
+    assert creds.huggingface_token() == "from-hf-token"
+
+    monkeypatch.delenv("HF_TOKEN")
+    assert creds.huggingface_token() == "from-generic-env"
+
+    monkeypatch.delenv("CLOUD_OFFLOAD_HUGGINGFACE_API_KEY")
+    assert creds.huggingface_token() == "from-keychain"
+
+
+def test_huggingface_token_is_empty_when_unconfigured(keychain, monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("CLOUD_OFFLOAD_HUGGINGFACE_API_KEY", raising=False)
+
+    assert creds.huggingface_token() == ""
+
+
 # === Migration ===
 
 def test_migrate_moves_credentials_and_removes_the_file(keychain, tmp_path):

@@ -595,6 +595,41 @@ def test_credentials_route_stores_secret_in_the_keychain(monkeypatch, tmp_path):
     assert client.post("/api/providers/nope/credentials", json={"api_key": "x"}).status_code == 404
 
 
+def test_credentials_route_accepts_the_huggingface_token(monkeypatch, isolate_credentials):
+    """The Hub token is not a connector but stores through the same route."""
+    client = TestClient(server.app)
+
+    response = client.post(
+        "/api/providers/huggingface/credentials", json={"api_key": "hf-secret"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"provider": "huggingface", "configured": True}
+    assert isolate_credentials.store["huggingface"] == "hf-secret"
+    assert "hf-secret" not in response.text
+
+    # While HF_TOKEN is set, a keychain write would be shadowed; refuse it.
+    monkeypatch.setenv("HF_TOKEN", "ambient")
+    conflict = client.post("/api/providers/huggingface/credentials", json={"api_key": "x"})
+    assert conflict.status_code == 409
+    assert "HF_TOKEN" in conflict.json()["error"]["message"]
+
+    # Clearing works like any connector credential.
+    monkeypatch.delenv("HF_TOKEN")
+    cleared = client.post("/api/providers/huggingface/credentials", json={"api_key": ""})
+    assert cleared.json() == {"provider": "huggingface", "configured": False}
+    assert "huggingface" not in isolate_credentials.store
+
+
+def test_config_reports_huggingface_presence_without_the_secret(isolate_credentials):
+    assert CloudConfig().to_dict()["huggingface_configured"] is False
+
+    isolate_credentials.store["huggingface"] = "hf-secret"
+    payload = CloudConfig().to_dict()
+
+    assert payload["huggingface_configured"] is True
+    assert "hf-secret" not in repr(payload)
+
+
 def test_config_route_still_refuses_provider_credentials():
     response = TestClient(server.app).post(
         "/api/config", json={"provider_credentials": {"runpod": "leak"}}
