@@ -15,6 +15,12 @@ if TYPE_CHECKING:
 
 ConnectorFactory = Callable[["CloudConfig"], CloudConnector]
 
+# Where a connector's compute actually runs. "cloud" is rented third-party
+# hardware; "on-prem" is infrastructure the operator controls (a LAN machine,
+# a studio fleet worker). Jobs constrained to on-prem execution may only route
+# to connectors of the "on-prem" class.
+RESIDENCY_CLASSES = ("cloud", "on-prem")
+
 _CONNECTORS: dict[str, ConnectorFactory] = {}
 _CANONICAL_NAMES: dict[str, str] = {}
 _METADATA: dict[str, dict] = {}
@@ -33,16 +39,24 @@ def register_connector(
     display_name: str | None = None,
     kind: str = "builtin",
     settings_schema: list[dict] | None = None,
+    residency_class: str = "cloud",
 ) -> None:
     """Register a connector factory under a canonical name and aliases.
 
     ``display_name``, ``kind`` (``builtin`` | ``plugin`` | ``declarative``) and
     ``settings_schema`` are presentation metadata: they let a settings UI render
-    fields for a connector it has never heard of.
+    fields for a connector it has never heard of. ``residency_class``
+    (``cloud`` | ``on-prem``) declares where the connector's compute runs; it
+    defaults to ``cloud`` because every rented-GPU provider is one, and routing
+    uses it to keep on-prem-only work off third-party hardware.
     """
     canonical = _normalize(name)
     if not canonical:
         raise ValueError("Connector name cannot be empty")
+    if residency_class not in RESIDENCY_CLASSES:
+        raise ValueError(
+            f"Connector residency_class must be one of: {', '.join(RESIDENCY_CLASSES)}"
+        )
 
     names = (canonical, *(_normalize(alias) for alias in aliases))
     for candidate in names:
@@ -58,6 +72,7 @@ def register_connector(
         "display_name": display_name or canonical,
         "kind": kind,
         "settings_schema": list(settings_schema or []),
+        "residency_class": residency_class,
     }
 
 
@@ -66,7 +81,7 @@ def connector_metadata(name: str) -> dict:
     canonical = _CANONICAL_NAMES.get(_normalize(name))
     if canonical is None:
         return {"display_name": name, "kind": "unknown", "registered": False,
-                "settings_schema": []}
+                "settings_schema": [], "residency_class": "cloud"}
     return {**_METADATA.get(canonical, {}), "registered": True}
 
 
@@ -154,6 +169,7 @@ __all__ = [
     "CloudProvider",
     "ConnectorFactory",
     "Instance",
+    "RESIDENCY_CLASSES",
     "connector_metadata",
     "connector_names",
     "create_connector",

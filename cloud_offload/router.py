@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cloud_offload.config import CloudConfig
-from cloud_offload.providers import create_connector
+from cloud_offload.providers import connector_metadata, create_connector
 from cloud_offload.profiles import (
     cloud_profiles_for_model,
     configured_worker_profiles,
@@ -97,8 +97,16 @@ def select_profile_provider(
     config: CloudConfig,
     profile_name: str,
     requested: str | None = None,
+    *,
+    residency: str = "cloud",
 ) -> Route:
-    """Select a provider for a worker profile such as the ComfyUI runner."""
+    """Select a provider for a worker profile such as the ComfyUI runner.
+
+    ``residency`` is the job's requirement, not a preference: ``"on-prem"``
+    restricts selection to connectors registered with that residency class, so
+    a partition tainted by on-prem-only assets can never route to rented
+    hardware even if a client asks for it by name.
+    """
     profile = configured_worker_profiles(config).get(profile_name)
     if not profile:
         raise ValueError(f"Cloud worker profile is not configured: {profile_name}")
@@ -107,6 +115,17 @@ def select_profile_provider(
         for name in profile["providers"]
         if name in config.provider_order and _configured(config, name)
     ]
+    if residency == "on-prem":
+        supported = [
+            name
+            for name in supported
+            if connector_metadata(name).get("residency_class") == "on-prem"
+        ]
+        if not supported:
+            raise ValueError(
+                "Partition requires on-prem execution (on-prem-only assets) "
+                "but no on-prem backend is registered"
+            )
     if requested and requested.lower() not in {"auto", "cloud"}:
         name = "vast.ai" if requested.lower() == "vast" else requested.lower()
         if name not in supported:

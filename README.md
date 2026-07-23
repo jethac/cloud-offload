@@ -267,6 +267,20 @@ See [`deploy/runtime-profiles/`](deploy/runtime-profiles/) for the model-agnosti
 runner image (plain ComfyUI + the `CloudPartition{Input,Output}` bridge nodes +
 the baked capability manifest).
 
+### On-prem-only assets
+
+Some assets — licensed models, NDA'd meshes — must never leave the building.
+List them in `on_prem_assets` (persisted like the other policy fields, via
+`POST /api/config` or `config.json`): case-insensitive `fnmatch`-style glob
+patterns (`*` and `?`) matched against asset strings such as checkpoint or
+LoRA file names, e.g. `["studiox_*.safetensors", "nda_*"]`. A node referencing
+a matching asset taints everything derived from it, so the node pack's
+queue-time compiler blocks any cloud-bound partition that uses or depends on
+the asset before anything is uploaded. The coordinator backs that up: a
+partition job whose `residency` is `"on-prem"` only routes to connectors
+registered with `residency_class="on-prem"`, and every bundled connector is
+cloud-class, so such jobs are refused until an on-prem backend exists.
+
 ## HTTP routes
 
 Client (node-pack) routes:

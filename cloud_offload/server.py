@@ -305,6 +305,7 @@ def _provider_statuses(config) -> list[dict[str, Any]]:
             "provider": name,
             "display_name": metadata.get("display_name") or name,
             "kind": metadata.get("kind", "builtin"),
+            "residency_class": metadata.get("residency_class", "cloud"),
             "registered": metadata.get("registered", False),
             "settings_schema": metadata.get("settings_schema", []),
             "settings": config.settings_for(name),
@@ -919,6 +920,15 @@ async def submit_partition(request: PartitionSubmitRequest):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid partition GPU VRAM requirement")
     gpu_type = str(runner.get("gpu_type") or "any").strip()[:100] or "any"
+    # The compiler stamps residency from its taint analysis; refusing an
+    # on-prem job here when only cloud backends exist is the server-side
+    # guarantee behind that client-side check.
+    residency = request.partition.get("residency", "cloud")
+    if residency not in {"cloud", "on-prem"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid partition residency (expected 'cloud' or 'on-prem')",
+        )
     config, queue = _queue()
     storage = create_storage(config)
     for boundary_key, artifact_id in request.input_artifacts.items():
@@ -928,7 +938,11 @@ async def submit_partition(request: PartitionSubmitRequest):
             raise HTTPException(status_code=404, detail=f"Input artifact not found: {artifact_id}")
     try:
         route = await asyncio.to_thread(
-            select_profile_provider, config, profile_name, request.provider
+            select_profile_provider,
+            config,
+            profile_name,
+            request.provider,
+            residency=residency,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

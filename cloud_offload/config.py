@@ -108,6 +108,18 @@ class CloudConfig:
     ingress: Literal["none", "cloudflared"] = field(
         default_factory=lambda: os.environ.get("CLOUD_OFFLOAD_INGRESS", "none")
     )
+    # Asset residency policy: case-insensitive glob patterns (fnmatch-style,
+    # ``*`` and ``?``) naming assets that must never leave operator-controlled
+    # hardware. The node pack's queue-time compiler reads this list through
+    # GET /api/config and blocks cloud submission for any partition that
+    # references, or depends on, a matching asset.
+    on_prem_assets: list[str] = field(
+        default_factory=lambda: [
+            item.strip()
+            for item in os.environ.get("CLOUD_OFFLOAD_ON_PREM_ASSETS", "").split(",")
+            if item.strip()
+        ]
+    )
 
     # Storage settings
     storage_type: Literal["local", "gcs", "s3"] = "local"
@@ -163,6 +175,9 @@ class CloudConfig:
             raise ValueError("routing_policy must be preferred or cheapest")
         if self.ingress not in {"none", "cloudflared"}:
             raise ValueError("ingress must be none or cloudflared")
+        self.on_prem_assets = [
+            str(item).strip() for item in (self.on_prem_assets or []) if str(item).strip()
+        ]
         self.runpod_cloud_type = self.runpod_cloud_type.upper()
         if self.runpod_cloud_type not in {"SECURE", "COMMUNITY"}:
             raise ValueError("runpod_cloud_type must be SECURE or COMMUNITY")
@@ -235,6 +250,11 @@ class CloudConfig:
             ),
             coordinator_url=os.environ.get("CLOUD_OFFLOAD_COORDINATOR_URL", ""),
             ingress=os.environ.get("CLOUD_OFFLOAD_INGRESS", "none"),
+            on_prem_assets=[
+                item.strip()
+                for item in os.environ.get("CLOUD_OFFLOAD_ON_PREM_ASSETS", "").split(",")
+                if item.strip()
+            ],
             storage_type=os.environ.get("CLOUD_OFFLOAD_STORAGE_TYPE", "local"),
             storage_path=os.environ.get("CLOUD_OFFLOAD_STORAGE_PATH", ""),
             vast_api_key=os.environ.get("VAST_API_KEY", ""),
@@ -290,6 +310,10 @@ class CloudConfig:
             "CLOUD_OFFLOAD_WORKER_MANIFEST": ("worker_manifest_path", str),
             "CLOUD_OFFLOAD_COORDINATOR_URL": ("coordinator_url", str),
             "CLOUD_OFFLOAD_INGRESS": ("ingress", str),
+            "CLOUD_OFFLOAD_ON_PREM_ASSETS": (
+                "on_prem_assets",
+                lambda value: [item.strip() for item in value.split(",") if item.strip()],
+            ),
             "CLOUD_OFFLOAD_STORAGE_TYPE": ("storage_type", str),
             "CLOUD_OFFLOAD_STORAGE_PATH": ("storage_path", str),
             "CLOUD_OFFLOAD_QUEUE_DB": ("queue_db_path", str),
@@ -333,6 +357,7 @@ class CloudConfig:
             "worker_manifest_path": self.worker_manifest_path,
             "coordinator_configured": bool(self.coordinator_url),
             "ingress": self.ingress,
+            "on_prem_assets": self.on_prem_assets,
             "storage_type": self.storage_type,
             "storage_path": self.storage_path,
             "queue_db_path": self.queue_db_path,
