@@ -170,6 +170,9 @@ def normalized_profile_custom_nodes(name: str, entries: Any) -> list[dict[str, A
         if registry_id and git_url:
             raise ValueError(f"{label}: give either registry_id or git, not both")
         install_requirements = bool(entry.get("install_requirements", True))
+        # A pack's published name need not match its repository or its install
+        # directory, so an entry may state outright which pack it provides.
+        explicit_id = str(entry.get("id") or "").strip()
         if registry_id:
             version = str(entry.get("version") or "").strip()
             if not version:
@@ -178,6 +181,7 @@ def normalized_profile_custom_nodes(name: str, entries: Any) -> list[dict[str, A
                 )
             normalized.append(
                 {
+                    **({"id": explicit_id} if explicit_id else {}),
                     "registry_id": registry_id,
                     "version": version,
                     "install_requirements": install_requirements,
@@ -195,6 +199,7 @@ def normalized_profile_custom_nodes(name: str, entries: Any) -> list[dict[str, A
             )
         normalized.append(
             {
+                **({"id": explicit_id} if explicit_id else {}),
                 "git": git_url,
                 "commit": _full_commit_sha(label, commit),
                 "install_requirements": install_requirements,
@@ -206,11 +211,18 @@ def normalized_profile_custom_nodes(name: str, entries: Any) -> list[dict[str, A
 def profile_pack_identifier(entry: dict[str, Any]) -> str:
     """The name a profile entry answers to when a partition requires a pack.
 
-    A registry entry answers to its ``registry_id``; a git entry answers to the
-    last path segment of its clone URL with any ``.git`` suffix removed, which is
-    the directory ``git clone`` would create and therefore the directory ComfyUI
-    would attribute its nodes to.
+    An explicit ``id`` always wins, because a pack's published name, its
+    repository name and the directory it is installed into are all free to
+    differ: ``eric-qwen-layer`` ships from a repository called
+    ``Qwen_Layers_Diffuser_Pipeline_Comfyui``, so a git entry that could only
+    answer to its URL could never match what ComfyUI reports. Failing that, a
+    registry entry answers to its ``registry_id``, and a git entry to the last
+    path segment of its clone URL with any ``.git`` suffix removed, which is the
+    directory ``git clone`` would create.
     """
+    explicit = str(entry.get("id") or "").strip()
+    if explicit:
+        return explicit
     registry_id = str(entry.get("registry_id") or "").strip()
     if registry_id:
         return registry_id

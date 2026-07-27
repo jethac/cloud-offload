@@ -29,6 +29,7 @@ from cloud_offload import router as router_module
 from cloud_offload import server
 from cloud_offload.config import CloudConfig
 from cloud_offload.node_packs import (
+    missing_node_packs,
     missing_node_packs_message,
     normalized_partition_node_packs,
 )
@@ -745,3 +746,53 @@ def test_the_missing_message_reads_the_same_way_the_asset_one_does():
     assert missing_node_packs_message([QWEN_PACK]).startswith(
         "Cloud Offload cannot provide 1 custom node pack required by this partition:"
     )
+
+
+# === A pack's name, its repository and its directory may all differ ===
+
+def test_an_entry_may_state_which_pack_it_provides():
+    # eric-qwen-layer ships from a repository called
+    # Qwen_Layers_Diffuser_Pipeline_Comfyui, so a git entry that could only
+    # answer to its URL would never match what ComfyUI reports.
+    entries = normalized_profile_custom_nodes(
+        "comfyui",
+        [
+            {
+                "id": "eric-qwen-layer",
+                "git": "https://github.com/EricRollei/Qwen_Layers_Diffuser_Pipeline_Comfyui.git",
+                "commit": "2be3bd30449771364af9a38d6ee55c6fa3d74724",
+            }
+        ],
+    )
+
+    assert entries[0]["id"] == "eric-qwen-layer"
+    assert profile_pack_identifier(entries[0]) == "eric-qwen-layer"
+
+
+def test_an_explicit_id_satisfies_the_preflight_check():
+    profile = {
+        "custom_nodes": normalized_profile_custom_nodes(
+            "comfyui",
+            [
+                {
+                    "id": "eric-qwen-layer",
+                    "git": "https://github.com/EricRollei/Qwen_Layers_Diffuser_Pipeline_Comfyui.git",
+                    "commit": "2be3bd30449771364af9a38d6ee55c6fa3d74724",
+                }
+            ],
+        )
+    }
+    required = [
+        {"id": "eric-qwen-layer", "directory": "eric-qwen-layer", "version": "0.1.0", "digest": "d" * 64}
+    ]
+
+    assert missing_node_packs(required, profile) == []
+
+
+def test_a_url_derived_name_still_works_without_an_explicit_id():
+    entries = normalized_profile_custom_nodes(
+        "comfyui",
+        [{"git": "https://github.com/acme/ComfyUI-Widgets.git", "commit": "b" * 40}],
+    )
+
+    assert profile_pack_identifier(entries[0]) == "ComfyUI-Widgets"
