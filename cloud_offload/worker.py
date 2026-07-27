@@ -6,7 +6,9 @@ publishes results/artifacts back to the coordinator. The worker never loads a
 3D model: generation rides inside the submitted subgraph.
 """
 
+import hashlib
 import logging
+import shutil
 import signal
 import subprocess
 import time
@@ -22,6 +24,19 @@ from cloud_offload.profiles import WORKFLOW_CAPABILITIES, load_worker_manifest
 logger = logging.getLogger(__name__)
 
 DEFAULT_PARTITION_ROOT = "/opt/cloud-offload/partitions"
+# Where a model file whose bytes contradict the job's manifest is set aside.
+# Quarantine rather than overwrite: it preserves the evidence, and it makes
+# "same filename, different weights" a loud event instead of a silent one.
+QUARANTINE_DIRNAME = ".cloud-offload-quarantine"
+
+
+def sha256_file(path: Path) -> str:
+    """Digest a file in bounded memory. Never opens it as anything but bytes."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class Worker:
@@ -284,16 +299,26 @@ class Worker:
         logger.info(f"Job {job.id} completed")
 
     def _stage_profile_weights(self, job: Job) -> None:
-        """Download the profile's pinned weights before the first job executes.
+        """Stage the profile's pinned weights and the job's declared assets.
+
+        Two lists with different lifetimes meet here. The profile's ``weights``
+        are what the operator pinned to the runner image and are staged once,
+        at the first claimed job. A job's ``assets`` are what its graph actually
+        declares, digest by digest, so they are checked on every job — cheaply,
+        because a file whose digest already matches is left alone.
 
         Progress rides the job's event stream as ``weights_staging`` events in
         the 3..9 band, after the dispatcher's ``runner_starting`` (2) and under
         the 10 that marks the job running. A failed download raises, which
         fails the job through the normal path in ``run``.
         """
-        if self._weights_staged:
-            return
-        if not self.weights:
+        assets = [
+            asset
+            for asset in ((job.request or {}).get("assets") or [])
+            if isinstance(asset, dict)
+        ]
+        pending_weights = [] if self._weights_staged else list(self.weights)
+        if not pending_weights and not assets:
             self._weights_staged = True
             return
 
@@ -309,11 +334,15 @@ class Worker:
         event_writer = getattr(self.queue, "append_event", None)
         progress_setter = getattr(self.queue, "set_progress", None)
         total_files = sum(
-            len(entry["files"]) if entry.get("files") else 1 for entry in self.weights
-        )
+            len(entry["files"]) if entry.get("files") else 1 for entry in pending_weights
+        ) + len(assets)
         downloaded = 0
 
-        def publish(repo_id: str | None, filename: str | None) -> None:
+        def publish(
+            repo_id: str | None,
+            filename: str | None,
+            category: str | None = None,
+        ) -> None:
             progress = 3 + round(6 * downloaded / max(1, total_files))
             if callable(progress_setter):
                 progress_setter(job.id, progress)
@@ -324,13 +353,14 @@ class Worker:
                         "type": "weights_staging",
                         "repo_id": repo_id,
                         "file": filename,
+                        "category": category,
                         "downloaded_files": downloaded,
                         "total_files": total_files,
                         "overall_progress": progress,
                     },
                 )
 
-        for entry in self.weights:
+        for entry in pending_weights:
             repo_id = str(entry.get("repo_id") or "")
             revision = str(entry.get("revision") or "")
             target_dir = (models_dir / str(entry.get("dest") or "")).resolve()
@@ -380,9 +410,113 @@ class Worker:
                     ) from exc
                 downloaded += 1
 
+        for asset in assets:
+            publish(
+                (asset.get("source") or {}).get("repo_id"),
+                str(asset.get("filename") or ""),
+                str(asset.get("category") or ""),
+            )
+            self._stage_declared_asset(asset, models_dir, token)
+            downloaded += 1
+
         publish(None, None)
         self._weights_staged = True
         logger.info("Staged %d weight file(s) into %s", total_files, models_dir)
+
+    def _stage_declared_asset(
+        self, asset: dict, models_dir: Path, token: str | None
+    ) -> None:
+        """Place one job-declared model file, verified by content digest.
+
+        A file already at the target path is trusted only when its digest
+        matches the manifest. A mismatch is quarantined, never overwritten in
+        silence: two checkpoints sharing a filename is exactly the failure that
+        otherwise produces confident, wrong output.
+
+        Nothing here loads or executes what it fetches — staging moves bytes.
+        """
+        category = str(asset.get("category") or "")
+        filename = str(asset.get("filename") or "")
+        expected = str(asset.get("sha256") or "").lower()
+        target = (models_dir / category / filename).resolve()
+        try:
+            target.relative_to(models_dir)
+        except ValueError:
+            raise RuntimeError(
+                f"Declared asset escapes the models directory: {category}/{filename}"
+            )
+
+        if target.is_file():
+            present = sha256_file(target)
+            if present == expected:
+                logger.info("Declared asset already staged, skipping %s", target.name)
+                return
+            quarantine = models_dir / QUARANTINE_DIRNAME / present / filename
+            quarantine.parent.mkdir(parents=True, exist_ok=True)
+            logger.warning(
+                "Declared asset %s/%s holds sha256 %s but this job requires %s; "
+                "quarantining it at %s and fetching the declared bytes",
+                category,
+                filename,
+                present,
+                expected,
+                quarantine,
+            )
+            shutil.move(str(target), str(quarantine))
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._fetch_declared_asset(asset, target, token)
+        written = sha256_file(target)
+        if written != expected:
+            raise RuntimeError(
+                f"Declared asset {category}/{filename} hashed {written} after "
+                f"staging but the job declared {expected}"
+            )
+
+    def _fetch_declared_asset(self, asset: dict, target: Path, token: str | None) -> None:
+        """Fetch one declared asset from the origin the coordinator resolved."""
+        source = asset.get("source") or {}
+        label = f"{asset.get('category')}/{asset.get('filename')}"
+        try:
+            if source.get("artifact_id"):
+                self._download_partition_artifact(str(source["artifact_id"]), target)
+            elif source.get("url"):
+                self._download_asset_url(str(source["url"]), target)
+            elif source.get("repo_id"):
+                import huggingface_hub
+
+                # hf_hub_download names the file after its path in the repo,
+                # which need not match the runner's filename, so it lands in a
+                # scratch directory and is moved into place.
+                staging = target.parent / ".cloud-offload-fetch"
+                staging.mkdir(parents=True, exist_ok=True)
+                try:
+                    fetched = huggingface_hub.hf_hub_download(
+                        repo_id=str(source["repo_id"]),
+                        filename=str(source.get("filename") or asset.get("filename")),
+                        revision=str(source.get("revision") or ""),
+                        local_dir=str(staging),
+                        token=token,
+                    )
+                    shutil.move(str(fetched), str(target))
+                finally:
+                    shutil.rmtree(staging, ignore_errors=True)
+            else:
+                raise RuntimeError("no source was resolved for it")
+        except Exception as exc:
+            raise RuntimeError(f"Declared asset staging failed for {label}: {exc}") from exc
+
+    @staticmethod
+    def _download_asset_url(url: str, target: Path) -> None:
+        """Stream a declared asset from a plain URL."""
+        import requests
+
+        with requests.get(url, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            with target.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
 
     def _run_comfyui_workflow(self, job: Job) -> dict:
         """Execute an arbitrary API-format workflow in the colocated ComfyUI."""
@@ -413,13 +547,7 @@ class Worker:
         uploader = getattr(self.queue, "upload_artifact", None)
         if callable(uploader):
             return uploader(source)
-        import hashlib
-
-        digest = hashlib.sha256()
-        with source.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        artifact_id = digest.hexdigest()
+        artifact_id = sha256_file(source)
         self.storage.upload(source, self._partition_artifact_key(artifact_id))
         return {"artifact_id": artifact_id, "sha256": artifact_id, "size": source.stat().st_size}
 

@@ -12,6 +12,8 @@ quarantined loudly rather than used.
 
 import hashlib
 import json
+import sys
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,6 +29,7 @@ from cloud_offload.assets import (
 from cloud_offload.config import CloudConfig
 from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.storage import LocalStorage, partition_artifact_key
+from cloud_offload.worker import Worker
 
 
 CHECKPOINT_BYTES = b"checkpoint weights"
@@ -417,3 +420,264 @@ def test_an_empty_asset_list_stays_out_of_the_job_request(monkeypatch, tmp_path)
 
     assert response.status_code == 202
     assert "assets" not in queue.get(response.json()["job_id"]).request
+
+
+# ---------------------------------------------------------------------------
+# Worker: digest-verified staging
+# ---------------------------------------------------------------------------
+
+
+class FakeHub:
+    """Stands in for huggingface_hub; records calls, writes the fetched bytes."""
+
+    def __init__(self, payload=CHECKPOINT_BYTES):
+        self.calls = []
+        self.payload = payload
+
+    def hf_hub_download(self, *, repo_id, filename, revision, local_dir, token):
+        self.calls.append((repo_id, filename, revision, token))
+        target = Path(local_dir) / Path(filename).name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(self.payload)
+        return str(target)
+
+    def snapshot_download(self, **kwargs):  # pragma: no cover - not used here
+        raise AssertionError("declared assets never snapshot a whole repo")
+
+
+def staging_worker(tmp_path, monkeypatch, hub=None, storage=None):
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub or FakeHub())
+    monkeypatch.setenv("CLOUD_OFFLOAD_COMFYUI_ROOT", str(tmp_path / "ComfyUI"))
+    worker = Worker.__new__(Worker)
+    worker.queue = JobQueue(tmp_path / "queue.db")
+    worker.storage = storage
+    worker.weights = []
+    worker._weights_staged = False
+    return worker
+
+
+def asset_job(worker, asset):
+    return worker.queue.create(
+        "comfyui-partition-v1",
+        "artifacts://comfyui-partition",
+        request={"kind": "comfyui-partition", "assets": [asset]},
+    )
+
+
+def source_asset(**overrides):
+    return {
+        **CHECKPOINT_ASSET,
+        "origin": "source",
+        "source": HF_SOURCE,
+        **overrides,
+    }
+
+
+def models_path(tmp_path, *parts):
+    return tmp_path.joinpath("ComfyUI", "models", *parts)
+
+
+def test_a_declared_asset_is_fetched_and_verified(tmp_path, monkeypatch):
+    hub = FakeHub()
+    worker = staging_worker(tmp_path, monkeypatch, hub)
+    job = asset_job(worker, source_asset())
+
+    worker._stage_profile_weights(job)
+
+    assert hub.calls == [
+        (HF_SOURCE["repo_id"], HF_SOURCE["filename"], HF_SOURCE["revision"], None)
+    ]
+    staged = models_path(tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"])
+    assert staged.read_bytes() == CHECKPOINT_BYTES
+    # The scratch directory hf_hub_download wrote into does not survive.
+    assert not (staged.parent / ".cloud-offload-fetch").exists()
+
+
+def test_a_matching_file_on_disk_is_not_downloaded_again(tmp_path, monkeypatch):
+    hub = FakeHub()
+    worker = staging_worker(tmp_path, monkeypatch, hub)
+    staged = models_path(tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"])
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(CHECKPOINT_BYTES)
+    job = asset_job(worker, source_asset())
+
+    worker._stage_profile_weights(job)
+
+    assert hub.calls == []
+    assert staged.read_bytes() == CHECKPOINT_BYTES
+
+
+def test_a_file_with_the_same_name_but_other_bytes_is_quarantined(tmp_path, monkeypatch):
+    hub = FakeHub()
+    worker = staging_worker(tmp_path, monkeypatch, hub)
+    staged = models_path(tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"])
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(b"different weights")
+    job = asset_job(worker, source_asset())
+
+    worker._stage_profile_weights(job)
+
+    quarantined = models_path(
+        tmp_path, ".cloud-offload-quarantine", OTHER_SHA, CHECKPOINT_ASSET["filename"]
+    )
+    # The impostor is preserved for inspection, not deleted or overwritten.
+    assert quarantined.read_bytes() == b"different weights"
+    assert staged.read_bytes() == CHECKPOINT_BYTES
+    assert len(hub.calls) == 1
+
+
+def test_bytes_that_do_not_match_the_manifest_fail_the_job(tmp_path, monkeypatch):
+    hub = FakeHub(payload=b"tampered weights")
+    worker = staging_worker(tmp_path, monkeypatch, hub)
+    job = asset_job(worker, source_asset())
+
+    with pytest.raises(RuntimeError) as failure:
+        worker._stage_profile_weights(job)
+
+    message = str(failure.value)
+    assert hashlib.sha256(b"tampered weights").hexdigest() in message
+    assert CHECKPOINT_SHA in message
+    assert "checkpoints/sd_xl_base_1.0.safetensors" in message
+    # Not marked staged: the next claimed job retries rather than running blind.
+    assert worker._weights_staged is False
+
+
+def test_a_url_source_is_streamed_to_disk(tmp_path, monkeypatch):
+    import requests
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield CHECKPOINT_BYTES[:4]
+            yield CHECKPOINT_BYTES[4:]
+
+    requested = []
+
+    def fake_get(url, **kwargs):
+        requested.append((url, kwargs.get("stream")))
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    worker = staging_worker(tmp_path, monkeypatch)
+    job = asset_job(
+        worker,
+        source_asset(origin="source", source={"url": "https://cdn.invalid/base.safetensors"}),
+    )
+
+    worker._stage_profile_weights(job)
+
+    assert requested == [("https://cdn.invalid/base.safetensors", True)]
+    assert models_path(
+        tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"]
+    ).read_bytes() == CHECKPOINT_BYTES
+
+
+def test_a_stored_artifact_comes_down_the_worker_channel(tmp_path, monkeypatch):
+    worker = staging_worker(tmp_path, monkeypatch)
+    downloads = []
+
+    def download_artifact(artifact_id, destination):
+        downloads.append(artifact_id)
+        Path(destination).write_bytes(CHECKPOINT_BYTES)
+        return Path(destination)
+
+    worker.queue.download_artifact = download_artifact
+    job = asset_job(
+        worker,
+        source_asset(origin="store", source={"artifact_id": CHECKPOINT_SHA}),
+    )
+
+    worker._stage_profile_weights(job)
+
+    assert downloads == [CHECKPOINT_SHA]
+    assert models_path(
+        tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"]
+    ).read_bytes() == CHECKPOINT_BYTES
+
+
+def test_an_asset_escaping_the_models_directory_is_refused(tmp_path, monkeypatch):
+    worker = staging_worker(tmp_path, monkeypatch)
+    job = asset_job(worker, source_asset(filename="../../escape.safetensors"))
+
+    with pytest.raises(RuntimeError, match="escapes the models directory"):
+        worker._stage_profile_weights(job)
+
+
+def test_staging_emits_one_event_per_asset(tmp_path, monkeypatch):
+    worker = staging_worker(tmp_path, monkeypatch)
+    worker.weights = [
+        {
+            "repo_id": "org/checkpoints",
+            "revision": "abc123",
+            "files": ["base.safetensors"],
+            "dest": "checkpoints",
+        }
+    ]
+    job = worker.queue.create(
+        "comfyui-partition-v1",
+        "artifacts://comfyui-partition",
+        request={
+            "kind": "comfyui-partition",
+            "assets": [source_asset(filename="detail.safetensors", category="loras")],
+        },
+    )
+
+    worker._stage_profile_weights(job)
+
+    events = [item["event"] for item in worker.queue.list_events(job.id)]
+    assert [event["type"] for event in events] == ["weights_staging"] * 3
+    assert [(event["file"], event["category"]) for event in events] == [
+        ("base.safetensors", None),
+        ("detail.safetensors", "loras"),
+        (None, None),  # completion marker
+    ]
+    # The profile's pinned weights and the job's declared assets share one budget.
+    assert [event["total_files"] for event in events] == [2, 2, 2]
+    progresses = [event["overall_progress"] for event in events]
+    assert progresses == sorted(progresses)
+    assert progresses[0] == 3 and progresses[-1] == 9
+
+
+def test_declared_assets_are_checked_on_every_job(tmp_path, monkeypatch):
+    """Profile weights stage once; a job's own assets are its own business."""
+    hub = FakeHub()
+    worker = staging_worker(tmp_path, monkeypatch, hub)
+    worker._run_comfyui_workflow = lambda job: {"outputs": {}}
+
+    first = asset_job(worker, source_asset())
+    second = asset_job(worker, source_asset())
+    worker._process_job(first)
+    staged = models_path(tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"])
+    staged.unlink()
+    worker._process_job(second)
+
+    assert len(hub.calls) == 2
+    assert worker.queue.get(second.id).status == JobStatus.COMPLETED
+
+
+def test_a_job_without_assets_stages_nothing_new(tmp_path, monkeypatch):
+    hub = FakeHub()
+    worker = staging_worker(tmp_path, monkeypatch, hub)
+    job = worker.queue.create("comfyui-partition-v1", "artifacts://comfyui-partition")
+
+    worker._stage_profile_weights(job)
+
+    assert hub.calls == []
+    assert worker.queue.list_events(job.id) == []
+    assert worker._weights_staged is True
+
+
+def test_an_asset_without_a_resolved_source_fails_loudly(tmp_path, monkeypatch):
+    worker = staging_worker(tmp_path, monkeypatch)
+    job = asset_job(worker, {**CHECKPOINT_ASSET, "origin": "source", "source": {}})
+
+    with pytest.raises(RuntimeError, match="no source was resolved for it"):
+        worker._stage_profile_weights(job)
