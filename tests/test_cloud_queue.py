@@ -762,3 +762,57 @@ def test_find_cheapest_exclude_filters_offers(tmp_path):
     assert provider.find_cheapest()["id"] == "offer-dead"
     assert provider.find_cheapest(exclude={"offer-dead"})["id"] == "offer-good"
     assert provider.find_cheapest(exclude={"offer-dead", "offer-good"}) is None
+
+
+# === Profile resolution: capability or name ===
+
+def _profile_config(tmp_path, profile_names=("comfyui",)):
+    profiles = {
+        name: {
+            "image": "registry.invalid/comfyui@sha256:" + "a" * 64,
+            "models": ["comfyui-workflow", "comfyui-partition-v1"],
+            "providers": ["runpod"],
+        }
+        for name in profile_names
+    }
+    return CloudConfig(
+        provider="runpod",
+        provider_order=["runpod"],
+        runpod_api_key="test-key",
+        queue_db_path=str(tmp_path / "queue.db"),
+        worker_profiles=profiles,
+    )
+
+
+def test_a_capability_resolves_to_the_profile_providing_it(tmp_path):
+    # What a box actually stamps is the capability it needs; only the operator
+    # knows what their profiles are called.
+    from cloud_offload.router import select_profile_provider
+
+    route = select_profile_provider(_profile_config(tmp_path), "comfyui-partition-v1")
+
+    assert route.profile["name"] == "comfyui"
+
+
+def test_an_exact_profile_name_still_wins(tmp_path):
+    from cloud_offload.router import select_profile_provider
+
+    route = select_profile_provider(_profile_config(tmp_path), "comfyui")
+
+    assert route.profile["name"] == "comfyui"
+
+
+def test_capability_resolution_is_deterministic_across_profiles(tmp_path):
+    from cloud_offload.router import select_profile_provider
+
+    config = _profile_config(tmp_path, profile_names=("zeta", "alpha"))
+    route = select_profile_provider(config, "comfyui-partition-v1")
+
+    assert route.profile["name"] == "alpha"
+
+
+def test_an_unknown_profile_names_what_is_configured(tmp_path):
+    from cloud_offload.router import select_profile_provider
+
+    with pytest.raises(ValueError, match="configured profiles: comfyui"):
+        select_profile_provider(_profile_config(tmp_path), "nonsense")

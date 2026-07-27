@@ -93,6 +93,21 @@ def select_provider(
     return Route(name, offer, profile)
 
 
+def _profile_providing(profiles: dict, capability: str) -> dict | None:
+    """Resolve a capability such as ``comfyui-partition-v1`` to a profile.
+
+    A client knows which capability its job needs; it cannot know what the
+    operator called their profiles. Accepting either keeps the wire contract
+    honest without making every box hardcode a local name.
+    """
+    matches = [
+        profile
+        for _, profile in sorted(profiles.items())
+        if capability in profile.get("models", [])
+    ]
+    return matches[0] if matches else None
+
+
 def select_profile_provider(
     config: CloudConfig,
     profile_name: str,
@@ -107,9 +122,14 @@ def select_profile_provider(
     a partition tainted by on-prem-only assets can never route to rented
     hardware even if a client asks for it by name.
     """
-    profile = configured_worker_profiles(config).get(profile_name)
+    profiles = configured_worker_profiles(config)
+    profile = profiles.get(profile_name) or _profile_providing(profiles, profile_name)
     if not profile:
-        raise ValueError(f"Cloud worker profile is not configured: {profile_name}")
+        known = ", ".join(sorted(profiles)) or "none"
+        raise ValueError(
+            f"No worker profile named or providing {profile_name!r} is configured "
+            f"(configured profiles: {known})"
+        )
     supported = [
         name
         for name in profile["providers"]
