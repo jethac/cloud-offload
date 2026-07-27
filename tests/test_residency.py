@@ -297,3 +297,40 @@ def test_on_prem_partition_routes_to_a_registered_on_prem_backend(
     job = queue.get(response.json()["job_id"])
     assert job.provider == "workroom"
     assert job.request["partition"]["residency"] == "on-prem"
+
+
+# === On-prem scopes: weights-only vs derived ===
+
+def test_bare_pattern_stays_a_plain_strict_entry():
+    config = CloudConfig(on_prem_assets=["hero_*.safetensors", "  ", "b*"])
+
+    # Bare patterns keep their historical strict meaning and their plain shape,
+    # so an existing config cannot silently loosen when scopes are introduced.
+    assert config.on_prem_assets == ["hero_*.safetensors", "b*"]
+
+
+def test_scope_entries_are_normalized_and_defaulted():
+    config = CloudConfig(
+        on_prem_assets=[
+            {"pattern": "licensed_*.safetensors", "scope": "weights"},
+            {"pattern": "nda_*.safetensors"},
+            {"pattern": "   "},
+        ]
+    )
+
+    assert config.on_prem_assets == [
+        {"pattern": "licensed_*.safetensors", "scope": "weights"},
+        {"pattern": "nda_*.safetensors", "scope": "derived"},
+    ]
+
+
+def test_unknown_scope_is_refused():
+    with pytest.raises(ValueError, match="scope must be"):
+        CloudConfig(on_prem_assets=[{"pattern": "a*", "scope": "public"}])
+
+
+def test_scoped_entries_round_trip_through_the_config_api(tmp_path):
+    entries = ["hero_*.safetensors", {"pattern": "licensed_*.safetensors", "scope": "weights"}]
+    config = CloudConfig(on_prem_assets=entries, queue_db_path=str(tmp_path / "q.db"))
+
+    assert config.to_dict()["on_prem_assets"] == entries

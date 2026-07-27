@@ -49,6 +49,32 @@ def load_provider_credentials() -> dict[str, str]:
     return _read_legacy_file()
 
 
+
+def _normalized_on_prem_assets(entries) -> list:
+    """Normalize on-prem entries, keeping bare patterns as plain strings.
+
+    A bare pattern keeps the strict meaning it has always had, so an existing
+    config never silently loosens; ``scope`` is opt-in for the licence case.
+    """
+    normalized: list = []
+    for entry in entries or []:
+        if isinstance(entry, dict):
+            pattern = str(entry.get("pattern") or "").strip()
+            if not pattern:
+                continue
+            scope = str(entry.get("scope") or "derived").strip()
+            if scope not in {"weights", "derived"}:
+                raise ValueError(
+                    f"on_prem_assets: scope must be 'weights' or 'derived', got {scope!r}"
+                )
+            normalized.append({"pattern": pattern, "scope": scope})
+            continue
+        pattern = str(entry).strip()
+        if pattern:
+            normalized.append(pattern)
+    return normalized
+
+
 @dataclass
 class CloudConfig:
     """Configuration for Cloud Offload operations."""
@@ -113,7 +139,14 @@ class CloudConfig:
     # hardware. The node pack's queue-time compiler reads this list through
     # GET /api/config and blocks cloud submission for any partition that
     # references, or depends on, a matching asset.
-    on_prem_assets: list[str] = field(
+    #
+    # An entry is a bare pattern, or ``{"pattern": ..., "scope": ...}``. Scope
+    # ``derived`` (the default, and what a bare pattern means) also restricts
+    # everything computed from the asset. Scope ``weights`` restricts only the
+    # file itself, which is what most licences say — the weights may not be
+    # redistributed, but the images they produce are yours, so a downstream
+    # upscale can still be offloaded.
+    on_prem_assets: list = field(
         default_factory=lambda: [
             item.strip()
             for item in os.environ.get("CLOUD_OFFLOAD_ON_PREM_ASSETS", "").split(",")
@@ -181,9 +214,7 @@ class CloudConfig:
             raise ValueError("routing_policy must be preferred or cheapest")
         if self.ingress not in {"none", "cloudflared"}:
             raise ValueError("ingress must be none or cloudflared")
-        self.on_prem_assets = [
-            str(item).strip() for item in (self.on_prem_assets or []) if str(item).strip()
-        ]
+        self.on_prem_assets = _normalized_on_prem_assets(self.on_prem_assets)
         self.runpod_cloud_type = self.runpod_cloud_type.upper()
         if self.runpod_cloud_type not in {"SECURE", "COMMUNITY"}:
             raise ValueError("runpod_cloud_type must be SECURE or COMMUNITY")

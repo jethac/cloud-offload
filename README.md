@@ -318,10 +318,29 @@ Some assets — licensed models, NDA'd meshes — must never leave the building.
 List them in `on_prem_assets` (persisted like the other policy fields, via
 `POST /api/config` or `config.json`): case-insensitive `fnmatch`-style glob
 patterns (`*` and `?`) matched against asset strings such as checkpoint or
-LoRA file names, e.g. `["studiox_*.safetensors", "nda_*"]`. A node referencing
-a matching asset taints everything derived from it, so the node pack's
-queue-time compiler blocks any cloud-bound partition that uses or depends on
-the asset before anything is uploaded. The coordinator backs that up: a
+LoRA file names, e.g. `["studiox_*.safetensors", "nda_*"]`.
+
+Restrictions come in two scopes, because most of them are about the *file*
+rather than what it produces — a licence usually forbids redistributing the
+weights, not the images they render:
+
+```json
+"on_prem_assets": [
+  "hero_character_*.safetensors",
+  { "pattern": "licensed_base_*.safetensors", "scope": "weights" }
+]
+```
+
+- **`weights`** — only the file is restricted. A partition that needs those
+  bytes staged remotely is refused, but values computed from it travel freely,
+  so you can sample on-prem and offload the upscale.
+- **`derived`** — the file *and* everything computed from it, for material
+  whose appearance is itself the secret. A bare pattern means `derived`, so an
+  existing policy never loosens when scopes are introduced.
+
+The node pack's queue-time compiler blocks any cloud-bound partition that uses
+(or, for `derived`, depends on) the asset before anything is uploaded. The
+coordinator backs that up: a
 partition job whose `residency` is `"on-prem"` only routes to connectors
 registered with `residency_class="on-prem"`, and every bundled connector is
 cloud-class, so such jobs are refused until an on-prem backend exists.
