@@ -120,6 +120,12 @@ class CloudConfig:
             if item.strip()
         ]
     )
+    # Where a declared model file can be obtained, keyed by its sha256. A
+    # partition that declares an asset this registry (or the artifact store, or
+    # the target profile's pinned weights) cannot account for is refused before
+    # anything is provisioned. Values are ``{repo_id, revision, filename}`` or
+    # ``{url}``.
+    asset_sources: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # Storage settings
     storage_type: Literal["local", "gcs", "s3"] = "local"
@@ -194,12 +200,15 @@ class CloudConfig:
         if not self.storage_path:
             self.storage_path = str(CONFIG_DIR / "job_files")
         # Malformed pinned weights fail here, at load, not at dispatch time when
-        # a worker is already being paid for.
+        # a worker is already being paid for. Asset sources fail here for the
+        # same reason: a half-read registry would refuse jobs it could serve.
+        from cloud_offload.assets import normalized_asset_sources
         from cloud_offload.profiles import normalized_profile_weights
 
         for profile_name, profile in (self.worker_profiles or {}).items():
             if isinstance(profile, dict):
                 normalized_profile_weights(str(profile_name), profile.get("weights"))
+        self.asset_sources = normalized_asset_sources(self.asset_sources)
 
     @classmethod
     def from_file(cls, path: str | Path) -> "CloudConfig":
@@ -255,6 +264,7 @@ class CloudConfig:
                 for item in os.environ.get("CLOUD_OFFLOAD_ON_PREM_ASSETS", "").split(",")
                 if item.strip()
             ],
+            asset_sources=json.loads(os.environ.get("CLOUD_OFFLOAD_ASSET_SOURCES_JSON", "{}")),
             storage_type=os.environ.get("CLOUD_OFFLOAD_STORAGE_TYPE", "local"),
             storage_path=os.environ.get("CLOUD_OFFLOAD_STORAGE_PATH", ""),
             vast_api_key=os.environ.get("VAST_API_KEY", ""),
@@ -314,6 +324,7 @@ class CloudConfig:
                 "on_prem_assets",
                 lambda value: [item.strip() for item in value.split(",") if item.strip()],
             ),
+            "CLOUD_OFFLOAD_ASSET_SOURCES_JSON": ("asset_sources", json.loads),
             "CLOUD_OFFLOAD_STORAGE_TYPE": ("storage_type", str),
             "CLOUD_OFFLOAD_STORAGE_PATH": ("storage_path", str),
             "CLOUD_OFFLOAD_QUEUE_DB": ("queue_db_path", str),
@@ -358,6 +369,7 @@ class CloudConfig:
             "coordinator_configured": bool(self.coordinator_url),
             "ingress": self.ingress,
             "on_prem_assets": self.on_prem_assets,
+            "asset_sources": self.asset_sources,
             "storage_type": self.storage_type,
             "storage_path": self.storage_path,
             "queue_db_path": self.queue_db_path,

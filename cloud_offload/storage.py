@@ -5,6 +5,19 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 
+def partition_artifact_key(digest: str) -> str:
+    """Storage key for an immutable, content-addressed partition artifact.
+
+    The same sha256-keyed layout backs boundary bundles and any model file
+    uploaded to the coordinator, which is what lets a declared asset be answered
+    by "we already hold those exact bytes".
+    """
+    normalized = str(digest).strip().lower()
+    if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+        raise ValueError(f"Invalid partition artifact digest: {digest!r}")
+    return f"partition-artifacts/{normalized[:2]}/{normalized}.part"
+
+
 class Storage(ABC):
     """Abstract storage interface."""
 

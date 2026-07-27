@@ -287,6 +287,27 @@ def _partition_artifact_response(digest: str):
     )
 
 
+def _asset_warnings(assets: list[dict[str, Any]]) -> dict[str, Any]:
+    """Surface assets resolved on the legacy name-matched path.
+
+    A digest-keyed source or a stored artifact proves the runner gets these
+    exact bytes; a profile weights entry only proves something with that name is
+    expected to arrive. The submitter is told which, so "same filename,
+    different weights" is visible before the output is trusted.
+    """
+    warnings = [
+        {
+            "category": asset["category"],
+            "filename": asset["filename"],
+            "sha256": asset["sha256"],
+            "warning": asset["warning"],
+        }
+        for asset in assets
+        if asset.get("warning")
+    ]
+    return {"asset_warnings": warnings} if warnings else {}
+
+
 def _provider_statuses(config) -> list[dict[str, Any]]:
     from cloud_offload.providers import connector_names, create_connector, connector_metadata
     from cloud_offload.profiles import configured_worker_profiles
@@ -903,6 +924,12 @@ async def submit_workflow(request: WorkflowSubmitRequest):
 @app.post("/api/partitions", status_code=202)
 async def submit_partition(request: PartitionSubmitRequest):
     """Queue a compiled subgraph with immutable typed boundary artifacts."""
+    from cloud_offload.assets import (
+        normalized_partition_assets,
+        resolve_partition_assets,
+        unresolved_assets_message,
+    )
+    from cloud_offload.profiles import configured_worker_profiles
     from cloud_offload.queue import JobStatus
     from cloud_offload.router import select_profile_provider
     from cloud_offload.storage import create_storage
@@ -929,6 +956,10 @@ async def submit_partition(request: PartitionSubmitRequest):
             status_code=400,
             detail="Invalid partition residency (expected 'cloud' or 'on-prem')",
         )
+    try:
+        declared_assets = normalized_partition_assets(request.partition.get("assets"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     config, queue = _queue()
     storage = create_storage(config)
     for boundary_key, artifact_id in request.input_artifacts.items():
@@ -936,6 +967,23 @@ async def submit_partition(request: PartitionSubmitRequest):
             raise HTTPException(status_code=400, detail=f"Invalid input boundary key: {boundary_key}")
         if not storage.exists(_partition_artifact_key(artifact_id)):
             raise HTTPException(status_code=404, detail=f"Input artifact not found: {artifact_id}")
+    # Declared assets resolve before routing, let alone provisioning: a model
+    # file nobody can supply must cost a 409, not a rented GPU that fails on its
+    # first prompt. The profile is read directly rather than taken from the
+    # route, because it is the same profile whichever provider wins.
+    assets, unresolved = resolve_partition_assets(
+        config,
+        declared_assets,
+        configured_worker_profiles(config).get(profile_name),
+        storage,
+    )
+    if unresolved:
+        return error_response(
+            409,
+            "cloud_offload.unresolved_assets",
+            unresolved_assets_message(unresolved),
+            {"unresolved": unresolved},
+        )
     try:
         route = await asyncio.to_thread(
             select_profile_provider,
@@ -974,6 +1022,7 @@ async def submit_partition(request: PartitionSubmitRequest):
                     "partition": request.partition,
                     "input_artifacts": request.input_artifacts,
                     "timeout_seconds": request.timeout_seconds,
+                    **({"assets": assets} if assets else {}),
                 },
                 provider=route.provider,
                 status=JobStatus.QUEUED,
@@ -992,6 +1041,7 @@ async def submit_partition(request: PartitionSubmitRequest):
                 "status": job.status.value,
                 "status_url": f"/api/jobs/{job.id}",
                 "cache_hit": True,
+                **_asset_warnings(assets),
             }
     job = queue.create(
         model="comfyui-partition-v1",
@@ -1009,6 +1059,10 @@ async def submit_partition(request: PartitionSubmitRequest):
             "partition": request.partition,
             "input_artifacts": request.input_artifacts,
             "timeout_seconds": request.timeout_seconds,
+            # Only present for a partition that declared assets: a manifest-less
+            # job carries exactly the request it carried before this existed, so
+            # the worker falls back to its profile's static weights list.
+            **({"assets": assets} if assets else {}),
         },
         provider=route.provider,
         status=JobStatus.QUEUED,
@@ -1017,6 +1071,7 @@ async def submit_partition(request: PartitionSubmitRequest):
         "job_id": job.id,
         "status": job.status.value,
         "status_url": f"/api/jobs/{job.id}",
+        **_asset_warnings(assets),
     }
 
 

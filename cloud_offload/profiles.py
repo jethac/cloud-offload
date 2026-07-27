@@ -56,7 +56,7 @@ def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
     return result
 
 
-def _require_models_relative(label: str, field: str, value: str) -> None:
+def require_models_relative(label: str, field: str, value: str) -> None:
     """Reject absolute paths and upward traversal in a models-relative path."""
     # PureWindowsPath also parses forward slashes and catches drive letters, so
     # one check covers both separator styles regardless of the host OS.
@@ -105,13 +105,13 @@ def normalized_profile_weights(name: str, entries: Any) -> list[dict[str, Any]]:
                 )
             files = [item.strip() for item in files]
             for item in files:
-                _require_models_relative(label, "files entry", item)
+                require_models_relative(label, "files entry", item)
         dest = str(entry.get("dest") or "").strip()
         if not dest:
             raise ValueError(
                 f"{label}: dest is required (a subdirectory of the ComfyUI models dir)"
             )
-        _require_models_relative(label, "dest", dest)
+        require_models_relative(label, "dest", dest)
         normalized.append(
             {
                 "repo_id": repo_id,

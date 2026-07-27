@@ -267,6 +267,51 @@ See [`deploy/runtime-profiles/`](deploy/runtime-profiles/) for the model-agnosti
 runner image (plain ComfyUI + the `CloudPartition{Input,Output}` bridge nodes +
 the baked capability manifest).
 
+### Declared assets and their sources
+
+A profile's `weights` list is what the operator *thinks* the graph needs. A
+compiled partition can instead declare what it *actually* references: the node
+pack classifies every model filename inside the box against the local ComfyUI's
+`folder_paths` registry, hashes each file, and stamps an `assets` list of
+`{category, filename, sha256, size, format}` onto the job.
+
+Before routing — so before a GPU is rented — the coordinator resolves each
+declared asset in this order:
+
+1. its sha256 appears in `asset_sources`;
+2. the artifact store already holds those exact bytes (the same content-addressed
+   store used for boundary bundles, so an uploaded file counts);
+3. `(category, filename)` matches an entry in the target profile's `weights`.
+   This is the legacy path: it is name-matched, not digest-verified, and the
+   submission response says so in `asset_warnings`.
+
+Anything left over is a `409` naming each file, its digest and its size, with no
+job created and nothing provisioned. Register the missing file in
+`asset_sources` — keyed by lowercase sha256, valued either by pinned Hugging Face
+file or by direct URL:
+
+```json
+"asset_sources": {
+  "31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b": {
+    "repo_id": "stabilityai/stable-diffusion-xl-base-1.0",
+    "revision": "462165984030d82259a11f4367a4eed129e94a7b",
+    "filename": "sd_xl_base_1.0.safetensors"
+  },
+  "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4": {
+    "url": "https://models.example.com/upscalers/4x-UltraSharp.safetensors"
+  }
+}
+```
+
+Malformed entries raise at load, naming the digest, rather than being dropped.
+The worker stages declared assets at its first job alongside the profile's
+pinned weights and verifies the digest after writing; a file already present
+under the same name with different bytes is moved to
+`models/.cloud-offload-quarantine/<its sha256>/` instead of being overwritten or
+trusted. A partition submitted without an `assets` list behaves exactly as it
+did before this existed: the runner gets its profile's `weights` and nothing
+more.
+
 ### On-prem-only assets
 
 Some assets — licensed models, NDA'd meshes — must never leave the building.
