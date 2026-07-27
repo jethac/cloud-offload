@@ -29,6 +29,15 @@ DEFAULT_PARTITION_ROOT = "/opt/cloud-offload/partitions"
 # "same filename, different weights" a loud event instead of a silent one.
 QUARANTINE_DIRNAME = ".cloud-offload-quarantine"
 
+# The Comfy Registry, which resolves a pack id and version to a download URL.
+DEFAULT_REGISTRY_URL = "https://api.comfy.org"
+REGISTRY_TIMEOUT_SECONDS = 60
+GIT_TIMEOUT_SECONDS = 600
+PIP_TIMEOUT_SECONDS = 1800
+# Enough to see what pip actually did without turning one failed build into an
+# event nobody can page through.
+MAX_CAPTURED_OUTPUT = 4000
+
 
 def sha256_file(path: Path) -> str:
     """Digest a file in bounded memory. Never opens it as anything but bytes."""
@@ -87,10 +96,13 @@ class Worker:
         self._apply_image_manifest()
         self.capabilities = self._validated_capabilities()
         self.gpu_name, self.gpu_vram_gb = self._detect_gpu()
-        # Pinned weights the launching profile wants on disk. Staged lazily at
-        # the first claimed job so the progress is visible in that job's events.
+        # Pinned weights and node packs the launching profile wants on disk.
+        # Staged lazily at the first claimed job so the progress is visible in
+        # that job's events.
         self.weights = self._load_weights_env()
         self._weights_staged = False
+        self.custom_nodes = self._load_custom_nodes_env()
+        self._custom_nodes_staged = False
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -120,21 +132,31 @@ class Worker:
             self.declared_capabilities.append("comfyui-partition-v1")
 
     @staticmethod
-    def _load_weights_env() -> list[dict]:
-        """Weight downloads requested by the launching profile, if any."""
+    def _load_json_list_env(name: str) -> list[dict]:
+        """Read one of the launching profile's JSON list environment variables."""
         import json
         import os
 
-        raw = os.environ.get("CLOUD_OFFLOAD_WEIGHTS", "").strip()
+        raw = os.environ.get(name, "").strip()
         if not raw:
             return []
         try:
             entries = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"CLOUD_OFFLOAD_WEIGHTS is not valid JSON: {exc}") from exc
+            raise RuntimeError(f"{name} is not valid JSON: {exc}") from exc
         if not isinstance(entries, list):
-            raise RuntimeError("CLOUD_OFFLOAD_WEIGHTS must be a JSON list")
+            raise RuntimeError(f"{name} must be a JSON list")
         return entries
+
+    @staticmethod
+    def _load_weights_env() -> list[dict]:
+        """Weight downloads requested by the launching profile, if any."""
+        return Worker._load_json_list_env("CLOUD_OFFLOAD_WEIGHTS")
+
+    @staticmethod
+    def _load_custom_nodes_env() -> list[dict]:
+        """Custom node packs requested by the launching profile, if any."""
+        return Worker._load_json_list_env("CLOUD_OFFLOAD_CUSTOM_NODES")
 
     def _validated_capabilities(self) -> list[str]:
         """Only claim workflow capabilities this ComfyUI runner actually offers."""
@@ -288,7 +310,11 @@ class Worker:
         if job.model not in WORKFLOW_CAPABILITIES:
             raise RuntimeError(f"Unsupported job model: {job.model}")
 
-        # The first claimed job pays the weight download; later jobs skip it.
+        # The first claimed job pays the node pack install and the weight
+        # download; later jobs skip both. Packs come first: they are what makes
+        # the graph's node types exist at all, and they are far the smaller
+        # download, so a profile that is wrong about them fails fast.
+        self._stage_custom_nodes(job)
         self._stage_profile_weights(job)
 
         # Mark as running
@@ -297,6 +323,259 @@ class Worker:
         result = self._run_comfyui_workflow(job)
         self.queue.update_status(job.id, JobStatus.COMPLETED, result=result)
         logger.info(f"Job {job.id} completed")
+
+    def _stage_custom_nodes(self, job: Job) -> None:
+        """Install the profile's declared node packs, once, at the first job.
+
+        The coordinator has already refused any partition whose required packs
+        this profile does not declare, so by the time a job is claimed the list
+        here is the answer to "what does the graph need". What is left is putting
+        the code on disk, pinned: a registry release by version, or a git
+        checkout at an exact commit.
+
+        Progress rides the job's event stream as ``node_pack_staging`` events in
+        the same 3..9 band weight staging uses, after the dispatcher's
+        ``runner_starting`` (2) and under the 10 that marks the job running.
+        Sharing one band keeps both phases of "preparing the runner" out of the
+        range that means "executing". A failed install raises, which fails the
+        job through the normal path in ``run``.
+        """
+        if self._custom_nodes_staged or not self.custom_nodes:
+            self._custom_nodes_staged = True
+            return
+
+        from cloud_offload.comfyui import comfyui_custom_nodes_dir
+        from cloud_offload.profiles import profile_pack_identifier
+
+        root = comfyui_custom_nodes_dir().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        event_writer = getattr(self.queue, "append_event", None)
+        progress_setter = getattr(self.queue, "set_progress", None)
+        total_packs = len(self.custom_nodes)
+        downloaded = 0
+
+        def publish(pack_id: str | None, source: str | None) -> None:
+            progress = 3 + round(6 * downloaded / max(1, total_packs))
+            if callable(progress_setter):
+                progress_setter(job.id, progress)
+            if callable(event_writer):
+                event_writer(
+                    job.id,
+                    {
+                        "type": "node_pack_staging",
+                        "pack_id": pack_id,
+                        "source": source,
+                        "downloaded_packs": downloaded,
+                        "total_packs": total_packs,
+                        "overall_progress": progress,
+                    },
+                )
+
+        for entry in self.custom_nodes:
+            pack_id = profile_pack_identifier(entry)
+            source = "registry" if entry.get("registry_id") else "git"
+            if not pack_id:
+                raise RuntimeError(f"Custom node pack entry names no pack: {entry!r}")
+            # The pack directory is named for the pin, which is also the name
+            # ComfyUI will report its nodes under and the name the coordinator
+            # matched the partition's requirement against.
+            target = (root / pack_id).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                raise RuntimeError(
+                    f"Custom node pack escapes the custom_nodes directory: {pack_id!r}"
+                )
+            publish(pack_id, source)
+            if target.exists():
+                logger.info(
+                    "Custom node pack already present, skipping %s (%s)", pack_id, target
+                )
+                downloaded += 1
+                continue
+            if source == "registry":
+                self._install_registry_pack(entry, target)
+            else:
+                self._install_git_pack(entry, target)
+            if entry.get("install_requirements", True):
+                self._install_pack_requirements(job, pack_id, target)
+            downloaded += 1
+
+        publish(None, None)
+        self._custom_nodes_staged = True
+        logger.info("Staged %d custom node pack(s) into %s", total_packs, root)
+
+    def _install_registry_pack(self, entry: dict, target: Path) -> None:
+        """Install one Comfy Registry release, pinned by version.
+
+        The registry's version list is the only place a release's artifact URL
+        is published, so the version is resolved to a ``downloadUrl`` and the
+        archive is unpacked through the traversal guard below.
+        """
+        import os
+        import tempfile
+
+        import requests
+
+        registry_id = str(entry.get("registry_id") or "")
+        version = str(entry.get("version") or "")
+        base = os.environ.get("CLOUD_OFFLOAD_REGISTRY_URL", DEFAULT_REGISTRY_URL).rstrip("/")
+        response = requests.get(
+            f"{base}/nodes/{registry_id}/versions", timeout=REGISTRY_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        payload = response.json()
+        versions = payload.get("versions") if isinstance(payload, dict) else payload
+        download_url = ""
+        for item in versions or ():
+            if isinstance(item, dict) and str(item.get("version") or "") == version:
+                download_url = str(item.get("downloadUrl") or "")
+                break
+        if not download_url:
+            raise RuntimeError(
+                f"Custom node pack {registry_id} has no registry version {version}"
+            )
+
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        archive = Path(handle.name)
+        handle.close()
+        try:
+            with requests.get(
+                download_url, stream=True, timeout=REGISTRY_TIMEOUT_SECONDS
+            ) as download:
+                download.raise_for_status()
+                with archive.open("wb") as sink:
+                    for chunk in download.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            sink.write(chunk)
+            self._extract_node_pack(archive, target, f"{registry_id}@{version}")
+        finally:
+            archive.unlink(missing_ok=True)
+
+    @staticmethod
+    def _extract_node_pack(archive: Path, target: Path, label: str) -> None:
+        """Unpack a node pack archive, refusing anything that escapes ``target``.
+
+        Every member is checked before a single one is written: an absolute path,
+        a ``..`` component or a symlink entry aborts the whole install, naming the
+        member. This is not a hypothetical class of bug — the pack this feature
+        was designed around shipped a path-traversal fix — and the blast radius
+        here is a runner's filesystem, so the archive is validated in full rather
+        than sanitized member by member.
+        """
+        import stat
+        import zipfile
+
+        from pathlib import PureWindowsPath
+
+        with zipfile.ZipFile(archive) as bundle:
+            for info in bundle.infolist():
+                name = info.filename
+                # PureWindowsPath parses both separator styles and catches drive
+                # letters, so one check covers archives from either platform.
+                pure = PureWindowsPath(name)
+                if pure.is_absolute() or pure.drive or name.startswith(("/", "\\")):
+                    raise RuntimeError(
+                        f"Custom node pack {label} archive member has an absolute "
+                        f"path and was refused: {name}"
+                    )
+                if ".." in pure.parts:
+                    raise RuntimeError(
+                        f"Custom node pack {label} archive member traverses upward "
+                        f"and was refused: {name}"
+                    )
+                if stat.S_ISLNK(info.external_attr >> 16):
+                    raise RuntimeError(
+                        f"Custom node pack {label} archive member is a symlink and "
+                        f"was refused: {name}"
+                    )
+            target.mkdir(parents=True, exist_ok=True)
+            bundle.extractall(target)
+
+    def _install_git_pack(self, entry: dict, target: Path) -> None:
+        """Clone one pack and check out the pinned commit, verifying HEAD.
+
+        A blobless clone rather than ``--depth 1``: a depth-1 clone contains only
+        the tip of the default branch, which need not include the pinned commit,
+        while ``--filter=blob:none`` fetches the history cheaply and can reach any
+        commit in it.
+
+        HEAD is re-read afterwards because ``checkout`` succeeding is not proof of
+        landing on the pin — an ambiguous ref or a rewritten remote would both
+        leave the runner quietly executing code nobody pinned.
+        """
+        url = str(entry.get("git") or "")
+        commit = str(entry.get("commit") or "").lower()
+        self._run_git(
+            ["clone", "--filter=blob:none", "--no-checkout", url, str(target)],
+            f"cloning {url}",
+        )
+        self._run_git(
+            ["-C", str(target), "checkout", "--detach", commit],
+            f"checking out {commit[:12]} of {url}",
+        )
+        head = self._run_git(
+            ["-C", str(target), "rev-parse", "HEAD"], f"reading HEAD of {url}"
+        ).strip().lower()
+        if head != commit:
+            raise RuntimeError(
+                f"Custom node pack {url} checked out {head} but the worker profile "
+                f"pins {commit}"
+            )
+
+    @staticmethod
+    def _run_git(arguments: list[str], description: str) -> str:
+        """Run one git command, failing loudly with its stderr."""
+        result = subprocess.run(
+            ["git", *arguments],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Custom node pack staging failed while {description}: "
+                f"{(result.stderr or result.stdout or '').strip()[:MAX_CAPTURED_OUTPUT]}"
+            )
+        return result.stdout or ""
+
+    def _install_pack_requirements(self, job: Job, pack_id: str, target: Path) -> None:
+        """Install a pack's requirements.txt, with pip's output in the events.
+
+        A pack whose dependencies are missing imports at ComfyUI startup and
+        vanishes from the node registry, which surfaces later as "unknown node
+        type" on a runner that is already rented. The output goes into the job's
+        event stream because that is the only place an operator can read it: the
+        runner is gone by the time anyone asks what happened.
+        """
+        import sys
+
+        requirements = target / "requirements.txt"
+        if not requirements.is_file():
+            return
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
+            capture_output=True,
+            text=True,
+            timeout=PIP_TIMEOUT_SECONDS,
+        )
+        output = ((result.stdout or "") + (result.stderr or "")).strip()
+        event_writer = getattr(self.queue, "append_event", None)
+        if callable(event_writer):
+            event_writer(
+                job.id,
+                {
+                    "type": "node_pack_requirements",
+                    "pack_id": pack_id,
+                    "returncode": result.returncode,
+                    "output": output[-MAX_CAPTURED_OUTPUT:],
+                },
+            )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Custom node pack {pack_id} requirements install failed: "
+                f"{output[-MAX_CAPTURED_OUTPUT:]}"
+            )
 
     def _stage_profile_weights(self, job: Job) -> None:
         """Stage the profile's pinned weights and the job's declared assets.

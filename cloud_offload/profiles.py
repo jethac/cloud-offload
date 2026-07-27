@@ -52,6 +52,9 @@ def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
             "wheelhouse_url": str(value.get("wheelhouse_url") or ""),
             "wheelhouse_sha256": str(value.get("wheelhouse_sha256") or ""),
             "weights": normalized_profile_weights(str(name), value.get("weights")),
+            "custom_nodes": normalized_profile_custom_nodes(
+                str(name), value.get("custom_nodes")
+            ),
         }
     return result
 
@@ -122,6 +125,97 @@ def normalized_profile_weights(name: str, entries: Any) -> list[dict[str, Any]]:
             }
         )
     return normalized
+
+
+def _full_commit_sha(label: str, value: str) -> str:
+    """Reject anything but a complete commit sha.
+
+    A branch or tag names whatever that ref points at today, which is not an
+    identity: two runners launched an hour apart from the same profile would
+    hold different code and both believe they matched the pin.
+    """
+    commit = value.strip().lower()
+    if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+        raise ValueError(
+            f"{label}: commit must be a full 40-character sha, not a branch or tag"
+        )
+    return commit
+
+
+def normalized_profile_custom_nodes(name: str, entries: Any) -> list[dict[str, Any]]:
+    """Validate and normalize a profile's optional ``custom_nodes`` list.
+
+    Each entry pins one custom node pack, either as a Comfy Registry release
+    (``registry_id`` plus ``version``) or as a git checkout (``git`` plus a full
+    ``commit``). Both source kinds are needed in practice: registry metadata can
+    point at a repository URL that 404s, and a pack can exist in git before it is
+    published at all.
+
+    Exactly one source kind per entry, and never a floating ref. Invalid entries
+    raise rather than being dropped, for the same reason ``weights`` does: a
+    profile that believes it installs a pack but silently does not would fail
+    every job that needs it, on a runner that is already being paid for.
+    """
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise ValueError(f"Worker profile {name!r}: custom_nodes must be a list")
+    normalized: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        label = f"Worker profile {name!r} custom_nodes[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label} must be an object")
+        registry_id = str(entry.get("registry_id") or "").strip()
+        git_url = str(entry.get("git") or "").strip()
+        if registry_id and git_url:
+            raise ValueError(f"{label}: give either registry_id or git, not both")
+        install_requirements = bool(entry.get("install_requirements", True))
+        if registry_id:
+            version = str(entry.get("version") or "").strip()
+            if not version:
+                raise ValueError(
+                    f"{label}: version is required; pin a published release, not a range"
+                )
+            normalized.append(
+                {
+                    "registry_id": registry_id,
+                    "version": version,
+                    "install_requirements": install_requirements,
+                }
+            )
+            continue
+        if not git_url:
+            raise ValueError(f"{label}: registry_id or git is required")
+        if not git_url.startswith(("http://", "https://")):
+            raise ValueError(f"{label}: git must be an http or https clone URL")
+        commit = str(entry.get("commit") or "").strip()
+        if not commit:
+            raise ValueError(
+                f"{label}: commit is required; pin a commit sha, not a branch"
+            )
+        normalized.append(
+            {
+                "git": git_url,
+                "commit": _full_commit_sha(label, commit),
+                "install_requirements": install_requirements,
+            }
+        )
+    return normalized
+
+
+def profile_pack_identifier(entry: dict[str, Any]) -> str:
+    """The name a profile entry answers to when a partition requires a pack.
+
+    A registry entry answers to its ``registry_id``; a git entry answers to the
+    last path segment of its clone URL with any ``.git`` suffix removed, which is
+    the directory ``git clone`` would create and therefore the directory ComfyUI
+    would attribute its nodes to.
+    """
+    registry_id = str(entry.get("registry_id") or "").strip()
+    if registry_id:
+        return registry_id
+    segment = str(entry.get("git") or "").rstrip("/").rsplit("/", 1)[-1]
+    return segment[:-4] if segment.lower().endswith(".git") else segment
 
 
 def worker_profile_gpu_type(profile: dict[str, Any], default: str | None = None) -> str | None:

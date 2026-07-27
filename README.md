@@ -312,6 +312,60 @@ trusted. A partition submitted without an `assets` list behaves exactly as it
 did before this existed: the runner gets its profile's `weights` and nothing
 more.
 
+### Required custom node packs
+
+Weights are only half of what a graph needs. A partition built from custom nodes
+also needs the code that defines them, and a runner without it fails on its first
+prompt with a GPU already rented.
+
+The node pack asks ComfyUI which pack defines each node type in the box — exact
+attribution, not a guess: ComfyUI reports the defining module of every class it
+loaded — and stamps a `node_packs` list of `{id, directory, version, digest}`
+onto the job. The `digest` is sha256 over the pack's `.py` files, path and bytes,
+in sorted path order.
+
+A worker profile declares what it can install, pinned, one entry per pack:
+
+```json
+"custom_nodes": [
+  { "registry_id": "eric-qwen-layer", "version": "0.1.0" },
+  {
+    "git": "https://github.com/owner/ComfyUI-Something.git",
+    "commit": "2be3bd3a1f4c9e77e0a0b5f6f0f1c2d3e4a5b6c7",
+    "install_requirements": false
+  }
+]
+```
+
+Exactly one source kind per entry, and never a floating ref: a branch or tag
+names whatever it points at today, so two runners launched an hour apart would
+hold different code and both believe they matched. Malformed entries raise at
+load, naming the entry index. Both kinds exist because both are needed — registry
+metadata can point at a repository URL that 404s, and a pack can exist in git
+before it is published at all.
+
+Before routing, every required pack must be declared by the target profile. A
+required `id` matches an entry's `registry_id`, or the last path segment of its
+clone URL (with any `.git` suffix removed, which is the directory `git clone`
+would create), compared case-insensitively. Anything unmatched is a `409` naming
+each pack, with no job created and nothing provisioned.
+
+A *version* disagreement is only a warning, returned in `node_pack_warnings`
+alongside a `202`. This is deliberate. The coordinator cannot know what code a
+runner actually holds until the runner reports its own digest, and a version
+match would not have proven a code match either: a pack can ship a security fix
+and still declare the version number of the unpatched release published under it.
+That is exactly why every requirement carries a digest and not just a version.
+
+The worker installs declared packs at its first job, before weights, emitting
+`node_pack_staging` events in the same 3..9 progress band. A registry entry is
+resolved to its release artifact and unpacked behind a hard path-traversal guard
+— any member with an absolute path, a `..` component, or a symlink bit aborts the
+whole install by name — and a git entry is cloned, checked out at the pinned
+commit, and verified by re-reading `HEAD`. A pack directory that already exists
+is left alone. A partition submitted without a `node_packs` list behaves exactly
+as it did before this existed.
+
 ### On-prem-only assets
 
 Some assets — licensed models, NDA'd meshes — must never leave the building.

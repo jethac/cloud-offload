@@ -374,6 +374,13 @@ class Dispatcher:
                         "likely fail",
                         profile_name,
                     )
+        if profile.get("custom_nodes"):
+            # Installed by the worker before its first job, alongside weights.
+            # These carry no credentials by construction: a registry release and
+            # a public clone URL are both fetched anonymously.
+            env_vars["CLOUD_OFFLOAD_CUSTOM_NODES"] = json.dumps(
+                profile["custom_nodes"], separators=(",", ":")
+            )
 
         try:
             instance = connector.launch(

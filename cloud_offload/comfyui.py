@@ -19,19 +19,29 @@ from typing import Any
 FILE_OUTPUT_KEYS = ("3d",)
 
 # Where the runner image checks ComfyUI out. Weight staging drops files under
-# its ``models`` directory (checkpoints/, vae/, ...).
+# its ``models`` directory (checkpoints/, vae/, ...); node pack staging installs
+# under its ``custom_nodes`` directory.
 DEFAULT_COMFYUI_ROOT = "/opt/ComfyUI"
 
 
-def comfyui_models_dir() -> Path:
-    """The colocated ComfyUI's models directory.
+def comfyui_root() -> Path:
+    """The colocated ComfyUI checkout.
 
     Resolved from ``CLOUD_OFFLOAD_COMFYUI_ROOT`` the same way the executor
     resolves ``CLOUD_OFFLOAD_COMFYUI_URL``, so a nonstandard checkout (or a
     test) can redirect it without touching the code.
     """
-    root = os.environ.get("CLOUD_OFFLOAD_COMFYUI_ROOT", DEFAULT_COMFYUI_ROOT)
-    return Path(root) / "models"
+    return Path(os.environ.get("CLOUD_OFFLOAD_COMFYUI_ROOT", DEFAULT_COMFYUI_ROOT))
+
+
+def comfyui_models_dir() -> Path:
+    """The colocated ComfyUI's models directory."""
+    return comfyui_root() / "models"
+
+
+def comfyui_custom_nodes_dir() -> Path:
+    """The colocated ComfyUI's custom node directory."""
+    return comfyui_root() / "custom_nodes"
 
 
 class ComfyUIWorkflowError(RuntimeError):

@@ -308,6 +308,11 @@ def _asset_warnings(assets: list[dict[str, Any]]) -> dict[str, Any]:
     return {"asset_warnings": warnings} if warnings else {}
 
 
+def _node_pack_warnings(warnings: list[dict[str, Any]]) -> dict[str, Any]:
+    """Surface node packs whose pinned version disagrees with the client's."""
+    return {"node_pack_warnings": warnings} if warnings else {}
+
+
 def _provider_statuses(config) -> list[dict[str, Any]]:
     from cloud_offload.providers import connector_names, create_connector, connector_metadata
     from cloud_offload.profiles import configured_worker_profiles
@@ -929,6 +934,12 @@ async def submit_partition(request: PartitionSubmitRequest):
         resolve_partition_assets,
         unresolved_assets_message,
     )
+    from cloud_offload.node_packs import (
+        missing_node_packs,
+        missing_node_packs_message,
+        node_pack_version_warnings,
+        normalized_partition_node_packs,
+    )
     from cloud_offload.profiles import configured_worker_profiles
     from cloud_offload.queue import JobStatus
     from cloud_offload.router import select_profile_provider
@@ -958,6 +969,9 @@ async def submit_partition(request: PartitionSubmitRequest):
         )
     try:
         declared_assets = normalized_partition_assets(request.partition.get("assets"))
+        declared_packs = normalized_partition_node_packs(
+            request.partition.get("node_packs")
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     config, queue = _queue()
@@ -967,15 +981,14 @@ async def submit_partition(request: PartitionSubmitRequest):
             raise HTTPException(status_code=400, detail=f"Invalid input boundary key: {boundary_key}")
         if not storage.exists(_partition_artifact_key(artifact_id)):
             raise HTTPException(status_code=404, detail=f"Input artifact not found: {artifact_id}")
-    # Declared assets resolve before routing, let alone provisioning: a model
-    # file nobody can supply must cost a 409, not a rented GPU that fails on its
-    # first prompt. The profile is read directly rather than taken from the
+    # Declared assets and node packs resolve before routing, let alone
+    # provisioning: a model file nobody can supply, or a node type that will not
+    # exist on the runner, must cost a 409 rather than a rented GPU that fails on
+    # its first prompt. The profile is read directly rather than taken from the
     # route, because it is the same profile whichever provider wins.
+    profile = configured_worker_profiles(config).get(profile_name)
     assets, unresolved = resolve_partition_assets(
-        config,
-        declared_assets,
-        configured_worker_profiles(config).get(profile_name),
-        storage,
+        config, declared_assets, profile, storage
     )
     if unresolved:
         return error_response(
@@ -984,6 +997,19 @@ async def submit_partition(request: PartitionSubmitRequest):
             unresolved_assets_message(unresolved),
             {"unresolved": unresolved},
         )
+    missing_packs = missing_node_packs(declared_packs, profile)
+    if missing_packs:
+        return error_response(
+            409,
+            "cloud_offload.missing_node_packs",
+            missing_node_packs_message(missing_packs),
+            {"missing": missing_packs},
+        )
+    # Divergence is not a refusal: the coordinator cannot know what code the
+    # runner will actually hold until the runner reports its own digest, and a
+    # version match would not have proven a code match either — a pack can ship
+    # a security fix under the version number of the unpatched release.
+    pack_warnings = node_pack_version_warnings(declared_packs, profile)
     try:
         route = await asyncio.to_thread(
             select_profile_provider,
@@ -1042,6 +1068,7 @@ async def submit_partition(request: PartitionSubmitRequest):
                 "status_url": f"/api/jobs/{job.id}",
                 "cache_hit": True,
                 **_asset_warnings(assets),
+                **_node_pack_warnings(pack_warnings),
             }
     job = queue.create(
         model="comfyui-partition-v1",
@@ -1072,6 +1099,7 @@ async def submit_partition(request: PartitionSubmitRequest):
         "status": job.status.value,
         "status_url": f"/api/jobs/{job.id}",
         **_asset_warnings(assets),
+        **_node_pack_warnings(pack_warnings),
     }
 
 

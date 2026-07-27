@@ -453,6 +453,8 @@ def staging_worker(tmp_path, monkeypatch, hub=None, storage=None):
     worker.storage = storage
     worker.weights = []
     worker._weights_staged = False
+    worker.custom_nodes = []
+    worker._custom_nodes_staged = False
     return worker
 
 

@@ -254,6 +254,8 @@ def staging_worker(tmp_path, monkeypatch, weights, hub):
     worker.queue = JobQueue(tmp_path / "queue.db")
     worker.weights = weights
     worker._weights_staged = False
+    worker.custom_nodes = []
+    worker._custom_nodes_staged = False
     return worker
 
 

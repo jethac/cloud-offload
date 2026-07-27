@@ -230,15 +230,22 @@ class CloudConfig:
             self.queue_db_path = str(CONFIG_DIR / "jobs.db")
         if not self.storage_path:
             self.storage_path = str(CONFIG_DIR / "job_files")
-        # Malformed pinned weights fail here, at load, not at dispatch time when
-        # a worker is already being paid for. Asset sources fail here for the
-        # same reason: a half-read registry would refuse jobs it could serve.
+        # Malformed pinned weights and node packs fail here, at load, not at
+        # dispatch time when a worker is already being paid for. Asset sources
+        # fail here for the same reason: a half-read registry would refuse jobs
+        # it could serve.
         from cloud_offload.assets import normalized_asset_sources
-        from cloud_offload.profiles import normalized_profile_weights
+        from cloud_offload.profiles import (
+            normalized_profile_custom_nodes,
+            normalized_profile_weights,
+        )
 
         for profile_name, profile in (self.worker_profiles or {}).items():
             if isinstance(profile, dict):
                 normalized_profile_weights(str(profile_name), profile.get("weights"))
+                normalized_profile_custom_nodes(
+                    str(profile_name), profile.get("custom_nodes")
+                )
         self.asset_sources = normalized_asset_sources(self.asset_sources)
 
     @classmethod
