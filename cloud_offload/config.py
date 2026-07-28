@@ -184,6 +184,10 @@ class CloudConfig:
     runpod_cloud_type: Literal["SECURE", "COMMUNITY"] = "SECURE"
     runpod_container_disk_gb: int = 20
     runpod_volume_gb: int = 0
+    # Ceiling on the container disk a storage plan may ask for. A partition that
+    # plans past this is refused before provisioning, like every other
+    # pre-flight refusal: an unnoticed 900 GB request is a bill, not a warning.
+    max_container_disk_gb: int = 500
     # Opaque RunPod credential record ID. The registry password/token remains
     # stored by RunPod and is never persisted in configuration.
     runpod_registry_auth_id: str = ""
@@ -222,6 +226,8 @@ class CloudConfig:
             raise ValueError("runpod_container_disk_gb must be at least 1")
         if self.runpod_volume_gb < 0:
             raise ValueError("runpod_volume_gb cannot be negative")
+        if self.max_container_disk_gb < 1:
+            raise ValueError("max_container_disk_gb must be at least 1")
         if self.idle_shutdown_seconds < 1:
             raise ValueError("idle_shutdown_seconds must be at least 1")
         if self.keep_warm_warning_seconds < 60:
@@ -237,6 +243,7 @@ class CloudConfig:
         from cloud_offload.assets import normalized_asset_sources
         from cloud_offload.profiles import (
             normalized_profile_custom_nodes,
+            normalized_profile_disk_gb,
             normalized_profile_weights,
         )
 
@@ -246,6 +253,10 @@ class CloudConfig:
                 normalized_profile_custom_nodes(
                     str(profile_name), profile.get("custom_nodes")
                 )
+                for storage_field in ("extra_disk_gb", "image_size_gb"):
+                    normalized_profile_disk_gb(
+                        str(profile_name), storage_field, profile.get(storage_field)
+                    )
         self.asset_sources = normalized_asset_sources(self.asset_sources)
 
     @classmethod
@@ -315,6 +326,9 @@ class CloudConfig:
             runpod_cloud_type=os.environ.get("RUNPOD_CLOUD_TYPE", "SECURE").upper(),
             runpod_container_disk_gb=int(os.environ.get("RUNPOD_CONTAINER_DISK_GB", "20")),
             runpod_volume_gb=int(os.environ.get("RUNPOD_VOLUME_GB", "0")),
+            max_container_disk_gb=int(
+                os.environ.get("CLOUD_OFFLOAD_MAX_CONTAINER_DISK_GB", "500")
+            ),
             runpod_registry_auth_id=os.environ.get("RUNPOD_REGISTRY_AUTH_ID", ""),
         )
 
@@ -374,6 +388,7 @@ class CloudConfig:
             "RUNPOD_CLOUD_TYPE": ("runpod_cloud_type", str),
             "RUNPOD_CONTAINER_DISK_GB": ("runpod_container_disk_gb", int),
             "RUNPOD_VOLUME_GB": ("runpod_volume_gb", int),
+            "CLOUD_OFFLOAD_MAX_CONTAINER_DISK_GB": ("max_container_disk_gb", int),
             "RUNPOD_REGISTRY_AUTH_ID": ("runpod_registry_auth_id", str),
         }
         for env_name, (field_name, converter) in env_map.items():
@@ -414,6 +429,7 @@ class CloudConfig:
             "runpod_cloud_type": self.runpod_cloud_type,
             "runpod_container_disk_gb": self.runpod_container_disk_gb,
             "runpod_volume_gb": self.runpod_volume_gb,
+            "max_container_disk_gb": self.max_container_disk_gb,
             "runpod_registry_auth_id": self.runpod_registry_auth_id,
             "vast_api_url": self.vast_api_url,
             "runpod_graphql_url": self.runpod_graphql_url,

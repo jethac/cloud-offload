@@ -55,8 +55,43 @@ def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
             "custom_nodes": normalized_profile_custom_nodes(
                 str(name), value.get("custom_nodes")
             ),
+            "extra_disk_gb": normalized_profile_disk_gb(
+                str(name), "extra_disk_gb", value.get("extra_disk_gb")
+            ),
+            "image_size_gb": normalized_profile_disk_gb(
+                str(name), "image_size_gb", value.get("image_size_gb")
+            ),
         }
     return result
+
+
+def normalized_profile_disk_gb(name: str, field: str, value: Any) -> float:
+    """Validate one of a profile's optional storage figures, in GB.
+
+    ``extra_disk_gb`` is the operator's declaration of storage the coordinator
+    cannot see. It exists because a custom node is free to download its own
+    weights the first time it runs — a node calling diffusers
+    ``from_pretrained`` pulls a repository nothing in the manifest mentions — and
+    no static analysis of a partition can discover that. Zero is the honest
+    default: it says nothing extra was declared, not that nothing extra exists.
+
+    ``image_size_gb`` is the runner image's size, so sizing a pod's disk never
+    depends on reaching a container registry. Zero means unknown, and the planner
+    substitutes a conservative figure rather than treating it as free.
+    """
+    if value is None or value == "":
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Worker profile {name!r}: {field} must be a number of GB, got {value!r}"
+        )
+    if not math.isfinite(number):
+        raise ValueError(f"Worker profile {name!r}: {field} must be a finite number")
+    if number < 0:
+        raise ValueError(f"Worker profile {name!r}: {field} cannot be negative")
+    return number
 
 
 def require_models_relative(label: str, field: str, value: str) -> None:

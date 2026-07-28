@@ -14,6 +14,15 @@ pod.
 """
 
 
+import json
+
+import pytest
+
+from cloud_offload.config import CloudConfig
+from cloud_offload.profiles import (
+    configured_worker_profiles,
+    normalized_profile_disk_gb,
+)
 from cloud_offload.storage_plan import (
     GIB,
     HEADROOM_FLOOR_BYTES,
@@ -245,3 +254,85 @@ def test_the_requested_disk_never_falls_below_the_minimum():
     assert plan_disk_gb({"total": 1}) == MINIMUM_DISK_GB
     assert plan_disk_gb({"total": 0}) == MINIMUM_DISK_GB
     assert plan_disk_gb({}) == MINIMUM_DISK_GB
+
+
+# ---------------------------------------------------------------------------
+# Profile fields
+# ---------------------------------------------------------------------------
+
+
+def storage_config(tmp_path, **profile_fields):
+    return CloudConfig(
+        enabled=True,
+        provider="runpod",
+        provider_order=["runpod"],
+        runpod_api_key="secret",
+        coordinator_url="https://coordinator.invalid",
+        queue_db_path=str(tmp_path / "queue.db"),
+        storage_path=str(tmp_path / "storage"),
+        worker_profiles={
+            "comfyui": {
+                "image": "ghcr.io/example/comfyui@sha256:" + "a" * 64,
+                "models": ["comfyui-partition-v1"],
+                "providers": ["runpod"],
+                **profile_fields,
+            }
+        },
+    )
+
+
+def test_the_storage_fields_surface_through_configured_profiles(tmp_path):
+    config = storage_config(tmp_path, extra_disk_gb=60, image_size_gb=14.6)
+
+    resolved = configured_worker_profiles(config)["comfyui"]
+
+    assert resolved["extra_disk_gb"] == 60.0
+    assert resolved["image_size_gb"] == 14.6
+
+
+def test_the_storage_fields_default_to_zero(tmp_path):
+    resolved = configured_worker_profiles(storage_config(tmp_path))["comfyui"]
+
+    assert resolved["extra_disk_gb"] == 0.0
+    assert resolved["image_size_gb"] == 0.0
+
+
+@pytest.mark.parametrize("field", ["extra_disk_gb", "image_size_gb"])
+def test_a_negative_storage_field_is_refused_by_name(field):
+    with pytest.raises(ValueError, match=f"{field} cannot be negative"):
+        normalized_profile_disk_gb("comfyui", field, -1)
+
+
+@pytest.mark.parametrize("field", ["extra_disk_gb", "image_size_gb"])
+def test_a_non_numeric_storage_field_is_refused_by_name(field):
+    with pytest.raises(ValueError, match=f"{field} must be a number"):
+        normalized_profile_disk_gb("comfyui", field, "lots")
+
+
+def test_an_invalid_storage_field_fails_at_config_load(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "cloud": {
+                    "worker_profiles": {
+                        "comfyui": {
+                            "image": "ghcr.io/example/comfyui@sha256:" + "a" * 64,
+                            "models": ["comfyui-workflow"],
+                            "extra_disk_gb": -5,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="extra_disk_gb cannot be negative"):
+        CloudConfig.load(config_path)
+
+
+def test_the_container_disk_ceiling_defaults_and_validates():
+    assert CloudConfig().max_container_disk_gb == 500
+    with pytest.raises(ValueError, match="max_container_disk_gb must be at least 1"):
+        CloudConfig(max_container_disk_gb=0)
