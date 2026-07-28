@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 # How long a specific offer sits out after its host refuses a launch.
 OFFER_COOLDOWN_SECONDS = 600
 
+# A provider can report a pod as running before it has created a container
+# runtime. If the entrypoint never runs, no worker can report the failure home.
+RUNNER_REGISTRATION_TIMEOUT_SECONDS = 3600
+
 
 def _load_or_create_worker_token(config: CloudConfig) -> str:
     """Return a stable coordinator credential for workers across restarts.
@@ -113,6 +117,7 @@ class Dispatcher:
         self.instance_providers: dict[str, str] = {}
         self.instance_profiles: dict[str, str] = {}
         self.last_activity: dict[str, datetime] = {}
+        self.launched_at: dict[str, datetime] = {}
         self.launch_failures: dict[tuple[str, str], int] = {}
         self.next_launch_at: dict[tuple[str, str], float] = {}
         # (provider, offer_id) -> monotonic expiry. A host that refuses a launch
@@ -176,20 +181,25 @@ class Dispatcher:
 
     def _tick(self):
         """Single dispatcher iteration."""
-        # Lifetime policy is user-controlled at runtime through the coordinator.
-        # Refresh only these safe fields so toggling keep-warm does not require a
-        # dispatcher restart or replace provider credentials/connectors.
+        # Runtime policy and immutable worker-profile pins are user-controlled
+        # through the coordinator. Refresh these non-secret fields each tick so
+        # a newly submitted job cannot launch with a stale image or GPU policy.
+        # Provider credentials/connectors remain process-owned.
         try:
             persisted = CloudConfig.load(resolve_secrets=False)
             self.config.keep_warm = persisted.keep_warm
             self.config.keep_warm_warning_seconds = persisted.keep_warm_warning_seconds
             self.config.idle_shutdown_seconds = persisted.idle_shutdown_seconds
+            self.config.min_queue_depth = persisted.min_queue_depth
+            self.config.gpu_type = persisted.gpu_type
+            self.config.max_hourly_rate = persisted.max_hourly_rate
+            self.config.worker_profiles = persisted.worker_profiles
             self.config.runpod_registry_auth_id = persisted.runpod_registry_auth_id
             runpod = self.connectors.get("runpod")
             if runpod is not None and hasattr(runpod, "registry_auth_id"):
                 runpod.registry_auth_id = persisted.runpod_registry_auth_id.strip()
         except Exception as exc:
-            logger.warning("Could not refresh cloud lifetime policy: %s", exc)
+            logger.warning("Could not refresh cloud runtime policy: %s", exc)
 
         # Count queued jobs
         queued_count = self.queue.count_by_status(JobStatus.QUEUED)
@@ -257,6 +267,9 @@ class Dispatcher:
 
         # Update worker tracking
         self._update_workers()
+
+        # A rented pod whose entrypoint never runs cannot report its own failure.
+        self._check_unregistered_workers()
 
         # Check for idle workers to terminate
         self._check_idle_workers()
@@ -368,24 +381,23 @@ class Dispatcher:
             "CLOUD_OFFLOAD_WORKER_MODELS": ",".join(profile["models"]),
         }
         if profile.get("weights"):
-            # The worker stages these before its first job. The Hub token rides
-            # along only when an entry is marked gated, so a profile of public
-            # weights puts no secret into the pod environment even when the
-            # operator's own shell has HF_TOKEN set.
+            # The worker stages these before its first job. Pass the configured
+            # Hub token for public weights too: authenticated downloads avoid
+            # the stricter anonymous rate limits and are materially more
+            # reliable for large model profiles.
             env_vars["CLOUD_OFFLOAD_WEIGHTS"] = json.dumps(
                 profile["weights"], separators=(",", ":")
             )
-            if any(entry.get("gated") for entry in profile["weights"]):
-                hub_token = huggingface_token()
-                if hub_token:
-                    env_vars["HF_TOKEN"] = hub_token
-                else:
-                    logger.warning(
-                        "Profile %s has gated weights but no Hugging Face token "
-                        "is configured; the download will run anonymously and "
-                        "likely fail",
-                        profile_name,
-                    )
+            hub_token = huggingface_token()
+            if hub_token:
+                env_vars["HF_TOKEN"] = hub_token
+            elif any(entry.get("gated") for entry in profile["weights"]):
+                logger.warning(
+                    "Profile %s has gated weights but no Hugging Face token "
+                    "is configured; the download will run anonymously and "
+                    "likely fail",
+                    profile_name,
+                )
         if profile.get("custom_nodes"):
             # Installed by the worker before its first job, alongside weights.
             # These carry no credentials by construction: a registry release and
@@ -408,7 +420,9 @@ class Dispatcher:
             self.active_instances[instance.id] = instance
             self.instance_providers[instance.id] = provider_name
             self.instance_profiles[instance.id] = profile_name
-            self.last_activity[instance.id] = datetime.utcnow()
+            launched_at = datetime.utcnow()
+            self.last_activity[instance.id] = launched_at
+            self.launched_at[instance.id] = launched_at
 
             logger.info(f"Launched worker {instance.id}")
             self.launch_failures.pop((provider_name, profile_name), None)
@@ -559,8 +573,44 @@ cloud-offload worker --poll 10
                 self.instance_providers.pop(instance_id, None)
                 self.instance_profiles.pop(instance_id, None)
                 self.last_activity.pop(instance_id, None)
+                self.launched_at.pop(instance_id, None)
             else:
                 self.active_instances[instance_id] = instance
+
+    def _check_unregistered_workers(self):
+        """Stop a paid instance whose runner never managed to call home."""
+        now = datetime.utcnow()
+        workers = self.queue.list_active_workers()
+        profiles = configured_worker_profiles(self.config)
+        for instance_id, launched_at in list(self.launched_at.items()):
+            provider_name = self.instance_providers[instance_id]
+            profile_name = self.instance_profiles[instance_id]
+            registered = any(
+                worker.get("provider") == provider_name
+                and worker.get("runtime_profile") == profile_name
+                for worker in workers
+            )
+            if registered or now - launched_at <= timedelta(
+                seconds=RUNNER_REGISTRATION_TIMEOUT_SECONDS
+            ):
+                continue
+
+            detail = (
+                f"Runner did not register within "
+                f"{RUNNER_REGISTRATION_TIMEOUT_SECONDS}s"
+            )
+            logger.error("Worker %s %s; terminating", instance_id, detail.lower())
+            queued_jobs = [
+                job
+                for job in self.queue.list_by_status(
+                    JobStatus.QUEUED, provider=provider_name
+                )
+                if self._job_profile_name(job, profiles) == profile_name
+            ]
+            self._record_launch_failure(
+                provider_name, profile_name, queued_jobs, detail
+            )
+            self._terminate_worker(instance_id)
 
     @staticmethod
     def _job_profile_name(job, profiles: dict) -> str:
@@ -633,6 +683,7 @@ cloud-offload worker --poll 10
         self.instance_providers.pop(instance_id, None)
         self.instance_profiles.pop(instance_id, None)
         self.last_activity.pop(instance_id, None)
+        self.launched_at.pop(instance_id, None)
 
     def shutdown(self):
         """Terminate all workers and shut down."""

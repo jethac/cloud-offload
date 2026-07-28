@@ -884,6 +884,7 @@ class StartingConnector(DummyProvider):
 
     def __init__(self):
         self.launches = 0
+        self.launch_kwargs = []
 
     @property
     def name(self):
@@ -897,6 +898,7 @@ class StartingConnector(DummyProvider):
 
     def launch(self, *args, **kwargs):
         self.launches += 1
+        self.launch_kwargs.append(kwargs)
         return SimpleNamespace(
             id="pod-1",
             provider="runpod",
@@ -968,6 +970,30 @@ def test_a_starting_runner_stops_a_second_pod_being_rented(tmp_path, monkeypatch
     assert provider.launches == 0
 
 
+def test_dispatcher_reloads_worker_profile_before_launch(tmp_path, monkeypatch):
+    config = starting_config(tmp_path)
+    persisted = starting_config(tmp_path)
+    persisted.worker_profiles["comfyui"]["image"] = (
+        "ghcr.io/example/comfyui@sha256:" + "b" * 64
+    )
+    queue = JobQueue(config.queue_db_path)
+    queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={"runtime_profile": "comfyui-partition-v1"},
+        status=JobStatus.QUEUED,
+    )
+    monkeypatch.setattr(
+        "cloud_offload.dispatcher.CloudConfig.load", lambda *args, **kwargs: persisted
+    )
+    provider = StartingConnector()
+
+    Dispatcher(config, queue=queue, provider=provider)._tick()
+
+    assert provider.launch_kwargs[0]["docker_image"] == persisted.worker_profiles["comfyui"]["image"]
+
+
 def long_idle_dispatcher(config, queue):
     from datetime import datetime, timedelta
 
@@ -980,6 +1006,52 @@ def long_idle_dispatcher(config, queue):
     dispatcher.instance_profiles["pod-1"] = "comfyui"
     dispatcher.last_activity["pod-1"] = datetime.utcnow() - timedelta(hours=1)
     return dispatcher
+
+
+def test_a_pod_that_never_registers_is_terminated(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    job = queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={"runtime_profile": "comfyui-partition-v1"},
+        status=JobStatus.QUEUED,
+    )
+    dispatcher = long_idle_dispatcher(config, queue)
+    dispatcher.launched_at["pod-1"] = datetime.utcnow() - timedelta(minutes=61)
+    monkeypatch.setattr(
+        "cloud_offload.dispatcher.RUNNER_REGISTRATION_TIMEOUT_SECONDS", 3600
+    )
+
+    dispatcher._check_unregistered_workers()
+
+    assert "pod-1" not in dispatcher.active_instances
+    assert dispatcher.provider.terminated is True
+    assert queue.get(job.id).status == JobStatus.QUEUED
+    events = queue.list_events(job.id)
+    assert events[-1]["event"]["type"] == "provisioning_failed"
+    assert events[-1]["event"]["error"] == "Runner did not register within 3600s"
+
+
+def test_a_registered_starting_runner_is_not_terminated_by_the_boot_deadline(
+    tmp_path,
+):
+    from datetime import datetime, timedelta
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    queue.record_worker(
+        "worker-boot", "runpod", status="starting", runtime_profile="comfyui"
+    )
+    dispatcher = long_idle_dispatcher(config, queue)
+    dispatcher.launched_at["pod-1"] = datetime.utcnow() - timedelta(hours=1)
+
+    dispatcher._check_unregistered_workers()
+
+    assert "pod-1" in dispatcher.active_instances
 
 
 def test_a_runner_that_is_still_starting_is_not_terminated_as_idle(tmp_path):
