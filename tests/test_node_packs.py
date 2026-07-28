@@ -490,6 +490,14 @@ def staging_worker(tmp_path, monkeypatch, custom_nodes, requests_module=None):
     monkeypatch.setitem(sys.modules, "requests", requests_module or FakeRequests())
     monkeypatch.setenv("CLOUD_OFFLOAD_COMFYUI_ROOT", str(tmp_path / "ComfyUI"))
     worker = Worker.__new__(Worker)
+    worker.config = CloudConfig(
+        provider="runpod",
+        queue_db_path=str(tmp_path / "queue.db"),
+        storage_path=str(tmp_path / "storage"),
+    )
+    worker.worker_id = "worker-staging"
+    worker.runtime_profile = "comfyui"
+    worker.capabilities = ["comfyui-partition-v1"]
     worker.queue = JobQueue(tmp_path / "queue.db")
     worker.custom_nodes = custom_nodes
     worker._custom_nodes_staged = False
@@ -740,6 +748,126 @@ def test_the_worker_rejects_a_malformed_custom_nodes_env(monkeypatch):
 
     monkeypatch.delenv("CLOUD_OFFLOAD_CUSTOM_NODES")
     assert Worker._load_custom_nodes_env() == []
+
+
+@pytest.mark.parametrize(
+    "value, match",
+    [
+        ("", "is set but empty"),
+        ("   ", "is set but empty"),
+        ('[{"registry_id": "pack", "version": "0.1.0"}', "not valid JSON"),
+        ('{"registry_id": "pack"}', "must be a JSON list"),
+        ('["eric-qwen-layer"]', r"\[0\] must be a JSON object"),
+    ],
+)
+def test_an_unusable_packs_variable_names_the_value_it_refused(monkeypatch, value, match):
+    """A variable that cannot be read is a launch that thinks it configured a
+    runner and did not. Yielding an empty list there is indistinguishable from a
+    profile that declared no packs at all, which is precisely the silence that
+    let a runner claim a job whose node types could never exist."""
+    monkeypatch.setenv("CLOUD_OFFLOAD_CUSTOM_NODES", value)
+
+    with pytest.raises(RuntimeError, match=match) as failure:
+        Worker._load_custom_nodes_env()
+
+    assert "CLOUD_OFFLOAD_CUSTOM_NODES" in str(failure.value)
+
+
+def test_what_the_dispatcher_serializes_is_what_the_worker_reads(tmp_path, monkeypatch):
+    """The whole channel, end to end, on the exact profile that failed in
+    production: two git-pinned packs with explicit ids, serialized by the
+    dispatcher's separators and parsed back by the worker."""
+    from cloud_offload.dispatcher import Dispatcher
+
+    declared = [
+        {
+            "id": "eric-qwen-layer",
+            "git": "https://github.com/EricRollei/Qwen_Layers_Diffuser_Pipeline_Comfyui.git",
+            "commit": "2be3bd30449771364af9a38d6ee55c6fa3d74724",
+            "install_requirements": True,
+        },
+        {
+            "id": "layerscope",
+            "git": "https://github.com/jethac/layerscope.git",
+            "commit": "9adb37b7c08b1c891900c4445be827740936e895",
+            "install_requirements": True,
+        },
+    ]
+    provider = LaunchProvider()
+    config = packs_config(tmp_path, custom_nodes=declared)
+
+    Dispatcher(config, provider=provider)._launch_worker("runpod", "comfyui")
+    monkeypatch.setenv(
+        "CLOUD_OFFLOAD_CUSTOM_NODES", provider.env_vars["CLOUD_OFFLOAD_CUSTOM_NODES"]
+    )
+
+    assert Worker._load_custom_nodes_env() == declared
+    assert [profile_pack_identifier(entry) for entry in Worker._load_custom_nodes_env()] == [
+        "eric-qwen-layer",
+        "layerscope",
+    ]
+
+
+def test_a_skipped_staging_says_so_and_says_why(tmp_path, monkeypatch):
+    """Silence is the bug. A second job on a runner that already staged its
+    packs emitted nothing at all, which reads exactly like a runner that was
+    never told to stage anything — the two are only distinguishable if the
+    skip is stated."""
+    fake = FakeRequests()
+    worker = staging_worker(tmp_path, monkeypatch, [dict(REGISTRY_ENTRY)], fake)
+
+    worker._stage_custom_nodes(staging_job(worker))
+    second = staging_job(worker)
+    worker._stage_custom_nodes(second)
+
+    events = [item["event"] for item in worker.queue.list_events(second.id)]
+    assert [event["type"] for event in events] == ["node_pack_staging"]
+    assert events[0]["skipped"] == "already_staged"
+    assert events[0]["total_packs"] == 1
+
+
+def test_declaring_no_packs_is_stated_rather_than_assumed(tmp_path, monkeypatch):
+    worker = staging_worker(tmp_path, monkeypatch, [])
+    job = staging_job(worker)
+
+    worker._stage_custom_nodes(job)
+
+    events = [item["event"] for item in worker.queue.list_events(job.id)]
+    assert [event["skipped"] for event in events] == ["none_declared"]
+    assert events[0]["total_packs"] == 0
+
+
+def test_a_pack_already_on_disk_is_reported_as_present(tmp_path, monkeypatch):
+    """What the boot phase leaves behind: the first claimed job still stages,
+    finds the directories there, and puts that in the job's own events."""
+    fake = FakeRequests()
+    worker = staging_worker(tmp_path, monkeypatch, [dict(REGISTRY_ENTRY)], fake)
+    pack_path(tmp_path, "eric-qwen-layer").mkdir(parents=True)
+    job = staging_job(worker)
+
+    worker._stage_custom_nodes(job)
+
+    events = [item["event"] for item in worker.queue.list_events(job.id)]
+    assert events[0]["pack_id"] == "eric-qwen-layer"
+    assert events[0]["present"] is True
+    assert fake.urls == []
+
+
+def test_staging_before_comfyui_exists_needs_no_job(tmp_path, monkeypatch):
+    """The runner boot stages with nothing to attach events to, because ComfyUI
+    has not started and no job has been claimed. It must still install."""
+    fake = FakeRequests()
+    worker = staging_worker(tmp_path, monkeypatch, [dict(REGISTRY_ENTRY)], fake)
+
+    worker.stage_node_packs()
+
+    assert pack_path(
+        tmp_path, "eric-qwen-layer", "eric-qwen-layer", "__init__.py"
+    ).read_bytes() == PACK_SOURCE
+    assert worker._custom_nodes_staged is True
+    # Nothing to attach progress to, so the worker record carries the only
+    # signal there is: this pod is alive and still coming up.
+    assert [item["status"] for item in worker.queue.list_active_workers()] == ["starting"]
 
 
 def test_the_missing_message_reads_the_same_way_the_asset_one_does():

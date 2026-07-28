@@ -39,6 +39,42 @@ PIP_TIMEOUT_SECONDS = 1800
 MAX_CAPTURED_OUTPUT = 4000
 
 
+def resolve_worker_id(explicit: str | None = None) -> str:
+    """The identity a runner answers to, shared by every phase of its startup.
+
+    A runner boots in more than one process: something registers and stages the
+    node packs before ComfyUI exists, and something else claims jobs once it
+    does. They must be the same worker to the coordinator, or a startup failure
+    is attributed to a worker nothing else ever mentions, so the id is taken
+    from the environment when the entrypoint has already chosen one.
+    """
+    import os
+
+    return (
+        explicit
+        or os.environ.get("CLOUD_OFFLOAD_WORKER_ID", "").strip()
+        or f"worker-{uuid.uuid4().hex[:8]}"
+    )
+
+
+def worker_queue(config: CloudConfig, worker_id: str):
+    """The queue channel a runner with this configuration talks to."""
+    if config.coordinator_url:
+        from cloud_offload.coordinator import CoordinatorQueue
+
+        if not config.worker_token:
+            raise ValueError(
+                "CLOUD_OFFLOAD_WORKER_TOKEN is required with CLOUD_OFFLOAD_COORDINATOR_URL"
+            )
+        return CoordinatorQueue(
+            config.coordinator_url,
+            config.worker_token,
+            config.provider,
+            worker_id,
+        )
+    return JobQueue(config.queue_db_path)
+
+
 def sha256_file(path: Path) -> str:
     """Digest a file in bounded memory. Never opens it as anything but bytes."""
     digest = hashlib.sha256()
@@ -69,24 +105,8 @@ class Worker:
         worker_id: str | None = None,
     ):
         self.config = config
-        self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
-        if queue is not None:
-            self.queue = queue
-        elif config.coordinator_url:
-            from cloud_offload.coordinator import CoordinatorQueue
-
-            if not config.worker_token:
-                raise ValueError(
-                    "CLOUD_OFFLOAD_WORKER_TOKEN is required with CLOUD_OFFLOAD_COORDINATOR_URL"
-                )
-            self.queue = CoordinatorQueue(
-                config.coordinator_url,
-                config.worker_token,
-                config.provider,
-                self.worker_id,
-            )
-        else:
-            self.queue = JobQueue(config.queue_db_path)
+        self.worker_id = resolve_worker_id(worker_id)
+        self.queue = queue if queue is not None else worker_queue(config, self.worker_id)
         self.storage = storage or create_storage(config)
 
         self.running = False
@@ -133,20 +153,44 @@ class Worker:
 
     @staticmethod
     def _load_json_list_env(name: str) -> list[dict]:
-        """Read one of the launching profile's JSON list environment variables."""
+        """Read one of the launching profile's JSON list environment variables.
+
+        An unset variable means the profile asked for nothing. Anything else —
+        a blank value, a truncated document, a JSON object where a list belongs,
+        an entry that is not an object — is a launch that believes it configured
+        the runner and did not, and it raises with the offending value named. The
+        alternative is an empty list that stages nothing and says nothing, which
+        is indistinguishable from a profile that declared nothing at all.
+        """
         import json
         import os
 
-        raw = os.environ.get(name, "").strip()
-        if not raw:
+        if name not in os.environ:
             return []
+        raw = os.environ[name].strip()
+        if not raw:
+            raise RuntimeError(f"{name} is set but empty: {os.environ[name]!r}")
         try:
             entries = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{name} is not valid JSON: {exc}") from exc
+            raise RuntimeError(
+                f"{name} is not valid JSON ({exc}): {Worker._quote_env(raw)}"
+            ) from exc
         if not isinstance(entries, list):
-            raise RuntimeError(f"{name} must be a JSON list")
+            raise RuntimeError(
+                f"{name} must be a JSON list: {Worker._quote_env(raw)}"
+            )
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"{name}[{index}] must be a JSON object: {entry!r}"
+                )
         return entries
+
+    @staticmethod
+    def _quote_env(value: str) -> str:
+        """A variable's value, quoted and bounded, for an error that names it."""
+        return repr(value if len(value) <= 300 else value[:300] + "...")
 
     @staticmethod
     def _load_weights_env() -> list[dict]:
@@ -167,6 +211,53 @@ class Worker:
                 if model in WORKFLOW_CAPABILITIES
             )
         )
+
+    def register(
+        self, status: str = "active", *, detail: str | None = None, idle: bool = False
+    ) -> None:
+        """Announce this worker to the coordinator without claiming anything.
+
+        Registering as ``starting`` is how a pod that is still importing ComfyUI
+        keeps the dispatcher from renting a second one for the same queue. It is
+        deliberately not a claim: a worker that took a job it could not execute
+        would turn a clean pre-execution failure into a paid one that also spends
+        a retry, so the claim path stays gated on ComfyUI actually answering.
+
+        Best effort. A worker whose registration does not land is a worker the
+        coordinator has not heard from yet, which it already knows how to handle.
+        """
+        recorder = getattr(self.queue, "record_worker", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                self.worker_id,
+                self.config.provider,
+                status=status,
+                runtime_profile=self.runtime_profile or "",
+                capabilities=self.capabilities,
+                idle=idle,
+                detail=detail,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not register worker %s as %s: %s", self.worker_id, status, exc
+            )
+
+    def stage_node_packs(self) -> None:
+        """Install the profile's declared node packs before ComfyUI starts.
+
+        ComfyUI builds its node registry once, while it imports: a pack that
+        lands in ``custom_nodes`` after the server is already up is invisible to
+        it. That is how a runner that had installed both of its declared packs,
+        with the events to prove it, still answered a prompt with "Node
+        'LayerScope Decompose' not found. The custom node may not be installed."
+
+        So the runner boot calls this before it launches ComfyUI. The first
+        claimed job still runs staging, finds every directory already present,
+        and says so in its own events.
+        """
+        self._stage_custom_nodes(None)
 
     def _handle_signal(self, signum, frame):
         """Handle shutdown signals."""
@@ -324,24 +415,34 @@ class Worker:
         self.queue.update_status(job.id, JobStatus.COMPLETED, result=result)
         logger.info(f"Job {job.id} completed")
 
-    def _stage_custom_nodes(self, job: Job) -> None:
-        """Install the profile's declared node packs, once, at the first job.
+    def _stage_custom_nodes(self, job: Job | None) -> None:
+        """Install the profile's declared node packs, once per runner.
 
         The coordinator has already refused any partition whose required packs
-        this profile does not declare, so by the time a job is claimed the list
-        here is the answer to "what does the graph need". What is left is putting
-        the code on disk, pinned: a registry release by version, or a git
-        checkout at an exact commit.
+        this profile does not declare, so the list here is the answer to "what
+        does the graph need". What is left is putting the code on disk, pinned:
+        a registry release by version, or a git checkout at an exact commit.
 
-        Progress rides the job's event stream as ``node_pack_staging`` events in
-        the same 3..9 band weight staging uses, after the dispatcher's
-        ``runner_starting`` (2) and under the 10 that marks the job running.
-        Sharing one band keeps both phases of "preparing the runner" out of the
-        range that means "executing". A failed install raises, which fails the
-        job through the normal path in ``run``.
+        Called with a job, progress rides that job's event stream as
+        ``node_pack_staging`` events in the same 3..9 band weight staging uses,
+        after the dispatcher's ``runner_starting`` (2) and under the 10 that
+        marks the job running. Sharing one band keeps both phases of "preparing
+        the runner" out of the range that means "executing". A failed install
+        raises, which fails the job through the normal path in ``run``.
+
+        Called with no job — the runner boot, before ComfyUI exists — the same
+        progress goes to the log, because there is nothing yet to attach it to.
+
+        Every exit publishes something. Skipping is a decision this makes, and a
+        decision nobody can see is the reason a second attempt on an already
+        staged runner looked exactly like a runner that never staged anything.
         """
-        if self._custom_nodes_staged or not self.custom_nodes:
+        if self._custom_nodes_staged:
+            self._publish_node_pack_skip(job, "already_staged")
+            return
+        if not self.custom_nodes:
             self._custom_nodes_staged = True
+            self._publish_node_pack_skip(job, "none_declared")
             return
 
         from cloud_offload.comfyui import comfyui_custom_nodes_dir
@@ -349,27 +450,24 @@ class Worker:
 
         root = comfyui_custom_nodes_dir().resolve()
         root.mkdir(parents=True, exist_ok=True)
-        event_writer = getattr(self.queue, "append_event", None)
-        progress_setter = getattr(self.queue, "set_progress", None)
         total_packs = len(self.custom_nodes)
         downloaded = 0
 
-        def publish(pack_id: str | None, source: str | None) -> None:
+        def publish(pack_id: str | None, source: str | None, **extra) -> None:
             progress = 3 + round(6 * downloaded / max(1, total_packs))
-            if callable(progress_setter):
-                progress_setter(job.id, progress)
-            if callable(event_writer):
-                event_writer(
-                    job.id,
-                    {
-                        "type": "node_pack_staging",
-                        "pack_id": pack_id,
-                        "source": source,
-                        "downloaded_packs": downloaded,
-                        "total_packs": total_packs,
-                        "overall_progress": progress,
-                    },
-                )
+            self._publish_staging_progress(job, progress)
+            self._publish_staging_event(
+                job,
+                {
+                    "type": "node_pack_staging",
+                    "pack_id": pack_id,
+                    "source": source,
+                    "downloaded_packs": downloaded,
+                    "total_packs": total_packs,
+                    "overall_progress": progress,
+                    **extra,
+                },
+            )
 
         for entry in self.custom_nodes:
             pack_id = profile_pack_identifier(entry)
@@ -386,8 +484,9 @@ class Worker:
                 raise RuntimeError(
                     f"Custom node pack escapes the custom_nodes directory: {pack_id!r}"
                 )
-            publish(pack_id, source)
-            if target.exists():
+            present = target.exists()
+            publish(pack_id, source, present=present)
+            if present:
                 logger.info(
                     "Custom node pack already present, skipping %s (%s)", pack_id, target
                 )
@@ -404,6 +503,46 @@ class Worker:
         publish(None, None)
         self._custom_nodes_staged = True
         logger.info("Staged %d custom node pack(s) into %s", total_packs, root)
+
+    def _publish_node_pack_skip(self, job: Job | None, reason: str) -> None:
+        """Say out loud that node pack staging did nothing, and why."""
+        total_packs = len(self.custom_nodes)
+        logger.info(
+            "Node pack staging skipped (%s): %d declared pack(s)", reason, total_packs
+        )
+        self._publish_staging_event(
+            job,
+            {
+                "type": "node_pack_staging",
+                "pack_id": None,
+                "source": None,
+                "skipped": reason,
+                "downloaded_packs": total_packs,
+                "total_packs": total_packs,
+                "overall_progress": 9,
+            },
+        )
+
+    def _publish_staging_event(self, job: Job | None, event: dict) -> None:
+        """Send one staging event to the job that is paying for it, if there is one."""
+        if job is None:
+            # Boot staging: no job exists yet, so the log takes the detail and
+            # the worker record takes the fact that this runner is still alive.
+            # A registration goes stale in ninety seconds, and a pod that looks
+            # stale while it installs packs is a pod the dispatcher replaces.
+            logger.info("Runner staging: %s", event)
+            self.register("starting")
+            return
+        event_writer = getattr(self.queue, "append_event", None)
+        if callable(event_writer):
+            event_writer(job.id, event)
+
+    def _publish_staging_progress(self, job: Job | None, progress: int) -> None:
+        if job is None:
+            return
+        progress_setter = getattr(self.queue, "set_progress", None)
+        if callable(progress_setter):
+            progress_setter(job.id, progress)
 
     def _install_registry_pack(self, entry: dict, target: Path) -> None:
         """Install one Comfy Registry release, pinned by version.
@@ -539,7 +678,7 @@ class Worker:
             )
         return result.stdout or ""
 
-    def _install_pack_requirements(self, job: Job, pack_id: str, target: Path) -> None:
+    def _install_pack_requirements(self, job: Job | None, pack_id: str, target: Path) -> None:
         """Install a pack's requirements.txt, with pip's output in the events.
 
         A pack whose dependencies are missing imports at ComfyUI startup and
@@ -560,17 +699,15 @@ class Worker:
             timeout=PIP_TIMEOUT_SECONDS,
         )
         output = ((result.stdout or "") + (result.stderr or "")).strip()
-        event_writer = getattr(self.queue, "append_event", None)
-        if callable(event_writer):
-            event_writer(
-                job.id,
-                {
-                    "type": "node_pack_requirements",
-                    "pack_id": pack_id,
-                    "returncode": result.returncode,
-                    "output": output[-MAX_CAPTURED_OUTPUT:],
-                },
-            )
+        self._publish_staging_event(
+            job,
+            {
+                "type": "node_pack_requirements",
+                "pack_id": pack_id,
+                "returncode": result.returncode,
+                "output": output[-MAX_CAPTURED_OUTPUT:],
+            },
+        )
         if result.returncode != 0:
             raise RuntimeError(
                 f"Custom node pack {pack_id} requirements install failed: "
