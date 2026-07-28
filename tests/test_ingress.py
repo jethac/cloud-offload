@@ -64,6 +64,27 @@ def test_tunnel_parses_the_url_from_stderr(monkeypatch):
     tunnel.close()
 
 
+def test_tunnel_keeps_draining_stderr_after_the_url(monkeypatch):
+    monkeypatch.setattr(ingress, "ensure_cloudflared", lambda: "cloudflared")
+    lines = [*BANNER, "2026 INF connected\n", "2026 ERR connection closed\n"]
+    monkeypatch.setattr(
+        ingress.subprocess,
+        "Popen",
+        lambda *a, **k: FakeProc(lines),
+    )
+
+    tunnel = ingress.CloudflaredTunnel()
+    tunnel.open(11436)
+    assert tunnel._reader is not None
+    tunnel._reader.join(timeout=1)
+
+    assert list(tunnel._stderr_tail)[-2:] == [
+        "2026 INF connected",
+        "2026 ERR connection closed",
+    ]
+    tunnel.close()
+
+
 def test_tunnel_raises_when_no_url_appears(monkeypatch):
     monkeypatch.setattr(ingress, "ensure_cloudflared", lambda: "cloudflared")
     monkeypatch.setattr(ingress, "_URL_TIMEOUT_SECONDS", 1)

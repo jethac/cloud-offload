@@ -642,25 +642,41 @@ class Worker:
         HEAD is re-read afterwards because ``checkout`` succeeding is not proof of
         landing on the pin — an ambiguous ref or a rewritten remote would both
         leave the runner quietly executing code nobody pinned.
+
+        Clone into a sibling staging directory and rename only after the pin is
+        verified. A failed checkout must not leave ``target`` behind: container
+        runtimes can restart the entrypoint, and the presence-only fast path
+        would otherwise treat that partial clone as an installed node pack.
         """
+        import shutil
+        import tempfile
+
         url = str(entry.get("git") or "")
         commit = str(entry.get("commit") or "").lower()
-        self._run_git(
-            ["clone", "--filter=blob:none", "--no-checkout", url, str(target)],
-            f"cloning {url}",
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{target.name}-staging-", dir=target.parent)
         )
-        self._run_git(
-            ["-C", str(target), "checkout", "--detach", commit],
-            f"checking out {commit[:12]} of {url}",
-        )
-        head = self._run_git(
-            ["-C", str(target), "rev-parse", "HEAD"], f"reading HEAD of {url}"
-        ).strip().lower()
-        if head != commit:
-            raise RuntimeError(
-                f"Custom node pack {url} checked out {head} but the worker profile "
-                f"pins {commit}"
+        try:
+            self._run_git(
+                ["clone", "--filter=blob:none", "--no-checkout", url, str(staging)],
+                f"cloning {url}",
             )
+            self._run_git(
+                ["-C", str(staging), "checkout", "--detach", commit],
+                f"checking out {commit[:12]} of {url}",
+            )
+            head = self._run_git(
+                ["-C", str(staging), "rev-parse", "HEAD"], f"reading HEAD of {url}"
+            ).strip().lower()
+            if head != commit:
+                raise RuntimeError(
+                    f"Custom node pack {url} checked out {head} but the worker profile "
+                    f"pins {commit}"
+                )
+            staging.replace(target)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
     @staticmethod
     def _run_git(arguments: list[str], description: str) -> str:

@@ -183,11 +183,11 @@ def test_dispatcher_passes_the_token_for_gated_weights(isolate_credentials, tmp_
     assert provider.env_vars["HF_TOKEN"] == "hf-secret"
 
 
-def test_dispatcher_keeps_the_token_out_of_public_weight_launches(
+def test_dispatcher_passes_the_token_for_public_weight_launches(
     isolate_credentials, tmp_path
 ):
-    # The operator's shell may carry HF_TOKEN globally; public weights must not
-    # copy it into a rented pod's environment.
+    # Public Hub downloads should authenticate too, avoiding anonymous rate
+    # limits during large model staging runs.
     isolate_credentials.store["huggingface"] = "hf-secret"
     provider = LaunchProvider()
     dispatcher = Dispatcher(weights_config(tmp_path), provider=provider)
@@ -195,7 +195,7 @@ def test_dispatcher_keeps_the_token_out_of_public_weight_launches(
     dispatcher._launch_worker("runpod", "comfyui")
 
     assert json.loads(provider.env_vars["CLOUD_OFFLOAD_WEIGHTS"]) == SDXL_NORMALIZED
-    assert "HF_TOKEN" not in provider.env_vars
+    assert provider.env_vars["HF_TOKEN"] == "hf-secret"
 
 
 def test_dispatcher_omits_the_token_when_none_resolves(tmp_path):

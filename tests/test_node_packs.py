@@ -567,7 +567,7 @@ def test_a_git_pack_is_cloned_and_pinned(tmp_path, monkeypatch):
         if arguments[-1] == "HEAD":
             return subprocess.CompletedProcess(arguments, 0, stdout=f"{COMMIT}\n", stderr="")
         if arguments[1] == "clone":
-            Path(arguments[-1]).mkdir(parents=True)
+            Path(arguments[-1]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -575,12 +575,17 @@ def test_a_git_pack_is_cloned_and_pinned(tmp_path, monkeypatch):
 
     worker._stage_custom_nodes(staging_job(worker))
 
-    target = str(pack_path(tmp_path, "eric-qwen-layer"))
+    target = pack_path(tmp_path, "eric-qwen-layer")
+    staging = Path(calls[0][-1])
+    assert staging.parent == target.parent
+    assert staging.name.startswith(".eric-qwen-layer-staging-")
     assert calls == [
-        ["git", "clone", "--filter=blob:none", "--no-checkout", GIT_ENTRY["git"], target],
-        ["git", "-C", target, "checkout", "--detach", COMMIT],
-        ["git", "-C", target, "rev-parse", "HEAD"],
+        ["git", "clone", "--filter=blob:none", "--no-checkout", GIT_ENTRY["git"], str(staging)],
+        ["git", "-C", str(staging), "checkout", "--detach", COMMIT],
+        ["git", "-C", str(staging), "rev-parse", "HEAD"],
     ]
+    assert target.is_dir()
+    assert not staging.exists()
 
 
 def test_a_checkout_that_lands_off_the_pin_fails_loudly(tmp_path, monkeypatch):
@@ -590,7 +595,7 @@ def test_a_checkout_that_lands_off_the_pin_fails_loudly(tmp_path, monkeypatch):
         if arguments[-1] == "HEAD":
             return subprocess.CompletedProcess(arguments, 0, stdout=f"{other}\n", stderr="")
         if arguments[1] == "clone":
-            Path(arguments[-1]).mkdir(parents=True)
+            Path(arguments[-1]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -609,6 +614,9 @@ def test_a_failing_git_command_reports_its_stderr(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="fatal: not found"):
         worker._stage_custom_nodes(staging_job(worker))
+
+    assert not pack_path(tmp_path, "eric-qwen-layer").exists()
+    assert not list(pack_path(tmp_path).glob(".eric-qwen-layer-staging-*"))
 
 
 def test_an_already_present_pack_is_skipped(tmp_path, monkeypatch):

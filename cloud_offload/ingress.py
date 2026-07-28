@@ -19,6 +19,7 @@ unpinned and unverified into ``site-packages``.
 from __future__ import annotations
 
 import atexit
+from collections import deque
 import hashlib
 import logging
 import os
@@ -172,6 +173,8 @@ class CloudflaredTunnel:
         self._binary = binary
         self._process: subprocess.Popen | None = None
         self._url: str | None = None
+        self._reader: threading.Thread | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=40)
 
     @property
     def url(self) -> str | None:
@@ -207,22 +210,33 @@ class CloudflaredTunnel:
         atexit.register(self.close)
 
         found: dict[str, str] = {}
-        done = threading.Event()
+        ready = threading.Event()
 
         def scan() -> None:
             assert self._process is not None and self._process.stderr is not None
             for line in self._process.stderr:
+                self._stderr_tail.append(line.rstrip())
                 match = _QUICK_TUNNEL_URL.search(line)
-                if match:
+                if match and "url" not in found:
                     found["url"] = match.group(0)
-                    done.set()
-                    return
-            done.set()  # stderr closed without a URL (process died)
+                    ready.set()
+                # Keep draining after the URL appears. cloudflared writes its
+                # lifetime diagnostics to stderr; returning here eventually
+                # fills the pipe and can strand a paid worker behind a dead
+                # quick-tunnel URL.
+            ready.set()  # stderr closed without a URL (process died)
+            process = self._process
+            if process is not None:
+                logger.warning(
+                    "cloudflared stderr closed (exit=%s); tail: %s",
+                    process.poll(),
+                    " | ".join(self._stderr_tail),
+                )
 
-        reader = threading.Thread(target=scan, daemon=True)
-        reader.start()
+        self._reader = threading.Thread(target=scan, daemon=True)
+        self._reader.start()
 
-        if not done.wait(timeout=_URL_TIMEOUT_SECONDS) or "url" not in found:
+        if not ready.wait(timeout=_URL_TIMEOUT_SECONDS) or "url" not in found:
             self.close()
             raise IngressError(
                 "cloudflared did not report a tunnel URL within "
