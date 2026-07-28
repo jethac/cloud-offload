@@ -26,6 +26,36 @@ class CoordinatorQueue:
         response.raise_for_status()
         return response.json()
 
+    def record_worker(
+        self,
+        worker_id: str,
+        provider: str,
+        status: str = "active",
+        runtime_profile: str | None = None,
+        capabilities: list[str] | None = None,
+        idle: bool = False,
+        detail: str | None = None,
+    ) -> dict[str, Any]:
+        """Report this worker's own state, claiming nothing.
+
+        Takes the same arguments as ``JobQueue.record_worker`` so a runner can
+        call it without knowing which side of the wire it is on. It is the only
+        channel a runner has before it claims a job, which makes it the only
+        place a failure to start can be attributed to anything.
+        """
+        return self._post(
+            "/api/workers/status",
+            {
+                "worker_id": worker_id,
+                "provider": provider,
+                "status": status,
+                "runtime_profile": runtime_profile,
+                "models": capabilities or [],
+                "idle": idle,
+                "detail": detail,
+            },
+        )
+
     def worker_policy(self) -> dict[str, Any]:
         """Fetch the coordinator-owned worker lifetime policy."""
         response = self.session.get(

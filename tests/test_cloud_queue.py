@@ -874,3 +874,143 @@ def test_a_card_sold_as_24gb_claims_a_job_needing_24(tmp_path):
         )
         assert len(claimed) == expected, f"{vram} GiB against a 24 GiB requirement"
         queue.update_status(job.id, JobStatus.FAILED)
+
+
+# === A runner that is still coming up is neither absent nor idle ===
+
+
+class StartingConnector(DummyProvider):
+    """A connector that records launches without performing any."""
+
+    def __init__(self):
+        self.launches = 0
+
+    @property
+    def name(self):
+        return "runpod"
+
+    def list_available(self, *args, **kwargs):
+        return []
+
+    def find_cheapest(self, **kwargs):
+        return {"id": "offer-1", "gpu_type": "RTX A5000", "hourly_rate": 0.27}
+
+    def launch(self, *args, **kwargs):
+        self.launches += 1
+        return SimpleNamespace(
+            id="pod-1",
+            provider="runpod",
+            gpu_type="RTX A5000",
+            hourly_rate=0.27,
+            status="running",
+        )
+
+    def get_instance(self, instance_id):
+        return SimpleNamespace(
+            id=instance_id,
+            provider="runpod",
+            gpu_type="RTX A5000",
+            hourly_rate=0.27,
+            status="running",
+        )
+
+    def terminate(self, instance_id):
+        self.terminated = True
+        return True
+
+    def list_instances(self):
+        return []
+
+
+def starting_config(tmp_path):
+    return CloudConfig(
+        enabled=True,
+        provider="runpod",
+        provider_order=["runpod"],
+        runpod_api_key="secret",
+        coordinator_url="https://coordinator.invalid",
+        min_queue_depth=1,
+        idle_shutdown_seconds=1,
+        queue_db_path=str(tmp_path / "queue.db"),
+        storage_path=str(tmp_path / "storage"),
+        worker_profiles={
+            "comfyui": {
+                "image": "ghcr.io/example/comfyui@sha256:" + "a" * 64,
+                "models": ["comfyui-partition-v1"],
+                "providers": ["runpod"],
+            }
+        },
+    )
+
+
+def test_a_starting_runner_stops_a_second_pod_being_rented(tmp_path, monkeypatch):
+    from cloud_offload.dispatcher import Dispatcher
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={"runtime_profile": "comfyui"},
+        status=JobStatus.QUEUED,
+    )
+    queue.record_worker(
+        "worker-boot", "runpod", status="starting", runtime_profile="comfyui"
+    )
+    monkeypatch.setattr(
+        "cloud_offload.dispatcher.CloudConfig.load", lambda *args, **kwargs: config
+    )
+    provider = StartingConnector()
+
+    Dispatcher(config, queue=queue, provider=provider)._tick()
+
+    assert provider.launches == 0
+
+
+def long_idle_dispatcher(config, queue):
+    from datetime import datetime, timedelta
+
+    from cloud_offload.dispatcher import Dispatcher
+
+    provider = StartingConnector()
+    dispatcher = Dispatcher(config, queue=queue, provider=provider)
+    dispatcher.active_instances["pod-1"] = provider.get_instance("pod-1")
+    dispatcher.instance_providers["pod-1"] = "runpod"
+    dispatcher.instance_profiles["pod-1"] = "comfyui"
+    dispatcher.last_activity["pod-1"] = datetime.utcnow() - timedelta(hours=1)
+    return dispatcher
+
+
+def test_a_runner_that_is_still_starting_is_not_terminated_as_idle(tmp_path):
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    queue.record_worker(
+        "worker-boot", "runpod", status="starting", runtime_profile="comfyui"
+    )
+    dispatcher = long_idle_dispatcher(config, queue)
+
+    dispatcher._check_idle_workers()
+
+    assert "pod-1" in dispatcher.active_instances
+
+
+def test_a_pod_is_not_killed_as_idle_while_its_own_work_is_queued(tmp_path):
+    """The job carries the capability a client stamped, the pod carries the
+    operator's profile name. Comparing them raw matched nothing, so a pod was
+    terminated for being idle while the queue held exactly the work it had been
+    rented for — and the next tick rented another one."""
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={"runtime_profile": "comfyui-partition-v1"},
+        status=JobStatus.QUEUED,
+    )
+    dispatcher = long_idle_dispatcher(config, queue)
+
+    dispatcher._check_idle_workers()
+
+    assert "pod-1" in dispatcher.active_instances

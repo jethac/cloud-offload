@@ -562,6 +562,19 @@ cloud-offload worker --poll 10
             else:
                 self.active_instances[instance_id] = instance
 
+    @staticmethod
+    def _job_profile_name(job, profiles: dict) -> str:
+        """The worker profile a job resolves to, resolved the way routing does.
+
+        Jobs carry the capability a client stamped — ``comfyui-partition-v1`` —
+        not an operator's profile name. Comparing the raw strings matched
+        nothing, so a pod could be terminated as idle while the queue held the
+        very work it had been rented for.
+        """
+        requested = str(job.params.get("runtime_profile") or "")
+        resolved = profiles.get(requested) or profile_providing(profiles, requested)
+        return resolved["name"] if resolved else requested
+
     def _check_idle_workers(self):
         """Terminate workers that have been idle too long."""
         if self.config.keep_warm:
@@ -570,11 +583,22 @@ cloud-offload worker --poll 10
         idle_threshold = timedelta(seconds=self.config.idle_shutdown_seconds)
         now = datetime.utcnow()
 
+        workers = self.queue.list_active_workers()
+        profiles = configured_worker_profiles(self.config)
         for instance_id, last_active in list(self.last_activity.items()):
             provider_name = self.instance_providers[instance_id]
             profile_name = self.instance_profiles[instance_id]
+            # A runner that has said it is still starting is not idle, it is
+            # busy importing ComfyUI. Terminating it on the idle clock is how a
+            # pod gets killed mid-boot and the whole rental paid for nothing.
+            starting = any(
+                worker.get("provider") == provider_name
+                and worker.get("runtime_profile") == profile_name
+                and worker.get("status") == "starting"
+                for worker in workers
+            )
             running_jobs = sum(
-                job.params.get("runtime_profile") == profile_name
+                self._job_profile_name(job, profiles) == profile_name
                 for job in self.queue.list_by_status(
                     JobStatus.RUNNING,
                     JobStatus.DISPATCHED,
@@ -582,12 +606,12 @@ cloud-offload worker --poll 10
                 )
             )
             queued_jobs = sum(
-                job.params.get("runtime_profile") == profile_name
+                self._job_profile_name(job, profiles) == profile_name
                 for job in self.queue.list_by_status(
                     JobStatus.QUEUED, provider=provider_name
                 )
             )
-            if running_jobs > 0 or queued_jobs > 0:
+            if starting or running_jobs > 0 or queued_jobs > 0:
                 self.last_activity[instance_id] = now
                 continue
             if now - last_active > idle_threshold:

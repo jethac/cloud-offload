@@ -43,6 +43,11 @@ WORKER_PATH_PREFIX = "/api/workers/"
 PARTITION_MEDIA_TYPE = "application/vnd.comfy.partition+zip"
 PARTITION_JOB_SCHEMA = "comfy.partition.job.v1"
 
+# A worker's self-reported detail carries the tail of its runner log, which the
+# runner already truncates. Bound it again here: what a worker sends is not
+# something the coordinator gets to trust the size of.
+MAX_WORKER_DETAIL_CHARS = 8000
+
 MAX_UPLOAD_BYTES = int(os.environ.get("CLOUD_OFFLOAD_MAX_UPLOAD_BYTES", str(32 * 1024 * 1024)))
 MAX_PARTITION_ARTIFACT_BYTES = int(
     os.environ.get(
@@ -398,6 +403,13 @@ async def status():
         "dead_letter_jobs": queue.count_by_status(JobStatus.DEAD_LETTER),
         "active_workers": len(workers),
         "workers": workers,
+        # A runner that failed to start is not an active worker, but it is the
+        # answer to "where did my pod go", so it is reported rather than dropped.
+        "failed_workers": [
+            worker
+            for worker in queue.list_recent_workers()
+            if worker["status"] == "failed"
+        ],
         "providers": await asyncio.to_thread(_provider_statuses, config),
         "config": config.to_dict(),
     }
@@ -1178,6 +1190,49 @@ async def worker_claim(request: Request, payload: dict[str, Any] = Body(...)):
     except (KeyError, PermissionError, ValueError) as exc:
         raise HTTPException(status_code=401, detail=str(exc))
     return [job.to_dict() for job in jobs]
+
+
+@app.post("/api/workers/status")
+async def worker_status(request: Request, payload: dict[str, Any] = Body(...)):
+    """Accept a worker's report of its own state, including why it never started.
+
+    A runner that dies during startup has no job to hang an error on — nothing
+    has been claimed, and the container's logs go with the container — so it
+    reports against its own worker id here instead. Registering as ``starting``
+    uses the same route: it tells the dispatcher a pod is already coming up for
+    this profile, and it deliberately claims nothing, because readiness is
+    proved by ComfyUI answering rather than by a worker asserting it.
+    """
+    from cloud_offload.queue import WORKER_STATUSES
+
+    _, queue = _queue()
+    try:
+        queue.authorize_worker(_worker_token(request))
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+
+    worker_id = str(payload.get("worker_id") or "").strip()
+    provider = str(payload.get("provider") or "").strip()
+    if not worker_id or not provider:
+        raise HTTPException(status_code=400, detail="worker_id and provider are required")
+    status = str(payload.get("status") or "active")
+    if status not in WORKER_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown worker status {status!r}; expected one of "
+            + ", ".join(WORKER_STATUSES),
+        )
+    detail = payload.get("detail")
+    queue.record_worker(
+        worker_id,
+        provider,
+        status=status,
+        runtime_profile=str(payload.get("runtime_profile") or ""),
+        capabilities=[str(item) for item in payload.get("models", [])],
+        idle=bool(payload.get("idle", False)),
+        detail=str(detail)[:MAX_WORKER_DETAIL_CHARS] if detail else None,
+    )
+    return {"worker_id": worker_id, "status": status}
 
 
 @app.get("/api/workers/policy")

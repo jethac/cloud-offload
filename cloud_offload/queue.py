@@ -12,6 +12,14 @@ from pathlib import Path
 from typing import Any
 
 
+# What a worker may report about itself. ``starting`` is a runner that has told
+# the coordinator it exists but is still bringing ComfyUI up, and ``failed`` is
+# one that never managed to; only the first two are a worker the dispatcher can
+# still expect work from.
+WORKER_STATUSES = ("starting", "active", "failed")
+LIVE_WORKER_STATUSES = ("starting", "active")
+
+
 class JobStatus(str, Enum):
     """Job lifecycle states."""
     PENDING = "pending"           # Created, needs local preview
@@ -174,7 +182,8 @@ class JobQueue:
                     last_seen TEXT NOT NULL,
                     idle_since TEXT,
                     runtime_profile TEXT,
-                    capabilities TEXT
+                    capabilities TEXT,
+                    detail TEXT
                 )
             """)
             worker_columns = {
@@ -186,6 +195,8 @@ class JobQueue:
                 conn.execute("ALTER TABLE workers ADD COLUMN capabilities TEXT")
             if "idle_since" not in worker_columns:
                 conn.execute("ALTER TABLE workers ADD COLUMN idle_since TEXT")
+            if "detail" not in worker_columns:
+                conn.execute("ALTER TABLE workers ADD COLUMN detail TEXT")
 
     def _get_meta(self, key: str) -> str | None:
         with sqlite3.connect(self.db_path) as conn:
@@ -605,8 +616,14 @@ class JobQueue:
         runtime_profile: str | None = None,
         capabilities: list[str] | None = None,
         idle: bool = False,
+        detail: str | None = None,
     ) -> None:
-        """Record a worker heartbeat."""
+        """Record a worker heartbeat, or its own report of what went wrong.
+
+        ``detail`` is where a runner that never got as far as a job leaves its
+        reason. A container that dies takes its logs with it, so the row is the
+        only place the answer can survive.
+        """
         now = datetime.utcnow().isoformat()
         idle_since = now if idle else None
         with sqlite3.connect(self.db_path) as conn:
@@ -614,9 +631,9 @@ class JobQueue:
                 """
                 INSERT INTO workers (
                     worker_id, provider, status, last_seen,
-                    idle_since, runtime_profile, capabilities
+                    idle_since, runtime_profile, capabilities, detail
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(worker_id) DO UPDATE SET
                     provider = excluded.provider,
                     status = excluded.status,
@@ -626,7 +643,8 @@ class JobQueue:
                         ELSE COALESCE(workers.idle_since, excluded.idle_since)
                     END,
                     runtime_profile = excluded.runtime_profile,
-                    capabilities = excluded.capabilities
+                    capabilities = excluded.capabilities,
+                    detail = excluded.detail
                 """,
                 (
                     worker_id,
@@ -636,22 +654,42 @@ class JobQueue:
                     idle_since,
                     runtime_profile,
                     json.dumps(capabilities or []),
+                    detail,
                 ),
             )
 
     def list_active_workers(self, max_age_seconds: int = 90) -> list[dict]:
-        """Return workers that have sent a recent heartbeat."""
+        """Return workers that have sent a recent heartbeat and are still alive.
+
+        A worker that has registered as ``starting`` counts: it is a pod already
+        being paid for, coming up for this profile, and treating it as absent is
+        what makes a dispatcher rent a second one for the same queue.
+        """
+        return self._list_workers(max_age_seconds, LIVE_WORKER_STATUSES)
+
+    def list_recent_workers(self, max_age_seconds: int = 900) -> list[dict]:
+        """Return every worker seen recently, including ones that failed to start."""
+        return self._list_workers(max_age_seconds, None)
+
+    def _list_workers(
+        self, max_age_seconds: int, statuses: tuple[str, ...] | None
+    ) -> list[dict]:
         cutoff = (datetime.utcnow() - timedelta(seconds=max_age_seconds)).isoformat()
+        clause = ""
+        parameters: list[Any] = [cutoff]
+        if statuses:
+            clause = f" AND status IN ({','.join('?' * len(statuses))})"
+            parameters.extend(statuses)
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT worker_id, provider, status, last_seen, idle_since,
-                       runtime_profile, capabilities
+                       runtime_profile, capabilities, detail
                 FROM workers
-                WHERE last_seen >= ? AND status = 'active'
+                WHERE last_seen >= ?{clause}
                 ORDER BY provider, worker_id
                 """,
-                (cutoff,),
+                parameters,
             ).fetchall()
         now = datetime.utcnow()
         return [
@@ -667,6 +705,7 @@ class JobQueue:
                 ) if row[4] else 0,
                 "runtime_profile": row[5],
                 "capabilities": json.loads(row[6]) if row[6] else [],
+                "detail": row[7],
             }
             for row in rows
         ]
