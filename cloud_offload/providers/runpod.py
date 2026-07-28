@@ -211,12 +211,19 @@ class RunPodConnector(CloudConnector):
         docker_image: str,
         env_vars: dict | None = None,
         startup_script: str | None = None,
+        disk_gb: int | None = None,
     ) -> Instance:
-        """Launch a RunPod pod and wait until it reaches running state."""
+        """Launch a RunPod pod and wait until it reaches running state.
+
+        ``disk_gb`` is the caller's planned container disk; without one the pod
+        gets the configured default, which is what every launch used before
+        partitions could be sized.
+        """
         self._ensure_image_pullable(docker_image)
+        container_disk_gb = int(disk_gb) if disk_gb else self.container_disk_gb
         pod_input: dict[str, Any] = {
             "cloudType": self.cloud_type,
-            "containerDiskInGb": self.container_disk_gb,
+            "containerDiskInGb": container_disk_gb,
             "env": [
                 {"key": str(key), "value": str(value)} for key, value in (env_vars or {}).items()
             ],

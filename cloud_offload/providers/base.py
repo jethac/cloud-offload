@@ -48,8 +48,16 @@ class CloudConnector(ABC):
         docker_image: str,
         env_vars: dict | None = None,
         startup_script: str | None = None,
+        disk_gb: int | None = None,
     ) -> Instance:
-        """Launch an instance with the given offer. Returns Instance object."""
+        """Launch an instance with the given offer. Returns Instance object.
+
+        ``disk_gb`` is the container disk the caller has planned for this job:
+        the runner image plus everything it will stage, sized before renting
+        rather than discovered when the pod runs out of space. A connector that
+        cannot size its disk per launch may ignore it and use its configured
+        default; ``None`` means the caller had nothing to say.
+        """
 
     @abstractmethod
     def get_instance(self, instance_id: str) -> Instance | None:

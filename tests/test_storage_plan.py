@@ -19,10 +19,12 @@ import json
 import pytest
 
 from cloud_offload.config import CloudConfig
+from cloud_offload.dispatcher import Dispatcher
 from cloud_offload.profiles import (
     configured_worker_profiles,
     normalized_profile_disk_gb,
 )
+from cloud_offload.providers.base import CloudProvider
 from cloud_offload.storage_plan import (
     GIB,
     HEADROOM_FLOOR_BYTES,
@@ -450,3 +452,134 @@ def test_a_cold_cache_reports_nothing_rather_than_guessing(tmp_path):
     resolved["weights"] = SDXL_WEIGHTS
 
     assert cached_weight_sizes(config, resolved) == {}
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher: renting the planned disk
+# ---------------------------------------------------------------------------
+
+
+class LaunchProvider(CloudProvider):
+    """Captures the launch kwargs, so the requested disk can be asserted."""
+
+    def __init__(self):
+        self.kwargs = None
+
+    @property
+    def name(self) -> str:
+        return "runpod"
+
+    def list_available(self, *args, **kwargs):
+        return []
+
+    def find_cheapest(self, **kwargs):
+        return {"id": "offer-1", "gpu_type": "RTX 4090", "hourly_rate": 0.34}
+
+    def launch(self, *args, **kwargs):
+        self.kwargs = kwargs
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id="pod-1",
+            provider="runpod",
+            gpu_type="RTX 4090",
+            hourly_rate=0.34,
+            status="running",
+        )
+
+    def get_instance(self, instance_id):
+        return None
+
+    def terminate(self, instance_id):
+        return True
+
+    def list_instances(self):
+        return []
+
+
+def queued_job(queue, disk_gb=None):
+    params = {"runtime_profile": "comfyui"}
+    if disk_gb is not None:
+        params["container_disk_gb"] = disk_gb
+    return queue.create("comfyui-partition-v1", "artifacts://partition", params=params)
+
+
+def test_the_dispatcher_rents_the_planned_disk_when_it_is_larger(tmp_path):
+    config = storage_config(tmp_path)
+    provider = LaunchProvider()
+    dispatcher = Dispatcher(config, provider=provider)
+    job = queued_job(dispatcher.queue, disk_gb=140)
+
+    dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert provider.kwargs["disk_gb"] == 140
+
+
+def test_the_dispatcher_keeps_the_configured_disk_when_the_plan_is_smaller(tmp_path):
+    config = storage_config(tmp_path)
+    config.runpod_container_disk_gb = 80
+    provider = LaunchProvider()
+    dispatcher = Dispatcher(config, provider=provider)
+    job = queued_job(dispatcher.queue, disk_gb=40)
+
+    dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert provider.kwargs["disk_gb"] == 80
+
+
+def test_a_job_queued_before_planning_existed_gets_the_configured_disk(tmp_path):
+    config = storage_config(tmp_path)
+    provider = LaunchProvider()
+    dispatcher = Dispatcher(config, provider=provider)
+    job = queued_job(dispatcher.queue)
+
+    dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert provider.kwargs["disk_gb"] == config.runpod_container_disk_gb
+
+
+def test_the_largest_queued_plan_wins(tmp_path):
+    config = storage_config(tmp_path)
+    provider = LaunchProvider()
+    dispatcher = Dispatcher(config, provider=provider)
+    jobs = [queued_job(dispatcher.queue, disk_gb=size) for size in (40, 260, 90)]
+
+    dispatcher._launch_worker("runpod", "comfyui", jobs)
+
+    assert provider.kwargs["disk_gb"] == 260
+
+
+def test_runpod_uses_the_planned_disk_for_its_pod():
+    from cloud_offload.providers.runpod import RunPodConnector
+
+    captured = {}
+
+    class FakeHttp:
+        def request(self, method, url, **kwargs):
+            captured.update(kwargs.get("json") or {})
+            raise RuntimeError("stop before the pod is created")
+
+    connector = RunPodConnector(api_key="k", container_disk_gb=20, http_client=FakeHttp())
+
+    with pytest.raises(RuntimeError, match="stop before"):
+        connector.launch(offer_id="gpu", docker_image="example/runner", disk_gb=140)
+
+    assert captured["variables"]["input"]["containerDiskInGb"] == 140
+
+
+def test_runpod_falls_back_to_its_configured_disk():
+    from cloud_offload.providers.runpod import RunPodConnector
+
+    captured = {}
+
+    class FakeHttp:
+        def request(self, method, url, **kwargs):
+            captured.update(kwargs.get("json") or {})
+            raise RuntimeError("stop before the pod is created")
+
+    connector = RunPodConnector(api_key="k", container_disk_gb=20, http_client=FakeHttp())
+
+    with pytest.raises(RuntimeError, match="stop before"):
+        connector.launch(offer_id="gpu", docker_image="example/runner")
+
+    assert captured["variables"]["input"]["containerDiskInGb"] == 20

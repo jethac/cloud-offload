@@ -382,12 +382,15 @@ class Dispatcher:
                 profile["custom_nodes"], separators=(",", ":")
             )
 
+        disk_gb = self._planned_disk_gb(profile_name, queued_jobs)
+
         try:
             instance = connector.launch(
                 offer_id=offer["id"],
                 docker_image=profile["image"],
                 env_vars=env_vars,
                 startup_script=startup_script,
+                disk_gb=disk_gb,
             )
 
             self.active_instances[instance.id] = instance
@@ -426,6 +429,34 @@ class Dispatcher:
                 provider_name, profile_name, queued_jobs, str(e)
             )
             return None
+
+    def _planned_disk_gb(self, profile_name: str, queued_jobs: list | None) -> int:
+        """The container disk to rent: the configured floor, or a job's plan if larger.
+
+        The coordinator sizes a partition's storage at submission and stamps the
+        answer onto the job, so this is the number that keeps a pod from dying
+        out of disk after the meter has started. A job queued before storage
+        planning existed carries no figure and gets exactly the configured value
+        it would have got before.
+        """
+        configured = int(self.config.runpod_container_disk_gb)
+        planned = max(
+            [0]
+            + [
+                int(job.params.get("container_disk_gb") or 0)
+                for job in (queued_jobs or [])
+            ]
+        )
+        if planned <= configured:
+            return configured
+        logger.info(
+            "Renting %s GB of container disk for profile %s: the storage plan for "
+            "its queued partitions needs more than the configured %s GB",
+            planned,
+            profile_name,
+            configured,
+        )
+        return planned
 
     def _offers_on_cooldown(self, provider_name: str) -> set[str]:
         """Offer ids currently sitting out after a failed launch on this provider."""

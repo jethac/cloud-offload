@@ -41,7 +41,9 @@ class __CLASS__(CloudConnector):
     def list_available(self, gpu_type=None, min_gpu_ram=None, max_hourly_rate=None):
         return [{"id": "offer-1", "provider": "__NAME__", "hourly_rate": 0.25}]
 
-    def launch(self, offer_id, docker_image, env_vars=None, startup_script=None):
+    def launch(
+        self, offer_id, docker_image, env_vars=None, startup_script=None, disk_gb=None
+    ):
         return Instance(
             id="i-1", provider="__NAME__", gpu_type="RTX_4090",
             gpu_count=1, hourly_rate=0.25, status="pending",
@@ -83,7 +85,9 @@ class DemoConnector(CloudConnector):
     def list_available(self, gpu_type=None, min_gpu_ram=None, max_hourly_rate=None):
         return []
 
-    def launch(self, offer_id, docker_image, env_vars=None, startup_script=None):
+    def launch(
+        self, offer_id, docker_image, env_vars=None, startup_script=None, disk_gb=None
+    ):
         return Instance(
             id="i-1", provider="demo", gpu_type="RTX_4090",
             gpu_count=1, hourly_rate=0.1, status="pending",

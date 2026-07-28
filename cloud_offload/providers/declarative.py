@@ -183,6 +183,7 @@ TEMPLATE_VARIABLES = (
     "gpu_type",
     "min_gpu_ram",
     "max_hourly_rate",
+    "disk_gb",
     "provider",
 )
 
@@ -859,8 +860,14 @@ class DeclarativeRestConnector(CloudConnector):
         docker_image: str,
         env_vars: dict | None = None,
         startup_script: str | None = None,
+        disk_gb: int | None = None,
     ) -> Instance:
-        """Launch an instance, optionally polling until it reports ready."""
+        """Launch an instance, optionally polling until it reports ready.
+
+        ``disk_gb`` is offered to the spec as a template variable and is
+        otherwise ignored: a provider whose launch payload has no place for a
+        container disk keeps rendering exactly the request it rendered before.
+        """
         endpoint = self._endpoint("launch")
         where = f"{self._name}.launch"
         variables = self._variables(
@@ -868,6 +875,7 @@ class DeclarativeRestConnector(CloudConnector):
             docker_image=docker_image,
             env_vars=env_vars or {},
             startup_script=startup_script,
+            disk_gb=disk_gb,
         )
         payload = self._request("launch", variables)
         if not isinstance(payload, dict):
