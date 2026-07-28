@@ -13,11 +13,12 @@ quietly treated as zero, because a confident under-estimate is what buys a dead
 pod.
 """
 
-
 import json
 
 import pytest
+from fastapi.testclient import TestClient
 
+from cloud_offload import server
 from cloud_offload.config import CloudConfig
 from cloud_offload.dispatcher import Dispatcher
 from cloud_offload.profiles import (
@@ -25,6 +26,7 @@ from cloud_offload.profiles import (
     normalized_profile_disk_gb,
 )
 from cloud_offload.providers.base import CloudProvider
+from cloud_offload.queue import JobQueue
 from cloud_offload.storage_plan import (
     GIB,
     HEADROOM_FLOOR_BYTES,
@@ -45,6 +47,7 @@ from cloud_offload.weight_sizes import (
     weight_size_cache_path,
 )
 
+# The image and model that actually filled a pod, to the byte.
 IMAGE_BYTES = 14_600_000_000
 MODEL_BYTES = 19_600_000_000
 
@@ -583,3 +586,100 @@ def test_runpod_falls_back_to_its_configured_disk():
         connector.launch(offer_id="gpu", docker_image="example/runner")
 
     assert captured["variables"]["input"]["containerDiskInGb"] == 20
+
+
+# ---------------------------------------------------------------------------
+# Submission
+# ---------------------------------------------------------------------------
+
+
+def storage_client(monkeypatch, config):
+    queue = JobQueue(config.queue_db_path)
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    return TestClient(server.app), queue
+
+
+def partition_request(assets=None):
+    partition = {
+        "schema": "comfy.partition.job.v1",
+        "partition_id": "part-1",
+        "workflow": {"1": {"class_type": "CloudPartitionInput", "inputs": {}}},
+        "inputs": [],
+        "outputs": [],
+        "runner": {"profile": "comfyui"},
+    }
+    if assets is not None:
+        partition["assets"] = assets
+    return {"partition": partition, "input_artifacts": {}, "provider": "auto"}
+
+
+def test_the_accepted_response_carries_the_storage_plan(monkeypatch, tmp_path):
+    config = storage_config(tmp_path, image_size_gb=14.6)
+    config.asset_sources = {"a" * 64: {"url": "https://example.invalid/model.safetensors"}}
+    client, _ = storage_client(monkeypatch, config)
+
+    response = client.post("/api/partitions", json=partition_request([asset(MODEL_BYTES)]))
+
+    assert response.status_code == 202
+    storage = response.json()["storage"]
+    assert storage["total_gb"] > 20
+    assert storage["total_bytes"] > MODEL_BYTES
+    assert [item["name"] for item in storage["components"]] == [
+        "image",
+        "assets",
+        "weights",
+        "packs",
+        "reserve",
+        "headroom",
+    ]
+    assert storage["unknown"] == []
+
+
+def test_an_undeclared_image_size_is_reported_to_the_submitter(monkeypatch, tmp_path):
+    client, _ = storage_client(monkeypatch, storage_config(tmp_path))
+
+    response = client.post("/api/partitions", json=partition_request())
+
+    assert response.status_code == 202
+    assert any(
+        "image_size_gb" in item for item in response.json()["storage"]["unknown"]
+    )
+
+
+def test_the_planned_disk_reaches_the_job(monkeypatch, tmp_path):
+    config = storage_config(tmp_path, image_size_gb=14.6)
+    config.asset_sources = {"a" * 64: {"url": "https://example.invalid/model.safetensors"}}
+    client, queue = storage_client(monkeypatch, config)
+
+    response = client.post("/api/partitions", json=partition_request([asset(MODEL_BYTES)]))
+
+    job = queue.get(response.json()["job_id"])
+    assert job.params["container_disk_gb"] == response.json()["storage"]["total_gb"]
+
+
+def test_a_plan_over_the_ceiling_is_refused_before_provisioning(monkeypatch, tmp_path):
+    config = storage_config(tmp_path, image_size_gb=14.6, extra_disk_gb=600)
+    client, queue = storage_client(monkeypatch, config)
+
+    response = client.post("/api/partitions", json=partition_request())
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["code"] == "cloud_offload.storage_plan_exceeds_ceiling"
+    assert "above the configured ceiling of 500 GB" in error["message"]
+    assert "reserve 600.0 GiB" in error["message"]
+    assert "max_container_disk_gb" in error["message"]
+    assert error["details"]["storage"]["total_gb"] > 500
+    # Refused before anything was queued, let alone rented.
+    assert queue.list_by_status() == []
+
+
+def test_raising_the_ceiling_accepts_the_same_partition(monkeypatch, tmp_path):
+    config = storage_config(tmp_path, image_size_gb=14.6, extra_disk_gb=600)
+    config.max_container_disk_gb = 2000
+    client, _ = storage_client(monkeypatch, config)
+
+    response = client.post("/api/partitions", json=partition_request())
+
+    assert response.status_code == 202

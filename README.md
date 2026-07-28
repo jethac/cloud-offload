@@ -366,6 +366,71 @@ commit, and verified by re-reading `HEAD`. A pack directory that already exists
 is left alone. A partition submitted without a `node_packs` list behaves exactly
 as it did before this existed.
 
+### Storage planning
+
+Everything above decides *whether* a runner can be given the right bytes. This
+decides whether they will fit. A worker rented with a fixed container disk died
+out of space once the meter was running: the runner image took 14.6 GB and the
+partition then staged a 19.6 GB model onto the same 20 GB partition.
+
+Almost all of that was knowable before renting. Declared assets carry exact byte
+counts. Pinned weights name a repo, a revision and a file list, so their sizes
+can be looked up once and cached forever — a pinned revision never changes. So
+at submission the coordinator sizes the disk and returns the working:
+
+```json
+"storage": {
+  "total_gb": 78,
+  "total_bytes": 83244544000,
+  "components": [
+    { "name": "image",    "bytes": 15676260352, "detail": "runner image, declared as 14.6 GiB" },
+    { "name": "assets",   "bytes": 19600000000, "detail": "1 declared model file, sized exactly by the partition manifest" },
+    { "name": "weights",  "bytes": 6938040714,  "detail": "1 pinned profile weights entry" },
+    { "name": "packs",    "bytes": 2147483648,  "detail": "1 custom node pack at a 2.0 GiB allowance each; ..." },
+    { "name": "reserve",  "bytes": 0,           "detail": "no extra_disk_gb declared; ..." },
+    { "name": "headroom", "bytes": 10737418240, "detail": "working space for outputs, temp files and pip caches; ..." }
+  ],
+  "unknown": []
+}
+```
+
+The dispatcher then rents `max(runpod_container_disk_gb, planned)`. A job queued
+before this existed carries no plan and gets exactly the configured value.
+
+Two figures are not measurements. A node pack's install is an unpinned
+`pip install -r requirements.txt`, so each declared pack gets a flat 2 GiB
+*allowance*. Headroom — working space for outputs, temp files and pip caches —
+is the larger of 10 GiB and 20% of everything else.
+
+Anything whose size cannot be determined is named in `unknown` **and** charged a
+conservative default, never treated as zero: a confident under-estimate is what
+buys a dead pod. Two optional profile fields remove the guessing:
+
+```json
+"image_size_gb": 14.6,
+"extra_disk_gb": 60
+```
+
+`image_size_gb` is the runner image, so sizing never depends on reaching a
+container registry. `extra_disk_gb` is the operator declaring storage the
+coordinator *cannot* see — and it exists for a specific real case: a custom node
+that calls diffusers `from_pretrained` downloads 53.8 GB the first time it runs,
+which no manifest mentions and no static analysis can find. Both default to 0,
+both refuse a negative value at load, naming the field.
+
+Weight sizes are resolved from the Hugging Face API and cached beside the queue
+database, keyed by repo, revision and filename. Submission only ever *reads* that
+cache: a job must not wait on, or fail because of, a third-party API. Warm it
+explicitly, which also prints the plan:
+
+```bash
+cloud-offload storage-plan comfyui --refresh
+```
+
+A plan above `max_container_disk_gb` (default 500) is a `409` naming the total
+and its largest components, with nothing queued and nothing rented — the same
+discipline as the other pre-flight refusals.
+
 ### On-prem-only assets
 
 Some assets — licensed models, NDA'd meshes — must never leave the building.

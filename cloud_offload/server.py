@@ -944,6 +944,14 @@ async def submit_partition(request: PartitionSubmitRequest):
     from cloud_offload.queue import JobStatus
     from cloud_offload.router import select_profile_provider
     from cloud_offload.storage import create_storage
+    from cloud_offload.storage_plan import (
+        GIB,
+        exceeds_ceiling_message,
+        plan_disk_gb,
+        plan_storage,
+        plan_summary,
+    )
+    from cloud_offload.weight_sizes import cached_weight_sizes
 
     if request.partition.get("schema") != PARTITION_JOB_SCHEMA:
         raise HTTPException(status_code=400, detail="Unsupported partition job schema")
@@ -1010,6 +1018,27 @@ async def submit_partition(request: PartitionSubmitRequest):
     # version match would not have proven a code match either — a pack can ship
     # a security fix under the version number of the unpatched release.
     pack_warnings = node_pack_version_warnings(declared_packs, profile)
+    # Size the pod's disk before anything is rented, for the same reason the
+    # checks above run here: a worker that runs out of space mid-job has already
+    # started the meter. Weight sizes come from the on-disk cache only — a
+    # submission must not wait on, or fail because of, the Hugging Face API, and
+    # anything unresolved is charged a conservative default and reported.
+    image_bytes = int(float((profile or {}).get("image_size_gb") or 0) * GIB) or None
+    plan = plan_storage(
+        assets,
+        profile,
+        image_bytes=image_bytes,
+        weight_bytes=cached_weight_sizes(config, profile),
+    )
+    disk_gb = plan_disk_gb(plan)
+    storage_summary = plan_summary(plan)
+    if disk_gb > config.max_container_disk_gb:
+        return error_response(
+            409,
+            "cloud_offload.storage_plan_exceeds_ceiling",
+            exceeds_ceiling_message(plan, disk_gb, config.max_container_disk_gb),
+            {"storage": storage_summary},
+        )
     try:
         route = await asyncio.to_thread(
             select_profile_provider,
@@ -1042,6 +1071,7 @@ async def submit_partition(request: PartitionSubmitRequest):
                     "cache_hit": True,
                     "gpu_type": gpu_type,
                     "min_gpu_ram_gb": min_gpu_ram_gb,
+                    "container_disk_gb": disk_gb,
                 },
                 request={
                     "kind": "comfyui-partition",
@@ -1067,6 +1097,7 @@ async def submit_partition(request: PartitionSubmitRequest):
                 "status": job.status.value,
                 "status_url": f"/api/jobs/{job.id}",
                 "cache_hit": True,
+                "storage": storage_summary,
                 **_asset_warnings(assets),
                 **_node_pack_warnings(pack_warnings),
             }
@@ -1079,6 +1110,9 @@ async def submit_partition(request: PartitionSubmitRequest):
             "partition_cache_key": cache_key,
             "gpu_type": gpu_type,
             "min_gpu_ram_gb": min_gpu_ram_gb,
+            # The dispatcher rents at least this much container disk, so the
+            # pod that stages these bytes has somewhere to put them.
+            "container_disk_gb": disk_gb,
             "keep_warm": bool(runner.get("keep_warm", False)),
         },
         request={
@@ -1098,6 +1132,7 @@ async def submit_partition(request: PartitionSubmitRequest):
         "job_id": job.id,
         "status": job.status.value,
         "status_url": f"/api/jobs/{job.id}",
+        "storage": storage_summary,
         **_asset_warnings(assets),
         **_node_pack_warnings(pack_warnings),
     }

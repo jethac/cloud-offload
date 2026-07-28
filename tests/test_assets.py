@@ -407,7 +407,9 @@ def test_a_partition_without_assets_behaves_exactly_as_before(monkeypatch, tmp_p
     response = client.post("/api/partitions", json=partition_request())
 
     assert response.status_code == 202
-    assert response.json().keys() == {"job_id", "status", "status_url"}
+    # ``storage`` is reported for every submission, including this one: a
+    # partition that declares nothing still stages a runner image.
+    assert response.json().keys() == {"job_id", "status", "status_url", "storage"}
     job = queue.get(response.json()["job_id"])
     assert "assets" not in job.request
     assert job.provider == "runpod"

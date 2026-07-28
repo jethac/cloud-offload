@@ -355,7 +355,7 @@ def test_a_partition_without_node_packs_behaves_exactly_as_before(monkeypatch, t
     response = client.post("/api/partitions", json=partition_request())
 
     assert response.status_code == 202
-    assert response.json().keys() == {"job_id", "status", "status_url"}
+    assert response.json().keys() == {"job_id", "status", "status_url", "storage"}
     job = queue.get(response.json()["job_id"])
     assert "node_packs" not in job.request
     assert job.provider == "runpod"
