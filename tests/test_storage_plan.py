@@ -35,6 +35,13 @@ from cloud_offload.storage_plan import (
     plan_storage,
     weight_key,
 )
+from cloud_offload.weight_sizes import (
+    cached_weight_sizes,
+    huggingface_file_sizes,
+    load_size_cache,
+    refresh_weight_sizes,
+    weight_size_cache_path,
+)
 
 IMAGE_BYTES = 14_600_000_000
 MODEL_BYTES = 19_600_000_000
@@ -336,3 +343,110 @@ def test_the_container_disk_ceiling_defaults_and_validates():
     assert CloudConfig().max_container_disk_gb == 500
     with pytest.raises(ValueError, match="max_container_disk_gb must be at least 1"):
         CloudConfig(max_container_disk_gb=0)
+
+
+# ---------------------------------------------------------------------------
+# Size discovery
+# ---------------------------------------------------------------------------
+
+
+class FakeHub:
+    """Answers the revision listing; records every URL it was asked for."""
+
+    def __init__(self, payload=None, status_code=200):
+        self.payload = payload if payload is not None else {
+            "siblings": [
+                {"rfilename": "sd_xl_base_1.0.safetensors", "size": 6_938_040_714},
+                {"rfilename": "config.json", "size": 512},
+            ]
+        }
+        self.status_code = status_code
+        self.urls = []
+
+    def __call__(self, url, headers):
+        self.urls.append(url)
+        return self
+
+    def json(self):
+        return self.payload
+
+
+def test_discovery_resolves_a_pinned_file_size():
+    hub = FakeHub()
+
+    sizes = huggingface_file_sizes(SDXL_WEIGHTS, fetch=hub)
+
+    assert sizes == {SDXL_KEY: 6_938_040_714}
+    assert hub.urls[0].startswith(
+        "https://huggingface.co/api/models/stabilityai/sdxl-base/revision/"
+    )
+
+
+def test_discovery_sums_a_whole_snapshot():
+    hub = FakeHub()
+
+    sizes = huggingface_file_sizes(SNAPSHOT_WEIGHTS, fetch=hub)
+
+    assert sizes == {SNAPSHOT_KEY: 6_938_040_714 + 512}
+
+
+def test_a_snapshot_with_an_unsized_file_stays_unknown():
+    # A partial sum presented as a fact would under-provision the pod.
+    hub = FakeHub({"siblings": [{"rfilename": "a.bin", "size": 10}, {"rfilename": "b.bin"}]})
+
+    assert huggingface_file_sizes(SNAPSHOT_WEIGHTS, fetch=hub) == {}
+
+
+def test_an_http_failure_degrades_to_unknown():
+    hub = FakeHub(status_code=404)
+
+    assert huggingface_file_sizes(SDXL_WEIGHTS, fetch=hub) == {}
+
+
+def test_a_raising_fetch_degrades_to_unknown():
+    def explode(url, headers):
+        raise ConnectionError("no route to host")
+
+    assert huggingface_file_sizes(SDXL_WEIGHTS, fetch=explode) == {}
+
+
+def test_a_cache_hit_avoids_a_second_fetch():
+    hub = FakeHub()
+    cache = {}
+
+    first = huggingface_file_sizes(SDXL_WEIGHTS, fetch=hub, cache=cache)
+    second = huggingface_file_sizes(SDXL_WEIGHTS, fetch=hub, cache=cache)
+
+    assert first == second == {SDXL_KEY: 6_938_040_714}
+    assert len(hub.urls) == 1
+
+
+def test_one_request_answers_for_every_file_in_a_revision():
+    hub = FakeHub()
+    weights = [{**SDXL_WEIGHTS[0], "files": ["sd_xl_base_1.0.safetensors", "config.json"]}]
+
+    sizes = huggingface_file_sizes(weights, fetch=hub)
+
+    assert len(sizes) == 2
+    assert len(hub.urls) == 1
+
+
+def test_resolved_sizes_persist_beside_the_queue_database(tmp_path):
+    config = storage_config(tmp_path)
+    resolved = configured_worker_profiles(config)["comfyui"]
+    resolved["weights"] = SDXL_WEIGHTS
+    hub = FakeHub()
+
+    refresh_weight_sizes(config, resolved, fetch=hub)
+
+    assert weight_size_cache_path(config).parent == (tmp_path / "queue.db").parent
+    assert load_size_cache(weight_size_cache_path(config))[SDXL_KEY] == 6_938_040_714
+    assert cached_weight_sizes(config, resolved) == {SDXL_KEY: 6_938_040_714}
+
+
+def test_a_cold_cache_reports_nothing_rather_than_guessing(tmp_path):
+    config = storage_config(tmp_path)
+    resolved = configured_worker_profiles(config)["comfyui"]
+    resolved["weights"] = SDXL_WEIGHTS
+
+    assert cached_weight_sizes(config, resolved) == {}

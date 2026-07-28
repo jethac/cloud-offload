@@ -97,6 +97,16 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_parser.add_argument("--config", help="Path to config file")
     dispatch_parser.add_argument("--once", action="store_true", help="Run once and exit")
 
+    storage_parser = subparsers.add_parser(
+        "storage-plan", help="Size the container disk a worker profile needs"
+    )
+    storage_parser.add_argument("profile", help="Configured worker profile name")
+    storage_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Resolve unknown weight sizes from Hugging Face and cache them",
+    )
+
     queue_parser = subparsers.add_parser("queue", help="Manage the local job queue")
     queue_sub = queue_parser.add_subparsers(dest="queue_command")
     queue_sub.add_parser("status", help="Show queue status")
@@ -159,6 +169,44 @@ def main():
             dispatcher.run(once=args.once)
         except KeyboardInterrupt:
             dispatcher.shutdown()
+
+    elif args.command == "storage-plan":
+        load_plugins()
+        from cloud_offload.config import CloudConfig
+        from cloud_offload.profiles import configured_worker_profiles
+        from cloud_offload.storage_plan import GIB, plan_disk_gb, plan_storage
+        from cloud_offload.weight_sizes import cached_weight_sizes, refresh_weight_sizes
+
+        config = CloudConfig.load()
+        profiles = configured_worker_profiles(config)
+        profile = profiles.get(args.profile)
+        if not profile:
+            known = ", ".join(sorted(profiles)) or "none"
+            print(f"No worker profile named {args.profile!r} (configured: {known})")
+            sys.exit(1)
+
+        # Resolving is explicit: the submission path only ever reads the cache,
+        # so a coordinator never blocks a job on the Hugging Face API. This is
+        # where an operator chooses to go and ask.
+        if args.refresh:
+            refresh_weight_sizes(config, profile)
+        weight_bytes = cached_weight_sizes(config, profile)
+        image_bytes = int(float(profile.get("image_size_gb") or 0) * GIB) or None
+        plan = plan_storage(
+            [], profile, image_bytes=image_bytes, weight_bytes=weight_bytes
+        )
+        print(f"Storage plan for worker profile {args.profile!r}, with no partition assets:")
+        for component in plan["components"]:
+            print(
+                f"  {component['name']:<9} {component['bytes'] / GIB:>9.1f} GiB  "
+                f"{component['detail']}"
+            )
+        print(f"  {'total':<9} {plan['total'] / GIB:>9.1f} GiB")
+        print(f"Container disk to request: {plan_disk_gb(plan)} GB")
+        if plan["unknown"]:
+            print("Unknown, charged a conservative default:")
+            for item in plan["unknown"]:
+                print(f"  - {item}")
 
     elif args.command == "queue":
         load_plugins()
