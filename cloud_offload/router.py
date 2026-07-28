@@ -8,6 +8,7 @@ from cloud_offload.providers import connector_metadata, create_connector
 from cloud_offload.profiles import (
     cloud_profiles_for_model,
     configured_worker_profiles,
+    profile_providing,
     worker_profile_gpu_type,
     worker_profile_min_gpu_ram,
 )
@@ -103,22 +104,8 @@ def resolve_worker_profile(config: CloudConfig, name: str) -> dict | None:
     ``None`` and reports every requirement as unmet.
     """
     profiles = configured_worker_profiles(config)
-    return profiles.get(name) or _profile_providing(profiles, name)
+    return profiles.get(name) or profile_providing(profiles, name)
 
-
-def _profile_providing(profiles: dict, capability: str) -> dict | None:
-    """Resolve a capability such as ``comfyui-partition-v1`` to a profile.
-
-    A client knows which capability its job needs; it cannot know what the
-    operator called their profiles. Accepting either keeps the wire contract
-    honest without making every box hardcode a local name.
-    """
-    matches = [
-        profile
-        for _, profile in sorted(profiles.items())
-        if capability in profile.get("models", [])
-    ]
-    return matches[0] if matches else None
 
 
 def select_profile_provider(
@@ -136,7 +123,7 @@ def select_profile_provider(
     hardware even if a client asks for it by name.
     """
     profiles = configured_worker_profiles(config)
-    profile = profiles.get(profile_name) or _profile_providing(profiles, profile_name)
+    profile = profiles.get(profile_name) or profile_providing(profiles, profile_name)
     if not profile:
         known = ", ".join(sorted(profiles)) or "none"
         raise ValueError(

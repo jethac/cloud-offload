@@ -94,6 +94,22 @@ def normalized_profile_disk_gb(name: str, field: str, value: Any) -> float:
     return number
 
 
+def profile_providing(profiles: dict, capability: str) -> dict | None:
+    """The profile that provides ``capability``, chosen deterministically.
+
+    Clients name the capability their job needs; only the operator knows what
+    the profiles are called. Every component that reads a profile must resolve
+    the two the same way, or a correctly configured worker is reported as
+    missing by one component and never launched by another.
+    """
+    matches = [
+        profile
+        for _, profile in sorted(profiles.items())
+        if capability in profile.get("models", [])
+    ]
+    return matches[0] if matches else None
+
+
 def require_models_relative(label: str, field: str, value: str) -> None:
     """Reject absolute paths and upward traversal in a models-relative path."""
     # PureWindowsPath also parses forward slashes and catches drive letters, so

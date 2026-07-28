@@ -20,6 +20,7 @@ from cloud_offload.providers.base import CloudConnector, CloudProvider, Instance
 from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.profiles import (
     configured_worker_profiles,
+    profile_providing,
     worker_profile_gpu_type,
     worker_profile_min_gpu_ram,
 )
@@ -204,10 +205,26 @@ class Dispatcher:
                 for job in queued_jobs
                 if job.params.get("runtime_profile")
             }
-            for profile_name in queued_profiles:
+            for requested_profile in queued_profiles:
+                # Jobs carry whatever the client stamped, which is usually a
+                # capability like comfyui-partition-v1 rather than an operator's
+                # profile name. Resolve it the way routing does, or a correctly
+                # configured worker never launches and the job waits forever.
+                resolved = profiles.get(requested_profile) or profile_providing(
+                    profiles, requested_profile
+                )
+                if resolved is None:
+                    logger.error(
+                        "Queued jobs reference unknown runtime profile %s "
+                        "(configured profiles: %s)",
+                        requested_profile,
+                        ", ".join(sorted(profiles)) or "none",
+                    )
+                    continue
+                profile_name = resolved["name"]
                 launch_key = (provider_name, profile_name)
                 profile_queued = sum(
-                    job.params.get("runtime_profile") == profile_name
+                    job.params.get("runtime_profile") == requested_profile
                     for job in queued_jobs
                 )
                 profile_running = any(
@@ -220,11 +237,6 @@ class Dispatcher:
                     and worker.get("runtime_profile") == profile_name
                     for worker in self.queue.list_active_workers()
                 )
-                if profile_name not in profiles:
-                    logger.error(
-                        "Queued jobs reference unknown runtime profile %s", profile_name
-                    )
-                    continue
                 if profile_queued < self.config.min_queue_depth or profile_running:
                     continue
                 if time.monotonic() < self.next_launch_at.get(launch_key, 0):
@@ -239,7 +251,7 @@ class Dispatcher:
                     [
                         job
                         for job in queued_jobs
-                        if job.params.get("runtime_profile") == profile_name
+                        if job.params.get("runtime_profile") == requested_profile
                     ],
                 )
 

@@ -816,3 +816,32 @@ def test_an_unknown_profile_names_what_is_configured(tmp_path):
 
     with pytest.raises(ValueError, match="configured profiles: comfyui"):
         select_profile_provider(_profile_config(tmp_path), "nonsense")
+
+
+def test_dispatcher_launches_for_a_capability_named_job(tmp_path, monkeypatch):
+    """A job stamped with a capability must still provision a worker.
+
+    The dispatcher looked its profile up by the raw name, so a job naming
+    comfyui-partition-v1 sat queued forever while the log repeated that the
+    profile was unknown — with a correctly configured profile providing it.
+    """
+    provider = TwoOfferProvider()
+    config = _profile_config(tmp_path)
+    config.coordinator_url = "https://coordinator.invalid"
+    config.min_queue_depth = 1
+    queue = JobQueue(config.queue_db_path)
+    queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={"runtime_profile": "comfyui-partition-v1"},
+        status=JobStatus.QUEUED,
+    )
+    dispatcher = Dispatcher(config, queue=queue, provider=provider)
+    monkeypatch.setattr(
+        "cloud_offload.dispatcher.CloudConfig.load", lambda *a, **k: config
+    )
+
+    dispatcher._tick()
+
+    assert provider.launch_attempts, "no worker was launched"
