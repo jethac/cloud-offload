@@ -93,6 +93,30 @@ def _build_parser() -> argparse.ArgumentParser:
     worker_parser.add_argument("--poll", type=int, default=10, help="Poll interval in seconds")
     worker_parser.add_argument("--max-jobs", type=int, help="Max jobs before exit")
 
+    boot_parser = subparsers.add_parser(
+        "runner-boot",
+        help="Register this runner and stage its node packs, before ComfyUI starts",
+    )
+    boot_parser.add_argument("--config", help="Path to config file")
+
+    ready_parser = subparsers.add_parser(
+        "runner-ready",
+        help="Wait for the colocated ComfyUI, or report home why it never answered",
+    )
+    ready_parser.add_argument("--config", help="Path to config file")
+    ready_parser.add_argument(
+        "--comfyui-pid", type=int, required=True, help="PID of the ComfyUI process"
+    )
+    ready_parser.add_argument(
+        "--log-file", help="Runner log whose tail is reported on failure"
+    )
+    ready_parser.add_argument(
+        "--timeout",
+        type=float,
+        help="Seconds to wait on a living but unready ComfyUI "
+        "(default: CLOUD_OFFLOAD_COMFYUI_READY_TIMEOUT, else 1200)",
+    )
+
     dispatch_parser = subparsers.add_parser("dispatch", help="Run the job dispatcher")
     dispatch_parser.add_argument("--config", help="Path to config file")
     dispatch_parser.add_argument("--once", action="store_true", help="Run once and exit")
@@ -156,6 +180,24 @@ def main():
         config = CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
         worker = Worker(config)
         worker.run(poll_interval=args.poll, max_jobs=args.max_jobs)
+
+    elif args.command in {"runner-boot", "runner-ready"}:
+        setup_logging("runner")
+        load_plugins()
+        from cloud_offload.config import CloudConfig
+        from cloud_offload.runner import DEFAULT_COMFYUI_LOG, run_boot, run_ready
+
+        config = CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
+        if args.command == "runner-boot":
+            raise SystemExit(run_boot(config))
+        raise SystemExit(
+            run_ready(
+                args.comfyui_pid,
+                log_path=args.log_file or DEFAULT_COMFYUI_LOG,
+                timeout_seconds=args.timeout,
+                config=config,
+            )
+        )
 
     elif args.command == "dispatch":
         setup_logging("dispatcher")

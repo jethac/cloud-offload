@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# One identity for every phase of the boot. The registration a starting runner
+# makes, the reason it reports if it never starts, and the worker that will
+# claim jobs are all the same worker to the coordinator.
+export CLOUD_OFFLOAD_WORKER_ID="${CLOUD_OFFLOAD_WORKER_ID:-worker-$(python -c 'import uuid; print(uuid.uuid4().hex[:8])')}"
+
+# Registers this runner as starting, and stages the profile's node packs. Both
+# happen before ComfyUI: it builds its node registry while it imports, so a pack
+# installed after the server is up is a pack the server will never see.
+cloud-offload runner-boot
+
 python /opt/ComfyUI/main.py \
   --listen 127.0.0.1 \
   --port 8188 \
@@ -14,21 +24,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-python - <<'PY'
-import time
-import requests
-
-deadline = time.monotonic() + 180
-while time.monotonic() < deadline:
-    try:
-        response = requests.get("http://127.0.0.1:8188/system_stats", timeout=2)
-        if response.ok:
-            break
-    except requests.RequestException:
-        pass
-    time.sleep(2)
-else:
-    raise SystemExit("ComfyUI did not become ready within 180 seconds")
-PY
+# Waits while ComfyUI is alive, fails the moment it is not, and reports either
+# outcome home with the tail of /tmp/comfyui.log before this container exits.
+cloud-offload runner-ready --comfyui-pid "${comfy_pid}" --log-file /tmp/comfyui.log
 
 cloud-offload worker --poll "${CLOUD_OFFLOAD_POLL_INTERVAL:-10}"

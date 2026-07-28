@@ -100,6 +100,8 @@ Other commands:
 ```bash
 cloud-offload dispatch      # run the provisioning dispatcher (needs provider creds)
 cloud-offload worker        # run a worker (normally the runner image's entrypoint)
+cloud-offload runner-boot   # register and stage node packs, before ComfyUI starts
+cloud-offload runner-ready  # wait for ComfyUI, or report home why it never came up
 cloud-offload queue status  # inspect the local job queue
 ```
 
@@ -357,14 +359,53 @@ match would not have proven a code match either: a pack can ship a security fix
 and still declare the version number of the unpatched release published under it.
 That is exactly why every requirement carries a digest and not just a version.
 
-The worker installs declared packs at its first job, before weights, emitting
-`node_pack_staging` events in the same 3..9 progress band. A registry entry is
-resolved to its release artifact and unpacked behind a hard path-traversal guard
-— any member with an absolute path, a `..` component, or a symlink bit aborts the
-whole install by name — and a git entry is cloned, checked out at the pinned
-commit, and verified by re-reading `HEAD`. A pack directory that already exists
-is left alone. A partition submitted without a `node_packs` list behaves exactly
-as it did before this existed.
+The runner installs declared packs **before it starts ComfyUI**, in its boot
+phase. This is not a detail: ComfyUI builds its node registry once, while it
+imports, so a pack that lands in `custom_nodes` after the server is up is
+invisible to it. A runner that had installed both of its declared packs, with the
+events to prove it, still answered a prompt with *"Node 'LayerScope Decompose'
+not found. The custom node may not be installed."* — because it installed them at
+its first claimed job, an hour of pod time after ComfyUI had finished importing.
+
+A registry entry is resolved to its release artifact and unpacked behind a hard
+path-traversal guard — any member with an absolute path, a `..` component, or a
+symlink bit aborts the whole install by name — and a git entry is cloned, checked
+out at the pinned commit, and verified by re-reading `HEAD`. A pack directory
+that already exists is left alone.
+
+The first claimed job still runs staging, finds every directory present, and says
+so in `node_pack_staging` events in the same 3..9 progress band as weights. Every
+outcome is stated, including doing nothing: a skip carries `skipped:
+"already_staged"` or `"none_declared"`, because a staging phase that emits nothing
+is indistinguishable from one that was never asked to stage anything — which is
+exactly how the failure above was missed on two of its three attempts. An
+unreadable `CLOUD_OFFLOAD_CUSTOM_NODES` raises, naming the value it refused,
+rather than resolving to an empty list. A partition submitted without a
+`node_packs` list behaves exactly as it did before this existed.
+
+### Runner startup
+
+A runner that cannot start must be loud, and a runner that is merely slow must be
+left alone. The image's entrypoint runs `cloud-offload runner-boot` (register,
+stage node packs), launches ComfyUI, then runs `cloud-offload runner-ready`, which
+waits on whether the ComfyUI **process is alive** rather than against a clock:
+
+- ComfyUI exits → fail immediately, with the tail of its own log.
+- ComfyUI is alive and slow → keep waiting. A cold pod walks a large models
+  directory and imports every staged pack behind torch; the fixed 180-second
+  window this replaces killed pods that were making progress.
+- ComfyUI is alive and wedged → give up at an absolute cap, default 1200 seconds,
+  configurable with `CLOUD_OFFLOAD_COMFYUI_READY_TIMEOUT`.
+
+On any startup failure the reason plus the last 4000 characters of
+`/tmp/comfyui.log` are posted to `POST /api/workers/status` against the runner's
+own worker id, so the failure survives the container that produced it and appears
+under `failed_workers` in `GET /api/status`. Nothing about this fakes readiness:
+the runner registers as `starting` — enough for the dispatcher to stop renting a
+second pod for the same queue, and to stop counting a booting pod as idle — but
+the claim path stays gated on ComfyUI actually answering. A worker that claimed a
+job it could not execute would turn a clean pre-execution failure into a paid one
+that also spends a retry.
 
 ### Storage planning
 
@@ -483,9 +524,13 @@ Client (node-pack) routes:
 | GET  | `/api/jobs/{id}/events?after=N&limit=M` | resumable event page (`next_after`) |
 
 Worker channel (separate `Bearer <worker_token>`, exempt from the LAN token):
-`POST /api/workers/claim`, `GET /api/workers/policy`,
+`POST /api/workers/claim`, `POST /api/workers/status`, `GET /api/workers/policy`,
 `GET|POST /api/workers/artifacts[/{id}]`, `GET /api/workers/jobs/{id}`,
 `.../running`, `.../progress`, `.../events`, `.../complete`, `.../fail`.
+
+`POST /api/workers/status` is how a runner reports itself before it has claimed
+anything: `starting` while it boots, `failed` with a `detail` carrying the reason
+and the tail of its log if it never gets further.
 
 Every error uses the stable envelope `{"error":{"code","message","details"}}`.
 
