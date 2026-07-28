@@ -93,6 +93,19 @@ def select_provider(
     return Route(name, offer, profile)
 
 
+def resolve_worker_profile(config: CloudConfig, name: str) -> dict | None:
+    """The profile a job means by ``name``: its own name, or what it provides.
+
+    Callers hold whatever the client stamped, which is a capability such as
+    ``comfyui-partition-v1`` far more often than an operator's profile name.
+    Anything that reads the profile — pack checks, asset resolution, storage
+    planning — must resolve it the same way routing does, or it silently reads
+    ``None`` and reports every requirement as unmet.
+    """
+    profiles = configured_worker_profiles(config)
+    return profiles.get(name) or _profile_providing(profiles, name)
+
+
 def _profile_providing(profiles: dict, capability: str) -> dict | None:
     """Resolve a capability such as ``comfyui-partition-v1`` to a profile.
 

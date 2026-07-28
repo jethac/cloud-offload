@@ -940,9 +940,8 @@ async def submit_partition(request: PartitionSubmitRequest):
         node_pack_version_warnings,
         normalized_partition_node_packs,
     )
-    from cloud_offload.profiles import configured_worker_profiles
     from cloud_offload.queue import JobStatus
-    from cloud_offload.router import select_profile_provider
+    from cloud_offload.router import resolve_worker_profile, select_profile_provider
     from cloud_offload.storage import create_storage
     from cloud_offload.storage_plan import (
         GIB,
@@ -994,7 +993,7 @@ async def submit_partition(request: PartitionSubmitRequest):
     # exist on the runner, must cost a 409 rather than a rented GPU that fails on
     # its first prompt. The profile is read directly rather than taken from the
     # route, because it is the same profile whichever provider wins.
-    profile = configured_worker_profiles(config).get(profile_name)
+    profile = resolve_worker_profile(config, profile_name)
     assets, unresolved = resolve_partition_assets(
         config, declared_assets, profile, storage
     )

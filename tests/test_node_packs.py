@@ -796,3 +796,36 @@ def test_a_url_derived_name_still_works_without_an_explicit_id():
     )
 
     assert profile_pack_identifier(entries[0]) == "ComfyUI-Widgets"
+
+
+def test_preflight_resolves_the_profile_by_capability(tmp_path, monkeypatch):
+    """A client stamps the capability, not the operator's profile name.
+
+    Reading the profile by the raw name returned None, so every declared pack
+    read as missing and a correctly configured worker was refused.
+    """
+    from cloud_offload.router import resolve_worker_profile
+
+    config = CloudConfig(
+        provider="runpod",
+        provider_order=["runpod"],
+        queue_db_path=str(tmp_path / "queue.db"),
+        worker_profiles={
+            "comfyui": {
+                "image": "registry.invalid/comfyui@sha256:" + "a" * 64,
+                "models": ["comfyui-partition-v1"],
+                "providers": ["runpod"],
+                "custom_nodes": [
+                    {"id": "layerscope", "git": "https://example.invalid/x.git", "commit": "c" * 40}
+                ],
+            }
+        },
+    )
+
+    profile = resolve_worker_profile(config, "comfyui-partition-v1")
+
+    assert profile is not None and profile["name"] == "comfyui"
+    required = [
+        {"id": "layerscope", "directory": "layerscope", "version": "0.1.0", "digest": "d" * 64}
+    ]
+    assert missing_node_packs(required, profile) == []
