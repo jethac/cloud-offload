@@ -438,7 +438,13 @@ class JobQueue:
                     " AND COALESCE(CAST(json_extract(params, '$.min_gpu_ram_gb') "
                     "AS REAL), 0) <= ?"
                 )
-                values.append(max(0.0, float(gpu_vram_gb)))
+                # A requirement is typed in the size a card is sold as, while a
+                # driver reports what it can actually address: an A5000 sold as
+                # 24 GB reports 24564 MiB, or 23.99 GiB. Comparing those raw made
+                # a worker refuse every job its own GPU was rented to run, and
+                # the job simply waited. Round to the nearest whole GiB so both
+                # sides speak the same units.
+                values.append(round(max(0.0, float(gpu_vram_gb))))
             if gpu_name:
                 # Treat "any"/missing as unconstrained. Normalizing separators makes
                 # provider labels such as RTX_4090 match NVIDIA GeForce RTX 4090.

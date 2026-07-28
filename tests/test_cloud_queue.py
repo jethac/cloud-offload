@@ -845,3 +845,32 @@ def test_dispatcher_launches_for_a_capability_named_job(tmp_path, monkeypatch):
     dispatcher._tick()
 
     assert provider.launch_attempts, "no worker was launched"
+
+
+def test_a_card_sold_as_24gb_claims_a_job_needing_24(tmp_path):
+    """Advertised size and driver-reported size are not the same number.
+
+    An A5000 is sold as 24 GB and reports 24564 MiB (23.99 GiB). Compared raw,
+    a worker refused every job its own GPU had been rented to run, and the job
+    waited in the queue with an idle worker beside it.
+    """
+    queue = JobQueue(str(tmp_path / "queue.db"))
+    queue.set_worker_token("t" * 40)
+    for vram, expected in ((23.99, 1), (23.69, 1), (22.4, 0), (15.99, 0)):
+        job = queue.create(
+            "comfyui-partition-v1",
+            "input.part",
+            provider="runpod",
+            params={"runtime_profile": "comfyui", "min_gpu_ram_gb": 24},
+            status=JobStatus.QUEUED,
+        )
+        claimed = queue.claim_jobs(
+            "worker-1",
+            limit=1,
+            token="t" * 40,
+            provider="runpod",
+            models=["comfyui-partition-v1"],
+            gpu_vram_gb=vram,
+        )
+        assert len(claimed) == expected, f"{vram} GiB against a 24 GiB requirement"
+        queue.update_status(job.id, JobStatus.FAILED)
