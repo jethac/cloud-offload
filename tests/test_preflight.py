@@ -123,9 +123,10 @@ def test_preflight_recommends_a_safe_offer_without_provider_mutation(tmp_path):
     assert report["schema"] == "cloud-offload.preflight.v1"
     assert report["status"] == "ready"
     assert report["blockers"] == []
-    assert report["recommendation"]["candidate_id"] == report["candidates"][0][
-        "candidate_id"
-    ]
+    assert (
+        report["recommendation"]["candidate_id"]
+        == report["candidates"][0]["candidate_id"]
+    )
     assert report["candidates"][0]["offer_id"] == "gpu-l40"
     assert report["execution_plan"]["offer_id"] == "gpu-l40"
     assert report["expires_at"] == "2026-07-29T00:01:00Z"
@@ -141,6 +142,135 @@ def test_preflight_recommends_a_safe_offer_without_provider_mutation(tmp_path):
     assert connector.mutations == []
     assert "private_provider_payload" not in str(report)
     assert finite_report(report)
+
+
+def test_runpod_total_cost_includes_idle_compute_disk_and_zero_transfer(tmp_path):
+    config = config_for_preflight(tmp_path)
+    legacy_runner_value = partition()
+    legacy_runner_value["runner"]["keep_warm"] = True
+
+    report = build_partition_preflight(
+        config=config,
+        partition=legacy_runner_value,
+        input_artifacts={},
+        provider="runpod",
+        recommendation_policy="cheapest",
+        storage=LocalStorage(config.storage_path),
+        cache_registry=CacheRegistry(config.queue_db_path),
+        connector_factory=lambda provider, config: ReadOnlyConnector(),
+    )
+
+    estimate = report["estimate"]
+    assert estimate["paid_idle_seconds"] == 300
+    assert estimate["incremental_transfer_cost_usd"] == [0.0, 0.0]
+    assert estimate["incremental_storage_cost_usd"][0] > 0
+    assert estimate["cost_complete"] is True
+    for index in (0, 1):
+        expected = sum(
+            component[index]
+            for component in (
+                estimate["compute_cost_usd"],
+                estimate["incremental_transfer_cost_usd"],
+                estimate["incremental_storage_cost_usd"],
+            )
+        )
+        assert abs(estimate["total_job_cost_usd"][index] - expected) < 0.000002
+    assert "incremental_costs_unmeasured" not in {
+        item["code"] for item in report["unknowns"]
+    }
+
+
+def test_matched_history_changes_fastest_recommendation(tmp_path):
+    config = config_for_preflight(tmp_path)
+
+    def history(_workload, performance_class):
+        execution = (
+            [30.0, 40.0]
+            if performance_class["gpu_type"] == "a10080gb"
+            else [400.0, 500.0]
+        )
+        return {
+            "sample_count": 2,
+            "startup_seconds": [40.0, 60.0],
+            "preparation_seconds": [10.0, 20.0],
+            "execution_seconds": execution,
+            "confidence": "medium",
+        }
+
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        provider="runpod",
+        recommendation_policy="fastest",
+        storage=LocalStorage(config.storage_path),
+        cache_registry=CacheRegistry(config.queue_db_path),
+        connector_factory=lambda provider, config: ReadOnlyConnector(),
+        history_lookup=history,
+    )
+
+    assert report["execution_plan"]["offer_id"] == "gpu-a100"
+    assert report["estimate"]["history_sample_count"] == 2
+    assert report["estimate"]["confidence"] == "medium"
+    assert "execution_history_unavailable" not in {
+        item["code"] for item in report["unknowns"]
+    }
+
+
+def test_unknown_provider_costs_are_not_reported_as_zero():
+    estimate = preflight._estimate(
+        provider="plugin-provider",
+        offer={"hourly_rate": 0.5},
+        required_bytes=1024**3,
+        cached_bytes=0,
+        container_disk_gb=40,
+        idle_shutdown_seconds=300,
+        keep_warm=False,
+        keep_warm_warning_seconds=3600,
+    )
+
+    assert estimate["compute_cost_usd"][0] > 0
+    assert estimate["incremental_transfer_cost_usd"] is None
+    assert estimate["incremental_storage_cost_usd"] is None
+    assert estimate["total_job_cost_usd"] is None
+    assert estimate["cost_complete"] is False
+
+
+def test_one_history_sample_does_not_change_gpu_ranking(tmp_path):
+    config = config_for_preflight(tmp_path)
+
+    def one_sample(_workload, performance_class):
+        return {
+            "sample_count": 1,
+            "startup_seconds": [1.0, 2.0],
+            "preparation_seconds": [1.0, 2.0],
+            "execution_seconds": (
+                [1.0, 2.0]
+                if performance_class["gpu_type"] == "a10080gb"
+                else [500.0, 600.0]
+            ),
+            "confidence": "low",
+        }
+
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        provider="runpod",
+        recommendation_policy="fastest",
+        storage=LocalStorage(config.storage_path),
+        cache_registry=CacheRegistry(config.queue_db_path),
+        connector_factory=lambda provider, config: ReadOnlyConnector(),
+        history_lookup=one_sample,
+    )
+
+    assert report["execution_plan"]["offer_id"] == "gpu-l40"
+    assert report["estimate"]["history_sample_count"] == 1
+    assert report["estimate"]["history_used"] is False
+    assert report["estimate"]["execution_seconds"] == [120.0, 300.0]
+    assert "execution_history_unavailable" in {
+        item["code"] for item in report["unknowns"]
+    }
 
 
 def test_deterministic_blocker_stops_before_provider_read(tmp_path):
@@ -188,9 +318,7 @@ def test_hard_total_cost_limit_filters_volatile_offers(tmp_path):
     assert connector.mutations == []
 
 
-def test_prepared_region_wins_balanced_recommendation(
-    monkeypatch, tmp_path
-):
+def test_prepared_region_wins_balanced_recommendation(monkeypatch, tmp_path):
     config = config_for_preflight(tmp_path)
     config.asset_sources = {
         "c" * 64: {
@@ -342,9 +470,7 @@ def test_paid_partition_requires_preflight_identity(monkeypatch, tmp_path):
     assert queue.count_by_status(*list(JobStatus)) == 0
 
 
-def test_preflight_identity_is_revalidated_and_bound_to_job(
-    monkeypatch, tmp_path
-):
+def test_preflight_identity_is_revalidated_and_bound_to_job(monkeypatch, tmp_path):
     config = config_for_preflight(tmp_path)
     queue = JobQueue(config.queue_db_path)
     connector = ReadOnlyConnector()
@@ -401,15 +527,17 @@ def test_preflight_accepts_dispatcher_managed_worker_auth(monkeypatch, tmp_path)
         lambda provider, config: connector,
     )
 
-    report = TestClient(server.app).post(
-        "/api/preflight",
-        json={"partition": partition(), "provider": "runpod"},
-    ).json()
+    report = (
+        TestClient(server.app)
+        .post(
+            "/api/preflight",
+            json={"partition": partition(), "provider": "runpod"},
+        )
+        .json()
+    )
 
     assert report["status"] == "ready"
-    assert "worker_token_missing" not in {
-        item["code"] for item in report["blockers"]
-    }
+    assert "worker_token_missing" not in {item["code"] for item in report["blockers"]}
 
 
 def test_request_cannot_loosen_configured_cost_or_region_limits(tmp_path):
@@ -436,8 +564,7 @@ def test_request_cannot_loosen_configured_cost_or_region_limits(tmp_path):
     assert conflict["request_policy"]["max_hourly_rate"] == 0.8
     assert conflict["request_policy"]["max_total_job_cost"] == 0.2
     assert any(
-        item["code"] == "region_policy_conflict"
-        for item in conflict["blockers"]
+        item["code"] == "region_policy_conflict" for item in conflict["blockers"]
     )
     assert connector.offer_reads == 0
 
@@ -531,9 +658,7 @@ def test_elapsed_countdown_and_never_policy_can_start_without_manual_action(
     assert accepted.json()["confirmation_action"] == "policy_skip"
 
 
-def test_price_change_returns_revised_preflight_without_queueing(
-    monkeypatch, tmp_path
-):
+def test_price_change_returns_revised_preflight_without_queueing(monkeypatch, tmp_path):
     config = config_for_preflight(tmp_path)
     queue = JobQueue(config.queue_db_path)
     connector = ReadOnlyConnector()
@@ -718,10 +843,11 @@ def test_confirmation_policy_settings_are_validated_and_persisted(
     persisted = json.loads((tmp_path / "config.json").read_text())
     assert persisted["rental_confirmation"] == "material_changes"
 
-    invalid = client.post(
-        "/api/config", json={"confirmation_countdown_seconds": 61}
-    )
+    invalid = client.post("/api/config", json={"confirmation_countdown_seconds": 61})
     assert invalid.status_code == 400
-    assert json.loads((tmp_path / "config.json").read_text())[
-        "confirmation_countdown_seconds"
-    ] == 15
+    assert (
+        json.loads((tmp_path / "config.json").read_text())[
+            "confirmation_countdown_seconds"
+        ]
+        == 15
+    )

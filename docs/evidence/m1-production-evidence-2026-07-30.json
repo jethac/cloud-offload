@@ -1,0 +1,103 @@
+{
+  "schema": "cloud-offload.m1-production-evidence.v1",
+  "recorded_date": "2026-07-30",
+  "implementation_revision": "0519e9c38f20a9538e300958a98f3dd220cfcf73",
+  "worker_image": "ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:30107fcfdda1ce4b03fe6a1c7d6cc42983177309d9f54591164e69326de516e4",
+  "redaction_contract": {
+    "included": [
+      "safe workload and manifest digests",
+      "aggregate timing and cost ranges",
+      "opaque job and provider resource identifiers",
+      "provider cleanup receipt",
+      "test counts and pass conclusions"
+    ],
+    "excluded": [
+      "prompts",
+      "workflows",
+      "artifact identifiers and locations",
+      "credentials",
+      "secret endpoints",
+      "private file locations"
+    ]
+  },
+  "free_preflight": {
+    "accepted": true,
+    "repeat_count": 2,
+    "status": "ready",
+    "workload_digest": "sha256:64e1be42653e49193e025f80eb3fb22b0d4b9093487a085900f0396a431064ae",
+    "manifest_digest": "sha256:c461b9f7d31b72332800fa200a6881f2d0059b1cd2f202b21a55859fa6efde7b",
+    "workload_digest_stable": true,
+    "manifest_digest_stable": true,
+    "job_count_unchanged": true,
+    "provider_resource_count_unchanged": true,
+    "provider_resource_identity_unchanged": true,
+    "unknowns": []
+  },
+  "recommendation": {
+    "provider": "runpod",
+    "gpu_type": "A100 SXM",
+    "region": "US-MD-1",
+    "prepared_state_local": true,
+    "history": {
+      "matched_completed_jobs": 2,
+      "confidence": "medium",
+      "startup_seconds": [36.597, 67.705],
+      "preparation_seconds": [40.219, 113.435],
+      "execution_seconds": [152.467, 210.539]
+    },
+    "estimate": {
+      "paid_idle_seconds": 300,
+      "paid_lifetime_seconds": [539.283, 721.679],
+      "compute_cost_usd": [0.223203, 0.298695],
+      "incremental_transfer_cost_usd": [0.0, 0.0],
+      "incremental_container_storage_cost_usd": [0.001352, 0.00181],
+      "total_job_cost_usd": [0.224556, 0.300505],
+      "cost_complete": true
+    }
+  },
+  "accepted_paid_journey": {
+    "accepted": true,
+    "job_id": "25e58a78-4ddb-49d3-b7d1-46f564a63319",
+    "provider_resource_id": "shx3qb2m66iyeg",
+    "worker_id": "worker-ebdd770f",
+    "confirmation": "default ten-second countdown",
+    "confirmed_offer_used": true,
+    "confirmed_prepared_volume_used": true,
+    "prepared_cache_hits": 6,
+    "output_node_groups": 2,
+    "output_artifact_groups": 2,
+    "visible_comfyui_result": true,
+    "comfyui_run_seconds": 297.24,
+    "cleanup": {
+      "idle_shutdown_seconds": 300,
+      "automatic_termination": true,
+      "manual_cleanup": false,
+      "provider_absent": true,
+      "queued_jobs_after": 0,
+      "running_jobs_after": 0,
+      "pending_jobs_after": 0
+    }
+  },
+  "verification": {
+    "focused_tests_passed": 25,
+    "full_tests_passed": 571,
+    "safe_workload_identity_tested": true,
+    "candidate_class_matching_tested": true,
+    "measured_history_changes_ranking_tested": true,
+    "idle_billing_window_tested": true,
+    "compute_transfer_storage_sum_tested": true,
+    "unknown_provider_costs_never_reported_as_zero": true,
+    "preflight_provider_mutation_guard_tested": true,
+    "confirmation_and_revalidation_tests_passed": true
+  },
+  "m1_exit_audit": {
+    "deterministic_blockers_create_no_provider_resource": true,
+    "reference_manifest_is_stable": true,
+    "recommendation_is_explainable": true,
+    "paid_launch_waits_for_confirmation": true,
+    "material_revalidation_changes_restart_confirmation": true,
+    "healthy_preflight_is_automatic_and_bounded": true,
+    "all_exits_passed": true
+  },
+  "conclusion": "M1 is accepted. Free readiness, measured recommendation, complete RunPod job cost, confirmation, exact paid binding, execution, result return, and automatic provider cleanup are proved."
+}

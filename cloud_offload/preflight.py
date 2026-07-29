@@ -27,6 +27,7 @@ from cloud_offload.cache_scheduler import (
     resolve_prepared_requirements,
     scheduler_runtime,
 )
+from cloud_offload.config import estimate_runpod_storage_monthly
 from cloud_offload.credentials import (
     RUNPOD_S3_ACCESS_CREDENTIAL,
     RUNPOD_S3_SECRET_CREDENTIAL,
@@ -44,6 +45,10 @@ from cloud_offload.profiles import (
 )
 from cloud_offload.providers import connector_metadata, create_connector
 from cloud_offload.providers.base import PlacementConstraints, StorageAttachment
+from cloud_offload.recommendation_history import (
+    candidate_class,
+    workload_digest,
+)
 from cloud_offload.router import resolve_worker_profile
 from cloud_offload.storage import partition_artifact_key
 from cloud_offload.storage_plan import (
@@ -62,9 +67,11 @@ RECOMMENDATION_POLICIES = frozenset({"balanced", "cheapest", "fastest", "manual"
 QUOTE_LIFETIME_SECONDS = 60
 DEFAULT_STARTUP_RANGE_SECONDS = (60.0, 180.0)
 DEFAULT_EXECUTION_RANGE_SECONDS = (120.0, 300.0)
-DEFAULT_CLOSURE_RANGE_SECONDS = (10.0, 30.0)
+DEFAULT_TERMINATION_RANGE_SECONDS = (10.0, 30.0)
 DOWNLOAD_THROUGHPUT_RANGE_BPS = (25 * 1024**2, 100 * 1024**2)
 RESTORE_THROUGHPUT_RANGE_BPS = (100 * 1024**2, 500 * 1024**2)
+RUNPOD_CONTAINER_DISK_USD_PER_GB_MONTH = 0.10
+PRICING_MONTH_SECONDS = 30 * 24 * 60 * 60
 _PINNED_IMAGE = re.compile(r"@sha256:([0-9a-fA-F]{64})$")
 
 
@@ -128,7 +135,7 @@ def _safe_offer(offer: dict[str, Any], provider: str) -> dict[str, Any]:
         raise ValueError("invalid GPU memory")
     if not math.isfinite(hourly_rate) or hourly_rate < 0:
         raise ValueError("invalid hourly rate")
-    return {
+    safe = {
         "offer_id": str(offer.get("id") or ""),
         "provider": provider,
         "gpu_type": str(offer.get("gpu_type") or "unknown"),
@@ -137,13 +144,43 @@ def _safe_offer(offer: dict[str, Any], provider: str) -> dict[str, Any]:
         "hourly_rate": hourly_rate,
         "region": str(region) if region else None,
     }
+    for name in (
+        "compute_hourly_rate",
+        "storage_hourly_rate",
+        "download_cost_per_gb",
+        "upload_cost_per_gb",
+    ):
+        raw = offer.get("raw") if isinstance(offer.get("raw"), dict) else {}
+        provider_field = {
+            "compute_hourly_rate": "dph_base",
+            "storage_hourly_rate": "storage_total_cost",
+            "download_cost_per_gb": "inet_down_cost",
+            "upload_cost_per_gb": "inet_up_cost",
+        }[name]
+        value = offer.get(name)
+        if value is None and provider == "vast.ai":
+            value = raw.get(provider_field)
+        if value is None:
+            continue
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized < 0:
+            raise ValueError(f"invalid {name}")
+        safe[name] = normalized
+    return safe
 
 
 def _estimate(
     *,
-    hourly_rate: float,
+    provider: str,
+    offer: dict[str, Any],
     required_bytes: int,
     cached_bytes: int,
+    container_disk_gb: int,
+    idle_shutdown_seconds: int,
+    keep_warm: bool,
+    keep_warm_warning_seconds: int,
+    timing_history: dict[str, Any] | None = None,
+    existing_storage_monthly_usd: float | None = None,
 ) -> dict[str, Any]:
     cached = max(0, min(int(cached_bytes), int(required_bytes)))
     missing = max(0, int(required_bytes) - cached)
@@ -155,34 +192,179 @@ def _estimate(
         cached / RESTORE_THROUGHPUT_RANGE_BPS[0]
         + missing / DOWNLOAD_THROUGHPUT_RANGE_BPS[0]
     )
+    history_sample_count = int((timing_history or {}).get("sample_count") or 0)
+    history_used = timing_history is not None and history_sample_count >= 2
+    if history_used:
+        startup_range = list(timing_history["startup_seconds"])
+        preparation_range = list(timing_history["preparation_seconds"])
+        execution_range = list(timing_history["execution_seconds"])
+        confidence = str(timing_history["confidence"])
+    else:
+        startup_range = list(DEFAULT_STARTUP_RANGE_SECONDS)
+        preparation_range = [preparation_low, preparation_high]
+        execution_range = list(DEFAULT_EXECUTION_RANGE_SECONDS)
+        confidence = "low"
+    paid_idle_seconds = (
+        max(0, int(keep_warm_warning_seconds))
+        if keep_warm
+        else max(0, int(idle_shutdown_seconds))
+    )
     total_low = (
-        DEFAULT_STARTUP_RANGE_SECONDS[0]
-        + preparation_low
-        + DEFAULT_EXECUTION_RANGE_SECONDS[0]
-        + DEFAULT_CLOSURE_RANGE_SECONDS[0]
+        float(startup_range[0])
+        + float(preparation_range[0])
+        + float(execution_range[0])
+        + paid_idle_seconds
+        + DEFAULT_TERMINATION_RANGE_SECONDS[0]
     )
     total_high = (
-        DEFAULT_STARTUP_RANGE_SECONDS[1]
-        + preparation_high
-        + DEFAULT_EXECUTION_RANGE_SECONDS[1]
-        + DEFAULT_CLOSURE_RANGE_SECONDS[1]
+        float(startup_range[1])
+        + float(preparation_range[1])
+        + float(execution_range[1])
+        + paid_idle_seconds
+        + DEFAULT_TERMINATION_RANGE_SECONDS[1]
     )
-    cost_low = hourly_rate * total_low / 3600
-    cost_high = hourly_rate * total_high / 3600
+    hourly_rate = float(offer["hourly_rate"])
+    compute_hourly_rate = float(offer.get("compute_hourly_rate", hourly_rate))
+    compute_cost = [
+        compute_hourly_rate * total_low / 3600,
+        compute_hourly_rate * total_high / 3600,
+    ]
+    cost_complete = not keep_warm
+    assumptions: list[str] = []
+    cost_basis: dict[str, str] = {
+        "compute": "current provider offer",
+    }
+    if provider == "runpod":
+        transfer_cost: list[float] | None = [0.0, 0.0]
+        storage_cost: list[float] | None = [
+            container_disk_gb
+            * RUNPOD_CONTAINER_DISK_USD_PER_GB_MONTH
+            * total_low
+            / PRICING_MONTH_SECONDS,
+            container_disk_gb
+            * RUNPOD_CONTAINER_DISK_USD_PER_GB_MONTH
+            * total_high
+            / PRICING_MONTH_SECONDS,
+        ]
+        cost_basis.update(
+            {
+                "transfer": "RunPod publishes no ingress or egress fee",
+                "storage": "RunPod container disk at 0.10 USD per GB-month, prorated for paid lifetime",
+            }
+        )
+    elif provider == "vast.ai" and all(
+        name in offer
+        for name in (
+            "storage_hourly_rate",
+            "download_cost_per_gb",
+            "upload_cost_per_gb",
+        )
+    ):
+        # Required misses enter the rented machine. Result size is not known
+        # before execution, so use zero through one required-data set as the
+        # explicit output-transfer range.
+        gib = float(1024**3)
+        download_rate = float(offer["download_cost_per_gb"])
+        upload_rate = float(offer["upload_cost_per_gb"])
+        transfer_cost = [
+            missing / gib * download_rate,
+            missing / gib * download_rate
+            + max(required_bytes, 1024**2) / gib * upload_rate,
+        ]
+        storage_hourly_rate = float(offer["storage_hourly_rate"])
+        storage_cost = [
+            storage_hourly_rate * total_low / 3600,
+            storage_hourly_rate * total_high / 3600,
+        ]
+        cost_basis.update(
+            {
+                "transfer": "current Vast.ai per-GB offer rates with a bounded result-size assumption",
+                "storage": "current Vast.ai offer storage rate",
+            }
+        )
+        assumptions.append(
+            "Vast.ai result transfer is estimated from zero bytes through one required-data set."
+        )
+    else:
+        transfer_cost = None
+        storage_cost = None
+        cost_complete = False
+        cost_basis.update(
+            {
+                "transfer": "provider rate unavailable",
+                "storage": "provider rate unavailable",
+            }
+        )
+    total_cost = None
+    if cost_complete and transfer_cost is not None and storage_cost is not None:
+        total_cost = [
+            compute_cost[0] + transfer_cost[0] + storage_cost[0],
+            compute_cost[1] + transfer_cost[1] + storage_cost[1],
+        ]
+    if history_used:
+        assumptions.append(
+            f"Timing uses {history_sample_count} matched completed job observations."
+        )
+    elif timing_history:
+        assumptions.append(
+            "One matched job observation is available; two are required before history changes timing or ranking."
+        )
+    else:
+        assumptions.append(
+            "No comparable execution history is available; timing uses conservative defaults."
+        )
+    if keep_warm:
+        assumptions.append(
+            "Keep-warm has no fixed billing end; the shown paid lifetime stops at the first configured warning."
+        )
+    else:
+        assumptions.append(
+            "Paid lifetime includes the configured idle shutdown period and provider termination time."
+        )
     return {
-        "startup_seconds": [round(DEFAULT_STARTUP_RANGE_SECONDS[0], 3), round(DEFAULT_STARTUP_RANGE_SECONDS[1], 3)],
-        "preparation_seconds": [round(preparation_low, 3), round(preparation_high, 3)],
-        "execution_seconds": [round(DEFAULT_EXECUTION_RANGE_SECONDS[0], 3), round(DEFAULT_EXECUTION_RANGE_SECONDS[1], 3)],
-        "paid_lifetime_seconds": [round(total_low, 3), round(total_high, 3)],
-        "total_job_cost_usd": [round(cost_low, 6), round(cost_high, 6)],
-        "incremental_transfer_cost_usd": [0.0, 0.0],
-        "incremental_storage_cost_usd": [0.0, 0.0],
-        "confidence": "low",
-        "assumptions": [
-            "No comparable execution history is available; execution uses the default range.",
-            "Provider startup, source download, prepared restore, and closure use conservative default ranges.",
-            "Provider transfer and incremental storage charges are not yet measured and are shown as zero, not guaranteed zero.",
+        "startup_seconds": [
+            round(float(startup_range[0]), 3),
+            round(float(startup_range[1]), 3),
         ],
+        "preparation_seconds": [
+            round(float(preparation_range[0]), 3),
+            round(float(preparation_range[1]), 3),
+        ],
+        "execution_seconds": [
+            round(float(execution_range[0]), 3),
+            round(float(execution_range[1]), 3),
+        ],
+        "paid_idle_seconds": paid_idle_seconds,
+        "termination_seconds": [
+            round(DEFAULT_TERMINATION_RANGE_SECONDS[0], 3),
+            round(DEFAULT_TERMINATION_RANGE_SECONDS[1], 3),
+        ],
+        "paid_lifetime_seconds": [round(total_low, 3), round(total_high, 3)],
+        "compute_cost_usd": [round(item, 6) for item in compute_cost],
+        "incremental_transfer_cost_usd": (
+            [round(item, 6) for item in transfer_cost]
+            if transfer_cost is not None
+            else None
+        ),
+        "incremental_storage_cost_usd": (
+            [round(item, 6) for item in storage_cost]
+            if storage_cost is not None
+            else None
+        ),
+        "total_job_cost_usd": (
+            [round(item, 6) for item in total_cost] if total_cost is not None else None
+        ),
+        "cost_complete": cost_complete and total_cost is not None,
+        "cost_basis": cost_basis,
+        "existing_storage_commitment_usd_per_month": (
+            round(float(existing_storage_monthly_usd), 2)
+            if existing_storage_monthly_usd is not None
+            else None
+        ),
+        "history_sample_count": history_sample_count,
+        "history_used": history_used,
+        "confidence": confidence,
+        "assumptions": assumptions,
     }
 
 
@@ -196,16 +378,38 @@ def _rank_candidates(
     if not candidates:
         return [], None
 
-    costs = [_midpoint(item["estimate"]["total_job_cost_usd"]) for item in candidates]
-    times = [_midpoint(item["estimate"]["paid_lifetime_seconds"]) for item in candidates]
+    complete = [
+        item
+        for item in candidates
+        if isinstance(item["estimate"].get("total_job_cost_usd"), list)
+    ]
+    known_costs = [
+        _midpoint(item["estimate"]["total_job_cost_usd"]) for item in complete
+    ]
+    unknown_cost = max(known_costs, default=0.0) + 1_000_000.0
+    costs = [
+        _midpoint(item["estimate"]["total_job_cost_usd"])
+        if isinstance(item["estimate"].get("total_job_cost_usd"), list)
+        else unknown_cost
+        for item in candidates
+    ]
+    times = [
+        _midpoint(item["estimate"]["paid_lifetime_seconds"]) for item in candidates
+    ]
     cost_low, cost_high = min(costs), max(costs)
     time_low, time_high = min(times), max(times)
 
     for index, candidate in enumerate(candidates):
         cost = costs[index]
         duration = times[index]
-        cost_score = 0.0 if cost_high == cost_low else (cost - cost_low) / (cost_high - cost_low)
-        time_score = 0.0 if time_high == time_low else (duration - time_low) / (time_high - time_low)
+        cost_score = (
+            0.0 if cost_high == cost_low else (cost - cost_low) / (cost_high - cost_low)
+        )
+        time_score = (
+            0.0
+            if time_high == time_low
+            else (duration - time_low) / (time_high - time_low)
+        )
         if policy == "cheapest":
             score = cost
         elif policy == "fastest":
@@ -231,7 +435,11 @@ def _rank_candidates(
     if policy == "manual":
         return ranked, None
 
-    selected = ranked[0]
+    selectable = [item for item in ranked if item["estimate"].get("cost_complete")]
+    if not selectable:
+        return ranked, None
+
+    selected = selectable[0]
     rationale = [
         f"Meets the {selected['gpu_requirement']['minimum_vram_gb']} GiB minimum VRAM requirement.",
         f"Has {selected['preparation']['coverage_percent']:.1f}% prepared-data coverage.",
@@ -241,11 +449,13 @@ def _rank_candidates(
     elif policy == "fastest":
         rationale.append("Has the lowest estimated time to result among viable offers.")
     else:
-        rationale.append("Has the best balanced time and total-cost score among viable offers.")
+        rationale.append(
+            "Has the best balanced time and total-cost score among viable offers."
+        )
     return ranked, {
         "policy": policy,
         "candidate_id": selected["candidate_id"],
-        "rank": 1,
+        "rank": int(selected["rank"]),
         "rationale": rationale,
     }
 
@@ -271,6 +481,8 @@ def build_partition_preflight(
     cache_registry: CacheRegistry,
     worker_auth_configured: bool | None = None,
     connector_factory: Callable[[str, Any], Any] | None = None,
+    history_lookup: Callable[[str, dict[str, Any]], dict[str, Any] | None]
+    | None = None,
     now: Callable[[], datetime] = _utc_now,
 ) -> dict[str, Any]:
     """Build a versioned report without creating or changing paid resources."""
@@ -280,18 +492,18 @@ def build_partition_preflight(
     warnings: list[dict[str, Any]] = []
     unknowns: list[dict[str, Any]] = []
     requested_provider = _provider_name(provider)
-    policy = str(
-        recommendation_policy or config.recommendation_policy or "balanced"
-    ).strip().lower()
+    policy = (
+        str(recommendation_policy or config.recommendation_policy or "balanced")
+        .strip()
+        .lower()
+    )
     configured_regions = {
         str(item).strip()
         for item in (getattr(config, "allowed_regions", None) or [])
         if str(item).strip()
     }
     requested_regions = {
-        str(item).strip()
-        for item in (allowed_regions or [])
-        if str(item).strip()
+        str(item).strip() for item in (allowed_regions or []) if str(item).strip()
     }
     if configured_regions and requested_regions:
         effective_regions = configured_regions.intersection(requested_regions)
@@ -341,8 +553,7 @@ def build_partition_preflight(
     except (TypeError, ValueError):
         requested_total_cost_limit = float("nan")
     if requested_total_cost_limit is not None and (
-        not math.isfinite(requested_total_cost_limit)
-        or requested_total_cost_limit <= 0
+        not math.isfinite(requested_total_cost_limit) or requested_total_cost_limit <= 0
     ):
         blockers.append(
             _issue(
@@ -387,7 +598,9 @@ def build_partition_preflight(
             )
         )
 
-    runner = partition.get("runner") if isinstance(partition.get("runner"), dict) else {}
+    runner = (
+        partition.get("runner") if isinstance(partition.get("runner"), dict) else {}
+    )
     profile_name = str((runner or {}).get("profile") or "comfyui").strip()[:100]
     if not profile_name.startswith("comfyui"):
         blockers.append(
@@ -398,7 +611,9 @@ def build_partition_preflight(
             )
         )
     try:
-        requested_vram = max(1, min(256, int((runner or {}).get("min_gpu_ram_gb") or 16)))
+        requested_vram = max(
+            1, min(256, int((runner or {}).get("min_gpu_ram_gb") or 16))
+        )
     except (TypeError, ValueError):
         requested_vram = 16
         blockers.append(
@@ -408,7 +623,9 @@ def build_partition_preflight(
                 field="partition.runner.min_gpu_ram_gb",
             )
         )
-    requested_gpu_type = str((runner or {}).get("gpu_type") or "any").strip()[:100] or "any"
+    requested_gpu_type = (
+        str((runner or {}).get("gpu_type") or "any").strip()[:100] or "any"
+    )
     residency = str(partition.get("residency") or "cloud")
     if residency not in {"cloud", "on-prem"}:
         blockers.append(
@@ -457,11 +674,15 @@ def build_partition_preflight(
     try:
         declared_assets = normalized_partition_assets(partition.get("assets"))
     except ValueError as exc:
-        blockers.append(_issue("invalid_asset_manifest", str(exc), field="partition.assets"))
+        blockers.append(
+            _issue("invalid_asset_manifest", str(exc), field="partition.assets")
+        )
     try:
         declared_packs = normalized_partition_node_packs(partition.get("node_packs"))
     except ValueError as exc:
-        blockers.append(_issue("invalid_node_pack_manifest", str(exc), field="partition.node_packs"))
+        blockers.append(
+            _issue("invalid_node_pack_manifest", str(exc), field="partition.node_packs")
+        )
 
     for boundary_key, artifact_id in input_artifacts.items():
         if not str(boundary_key).startswith("input_"):
@@ -612,6 +833,14 @@ def build_partition_preflight(
         requested_vram,
         worker_profile_min_gpu_ram(profile) if profile else 0,
     )
+    workload_identity = workload_digest(
+        partition,
+        profile_name=profile_name,
+        minimum_vram_gb=requested_vram,
+    )
+    # Worker and dispatcher lifetime policy is coordinator-owned. A legacy
+    # runner.keep_warm field does not change the paid resource lifecycle.
+    effective_keep_warm = bool(getattr(config, "keep_warm", False))
     gpu_type = (
         requested_gpu_type
         if requested_gpu_type.lower() != "any"
@@ -654,9 +883,7 @@ def build_partition_preflight(
         volume
         for volume in cache_registry.list_volumes(status="ready")
         if volume.provider in configured_providers
-        and (
-            not region_allowlist or volume.datacenter_id in region_allowlist
-        )
+        and (not region_allowlist or volume.datacenter_id in region_allowlist)
         and (
             prepared_policy.get("policy") != "pinned"
             or volume.datacenter_id == prepared_policy.get("region")
@@ -711,7 +938,9 @@ def build_partition_preflight(
                 )
                 continue
 
-            provider_candidates: list[tuple[dict[str, Any], CacheVolume | None, int, bool]] = []
+            provider_candidates: list[
+                tuple[dict[str, Any], CacheVolume | None, int, bool]
+            ] = []
             try:
                 for offer in connector.list_available(
                     gpu_type=gpu_type,
@@ -732,11 +961,15 @@ def build_partition_preflight(
                 for volume in cache_registry.list_volumes(status="ready"):
                     if volume.provider != provider_name:
                         continue
-                    if region_allowlist and volume.datacenter_id not in region_allowlist:
-                        continue
                     if (
-                        prepared_policy.get("policy") == "pinned"
-                        and volume.datacenter_id != prepared_policy.get("region")
+                        region_allowlist
+                        and volume.datacenter_id not in region_allowlist
+                    ):
+                        continue
+                    if prepared_policy.get(
+                        "policy"
+                    ) == "pinned" and volume.datacenter_id != prepared_policy.get(
+                        "region"
                     ):
                         continue
                     try:
@@ -834,19 +1067,46 @@ def build_partition_preflight(
                     if complete
                     else min(required_data_bytes, max(0, cached_bytes))
                 )
+                performance_class = candidate_class(
+                    provider=provider_name,
+                    gpu_type=safe["gpu_type"],
+                    region=region,
+                    prepared=volume is not None,
+                )
+                timing_history = (
+                    history_lookup(workload_identity, performance_class)
+                    if history_lookup is not None
+                    else None
+                )
+                existing_storage_monthly_usd = None
+                if provider_name == "runpod" and volume is not None:
+                    existing_storage_monthly_usd = estimate_runpod_storage_monthly(
+                        float(volume.capacity_bytes) / GIB
+                    )
                 estimate = _estimate(
-                    hourly_rate=safe["hourly_rate"],
+                    provider=provider_name,
+                    offer=safe,
                     required_bytes=required_data_bytes,
                     cached_bytes=cached,
+                    container_disk_gb=disk_gb,
+                    idle_shutdown_seconds=int(config.idle_shutdown_seconds),
+                    keep_warm=effective_keep_warm,
+                    keep_warm_warning_seconds=int(config.keep_warm_warning_seconds),
+                    timing_history=timing_history,
+                    existing_storage_monthly_usd=existing_storage_monthly_usd,
                 )
-                if (
-                    total_cost_limit is not None
-                    and estimate["total_job_cost_usd"][1] > total_cost_limit
+                if total_cost_limit is not None and (
+                    not isinstance(estimate["total_job_cost_usd"], list)
+                    or estimate["total_job_cost_usd"][1] > total_cost_limit
                 ):
                     continue
                 coverage_percent = (
-                    100.0 if complete else (
-                        cached / required_data_bytes * 100 if required_data_bytes else 0.0
+                    100.0
+                    if complete
+                    else (
+                        cached / required_data_bytes * 100
+                        if required_data_bytes
+                        else 0.0
                     )
                 )
                 candidate_id = _digest(
@@ -863,6 +1123,7 @@ def build_partition_preflight(
                         **safe,
                         "region": region,
                         "prepared_volume_id": volume.id if volume else None,
+                        "preparation_class": performance_class["preparation_class"],
                         "gpu_requirement": {
                             "requested_type": gpu_type or "any",
                             "minimum_vram_gb": minimum_vram,
@@ -879,20 +1140,34 @@ def build_partition_preflight(
                 )
 
     ranked, recommendation = _rank_candidates(candidates, policy)
-    if ranked:
-        unknowns.extend(
-            [
-                _issue(
-                    "execution_history_unavailable",
-                    "No comparable execution history is available; the time and compute-cost estimate uses a conservative default execution range.",
-                    action="Collect completed job observations to improve this estimate.",
-                ),
-                _issue(
-                    "incremental_costs_unmeasured",
-                    "Incremental transfer and storage charges are not measured by this report.",
-                    action="Review provider pricing before launch when these charges can apply.",
-                ),
-            ]
+    relevant_candidates = (
+        [
+            item
+            for item in ranked
+            if recommendation and item["candidate_id"] == recommendation["candidate_id"]
+        ]
+        if recommendation
+        else ranked
+    )
+    if relevant_candidates and not any(
+        bool(item["estimate"].get("history_used")) for item in relevant_candidates
+    ):
+        unknowns.append(
+            _issue(
+                "execution_history_unavailable",
+                "No comparable execution history is available; the timing estimate uses conservative defaults.",
+                action="Collect completed job observations to improve this estimate.",
+            )
+        )
+    if relevant_candidates and any(
+        not bool(item["estimate"].get("cost_complete")) for item in relevant_candidates
+    ):
+        unknowns.append(
+            _issue(
+                "incremental_costs_unmeasured",
+                "A complete transfer or storage rate is unavailable for one or more current choices.",
+                action="Choose a fully priced offer or review provider pricing before launch.",
+            )
         )
     if not blockers and not ranked:
         unknowns.append(
@@ -905,7 +1180,7 @@ def build_partition_preflight(
 
     if blockers:
         status = "blocked"
-    elif not ranked:
+    elif not ranked or (policy != "manual" and recommendation is None):
         status = "uncertain"
     elif any(item["preparation"]["missing_bytes"] > 0 for item in ranked[:1]):
         status = "ready_with_preparation"
@@ -916,9 +1191,7 @@ def build_partition_preflight(
     confirmation_policy = str(
         getattr(config, "rental_confirmation", "always") or "always"
     )
-    countdown_seconds = int(
-        getattr(config, "confirmation_countdown_seconds", 10)
-    )
+    countdown_seconds = int(getattr(config, "confirmation_countdown_seconds", 10))
     confirmation_required = (
         status in {"ready", "ready_with_preparation"}
         and confirmation_policy == "always"
@@ -946,13 +1219,16 @@ def build_partition_preflight(
     selected = None
     if recommendation:
         selected = next(
-            item for item in ranked if item["candidate_id"] == recommendation["candidate_id"]
+            item
+            for item in ranked
+            if item["candidate_id"] == recommendation["candidate_id"]
         )
 
     return {
         "schema": PREFLIGHT_SCHEMA,
         "preflight_id": str(uuid.uuid4()),
         "manifest_digest": manifest_digest,
+        "workload_digest": workload_identity,
         "status": status,
         "created_at": _iso(created_at),
         "expires_at": _iso(created_at + timedelta(seconds=QUOTE_LIFETIME_SECONDS)),
@@ -1043,6 +1319,5 @@ def finite_report(report: dict[str, Any]) -> bool:
                 yield from walk(item)
 
     return all(
-        not isinstance(value, float) or math.isfinite(value)
-        for value in walk(report)
+        not isinstance(value, float) or math.isfinite(value) for value in walk(report)
     )
