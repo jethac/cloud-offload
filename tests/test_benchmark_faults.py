@@ -129,6 +129,7 @@ class FakeS3Client:
     def __init__(self):
         self.objects = {"indexes/latest": b"original-generation"}
         self.deleted = []
+        self.puts = []
 
     def head_object(self, *, Bucket, Key):
         if Key not in self.objects:
@@ -141,7 +142,9 @@ class FakeS3Client:
         return {"Body": io.BytesIO(self.objects[Key])}
 
     def put_object(self, *, Bucket, Key, Body):
-        self.objects[Key] = bytes(Body)
+        payload = bytes(Body)
+        self.puts.append((Key, payload))
+        self.objects[Key] = payload
 
     def delete_object(self, *, Bucket, Key):
         self.deleted.append(Key)
@@ -391,6 +394,12 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
     }
     canary_key = blob_key(canary["sha256"])
     assert s3.objects[canary_key] == b"cloud-offload-benchmark-corrupt"
+    assert [body for key, body in s3.puts if key == canary_key] == [
+        b"cloud-offload-benchmark-corrupt"
+    ]
+    coordinator_payload = next(iter(coordinator_storage.objects.values()))
+    assert len(coordinator_payload) == canary["size"]
+    assert coordinator_payload != b"cloud-offload-benchmark-corrupt"
     assert s3.objects["indexes/latest"] != b"original-generation"
     assert len(registry.announced) == 1
 

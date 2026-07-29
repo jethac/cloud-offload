@@ -511,13 +511,14 @@ def prepare_corruption(
         coordinator_storage.delete(coordinator_artifact_key)
         raise
     try:
+        corrupt_payload = b"cloud-offload-benchmark-corrupt"
         store.client.put_object(
             Bucket=store.volume_id,
             Key=keys["blob_key"],
-            Body=valid_payload,
+            Body=corrupt_payload,
         )
-        if _object_bytes(store, keys["blob_key"]) != valid_payload:
-            raise RuntimeError("Fresh corruption canary valid object was not published")
+        if _object_bytes(store, keys["blob_key"]) != corrupt_payload:
+            raise RuntimeError("Fresh corruption canary object was not published")
         manifest_payload = canonical_json(canary_manifest)
         store.client.put_object(
             Bucket=store.volume_id, Key=manifest_key, Body=manifest_payload
@@ -556,14 +557,6 @@ def prepare_corruption(
             Key="indexes/latest",
             Body=generation.encode("utf-8"),
         )
-        corrupt_payload = b"cloud-offload-benchmark-corrupt"
-        store.client.put_object(
-            Bucket=store.volume_id,
-            Key=keys["blob_key"],
-            Body=corrupt_payload,
-        )
-        if _object_bytes(store, keys["blob_key"]) != corrupt_payload:
-            raise RuntimeError("Fresh corruption object did not replace valid bytes")
         time.sleep(max(0.0, settle_seconds))
         if _object_bytes(store, keys["blob_key"]) != corrupt_payload:
             raise RuntimeError(
