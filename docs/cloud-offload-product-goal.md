@@ -2,7 +2,7 @@
 
 > Status: **canonical product goal**
 > Last updated: **2026-07-30**
-> Program status: **in progress — Milestone 3 is complete and Milestone 4 fast trusted restore is the current gate**
+> Program status: **in progress — Milestone 4 is complete and Milestone 5 prepared workflow capsules are the current gate**
 > Scope: the end-to-end Cloud Offload product across the coordinator, dispatcher,
 > workers, provider connectors, prepared storage, and ComfyUI extension.
 >
@@ -651,6 +651,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#35](https://github.com/jethac/cloud-offload/pull/35) | Records the accepted bounded paid RunPod worker-boot cancellation and coordinator-restart campaign, exact lease closure receipts, empty final provider inventory, and the compact redacted M3 evidence. | 594 tests passed. Both exact Pods became provider-absent, both leases received provider termination confirmation, the conservative cost upper bound was USD 0.033868, and no manual cleanup was required. M3 is complete. |
 | [#36](https://github.com/jethac/cloud-offload/pull/36) | Adds coordinator-signed prepared-cache trust receipts, exact manifest/artifact/provider-volume/runtime/generation binding, a rotating sampled hot path, full-verification fallbacks, sensitive-asset policy, and safe verification telemetry. | 599 tests passed. A 6 MiB eligible hot artifact reads one 1 MiB signed sample instead of a complete digest; tampering, metadata change, expiry, audit due state, and private policy return to full verification. Background scrub enforcement and paid M4 performance proof remain. |
 | [#37](https://github.com/jethac/cloud-offload/pull/37) | Adds a second signed cache sample during materialization, blocks return of a corrupt target, degrades affected cache volumes, and restores placement eligibility only after a new full digest verification. | 600 tests passed. The focused corruption test places damage only in the background-selected range and proves that the target is removed before return. The registry test proves that corruption removes the volume from placement and that full verification restores it. The paid M4 performance proof remains. |
+| [#38](https://github.com/jethac/cloud-offload/pull/38) | Records the redacted paid M4 preparation evidence, exact trusted-read telemetry, complete first-seen verification, bounded campaign incidents, and provider closure. It marks M4 complete and makes M5 active. | 601 tests passed. Four cold samples have a 176.482397-second median. Three hot samples have a 15.179662-second median. Hot is 8.601% of cold. Two trusted restores each materialized 36,664,522,522 bytes with 12,582,912 verification bytes, six background scrubs, zero full-digest hits, and provider-confirmed absence. |
 
 ### ComfyUI extension repository
 
@@ -1216,7 +1217,42 @@ identity, opaque job/lease/resource IDs, and provider-closure receipts.
 
 The campaign had a USD 0.30 total limit and a USD 0.15 per-case limit. Its
 conservative compute-cost upper bound was USD 0.033868. All M3 exits pass. M3 is
-complete. M4 is the first unmet milestone.
+complete.
+
+### M4 evidence and exit audit
+
+The safe evidence projection is
+[M4 fast restore evidence](evidence/m4-fast-restore-evidence-2026-07-30.json).
+It combines the complete automated integrity matrix with two spend-capped
+merged-stack RunPod preparation campaigns. It contains only safe counts, limits,
+aggregate timings, immutable build identity, and provider-closure conclusions.
+
+1. **No complete hot read:** two fresh-Pod trusted restores each materialized six
+   artifacts and 36,664,522,522 bytes while reading 12,582,912 verification
+   bytes. Both show six trusted hits, six background scrubs, and zero full-digest
+   hits.
+2. **First-seen integrity:** the receipt-issue run performed complete digest
+   verification for all six artifacts and all 36,664,522,522 bytes before it
+   issued trust receipts.
+3. **Corruption safety:** same-generation foreground and background sample tests
+   detect corruption, remove a materialized target before return, quarantine the
+   object, remove the volume from placement, and permit recovery only after a new
+   complete verification. Private and audit-due assets remain on complete digest
+   verification. The accepted M0 production corruption canary remains durable.
+4. **Measured speed:** four cold preparation samples have a median of 176.482397
+   seconds. Three hot samples, including receipt issue, have a median of 15.179662
+   seconds. Hot preparation is 8.601% of cold, or 91.399% faster.
+5. **Bounded closure:** eight attributed Pods received provider-absence receipts,
+   both campaigns stayed within their combined USD 2.15 limit, and independent
+   final inventory contained zero resources. A 300-second initial-start lease
+   expired before one worker became ready; the production lease setting was
+   corrected to 900 seconds before the accepted preparation observations.
+
+The campaign scorecards also record two post-preparation workflow outcomes: one
+execution failure and one scenario cost limit. They do not change the completed
+preparation measurements, integrity observations, or provider closure. They remain
+visible for the production release gate. All M4 exits pass. M4 is complete. M5 is
+the first unmet milestone.
 
 ### Operational safety rules
 
@@ -1244,8 +1280,8 @@ complete. M4 is the first unmet milestone.
 | M1 — preflight, recommendation, confirmation | **Complete** | All exits passed; the merged-stack paid journey, automatic cleanup, stable free preflight, measured recommendation history, and complete RunPod cost are durable. |
 | M2 — persistent visibility | **Complete** | All exits passed; the persistent Cloud Jobs surface, reload reconstruction, complete safe telemetry, and compact evidence are durable. |
 | M3 — leases and billing closure | **Complete** | The automated five-phase matrix and the bounded paid RunPod cancellation/restart campaign pass with provider-confirmed closure and zero final resources. |
-| M4 — fast trusted restore | **In progress** | Durable prepared storage exists; trust receipts, background scrubbing, and the hot-path performance target are the current gate. |
-| M5 — workflow capsules | **Not started** | Schema and custom-node readiness contracts remain. |
+| M4 — fast trusted restore | **Complete** | Signed trust receipts, complete first-seen verification, foreground and background corruption handling, safe fallback, and the paid 8.601% hot-to-cold preparation result are durable. |
+| M5 — workflow capsules | **In progress** | Schema, full-workflow preflight, prepared assets, custom-node readiness, cooperative cancellation, and artifact results are the current gate. |
 | M6 — regional replication | **Not started** | Shadow recommendations precede automation. |
 | M7 — production release gate | **Not started** | Requires all prior exits and continuous canaries. |
 
@@ -1341,14 +1377,15 @@ Exit:
 - Add sampled background scrubbing and scheduled complete audits.
 - Quarantine mismatches and preserve safe cold fallback.
 
-Implementation status: the signed trust-receipt and metadata/sample fast path is
-implemented. It binds the exact manifest signature, artifact, volume,
-compatibility contract, object generation, expiry, and audit policy. Private and
-sensitive artifacts stay on full verification. Invalid, changed, expired, or
-audit-due receipts also return to a complete digest read. A second signed sample
-runs while materialization proceeds; failure removes the target before return,
-quarantines the object through the worker fallback path, and degrades the volume.
-The paid 25% cold/hot performance proof remains before M4 can close.
+Implementation status: complete. The signed trust-receipt and metadata/sample
+fast path binds the exact manifest signature, artifact, volume, compatibility
+contract, object generation, expiry, and audit policy. Private and sensitive
+artifacts stay on full verification. Invalid, changed, expired, or audit-due
+receipts also return to a complete digest read. A second signed sample runs while
+materialization proceeds; failure removes the target before return, quarantines
+the object through the worker fallback path, and degrades the volume. Paid
+fresh-Pod evidence puts median hot preparation at 8.601% of median cold
+preparation.
 
 Exit:
 
