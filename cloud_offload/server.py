@@ -665,6 +665,9 @@ async def health():
         "status": "ok",
         "version": VERSION,
         "api_version": API_VERSION,
+        # Local restart canaries compare this with the service-discovery file
+        # before signaling a process. It is operational identity, not a secret.
+        "pid": os.getpid(),
     }
 
 

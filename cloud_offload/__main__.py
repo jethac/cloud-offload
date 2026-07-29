@@ -163,6 +163,12 @@ def _build_parser() -> tuple[
         help="Allow explicit storage/corruption/restart hook commands from the plan",
     )
 
+    benchmark_hook = subparsers.add_parser(
+        "benchmark-hook",
+        help="Run a reviewed fault canary inside an authorized benchmark",
+    )
+    benchmark_hook.add_argument("kind", choices=("storage", "corruption", "restart"))
+
     queue_parser = subparsers.add_parser("queue", help="Manage the local job queue")
     queue_sub = queue_parser.add_subparsers(dest="queue_command")
     queue_sub.add_parser("status", help="Show queue status")
@@ -291,6 +297,19 @@ def main():
             print("Unknown, charged a conservative default:")
             for item in plan["unknown"]:
                 print(f"  - {item}")
+
+    elif args.command == "benchmark-hook":
+        from cloud_offload.benchmark_faults import run_fault
+
+        try:
+            receipt = run_fault(args.kind)
+        except Exception as exc:  # noqa: BLE001 - hook returns a safe failure code
+            print(
+                f"Benchmark {args.kind} canary failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+        print(json.dumps(receipt, sort_keys=True))
 
     elif args.command == "benchmark":
         from cloud_offload.benchmark import (
