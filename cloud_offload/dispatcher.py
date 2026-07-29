@@ -116,7 +116,9 @@ class Dispatcher:
                 if config.api_key_for(name)
             }
             if not self.connectors:
-                self.connectors = {config.provider: create_connector(config.provider, config)}
+                self.connectors = {
+                    config.provider: create_connector(config.provider, config)
+                }
         self.connector = self.connectors.get(config.provider) or next(
             iter(self.connectors.values())
         )
@@ -180,7 +182,9 @@ class Dispatcher:
         Args:
             once: If True, run one iteration and exit (for testing)
         """
-        logger.info(f"Dispatcher starting (min_queue_depth={self.config.min_queue_depth})")
+        logger.info(
+            f"Dispatcher starting (min_queue_depth={self.config.min_queue_depth})"
+        )
 
         while True:
             try:
@@ -223,7 +227,9 @@ class Dispatcher:
 
         # Count queued jobs
         queued_count = self.queue.count_by_status(JobStatus.QUEUED)
-        logger.debug(f"Queue: {queued_count} queued, {len(self.active_instances)} workers active")
+        logger.debug(
+            f"Queue: {queued_count} queued, {len(self.active_instances)} workers active"
+        )
 
         profiles = configured_worker_profiles(self.config)
         for provider_name in self.connectors:
@@ -324,7 +330,10 @@ class Dispatcher:
             return None
         minimum_vram = max(
             [worker_profile_min_gpu_ram(profile)]
-            + [int(job.params.get("min_gpu_ram_gb") or 0) for job in (queued_jobs or [])]
+            + [
+                int(job.params.get("min_gpu_ram_gb") or 0)
+                for job in (queued_jobs or [])
+            ]
         )
         requested_gpu_types = [
             str(job.params.get("gpu_type"))
@@ -359,7 +368,10 @@ class Dispatcher:
                     **placement_decision.explanation(),
                 },
             )
-            if placement_decision.action != "launch" or not placement_decision.candidate:
+            if (
+                placement_decision.action != "launch"
+                or not placement_decision.candidate
+            ):
                 detail = placement_decision.reason
                 self._record_launch_failure(
                     provider_name, profile_name, queued_jobs, detail
@@ -392,7 +404,9 @@ class Dispatcher:
                 f"(type={self.config.gpu_type}, max_rate=${self.config.max_hourly_rate}/hr"
                 + (f", {len(cooling)} on cooldown)" if cooling else ")")
             )
-            self._record_launch_failure(provider_name, profile_name, queued_jobs, detail)
+            self._record_launch_failure(
+                provider_name, profile_name, queued_jobs, detail
+            )
             return None
 
         logger.info(
@@ -432,7 +446,9 @@ class Dispatcher:
             "CLOUD_OFFLOAD_PROVIDER": provider_name,
             "CLOUD_OFFLOAD_IDLE_SHUTDOWN": str(worker_idle_seconds),
             "CLOUD_OFFLOAD_KEEP_WARM": str(self.config.keep_warm).lower(),
-            "CLOUD_OFFLOAD_KEEP_WARM_WARNING": str(self.config.keep_warm_warning_seconds),
+            "CLOUD_OFFLOAD_KEEP_WARM_WARNING": str(
+                self.config.keep_warm_warning_seconds
+            ),
             "CLOUD_OFFLOAD_WORKER_WHEELHOUSE_URL": wheelhouse_url,
             "CLOUD_OFFLOAD_WORKER_WHEELHOUSE_SHA256": wheelhouse_sha256,
             "CLOUD_OFFLOAD_WORKER_PROFILE": profile_name,
@@ -467,11 +483,22 @@ class Dispatcher:
         placement = placement_decision.placement() if placement_decision else None
         if placement and placement_decision and placement_decision.candidate:
             volume = placement_decision.candidate.volume
+            selected_manifest_id = (
+                placement_decision.candidate.manifest_ids[0]
+                if placement_decision.candidate.manifest_ids
+                else ""
+            )
             for queued_job in queued_jobs or []:
                 queued_job.params["prepared_requirement"] = requirements
                 queued_job.params["cache_volume_id"] = volume.id
-                queued_job.params["cache_provider_volume_id"] = volume.provider_volume_id
+                queued_job.params["cache_provider_volume_id"] = (
+                    volume.provider_volume_id
+                )
                 queued_job.params["cache_datacenter_id"] = volume.datacenter_id
+                if selected_manifest_id:
+                    queued_job.params["cache_manifest_id"] = selected_manifest_id
+                else:
+                    queued_job.params.pop("cache_manifest_id", None)
                 self.queue.update(queued_job)
             env_vars.update(
                 {
@@ -479,8 +506,8 @@ class Dispatcher:
                     "CLOUD_OFFLOAD_CACHE_VOLUME_ID": volume.id,
                     "CLOUD_OFFLOAD_CACHE_EXPECTED_PROVIDER_VOLUME_ID": volume.provider_volume_id,
                     "CLOUD_OFFLOAD_CACHE_MANIFEST": (
-                        placement_decision.candidate.manifest_ids[0]
-                        if placement_decision.candidate.manifest_ids
+                        selected_manifest_id
+                        if selected_manifest_id
                         else requirements["profile_fingerprint"]
                     ),
                     "CLOUD_OFFLOAD_CACHE_MODE": "restore-and-populate",
@@ -579,8 +606,11 @@ class Dispatcher:
                     }
                     for queued_job in queued_jobs or []:
                         for key in (
-                            "prepared_requirement", "cache_volume_id",
-                            "cache_provider_volume_id", "cache_datacenter_id",
+                            "prepared_requirement",
+                            "cache_volume_id",
+                            "cache_provider_volume_id",
+                            "cache_datacenter_id",
+                            "cache_manifest_id",
                         ):
                             queued_job.params.pop(key, None)
                         self.queue.update(queued_job)
@@ -703,8 +733,11 @@ class Dispatcher:
                         ),
                     )
                     return PlacementDecision(
-                        "launch", PlacementCandidate(offer, None),
-                        f"{reason}_running_cold", (), fallback=True,
+                        "launch",
+                        PlacementCandidate(offer, None),
+                        f"{reason}_running_cold",
+                        (),
+                        fallback=True,
                     )
             return PlacementDecision("unavailable", None, reason, ())
 
@@ -716,10 +749,7 @@ class Dispatcher:
                 if registered.provider != provider_name:
                     continue
                 actual = connector.get_storage(registered.provider_volume_id)
-                if (
-                    actual is None
-                    or actual.datacenter_id != registered.datacenter_id
-                ):
+                if actual is None or actual.datacenter_id != registered.datacenter_id:
                     self.cache_registry.mark_volume(registered.id, "degraded")
                     if registered.provider_volume_id == existing:
                         return storage_failure(
@@ -728,7 +758,9 @@ class Dispatcher:
                             else "configured_cache_volume_wrong_datacenter"
                         )
 
-            if existing and not self.cache_registry.get_provider_volume(provider_name, existing):
+            if existing and not self.cache_registry.get_provider_volume(
+                provider_name, existing
+            ):
                 provider_volume = connector.get_storage(existing)
                 if provider_volume is None:
                     return storage_failure("configured_cache_volume_not_found")
@@ -745,7 +777,8 @@ class Dispatcher:
                 )
 
             ready = [
-                item for item in self.cache_registry.list_volumes(status="ready")
+                item
+                for item in self.cache_registry.list_volumes(status="ready")
                 if item.provider == provider_name
             ]
             if not ready and not existing:
@@ -801,7 +834,9 @@ class Dispatcher:
         for volume in self.cache_registry.list_volumes(status="ready"):
             if volume.provider != provider_name:
                 continue
-            if policy.get("policy") == "pinned" and volume.datacenter_id != policy.get("region"):
+            if policy.get("policy") == "pinned" and volume.datacenter_id != policy.get(
+                "region"
+            ):
                 continue
             constraints = PlacementConstraints(
                 datacenter_ids=(volume.datacenter_id,),
@@ -1011,10 +1046,7 @@ cloud-offload worker --poll 10
                     return False
                 return seen >= launched_at
 
-            registered = any(
-                registered_after_launch(worker)
-                for worker in workers
-            )
+            registered = any(registered_after_launch(worker) for worker in workers)
             if registered:
                 self.runner_feedback_at.pop(instance_id, None)
                 continue
@@ -1028,8 +1060,7 @@ cloud-offload worker --poll 10
             ]
             last_feedback = self.runner_feedback_at.get(instance_id)
             if queued_jobs and (
-                last_feedback is None
-                or now - last_feedback >= timedelta(seconds=10)
+                last_feedback is None or now - last_feedback >= timedelta(seconds=10)
             ):
                 elapsed = round((now - launched_at).total_seconds(), 1)
                 self._publish_launch_event(
@@ -1055,8 +1086,7 @@ cloud-offload worker --poll 10
                 continue
 
             detail = (
-                f"Runner did not register within "
-                f"{RUNNER_REGISTRATION_TIMEOUT_SECONDS}s"
+                f"Runner did not register within {RUNNER_REGISTRATION_TIMEOUT_SECONDS}s"
             )
             logger.error("Worker %s %s; terminating", instance_id, detail.lower())
             self._record_launch_failure(

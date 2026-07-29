@@ -126,6 +126,8 @@ class CoordinatorManifestAuthority:
             raise RuntimeError("Coordinator channel cannot verify prepared manifests")
         if not callable(getattr(channel, "announce_prepared_manifest", None)):
             raise RuntimeError("Coordinator channel cannot announce prepared manifests")
+        if not callable(getattr(channel, "fetch_prepared_manifest", None)):
+            raise RuntimeError("Coordinator channel cannot fetch prepared manifests")
         self.channel = channel
         self.job_id: str | None = None
         self.volume_id: str | None = None
@@ -145,6 +147,15 @@ class CoordinatorManifestAuthority:
 
     def verify(self, manifest: dict[str, Any]) -> dict[str, Any]:
         return self.channel.verify_prepared_manifest(manifest)
+
+    def fetch(self, manifest_id: str) -> dict[str, Any]:
+        if not self.job_id or not self.volume_id:
+            raise RuntimeError(
+                "Prepared manifest fetches require an active coordinator job and volume"
+            )
+        return self.channel.fetch_prepared_manifest(
+            manifest_id, job_id=self.job_id, volume_id=self.volume_id
+        )
 
     def announce(self, manifest: dict[str, Any], *, generation: str) -> dict[str, Any]:
         if not self.job_id or not self.volume_id:
@@ -180,15 +191,11 @@ def environment_key(runtime: dict[str, Any]) -> str:
 
 
 def kernel_key(runtime: dict[str, Any]) -> str:
-    required = (
-        "code_digest", "torch", "cuda", "driver_constraint", "gpu_capability"
-    )
+    required = ("code_digest", "torch", "cuda", "driver_constraint", "gpu_capability")
     return fingerprint({key: runtime.get(key) for key in required})
 
 
-def profile_key(
-    runtime_profile: str, required_artifact_keys: Iterable[str]
-) -> str:
+def profile_key(runtime_profile: str, required_artifact_keys: Iterable[str]) -> str:
     return fingerprint(
         {
             "runtime_profile": str(runtime_profile),
@@ -215,7 +222,9 @@ def artifact_requirement_key(artifact: dict[str, Any]) -> str | None:
         return profile_weight_requirement_key(
             str(source.get("repo_id") or ""),
             str(source.get("revision") or ""),
-            None if source.get("snapshot") is True else str(source.get("filename") or ""),
+            None
+            if source.get("snapshot") is True
+            else str(source.get("filename") or ""),
         )
     if kind == "custom-node-bundle":
         return custom_node_requirement_key(
@@ -261,7 +270,11 @@ _TIER_FIELDS = {
     "portable": (),
     "runtime-bound": ("image_digest", "platform", "python_abi", "dependency_lock"),
     "gpu-class-bound": (
-        "code_digest", "torch", "cuda", "driver_constraint", "gpu_capability"
+        "code_digest",
+        "torch",
+        "cuda",
+        "driver_constraint",
+        "gpu_capability",
     ),
 }
 
@@ -497,8 +510,14 @@ class PreparedStateCAS:
         self.root = Path(root).resolve()
         self.signer = signer
         for name in (
-            "blobs", "bundles", "manifests", "indexes", "staging", "quarantine",
-            "leases", "pending-announcements",
+            "blobs",
+            "bundles",
+            "manifests",
+            "indexes",
+            "staging",
+            "quarantine",
+            "leases",
+            "pending-announcements",
         ):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         self._index_thread_lock = _local_publication_lock(self.root)
@@ -555,7 +574,9 @@ class PreparedStateCAS:
                 f"Cannot identify expected cache volume {expected_volume_id} at {self.root}"
             )
 
-    def _lease(self, digest: str, writer_id: str, ttl_seconds: int = 900) -> Path | None:
+    def _lease(
+        self, digest: str, writer_id: str, ttl_seconds: int = 900
+    ) -> Path | None:
         lease = self._resolve(f"leases/{normalize_digest(digest)}.json")
         lease.parent.mkdir(parents=True, exist_ok=True)
         payload = canonical_json(
@@ -590,7 +611,9 @@ class PreparedStateCAS:
         source = Path(source)
         digest = normalize_digest(expected_digest)
         if not source_verified and sha256_file(source) != digest:
-            raise CacheCorruptionError(f"Population source does not match sha256:{digest}")
+            raise CacheCorruptionError(
+                f"Population source does not match sha256:{digest}"
+            )
         target = self._resolve(bundle_key(digest) if bundle else blob_key(digest))
         if target.is_file():
             self.verify_object(digest, target=target)
@@ -666,12 +689,18 @@ class PreparedStateCAS:
                         time.sleep(0.01)
 
     def verify_object(
-        self, digest: str, *, target: Path | None = None, expected_size: int | None = None
+        self,
+        digest: str,
+        *,
+        target: Path | None = None,
+        expected_size: int | None = None,
     ) -> Path:
         normalized = normalize_digest(digest)
         path = target or self._resolve(blob_key(normalized))
         if not path.is_file():
-            raise CacheCorruptionError(f"Prepared object sha256:{normalized} is missing")
+            raise CacheCorruptionError(
+                f"Prepared object sha256:{normalized} is missing"
+            )
         if expected_size is not None and path.stat().st_size != int(expected_size):
             raise CacheCorruptionError(
                 f"Prepared object sha256:{normalized} has the wrong size"
@@ -695,7 +724,9 @@ class PreparedStateCAS:
                 self._resolve(bundle_key(normalized)),
             ]
         )
-        source = next((candidate for candidate in candidates if candidate.exists()), None)
+        source = next(
+            (candidate for candidate in candidates if candidate.exists()), None
+        )
         if source is None:
             return None
         target = self._resolve(
@@ -733,7 +764,9 @@ class PreparedStateCAS:
         temporary.write_bytes(canonical_json(verified))
         os.replace(temporary, target)
         self.publish_index(
-            [verified], generation=generation, manifest_keys={verified["manifest_id"]: key}
+            [verified],
+            generation=generation,
+            manifest_keys={verified["manifest_id"]: key},
         )
         announcer = getattr(self.signer, "announce", None)
         if callable(announcer):
@@ -852,26 +885,48 @@ class PreparedStateCAS:
             )
             and (not manifest_id or entry["manifest_id"] == manifest_id)
         ]
-        if not candidates:
-            if manifest_id:
+        if manifest_id:
+            document = None
+            if candidates:
+                newest = max(
+                    candidates,
+                    key=lambda item: (
+                        item.get("created_at") or "",
+                        item.get("generation") or "",
+                    ),
+                )
+                key = newest.get("storage_key")
+                path = self._resolve(key) if key else None
+                if path and path.is_file():
+                    document = json.loads(path.read_text(encoding="utf-8"))
+            if document is None:
                 direct = self._resolve(manifest_by_id_key(manifest_id))
                 if direct.is_file():
                     document = json.loads(direct.read_text(encoding="utf-8"))
-                    verified = self.signer.verify(document)
-                    if verified["manifest_id"] != digest_id(manifest_id):
-                        raise ManifestError(
-                            "Direct manifest path contains a different manifest"
-                        )
-                    if (
-                        profile_fingerprint
-                        and verified["profile_fingerprint"] != profile_fingerprint
-                    ):
-                        return None
-                    return verified
+            if document is None:
+                fetch = getattr(self.signer, "fetch", None)
+                if not callable(fetch):
+                    return None
+                document = fetch(manifest_id)
+            verified = self.signer.verify(document)
+            if verified["manifest_id"] != digest_id(manifest_id):
+                raise ManifestError(
+                    "Exact manifest source contains a different manifest"
+                )
+            if (
+                profile_fingerprint
+                and verified["profile_fingerprint"] != profile_fingerprint
+            ):
+                return None
+            return verified
+        if not candidates:
             return None
         newest = max(
             candidates,
-            key=lambda item: (item.get("created_at") or "", item.get("generation") or ""),
+            key=lambda item: (
+                item.get("created_at") or "",
+                item.get("generation") or "",
+            ),
         )
         key = newest.get("storage_key")
         if not key:
@@ -892,7 +947,10 @@ class PreparedStateCAS:
         ]
         for entry in sorted(
             candidates,
-            key=lambda item: (item.get("created_at") or "", item.get("generation") or ""),
+            key=lambda item: (
+                item.get("created_at") or "",
+                item.get("generation") or "",
+            ),
             reverse=True,
         ):
             manifest = self.find_manifest(manifest_id=entry["manifest_id"])
@@ -943,11 +1001,15 @@ class PreparedStateCAS:
         ):
             self._extract_verified_bundle(source, destination)
         elif symlink_portable:
-            temporary = destination.with_name(destination.name + f".{uuid.uuid4().hex}.tmp")
+            temporary = destination.with_name(
+                destination.name + f".{uuid.uuid4().hex}.tmp"
+            )
             temporary.symlink_to(source)
             os.replace(temporary, destination)
         else:
-            temporary = destination.with_name(destination.name + f".{uuid.uuid4().hex}.tmp")
+            temporary = destination.with_name(
+                destination.name + f".{uuid.uuid4().hex}.tmp"
+            )
             shutil.copyfile(source, temporary)
             os.replace(temporary, destination)
         return destination
@@ -961,7 +1023,9 @@ class PreparedStateCAS:
                 for member in bundle.getmembers():
                     relative = PurePosixPath(member.name)
                     if relative.is_absolute() or ".." in relative.parts:
-                        raise CacheCorruptionError("Prepared bundle contains path traversal")
+                        raise CacheCorruptionError(
+                            "Prepared bundle contains path traversal"
+                        )
                     if not member.isdir() and not member.isfile():
                         raise CacheCorruptionError(
                             "Prepared bundle contains a link or special filesystem member"
@@ -1056,7 +1120,9 @@ class RunPodS3PreparedStore:
             try:
                 import boto3
             except ImportError as exc:
-                raise ImportError("boto3 is required for RunPod S3 prepopulation") from exc
+                raise ImportError(
+                    "boto3 is required for RunPod S3 prepopulation"
+                ) from exc
             client_factory = boto3.client
         client = client_factory(
             "s3",
@@ -1110,7 +1176,9 @@ class RunPodS3PreparedStore:
         source = Path(source)
         digest = normalize_digest(expected_digest)
         if sha256_file(source) != digest:
-            raise CacheCorruptionError(f"Prepopulation source does not match sha256:{digest}")
+            raise CacheCorruptionError(
+                f"Prepopulation source does not match sha256:{digest}"
+            )
         key = str(storage_key or blob_key(digest))
         if self.exists(key, source.stat().st_size):
             return key
@@ -1143,10 +1211,14 @@ class RunPodS3PreparedStore:
             payload = canonical_json(manifest)
             self.client.put_object(Bucket=self.volume_id, Key=key, Body=payload)
             if not self.exists(key, len(payload)):
-                raise CacheCorruptionError("RunPod S3 manifest publication was incomplete")
+                raise CacheCorruptionError(
+                    "RunPod S3 manifest publication was incomplete"
+                )
             entries = self._load_latest_index_entries()
             entries = [
-                item for item in entries if item.get("manifest_id") != manifest["manifest_id"]
+                item
+                for item in entries
+                if item.get("manifest_id") != manifest["manifest_id"]
             ]
             entries.append(
                 {
@@ -1157,9 +1229,12 @@ class RunPodS3PreparedStore:
                     "generation": generation,
                     "artifacts": [
                         {
-                            "digest": item["digest"], "kind": item["kind"],
-                            "size": item["size"], "portability": item["portability"],
-                            "requirements": item["requirements"], "policy": item["policy"],
+                            "digest": item["digest"],
+                            "kind": item["kind"],
+                            "size": item["size"],
+                            "portability": item["portability"],
+                            "requirements": item["requirements"],
+                            "policy": item["policy"],
                         }
                         for item in manifest["artifacts"]
                     ],
@@ -1177,7 +1252,9 @@ class RunPodS3PreparedStore:
                 Bucket=self.volume_id, Key=index_key, Body=index_payload
             )
             if not self.exists(index_key, len(index_payload)):
-                raise CacheCorruptionError("RunPod S3 inventory publication was incomplete")
+                raise CacheCorruptionError(
+                    "RunPod S3 inventory publication was incomplete"
+                )
             pointer = generation.encode("utf-8")
             # RunPod S3 offers no conditional writes. This small pointer is
             # published last under a coordinator-side critical section; every
@@ -1222,9 +1299,7 @@ class RunPodS3PreparedStore:
         response = self.client.get_object(Bucket=self.volume_id, Key=str(key))
         return json.loads(response["Body"].read())
 
-    def download_verified(
-        self, key: str, digest: str, destination: str | Path
-    ) -> Path:
+    def download_verified(self, key: str, digest: str, destination: str | Path) -> Path:
         destination = Path(destination)
         self.client.download_file(self.volume_id, str(key), str(destination))
         if sha256_file(destination) != normalize_digest(digest):
@@ -1238,7 +1313,10 @@ class RunPodS3PreparedStore:
         temporary = Path(temporary_name)
         try:
             self.client.download_file(self.volume_id, key, str(temporary))
-            if temporary.stat().st_size != int(size) or sha256_file(temporary) != digest:
+            if (
+                temporary.stat().st_size != int(size)
+                or sha256_file(temporary) != digest
+            ):
                 raise CacheCorruptionError(
                     f"RunPod S3 object {key} failed digest verification"
                 )

@@ -632,7 +632,8 @@ This ledger records merged implementation evidence across both repositories.
 | [#18](https://github.com/jethac/cloud-offload/pull/18) | Recomputes the injected requirement profile, publishes signed manifests by immutable exact ID, falls back to that verified object when a mounted index is stale, and starts corruption observation at `cache_mount_ready`; also brings this goal record through the fresh-object campaign. | Merged as `f4d9cf9`; 529 tests passed. A bounded replay proved that the hook must fingerprint the configured launch profile name, not its requested capability name. |
 | [#19](https://github.com/jethac/cloud-offload/pull/19) | Resolves the requested worker capability to the normalized configured launch profile before computing the corruption canary fingerprint and records the bounded failed exact-ID replay. | Merged as `3e43ff5`; 530 tests passed. The next replay proved exact selection and direct loading, then exposed first-write object caching. |
 | [#20](https://github.com/jethac/cloud-offload/pull/20) | Writes corrupt bytes as the first and only value of the synthetic S3 key, keeps valid bytes only in coordinator fallback storage, and records the exact-selection replay. | Merged as `b1e6509`; 530 tests passed. Its bounded replay proved that a deterministic canary still reused the same digest and mounted object identity across campaigns. |
-| [#21](https://github.com/jethac/cloud-offload/pull/21) | Gives every corruption campaign a safe random nonce and uses it to create a new payload, digest, object key, file name, and state path across all hook stages. It also records the deterministic-identity replay. | 531 tests pass; merge and a bounded production replay remain the evidence gate. |
+| [#21](https://github.com/jethac/cloud-offload/pull/21) | Gives every corruption campaign a safe random nonce and uses it to create a new payload, digest, object key, file name, and state path across all hook stages. It also records the deterministic-identity replay. | Merged as `a33fd16`; 531 tests passed. Its replay proved unique identity and exact placement, but the mounted view could not read the new manifest and automated cleanup missed one fallback-created registry projection. |
+| [#22](https://github.com/jethac/cloud-offload/pull/22) | Persists the exact placement manifest on the assigned job, adds an active-job and volume-bound signed manifest fetch for stale mounted views, keeps exact placement authoritative in the worker, and removes fallback-created synthetic manifests during cleanup. It also records the unique-identity replay. | 533 tests pass; merge, a pinned worker image, and a bounded production replay remain the evidence gate. |
 
 ### ComfyUI extension repository
 
@@ -774,6 +775,33 @@ not blanket production-readiness claims:
   state, blob, and coordinator fallback were absent. The interrupted command has
   no accepted cost figure; its configured scenario and campaign ceiling was
   $0.50.
+- The PR #21 replay created job `73228360-51f3-4522-adbb-4b1161bc3002` and
+  exact Pod `3nalcbc4qt2iom`. It used new 82-byte synthetic digest
+  `sha256:d1562543c90e65de8384031c75c4f1f9e9470362fe3619cb49b6349429d76f1f`.
+  This proves that campaign identity no longer aliases any earlier canary.
+  Placement selected exact manifest
+  `sha256:bfe5146c7b935c3cd942875ce72233ba25f29121ff3719f66afee3d6179fb16d`,
+  and the worker emitted `cache_mount_ready`.
+- The PR #21 replay is still failed evidence. The mounted worker view verified
+  base manifest
+  `sha256:5efb685fc493e5c12882587f2365849e8b4a4f94a0809a334fb6236adf996631`
+  but could not read the new exact manifest. It reported the canary as
+  `cache_artifact_miss` with reason `manifest_not_found`, then populated the
+  valid coordinator fallback. The operator cancelled immediately because no
+  later quarantine could satisfy the canary. The scorecard failed after 294.609
+  seconds with a conservative $0.121935 compute upper bound. Preparation and
+  cleanup hooks exited successfully, the observation hook failed as required,
+  no orphan was reported, the exact Pod became provider-absent, provider
+  inventory returned empty, and policy returned `smart`.
+- Automated cleanup was not complete. Fallback population announced registry
+  manifest
+  `sha256:c4a4ba7f13f8146abafae257dbd033f651c5d5ff15d3fdd8e74a4ff4cb13b7b7`
+  with the synthetic artifact after the hook recorded its original cleanup
+  target. It had no durable index entry or manifest object. An exact manual removal
+  removed that artifact, restored six normal artifact projections, and left no
+  synthetic manifest, artifact, invalidation, object, quarantine, fallback,
+  state object, active job, worker, or provider instance. This manual repair is
+  cleanup evidence, not an accepted automated canary.
 
 The accepted cold/hot scorecard and four accepted failure canaries prove a
 larger part of M0, but M0 is not complete until the corruption canary passes and
@@ -793,6 +821,7 @@ a compact redacted evidence projection is committed.
 | Corruption, first exact-ID attempt | **Failed safely** | The immutable worker path was present, but capability-name fingerprinting did not match the dispatcher's configured launch-profile fingerprint. The run stopped at placement and cleanup was complete. |
 | Corruption, first-write attempt | **Failed safely** | Exact manifest selection and loading passed, but writing valid bytes before corrupt bytes let the mount retain the valid first value. The run stopped after the synthetic verified hit and cleanup was complete. |
 | Corruption, deterministic-campaign attempt | **Failed safely** | Corrupt-first publication worked, but each campaign reused the same digest and object key. A mounted volume view retained earlier valid bytes. The run stopped after the synthetic verified hit and cleanup was complete. |
+| Corruption, unique campaign attempt | **Failed; cleaned manually** | Unique digest and exact placement passed, but the mounted view missed the new manifest and used coordinator fallback. Automated cleanup missed its derived registry projection; exact manual cleanup removed it. |
 | Compact redacted projection | **Required** | Accepted raw scorecards remain local under `.runlogs/`; a safe comparable projection still must be committed. |
 
 ## Current execution state and immediate next work
@@ -835,9 +864,12 @@ Status snapshot as of 2026-07-29:
   and loading, then showed that a valid first write can remain cached after an
   object update. PR #20 made corrupt bytes the first and only S3 write. Its
   replay then proved that the deterministic scenario digest still reused one
-  mounted object identity across campaigns. The campaign-nonce correction now
-  passes 531 tests on its PR branch. Corruption remains unaccepted until that
-  change merges and a bounded replay passes.
+  mounted object identity across campaigns. PR #21 corrected campaign identity.
+  Its replay proved that a fresh mounted view can still miss a newly published
+  exact manifest and that fallback publication expands the cleanup target set.
+  An authenticated exact-manifest fetch and complete derived-manifest cleanup
+  now pass 533 tests on the next PR branch. Corruption remains unaccepted until
+  that change merges, a worker image is pinned, and a bounded replay passes.
 - The first unmet M0 work is therefore: compute the corruption manifest from the
   actual injected requirement profile; publish and resolve it through an
   immutable manifest-by-ID path when a mounted mutable index is stale; trigger
@@ -865,13 +897,23 @@ The direct-manifest corruption fix is bounded to these contracts:
    digest, object key, file name, and state path. The same nonce is passed to the
    prepare, observe, and cleanup hooks. A campaign cannot reuse a synthetic
    mounted object identity from an earlier run.
-6. `PreparedStateCAS.find_manifest(manifest_id=...)` may load and verify that
-   exact immutable object if the mounted `indexes/latest` view is stale. A
-   mismatched ID or bad signature remains a hard failure.
-7. Corruption observation defaults to the durable `cache_mount_ready` event so
+6. The dispatcher persists the selected exact manifest ID in the assigned job.
+   An authenticated worker may fetch only that ID, for its active job and bound
+   volume, from the coordinator registry. The coordinator verifies the signed
+   document and volume claim before it returns the manifest.
+7. `PreparedStateCAS.find_manifest(manifest_id=...)` first uses a mounted indexed
+   or immutable direct object. If either mounted view is stale, it may fetch the
+   exact assigned manifest through the coordinator authority. A mismatched ID,
+   profile, volume claim, or signature remains a hard failure. A later
+   same-profile worker publication cannot replace the exact placement promise.
+8. Corruption cleanup removes every registry manifest, durable metadata object,
+   invalidation, quarantine object, blob, and fallback that references the
+   unique digest, including manifests created by valid fallback population.
+9. Corruption observation defaults to the durable `cache_mount_ready` event so
    a finite observation window is not consumed by unrelated image startup.
-8. Existing manifest/index behavior remains the normal path; the direct object
-   is a narrow exact-ID fallback, not a second source of unsigned truth.
+10. Existing manifest/index behavior remains the normal path. The coordinator
+    fetch is a narrow exact-ID recovery path, not a second source of unsigned
+    truth or a general manifest query surface.
 
 Before this change can become accepted evidence it must pass focused and full
 tests, merge through a reviewed PR, and pass one spend-capped production replay.

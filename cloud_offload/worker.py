@@ -107,7 +107,9 @@ class Worker:
     ):
         self.config = config
         self.worker_id = resolve_worker_id(worker_id)
-        self.queue = queue if queue is not None else worker_queue(config, self.worker_id)
+        self.queue = (
+            queue if queue is not None else worker_queue(config, self.worker_id)
+        )
         self.storage = storage or create_storage(config)
 
         self.running = False
@@ -179,14 +181,10 @@ class Worker:
                 f"{name} is not valid JSON ({exc}): {Worker._quote_env(raw)}"
             ) from exc
         if not isinstance(entries, list):
-            raise RuntimeError(
-                f"{name} must be a JSON list: {Worker._quote_env(raw)}"
-            )
+            raise RuntimeError(f"{name} must be a JSON list: {Worker._quote_env(raw)}")
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
-                raise RuntimeError(
-                    f"{name}[{index}] must be a JSON object: {entry!r}"
-                )
+                raise RuntimeError(f"{name}[{index}] must be a JSON object: {entry!r}")
         return entries
 
     @staticmethod
@@ -284,8 +282,16 @@ class Worker:
             first = result.stdout.strip().splitlines()[0]
             name, memory_mib = first.rsplit(",", 1)
             return name.strip(), float(memory_mib.strip()) / 1024.0
-        except (FileNotFoundError, IndexError, OSError, ValueError, subprocess.SubprocessError):
-            logger.warning("Unable to detect an NVIDIA GPU; constrained jobs will not be claimed")
+        except (
+            FileNotFoundError,
+            IndexError,
+            OSError,
+            ValueError,
+            subprocess.SubprocessError,
+        ):
+            logger.warning(
+                "Unable to detect an NVIDIA GPU; constrained jobs will not be claimed"
+            )
             return "", 0.0
 
     def run(
@@ -370,7 +376,9 @@ class Worker:
             if self.running:
                 time.sleep(poll_interval)
 
-        logger.info(f"Worker {self.worker_id} shutting down (processed {jobs_processed} jobs)")
+        logger.info(
+            f"Worker {self.worker_id} shutting down (processed {jobs_processed} jobs)"
+        )
 
     def _should_shutdown(self) -> bool:
         """Check if worker should shut down due to idle timeout."""
@@ -558,7 +566,9 @@ class Worker:
             publish(pack_id, source, present=present)
             if present:
                 logger.info(
-                    "Custom node pack already present, skipping %s (%s)", pack_id, target
+                    "Custom node pack already present, skipping %s (%s)",
+                    pack_id,
+                    target,
                 )
                 if restored and entry.get("install_requirements", True):
                     self._install_pack_requirements(job, pack_id, target)
@@ -734,7 +744,9 @@ class Worker:
 
         registry_id = str(entry.get("registry_id") or "")
         version = str(entry.get("version") or "")
-        base = os.environ.get("CLOUD_OFFLOAD_REGISTRY_URL", DEFAULT_REGISTRY_URL).rstrip("/")
+        base = os.environ.get(
+            "CLOUD_OFFLOAD_REGISTRY_URL", DEFAULT_REGISTRY_URL
+        ).rstrip("/")
         response = requests.get(
             f"{base}/nodes/{registry_id}/versions", timeout=REGISTRY_TIMEOUT_SECONDS
         )
@@ -841,9 +853,13 @@ class Worker:
                 ["-C", str(staging), "checkout", "--detach", commit],
                 f"checking out {commit[:12]} of {url}",
             )
-            head = self._run_git(
-                ["-C", str(staging), "rev-parse", "HEAD"], f"reading HEAD of {url}"
-            ).strip().lower()
+            head = (
+                self._run_git(
+                    ["-C", str(staging), "rev-parse", "HEAD"], f"reading HEAD of {url}"
+                )
+                .strip()
+                .lower()
+            )
             if head != commit:
                 raise RuntimeError(
                     f"Custom node pack {url} checked out {head} but the worker profile "
@@ -870,7 +886,9 @@ class Worker:
             )
         return result.stdout or ""
 
-    def _install_pack_requirements(self, job: Job | None, pack_id: str, target: Path) -> None:
+    def _install_pack_requirements(
+        self, job: Job | None, pack_id: str, target: Path
+    ) -> None:
         """Install a pack's requirements.txt, with pip's output in the events.
 
         A pack whose dependencies are missing imports at ComfyUI startup and
@@ -942,7 +960,8 @@ class Worker:
         event_writer = getattr(self.queue, "append_event", None)
         progress_setter = getattr(self.queue, "set_progress", None)
         total_files = sum(
-            len(entry["files"]) if entry.get("files") else 1 for entry in pending_weights
+            len(entry["files"]) if entry.get("files") else 1
+            for entry in pending_weights
         ) + len(assets)
         downloaded = 0
 
@@ -985,7 +1004,9 @@ class Worker:
                     target = target_dir / filename
                     if target.is_file() and target.stat().st_size > 0:
                         logger.info(
-                            "Weights already staged, skipping %s (%s)", filename, repo_id
+                            "Weights already staged, skipping %s (%s)",
+                            filename,
+                            repo_id,
                         )
                         downloaded += 1
                         continue
@@ -1103,8 +1124,11 @@ class Worker:
             )
             if self.cache_receipt:
                 self.cache_receipt.record(
-                    digest=artifact["digest"], kind="profile-weight", result="hit",
-                    bytes=artifact["size"], reason="verified",
+                    digest=artifact["digest"],
+                    kind="profile-weight",
+                    result="hit",
+                    bytes=artifact["size"],
+                    reason="verified",
                     total_ms=round((time.monotonic() - started) * 1000, 3),
                 )
             return True
@@ -1159,7 +1183,10 @@ class Worker:
 
         digest = sha256_file(target)
         self._cache_event(
-            job, "cache_population_started", kind="profile-weight", digest="sha256:" + digest
+            job,
+            "cache_population_started",
+            kind="profile-weight",
+            digest="sha256:" + digest,
         )
         cache.publish_blob(
             target,
@@ -1183,7 +1210,9 @@ class Worker:
         artifacts = [
             item
             for item in artifacts
-            if not (item.get("kind") == "profile-weight" and item.get("source") == source)
+            if not (
+                item.get("kind") == "profile-weight" and item.get("source") == source
+            )
         ]
         artifacts.append(
             {
@@ -1271,12 +1300,15 @@ class Worker:
         artifact = None
         try:
             for artifact in sorted(
-                artifacts, key=lambda item: str((item.get("source") or {}).get("filename"))
+                artifacts,
+                key=lambda item: str((item.get("source") or {}).get("filename")),
             ):
                 filename = str((artifact.get("source") or {}).get("filename") or "")
                 relative = PurePosixPath(filename)
                 if not filename or relative.is_absolute() or ".." in relative.parts:
-                    raise RuntimeError("Prepared snapshot contains an unsafe destination")
+                    raise RuntimeError(
+                        "Prepared snapshot contains an unsafe destination"
+                    )
                 target = (target_dir / relative).resolve()
                 try:
                     target.relative_to(target_dir.resolve())
@@ -1508,7 +1540,10 @@ class Worker:
                         for item in manifest.get("artifacts") or []
                     )
                 )
-                if getattr(self, "prepared_cache", None) is not None and not represented:
+                if (
+                    getattr(self, "prepared_cache", None) is not None
+                    and not represented
+                ):
                     self._populate_declared_asset(asset, target)
                 return
             quarantine = models_dir / QUARANTINE_DIRNAME / present / filename
@@ -1569,7 +1604,9 @@ class Worker:
             if not expected or not root.parent.is_dir():
                 from cloud_offload.prepared_state import CacheMountError
 
-                raise CacheMountError(f"Expected prepared cache mount is absent: {root}")
+                raise CacheMountError(
+                    f"Expected prepared cache mount is absent: {root}"
+                )
             # The provider mounted /workspace and proved its identity. Creating
             # our namespaced child on an empty first-use volume is safe.
             root.mkdir(parents=False)
@@ -1584,7 +1621,9 @@ class Worker:
                 "CLOUD_OFFLOAD_CACHE_MANIFEST", ""
             ).strip()
         except json.JSONDecodeError as exc:
-            raise RuntimeError("Prepared cache instructions are malformed JSON") from exc
+            raise RuntimeError(
+                "Prepared cache instructions are malformed JSON"
+            ) from exc
         from cloud_offload.prepared_state import (
             CoordinatorManifestAuthority,
             PreparedStateCAS,
@@ -1619,17 +1658,17 @@ class Worker:
         if cache is None:
             return None
         profile = str(self.cache_requirements.get("profile_fingerprint") or "")
+        selected = str(getattr(self, "cache_manifest_instruction", "") or "")
         latest = getattr(self, "_latest_prepared_manifest", None)
-        if latest and latest.get("profile_fingerprint") == profile:
+        if selected and selected != profile:
+            # An exact placement promise is authoritative for this Pod. A
+            # same-profile manifest that this worker publishes later cannot
+            # replace it during the assigned job.
+            manifest = cache.find_manifest(manifest_id=selected)
+        elif latest and latest.get("profile_fingerprint") == profile:
             manifest = latest
         else:
-            selected = str(getattr(self, "cache_manifest_instruction", "") or "")
-            if selected and selected != profile:
-                # A selected manifest is a placement promise. Do not silently pick
-                # a different generation when that exact promise is absent.
-                manifest = cache.find_manifest(manifest_id=selected)
-            else:
-                manifest = cache.find_manifest(profile_fingerprint=profile)
+            manifest = cache.find_manifest(profile_fingerprint=profile)
         expected_volume = os.environ.get("CLOUD_OFFLOAD_CACHE_VOLUME_ID", "").strip()
         if manifest and expected_volume:
             if str(manifest.get("cache_volume_id") or "") != expected_volume:
@@ -1709,7 +1748,9 @@ class Worker:
                             "datacenter_id": receipt["datacenter_id"],
                             "worker_class": receipt["worker_class"],
                             "image_digest": self.cache_runtime.get("image_digest"),
-                            "strategy": "symlink" if item.get("kind") != "custom-node-bundle" else "extract",
+                            "strategy": "symlink"
+                            if item.get("kind") != "custom-node-bundle"
+                            else "extract",
                             "result": item.get("result") or "unknown",
                             "bytes": int(item.get("bytes") or 0),
                             "file_count": 1,
@@ -1748,7 +1789,11 @@ class Worker:
             source_manifest_id = manifest["manifest_id"] if manifest else None
             artifact = (
                 next(
-                    (item for item in manifest["artifacts"] if item["digest"] == digest),
+                    (
+                        item
+                        for item in manifest["artifacts"]
+                        if item["digest"] == digest
+                    ),
                     None,
                 )
                 if manifest
@@ -1788,13 +1833,13 @@ class Worker:
                 getattr(self, "_verified_prepared_digests", set())
             )
             self._verified_prepared_digests.add(digest)
-            self._record_cache_result(asset, "hit", "verified", started, target.stat().st_size)
+            self._record_cache_result(
+                asset, "hit", "verified", started, target.stat().st_size
+            )
             if shared:
                 # Publish a profile-B reference only after policy and digest
                 # verification. The immutable blob is reused; no origin call.
-                self._populate_declared_asset(
-                    asset, target, blob_already_verified=True
-                )
+                self._populate_declared_asset(asset, target, blob_already_verified=True)
             return True
         except CacheCorruptionError as exc:
             cache.quarantine(
@@ -1822,7 +1867,8 @@ class Worker:
     ) -> None:
         elapsed = round((time.monotonic() - started) * 1000, 3)
         entry = {
-            "digest": "sha256:" + str(asset.get("sha256") or "").removeprefix("sha256:"),
+            "digest": "sha256:"
+            + str(asset.get("sha256") or "").removeprefix("sha256:"),
             "kind": "model-weight",
             "file": str(asset.get("filename") or ""),
             "category": str(asset.get("category") or ""),
@@ -1854,7 +1900,9 @@ class Worker:
         if cache is None:
             return
         policy = {
-            "tenant": str(asset.get("tenant") or self.cache_policy.get("tenant") or "default"),
+            "tenant": str(
+                asset.get("tenant") or self.cache_policy.get("tenant") or "default"
+            ),
             "cacheable": bool(asset.get("cacheable", True)),
             "private": bool(asset.get("private") or asset.get("gated")),
         }
@@ -1866,7 +1914,8 @@ class Worker:
                 self._cache_event(
                     job,
                     "cache_artifact_refused",
-                    digest="sha256:" + str(asset.get("sha256") or "").removeprefix("sha256:"),
+                    digest="sha256:"
+                    + str(asset.get("sha256") or "").removeprefix("sha256:"),
                     reason="asset_policy_refuses_population",
                 )
             return
@@ -1898,12 +1947,16 @@ class Worker:
                     target.stat().st_size,
                     file=str(asset.get("filename") or target.name),
                     category=str(asset.get("category") or ""),
-                ) if job else None,
+                )
+                if job
+                else None,
                 commit_callback=self._cache_commit_reporter(
                     job,
                     "sha256:" + digest,
                     file=str(asset.get("filename") or target.name),
-                ) if job else None,
+                )
+                if job
+                else None,
             )
         self._verified_prepared_digests = set(
             getattr(self, "_verified_prepared_digests", set())
@@ -1959,9 +2012,7 @@ class Worker:
         )
         cache.publish_manifest(
             manifest,
-            verified_digests=set(
-                getattr(self, "_verified_prepared_digests", set())
-            ),
+            verified_digests=set(getattr(self, "_verified_prepared_digests", set())),
         )
         self._latest_prepared_manifest = manifest
         if job:
@@ -1984,9 +2035,7 @@ class Worker:
         self._publish_prepared_artifacts(additions, job)
         self._pending_prepared_artifacts = []
 
-    def _cache_population_reporter(
-        self, job: Job, digest: str, total: int, **fields
-    ):
+    def _cache_population_reporter(self, job: Job, digest: str, total: int, **fields):
         started = time.monotonic()
         last_emit = 0.0
 
@@ -2045,13 +2094,18 @@ class Worker:
                 staging = target.parent / ".cloud-offload-fetch"
                 staging.mkdir(parents=True, exist_ok=True)
                 try:
-                    download = lambda: huggingface_hub.hf_hub_download(
+
+                    def download():
+                        return huggingface_hub.hf_hub_download(
                             repo_id=str(source["repo_id"]),
-                            filename=str(source.get("filename") or asset.get("filename")),
+                            filename=str(
+                                source.get("filename") or asset.get("filename")
+                            ),
                             revision=str(source.get("revision") or ""),
                             local_dir=str(staging),
                             token=token,
-                    )
+                        )
+
                     fetched = (
                         self._run_with_feedback(
                             job,
@@ -2070,7 +2124,9 @@ class Worker:
             else:
                 raise RuntimeError("no source was resolved for it")
         except Exception as exc:
-            raise RuntimeError(f"Declared asset staging failed for {label}: {exc}") from exc
+            raise RuntimeError(
+                f"Declared asset staging failed for {label}: {exc}"
+            ) from exc
 
     @staticmethod
     def _download_asset_url(url: str, target: Path) -> None:
@@ -2118,7 +2174,9 @@ class Worker:
 
     @staticmethod
     def _partition_artifact_key(artifact_id: str) -> str:
-        if len(artifact_id) != 64 or any(c not in "0123456789abcdef" for c in artifact_id):
+        if len(artifact_id) != 64 or any(
+            c not in "0123456789abcdef" for c in artifact_id
+        ):
             raise ValueError(f"Invalid partition artifact ID: {artifact_id}")
         return f"partition-artifacts/{artifact_id[:2]}/{artifact_id}.part"
 
@@ -2126,7 +2184,9 @@ class Worker:
         downloader = getattr(self.queue, "download_artifact", None)
         if callable(downloader):
             return downloader(artifact_id, destination)
-        return self.storage.download(self._partition_artifact_key(artifact_id), destination)
+        return self.storage.download(
+            self._partition_artifact_key(artifact_id), destination
+        )
 
     def _upload_partition_artifact(self, source: Path) -> dict:
         uploader = getattr(self.queue, "upload_artifact", None)
@@ -2134,7 +2194,11 @@ class Worker:
             return uploader(source)
         artifact_id = sha256_file(source)
         self.storage.upload(source, self._partition_artifact_key(artifact_id))
-        return {"artifact_id": artifact_id, "sha256": artifact_id, "size": source.stat().st_size}
+        return {
+            "artifact_id": artifact_id,
+            "sha256": artifact_id,
+            "size": source.stat().st_size,
+        }
 
     def _run_comfyui_partition(self, job: Job, executor) -> dict:
         """Stage typed boundaries, execute the extracted prompt, and publish outputs."""
@@ -2172,7 +2236,9 @@ class Worker:
         input_artifacts = request.get("input_artifacts") or {}
         expected_inputs = {item["key"] for item in partition.get("inputs") or []}
         if set(input_artifacts) != expected_inputs:
-            raise ValueError("Partition input artifact keys do not match the compiled boundary")
+            raise ValueError(
+                "Partition input artifact keys do not match the compiled boundary"
+            )
         input_paths = {}
         for boundary_key, artifact_id in input_artifacts.items():
             path = input_root / f"{boundary_key}.part"
@@ -2199,7 +2265,9 @@ class Worker:
                 output_paths[key] = path
                 seen_outputs.add(key)
         if seen_inputs != expected_inputs or seen_outputs != expected_outputs:
-            raise ValueError("Compiled partition bridge nodes do not match its boundary manifest")
+            raise ValueError(
+                "Compiled partition bridge nodes do not match its boundary manifest"
+            )
 
         total_nodes = max(1, len(workflow))
         finished_nodes: set[str] = set()
@@ -2279,8 +2347,12 @@ class Worker:
         output_artifacts = {}
         for boundary_key, path in output_paths.items():
             if not path.is_file():
-                raise RuntimeError(f"ComfyUI produced no partition output: {boundary_key}")
-            output_artifacts[boundary_key] = self._upload_partition_artifact(path)["artifact_id"]
+                raise RuntimeError(
+                    f"ComfyUI produced no partition output: {boundary_key}"
+                )
+            output_artifacts[boundary_key] = self._upload_partition_artifact(path)[
+                "artifact_id"
+            ]
         return {
             "schema": "comfy.partition.result.v1",
             "partition_id": partition.get("partition_id"),

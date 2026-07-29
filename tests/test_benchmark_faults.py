@@ -18,7 +18,7 @@ from cloud_offload.benchmark_faults import (
     restart_coordinator,
     run_fault,
 )
-from cloud_offload.prepared_state import ManifestSigner, blob_key
+from cloud_offload.prepared_state import ManifestSigner, blob_key, canonical_json
 
 
 class FakeFaultClient:
@@ -178,13 +178,26 @@ class FakeRegistry:
     def __init__(self):
         self.announced = []
         self.removed = []
+        self.manifests = []
 
     def announce_manifest(self, volume_id, generation, manifest):
         self.announced.append((volume_id, generation, manifest["manifest_id"]))
+        self.manifests.append({**manifest, "volume_id": volume_id})
         return {"artifacts": len(manifest["artifacts"]), "drifted": 0}
+
+    def query_manifests(self):
+        return list(self.manifests)
 
     def remove_manifest(self, volume_id, manifest_id, *, inventory_generation=None):
         self.removed.append((volume_id, manifest_id, inventory_generation))
+        self.manifests = [
+            manifest
+            for manifest in self.manifests
+            if not (
+                manifest["volume_id"] == volume_id
+                and manifest["manifest_id"] == manifest_id
+            )
+        ]
         return {"manifests": 1, "artifacts_restored": 2, "artifacts_removed": 1}
 
 
@@ -405,6 +418,22 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
     assert s3.objects["indexes/latest"] != b"original-generation"
     assert len(registry.announced) == 1
 
+    derived_manifest = {
+        "manifest_id": "sha256:" + "d" * 64,
+        "volume_id": "registry-volume",
+        "artifacts": [{"digest": "sha256:" + canary["sha256"]}],
+    }
+    registry.manifests.append(derived_manifest)
+    s3.objects["manifests/profile/derived-generation.json"] = canonical_json(
+        derived_manifest
+    )
+    s3.objects["indexes/derived-generation.json"] = canonical_json(
+        {"manifests": [derived_manifest]}
+    )
+    s3.objects["pending-announcements/derived.json"] = canonical_json(
+        {"manifest": derived_manifest}
+    )
+
     observed = observe_corruption(
         client,
         "job-corruption",
@@ -437,7 +466,9 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
     assert cleaned["canary_deleted"] is True
     assert s3.objects["indexes/latest"] == b"original-generation"
     assert canary_key not in s3.objects
-    assert len(registry.removed) == 1
+    assert len(registry.removed) == 2
+    assert registry.manifests == []
+    assert not any("derived" in key for key in s3.objects)
     assert coordinator_storage.objects == {}
 
     assert (

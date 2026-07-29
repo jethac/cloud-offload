@@ -443,6 +443,50 @@ def _delete_quarantine_objects(store: RunPodS3PreparedStore, prefix: str) -> int
     return deleted
 
 
+def _metadata_objects_referencing_digest(
+    store: RunPodS3PreparedStore, prefix: str, digest: str
+) -> list[str]:
+    """Find benchmark metadata objects that contain one exact synthetic digest."""
+
+    matches: list[str] = []
+    continuation = None
+    needle = digest.encode("ascii")
+    while True:
+        request: dict[str, Any] = {"Bucket": store.volume_id, "Prefix": prefix}
+        if continuation:
+            request["ContinuationToken"] = continuation
+        response = store.client.list_objects_v2(**request)
+        for item in response.get("Contents") or []:
+            key = str(item.get("Key") or "")
+            if key == "indexes/latest":
+                continue
+            payload = _object_bytes(store, key)
+            if payload is not None and needle in payload:
+                matches.append(key)
+        if not response.get("IsTruncated"):
+            break
+        continuation = response.get("NextContinuationToken")
+        if not continuation:
+            raise RuntimeError("Corruption metadata listing has no cursor")
+    return matches
+
+
+def _synthetic_registry_manifest_ids(
+    registry: CacheRegistry, volume_id: str, digest: str
+) -> set[str]:
+    wanted = "sha256:" + normalize_digest(digest)
+    return {
+        str(manifest.get("manifest_id") or "")
+        for manifest in registry.query_manifests()
+        if str(manifest.get("volume_id") or "") == volume_id
+        and any(
+            str(artifact.get("digest") or "") == wanted
+            for artifact in manifest.get("artifacts") or []
+        )
+        and manifest.get("manifest_id")
+    }
+
+
 def prepare_corruption(
     client: CoordinatorFaultClient,
     scenario: str,
@@ -641,19 +685,54 @@ def cleanup_corruption(
     keys = _corruption_keys(scenario, canary_nonce=canary_nonce)
     state_payload = _object_bytes(store, keys["state_key"])
     if state_payload is None:
-        if _object_size(store, keys["blob_key"]) is not None:
-            raise RuntimeError("Canary state is absent while its unique blob remains")
-        coordinator_key = partition_artifact_key(keys["digest"])
-        if coordinator_storage_factory().exists(coordinator_key):
-            raise RuntimeError(
-                "Canary state is absent while its coordinator artifact remains"
+        current_generation = (
+            (_object_bytes(store, "indexes/latest") or b"").decode("utf-8").strip()
+        )
+        metadata_keys = {
+            key
+            for prefix in ("manifests/", "indexes/", "pending-announcements/")
+            for key in _metadata_objects_referencing_digest(
+                store, prefix, keys["digest"]
             )
+        }
+        if f"indexes/{current_generation}.json" in metadata_keys:
+            raise RuntimeError(
+                "Canary state is absent while its inventory generation is active"
+            )
+        registry = registry_factory()
+        registry_ids = _synthetic_registry_manifest_ids(
+            registry, str(volume["id"]), keys["digest"]
+        )
+        for manifest_id in sorted(registry_ids):
+            registry.remove_manifest(str(volume["id"]), manifest_id)
+        for key in sorted(metadata_keys):
+            store.client.delete_object(Bucket=store.volume_id, Key=key)
+        blob_present = _object_size(store, keys["blob_key"]) is not None
+        if blob_present:
+            store.client.delete_object(Bucket=store.volume_id, Key=keys["blob_key"])
+        coordinator_key = partition_artifact_key(keys["digest"])
+        coordinator_storage = coordinator_storage_factory()
+        fallback_present = coordinator_storage.exists(coordinator_key)
+        if fallback_present:
+            coordinator_storage.delete(coordinator_key)
+        deleted_quarantine = _delete_quarantine_objects(
+            store, keys["quarantine_prefix"]
+        )
         return {
             "kind": "corruption",
             "stage": "cleanup",
             "original_generation_restored": True,
             "canary_deleted": True,
-            "changed": False,
+            "registry_manifests_deleted": len(registry_ids),
+            "metadata_objects_deleted": len(metadata_keys),
+            "quarantine_objects_deleted": deleted_quarantine,
+            "changed": bool(
+                registry_ids
+                or metadata_keys
+                or blob_present
+                or fallback_present
+                or deleted_quarantine
+            ),
         }
     state = json.loads(state_payload)
     if state.get("schema") != CORRUPTION_STATE_SCHEMA:
@@ -673,11 +752,17 @@ def cleanup_corruption(
         raise RuntimeError(
             "Prepared inventory changed during corruption canary; refusing to overwrite it"
         )
-    registry_factory().remove_manifest(
-        str(state["volume_id"]),
-        str(state["manifest_id"]),
-        inventory_generation=original_generation,
+    registry = registry_factory()
+    registry_ids = _synthetic_registry_manifest_ids(
+        registry, str(state["volume_id"]), keys["digest"]
     )
+    registry_ids.add(str(state["manifest_id"]))
+    for manifest_id in sorted(registry_ids):
+        registry.remove_manifest(
+            str(state["volume_id"]),
+            manifest_id,
+            inventory_generation=original_generation,
+        )
     if state.get("coordinator_artifact_created"):
         coordinator_storage_factory().delete(str(state["coordinator_artifact_key"]))
     deleted_quarantine = _delete_quarantine_objects(
@@ -689,6 +774,13 @@ def cleanup_corruption(
         str(state["index_key"]),
     ):
         store.client.delete_object(Bucket=store.volume_id, Key=key)
+    metadata_keys = {
+        key
+        for prefix in ("manifests/", "indexes/", "pending-announcements/")
+        for key in _metadata_objects_referencing_digest(store, prefix, keys["digest"])
+    }
+    for key in sorted(metadata_keys):
+        store.client.delete_object(Bucket=store.volume_id, Key=key)
     store.client.delete_object(Bucket=store.volume_id, Key=keys["state_key"])
     restored = (_object_bytes(store, "indexes/latest") or b"").decode("utf-8").strip()
     if restored != original_generation:
@@ -698,6 +790,8 @@ def cleanup_corruption(
         "stage": "cleanup",
         "original_generation_restored": True,
         "canary_deleted": True,
+        "registry_manifests_deleted": len(registry_ids),
+        "metadata_objects_deleted": len(metadata_keys),
         "quarantine_objects_deleted": deleted_quarantine,
         "changed": True,
     }
