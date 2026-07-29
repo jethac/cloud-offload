@@ -131,6 +131,14 @@ variables. Hook arguments and output are deliberately absent from the scorecard
 because either can contain object keys, URLs, or credentials. A non-zero hook
 exit code fails the scenario.
 
+An external hook may also set `before_submit: true`. The harness then invokes it
+in three explicit stages: `prepare` before the job exists, `observe` at the
+configured post-submit trigger, and `cleanup` on every exit path. Context includes
+only the request digest and declared asset digests, never the request body. The
+scorecard requires all three receipts to succeed. This is used when provider
+state must settle before Pod creation, such as a corruption canary on a newly
+attached volume.
+
 Hooks are an explicit operator boundary: they may mutate external state. Keep
 them narrow, idempotent, and reversible, and make the hook wait until its intended
 failure or restart is observable before it exits.
@@ -141,7 +149,7 @@ invocation is refused:
 
 ```json
 {"kind": "storage", "hook_argv": ["cloud-offload", "benchmark-hook", "storage"]}
-{"kind": "corruption", "hook_argv": ["cloud-offload", "benchmark-hook", "corruption"]}
+{"kind": "corruption", "before_submit": true, "hook_argv": ["cloud-offload", "benchmark-hook", "corruption"]}
 {"kind": "restart", "hook_argv": ["cloud-offload", "benchmark-hook", "restart"]}
 ```
 
@@ -149,10 +157,12 @@ invocation is refused:
   nonexistent volume binding, requires `provisioning_failed` before any provider
   launch, and restores the complete scenario config. It never mutates provider
   storage.
-- `corruption` selects the smallest digest-addressed model object required by the
-  job, makes a server-side backup, writes a wrong-sized canary, requires the
-  worker to emit `cache_artifact_quarantined`, restores the canonical object if
-  the worker has not already repopulated it, and deletes the backup.
+- `corruption` is configured with `before_submit: true`. Its prepare stage selects
+  the smallest digest-addressed model object required by the plan, makes a
+  server-side backup, writes and settles a wrong-sized canary, and only then
+  permits job submission. Its observe stage requires the worker to emit
+  `cache_artifact_quarantined`; cleanup restores the canonical object if the
+  worker has not already repopulated it and deletes the backup on every path.
 - `restart` supports a local HTTP coordinator. It requires the service-file PID
   and authenticated health PID to agree, stops that exact process, starts a
   replacement on the same address, and succeeds only when health and the active

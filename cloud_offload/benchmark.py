@@ -103,6 +103,7 @@ class FailureInjection:
     trigger_event: str | None = None
     after_seconds: float = 0.0
     hook_argv: tuple[str, ...] = ()
+    before_submit: bool = False
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "FailureInjection":
@@ -120,6 +121,9 @@ class FailureInjection:
             raise ValueError(
                 f"failure kind {kind!r} uses a built-in action, not a hook"
             )
+        before_submit = bool(value.get("before_submit", False))
+        if before_submit and kind not in {"storage", "corruption", "restart"}:
+            raise ValueError("failure.before_submit requires an external hook kind")
         return cls(
             kind=kind,
             trigger_phase=(
@@ -134,6 +138,7 @@ class FailureInjection:
                 allow_zero=True,
             ),
             hook_argv=tuple(str(item) for item in hook),
+            before_submit=before_submit,
         )
 
 
@@ -317,6 +322,9 @@ class BenchmarkPlan:
                     "fresh_instance": item.fresh_instance,
                     "prepared_storage_policy": item.prepared_storage_policy,
                     "failure_kind": item.failure.kind if item.failure else None,
+                    "failure_before_submit": (
+                        item.failure.before_submit if item.failure else False
+                    ),
                 }
                 for item in self.scenarios
             ],
@@ -581,9 +589,23 @@ class BenchmarkRunner:
         support_bundle: dict[str, Any] | None = None
         preparation: dict[str, Any] | None = None
         restoration: dict[str, Any] | None = None
+        failure_preparation: dict[str, Any] | None = None
+        failure_cleanup: dict[str, Any] | None = None
 
         try:
             preparation = self.driver.prepare_scenario(scenario)
+            if scenario.failure and scenario.failure.before_submit:
+                failure_preparation = self.driver.run_hook(
+                    scenario.failure,
+                    self._hook_context(
+                        scenario,
+                        stage="prepare",
+                        job_id=None,
+                        resources=resources,
+                    ),
+                )
+                if failure_preparation.get("exit_code") != 0:
+                    raise RuntimeError("Pre-submit failure hook did not succeed")
             job_id = self.driver.submit(scenario)
             while True:
                 now = self.driver.monotonic()
@@ -666,6 +688,7 @@ class BenchmarkRunner:
                         resources,
                         elapsed,
                         job_id,
+                        failure_preparation,
                     )
                 if status in TERMINAL_STATUSES:
                     break
@@ -685,6 +708,31 @@ class BenchmarkRunner:
                         "schema": "cloud-offload.support-bundle-error.v1",
                         "error": f"{type(exc).__name__}: {exc}",
                     }
+
+        if scenario.failure and scenario.failure.before_submit and failure_preparation:
+            try:
+                failure_cleanup = self.driver.run_hook(
+                    scenario.failure,
+                    self._hook_context(
+                        scenario,
+                        stage="cleanup",
+                        job_id=job_id,
+                        resources=resources,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - cleanup must remain visible
+                failure_cleanup = {
+                    "exit_code": None,
+                    "error_type": type(exc).__name__,
+                    "output_omitted": True,
+                }
+            if failure_result is None:
+                failure_result = {
+                    "kind": scenario.failure.kind,
+                    "triggered": False,
+                    "preparation_hook": failure_preparation,
+                }
+            failure_result["cleanup_hook"] = failure_cleanup
 
         cleanup_started = self.driver.monotonic()
         cleanup = self._cleanup_resources(
@@ -781,7 +829,12 @@ class BenchmarkRunner:
             return bool(receipts) and all(
                 item.get("termination_requested") for item in receipts
             )
-        return (result.get("hook") or {}).get("exit_code") == 0
+        hook_succeeded = (result.get("hook") or {}).get("exit_code") == 0
+        preparation_succeeded = (result.get("preparation_hook") or {}).get(
+            "exit_code", 0
+        ) == 0
+        cleanup_succeeded = (result.get("cleanup_hook") or {}).get("exit_code", 0) == 0
+        return hook_succeeded and preparation_succeeded and cleanup_succeeded
 
     def _maybe_inject(
         self,
@@ -791,6 +844,7 @@ class BenchmarkRunner:
         resources: dict[tuple[str, str], _ResourceMeter],
         elapsed: float,
         job_id: str,
+        failure_preparation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         injection = scenario.failure
         if injection is None or elapsed < injection.after_seconds:
@@ -819,18 +873,59 @@ class BenchmarkRunner:
                 for meter in resources.values()
             ]
             return {"kind": injection.kind, "triggered": True, "receipts": receipts}
-        context = {
-            "CLOUD_OFFLOAD_BENCHMARK_JOB_ID": job_id,
+        result = {
+            "kind": injection.kind,
+            "triggered": True,
+            "hook": self.driver.run_hook(
+                injection,
+                self._hook_context(
+                    scenario,
+                    stage="observe",
+                    job_id=job_id,
+                    resources=resources,
+                ),
+            ),
+        }
+        if failure_preparation is not None:
+            result["preparation_hook"] = failure_preparation
+        return result
+
+    @staticmethod
+    def _hook_context(
+        scenario: BenchmarkScenario,
+        *,
+        stage: str,
+        job_id: str | None,
+        resources: dict[tuple[str, str], _ResourceMeter],
+    ) -> dict[str, str]:
+        injection = scenario.failure
+        assets = (scenario.request.get("partition") or {}).get("assets") or []
+        digests = sorted(
+            {
+                str(item.get("sha256") or "").lower()
+                for item in assets
+                if isinstance(item, dict)
+                and len(str(item.get("sha256") or "")) == 64
+                and all(
+                    character in "0123456789abcdefABCDEF"
+                    for character in str(item.get("sha256") or "")
+                )
+            }
+        )
+        return {
+            "CLOUD_OFFLOAD_BENCHMARK_JOB_ID": job_id or "",
             "CLOUD_OFFLOAD_BENCHMARK_SCENARIO": scenario.name,
-            "CLOUD_OFFLOAD_BENCHMARK_FAILURE_KIND": injection.kind,
+            "CLOUD_OFFLOAD_BENCHMARK_FAILURE_KIND": (
+                injection.kind if injection else ""
+            ),
+            "CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE": stage,
+            "CLOUD_OFFLOAD_BENCHMARK_REQUEST_DIGEST": _canonical_digest(
+                scenario.request
+            ),
+            "CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS": ",".join(digests),
             "CLOUD_OFFLOAD_BENCHMARK_INSTANCE_IDS": ",".join(
                 meter.id for meter in resources.values()
             ),
-        }
-        return {
-            "kind": injection.kind,
-            "triggered": True,
-            "hook": self.driver.run_hook(injection, context),
         }
 
     @staticmethod

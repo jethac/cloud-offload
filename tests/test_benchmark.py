@@ -301,6 +301,14 @@ def test_plan_requires_alternating_cold_hot_and_explicit_failure_hooks():
     with pytest.raises(ValueError, match="hot runs require"):
         BenchmarkPlan.from_dict(plan_dict([unproven_hot]))
 
+    invalid_pre_submit = scenario(
+        "cancel-before-submit",
+        "failure",
+        failure={"kind": "cancellation", "before_submit": True},
+    )
+    with pytest.raises(ValueError, match="before_submit"):
+        BenchmarkPlan.from_dict(plan_dict([invalid_pre_submit]))
+
 
 def test_cold_hot_campaign_records_comparable_json_and_removes_exact_pods(tmp_path):
     plan = BenchmarkPlan.from_dict(
@@ -407,6 +415,77 @@ def test_cancellation_and_hook_failures_are_injected_at_the_requested_phase():
     assert scorecard["results"][1]["failure_injection"]["hook"]["exit_code"] == 0
     assert driver.hooks[0][0] == "restart"
     assert driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == "job-2"
+
+
+def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [
+                scenario(
+                    "corruption",
+                    "failure",
+                    failure={
+                        "kind": "corruption",
+                        "before_submit": True,
+                        "hook_argv": ["cloud-offload", "benchmark-hook", "corruption"],
+                    },
+                )
+            ]
+        )
+    )
+    driver = FakeDriver({"corruption": successful_script("pod-corruption")})
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+    result = scorecard["results"][0]
+
+    assert scorecard["passed"] is True
+    assert [
+        context["CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE"] for _, context in driver.hooks
+    ] == [
+        "prepare",
+        "observe",
+        "cleanup",
+    ]
+    assert driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == ""
+    assert driver.hooks[1][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == "job-1"
+    assert result["failure_injection"]["preparation_hook"]["exit_code"] == 0
+    assert result["failure_injection"]["hook"]["exit_code"] == 0
+    assert result["failure_injection"]["cleanup_hook"]["exit_code"] == 0
+
+
+def test_two_phase_hook_cleans_up_when_submission_never_creates_a_job():
+    class BrokenSubmitDriver(FakeDriver):
+        def submit(self, scenario):
+            raise RuntimeError("submission failed")
+
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [
+                scenario(
+                    "corruption",
+                    "failure",
+                    failure={
+                        "kind": "corruption",
+                        "before_submit": True,
+                        "hook_argv": ["corruption-canary"],
+                    },
+                )
+            ]
+        )
+    )
+    driver = BrokenSubmitDriver({})
+
+    result = BenchmarkRunner(driver).run(plan)["results"][0]
+
+    assert result["passed"] is False
+    assert [
+        context["CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE"] for _, context in driver.hooks
+    ] == [
+        "prepare",
+        "cleanup",
+    ]
+    assert result["failure_injection"]["triggered"] is False
+    assert result["failure_injection"]["cleanup_hook"]["exit_code"] == 0
 
 
 def test_provider_failure_terminates_only_the_observed_instance():
