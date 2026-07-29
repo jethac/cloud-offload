@@ -200,6 +200,33 @@ class BenchmarkScenario:
         failure = value.get("failure")
         if failure is not None and not isinstance(failure, dict):
             raise ValueError(f"scenarios[{index}].failure must be an object")
+        failure_injection = FailureInjection.from_dict(failure) if failure else None
+        if failure_injection and failure_injection.kind == "corruption":
+            if endpoint != "/api/partitions" or not failure_injection.before_submit:
+                raise ValueError(
+                    f"scenarios[{index}] corruption requires a pre-submit partition hook"
+                )
+            from cloud_offload.benchmark_faults import corruption_canary_asset
+
+            request = json.loads(json.dumps(request, allow_nan=False))
+            partition = request.get("partition")
+            if not isinstance(partition, dict):
+                raise ValueError(
+                    f"scenarios[{index}] corruption requires request.partition"
+                )
+            assets = partition.setdefault("assets", [])
+            if not isinstance(assets, list):
+                raise ValueError(
+                    f"scenarios[{index}] corruption requires partition.assets"
+                )
+            canary_asset = corruption_canary_asset(name)
+            if not any(
+                isinstance(item, dict)
+                and str(item.get("sha256") or "") == canary_asset["sha256"]
+                for item in assets
+            ):
+                assets.append(canary_asset)
+            _canonical_digest(request)
         raw_storage_policy = value.get("prepared_storage_policy")
         storage_policy = (
             str(raw_storage_policy).strip().lower()
@@ -238,7 +265,7 @@ class BenchmarkScenario:
             expected_statuses=normalized_statuses,
             fresh_instance=bool(value.get("fresh_instance", True)),
             prepared_storage_policy=storage_policy,
-            failure=FailureInjection.from_dict(failure) if failure else None,
+            failure=failure_injection,
         )
 
 

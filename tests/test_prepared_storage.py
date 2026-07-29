@@ -134,15 +134,35 @@ def test_manifest_signature_binds_content_policy_and_compatibility():
         ("portable", {}, {}, True, "compatible"),
         (
             "runtime-bound",
-            {"image_digest": "i", "platform": "p", "python_abi": "a", "dependency_lock": "d"},
-            {"image_digest": "i", "platform": "p", "python_abi": "a", "dependency_lock": "d"},
+            {
+                "image_digest": "i",
+                "platform": "p",
+                "python_abi": "a",
+                "dependency_lock": "d",
+            },
+            {
+                "image_digest": "i",
+                "platform": "p",
+                "python_abi": "a",
+                "dependency_lock": "d",
+            },
             True,
             "compatible",
         ),
         (
             "runtime-bound",
-            {"image_digest": "i", "platform": "p", "python_abi": "a", "dependency_lock": "d"},
-            {"image_digest": "other", "platform": "p", "python_abi": "a", "dependency_lock": "d"},
+            {
+                "image_digest": "i",
+                "platform": "p",
+                "python_abi": "a",
+                "dependency_lock": "d",
+            },
+            {
+                "image_digest": "other",
+                "platform": "p",
+                "python_abi": "a",
+                "dependency_lock": "d",
+            },
             False,
             "runtime_mismatch",
         ),
@@ -386,20 +406,23 @@ def test_runpod_storage_crud_and_storage_aware_rest_launch():
     http = Http(
         Response(volume),
         Response({"id": "pod-1", "desiredStatus": "CREATED"}, status=201),
-        Response({
-            "id": "pod-1", "desiredStatus": "RUNNING", "gpuTypeId": "gpu",
-            "gpuCount": 1, "costPerHr": 0.5,
-            "machine": {"dataCenterId": "US-KS-2"},
-        }),
+        Response(
+            {
+                "id": "pod-1",
+                "desiredStatus": "RUNNING",
+                "gpuTypeId": "gpu",
+                "gpuCount": 1,
+                "costPerHr": 0.5,
+                "machine": {"dataCenterId": "US-KS-2"},
+            }
+        ),
     )
     connector = RunPodConnector(
         api_key="secret", http_client=http, launch_timeout=1, poll_interval=0
     )
     placement = PlacementConstraints(
         datacenter_ids=("US-KS-2",),
-        storage_attachments=(
-            StorageAttachment("vol-1", datacenter_id="US-KS-2"),
-        ),
+        storage_attachments=(StorageAttachment("vol-1", datacenter_id="US-KS-2"),),
     )
     instance = connector.launch(
         "gpu", "example/runner", env_vars={"X": "1"}, placement=placement
@@ -423,7 +446,9 @@ def test_runpod_refuses_wrong_dc_community_and_read_only_before_create():
         connector.launch("gpu", "example/runner", placement=placement)
     assert len(wrong.calls) == 1
 
-    community = RunPodConnector(api_key="secret", cloud_type="COMMUNITY", http_client=Http())
+    community = RunPodConnector(
+        api_key="secret", cloud_type="COMMUNITY", http_client=Http()
+    )
     with pytest.raises(PlacementError, match="Secure Cloud"):
         community.list_available(placement=placement)
     readonly = PlacementConstraints(
@@ -449,8 +474,12 @@ def test_runpod_published_storage_estimate_tier_boundary():
 
 def registered_volume(registry, provider_id, dc):
     return registry.upsert_volume(
-        provider="runpod", provider_volume_id=provider_id, datacenter_id=dc,
-        ownership="adopted", capacity_bytes=100 * 1024**3, policy=policy(),
+        provider="runpod",
+        provider_volume_id=provider_id,
+        datacenter_id=dc,
+        ownership="adopted",
+        capacity_bytes=100 * 1024**3,
+        policy=policy(),
     )
 
 
@@ -459,23 +488,39 @@ def test_scheduler_is_deterministic_complete_then_coverage_then_price(tmp_path):
     a = registered_volume(registry, "a", "A")
     b = registered_volume(registry, "b", "B")
     candidates = [
-        PlacementCandidate({"id": "cheap-partial", "provider": "runpod", "hourly_rate": .1}, a, 90, 100, False),
-        PlacementCandidate({"id": "complete", "provider": "runpod", "hourly_rate": .5}, b, 100, 100, True),
+        PlacementCandidate(
+            {"id": "cheap-partial", "provider": "runpod", "hourly_rate": 0.1},
+            a,
+            90,
+            100,
+            False,
+        ),
+        PlacementCandidate(
+            {"id": "complete", "provider": "runpod", "hourly_rate": 0.5},
+            b,
+            100,
+            100,
+            True,
+        ),
     ]
     started = time.perf_counter()
-    decision = choose_placement(policy=policy(), cached_candidates=candidates, cold_offers=[])
+    decision = choose_placement(
+        policy=policy(), cached_candidates=candidates, cold_offers=[]
+    )
     assert time.perf_counter() - started < 1
     assert decision.candidate.offer["id"] == "complete"
     assert decision.reason == "complete_compatible_cache"
 
     smart = choose_placement(
-        policy=policy(), cached_candidates=[],
-        cold_offers=[{"id": "cold", "provider": "runpod", "hourly_rate": .2}],
+        policy=policy(),
+        cached_candidates=[],
+        cold_offers=[{"id": "cold", "provider": "runpod", "hourly_rate": 0.2}],
     )
     assert smart.fallback and smart.action == "launch"
     strict = choose_placement(
-        policy=policy(policy="strict"), cached_candidates=[],
-        cold_offers=[{"id": "cold", "provider": "runpod", "hourly_rate": .2}],
+        policy=policy(policy="strict"),
+        cached_candidates=[],
+        cold_offers=[{"id": "cold", "provider": "runpod", "hourly_rate": 0.2}],
     )
     assert strict.action == "unavailable"
 
@@ -615,7 +660,9 @@ def test_huggingface_xet_metadata_is_downloaded_and_byte_hashed(monkeypatch, tmp
     monkeypatch.setattr(
         huggingface_hub,
         "get_hf_file_metadata",
-        lambda *args, **kwargs: SimpleNamespace(etag="f" * 64, xet_file_data={"hash": "x"}),
+        lambda *args, **kwargs: SimpleNamespace(
+            etag="f" * 64, xet_file_data={"hash": "x"}
+        ),
     )
     monkeypatch.setattr(
         huggingface_hub,
@@ -646,17 +693,91 @@ def test_registry_tracks_one_manifest_on_multiple_replica_volumes(tmp_path):
     index = {
         "schema": "cloud-offload.prepared-state.index.v1",
         "generation": "g1",
-        "manifests": [{
-            "manifest_id": manifest["manifest_id"],
-            "profile_fingerprint": manifest["profile_fingerprint"],
-            "created_at": manifest["created_at"],
-            "artifacts": manifest["artifacts"],
-        }],
+        "manifests": [
+            {
+                "manifest_id": manifest["manifest_id"],
+                "profile_fingerprint": manifest["profile_fingerprint"],
+                "created_at": manifest["created_at"],
+                "artifacts": manifest["artifacts"],
+            }
+        ],
     }
-    registry.reconcile_index(first.id, index, manifest_documents={manifest["manifest_id"]: manifest})
-    registry.reconcile_index(second.id, index, manifest_documents={manifest["manifest_id"]: manifest})
-    matches = registry.query_manifests(profile_fingerprint=manifest["profile_fingerprint"])
+    registry.reconcile_index(
+        first.id, index, manifest_documents={manifest["manifest_id"]: manifest}
+    )
+    registry.reconcile_index(
+        second.id, index, manifest_documents={manifest["manifest_id"]: manifest}
+    )
+    matches = registry.query_manifests(
+        profile_fingerprint=manifest["profile_fingerprint"]
+    )
     assert {item["volume_id"] for item in matches} == {first.id, second.id}
+
+
+def test_registry_removes_temporary_manifest_and_restores_prior_projection(tmp_path):
+    registry = CacheRegistry(tmp_path / "queue.db")
+    volume = registered_volume(registry, "temporary", "A")
+    signer = ManifestSigner(b"t" * 32)
+    profile = fingerprint({"profile": "temporary"})
+    shared = portable_artifact(b"shared")
+    synthetic = portable_artifact(b"synthetic")
+    base = build_manifest(
+        profile_fingerprint=profile,
+        producer={"image_digest": "sha256:" + "a" * 64},
+        artifacts=[shared],
+        signer=signer,
+        created_at="2026-01-01T00:00:00Z",
+    )
+    canary = build_manifest(
+        profile_fingerprint=profile,
+        producer={"image_digest": "sha256:" + "a" * 64},
+        artifacts=[shared, synthetic],
+        signer=signer,
+        created_at="2026-01-02T00:00:00Z",
+    )
+    registry.reconcile_index(
+        volume.id,
+        {
+            "schema": "cloud-offload.prepared-state.index.v1",
+            "generation": "base-generation",
+            "manifests": [base],
+        },
+        manifest_documents={base["manifest_id"]: base},
+    )
+    registry.announce_manifest(volume.id, "canary-generation", canary)
+    registry.invalidate(volume.id, synthetic["digest"], "benchmark")
+
+    result = registry.remove_manifest(
+        volume.id,
+        canary["manifest_id"],
+        inventory_generation="base-generation",
+    )
+
+    assert result == {
+        "manifests": 1,
+        "artifacts_restored": 1,
+        "artifacts_removed": 1,
+    }
+    assert [item["manifest_id"] for item in registry.query_manifests()] == [
+        base["manifest_id"]
+    ]
+    with registry._connect() as connection:
+        projected = connection.execute(
+            "SELECT manifest_id FROM cache_artifacts WHERE volume_id=? AND digest=?",
+            (volume.id, shared["digest"]),
+        ).fetchone()
+        removed = connection.execute(
+            "SELECT 1 FROM cache_artifacts WHERE volume_id=? AND digest=?",
+            (volume.id, synthetic["digest"]),
+        ).fetchone()
+        invalidation = connection.execute(
+            "SELECT 1 FROM cache_invalidations WHERE volume_id=? AND digest=?",
+            (volume.id, synthetic["digest"]),
+        ).fetchone()
+    assert projected["manifest_id"] == base["manifest_id"]
+    assert removed is None
+    assert invalidation is None
+    assert registry.get_volume(volume.id).inventory_generation == "base-generation"
 
 
 def test_detach_clears_matching_persisted_volume_binding(monkeypatch, tmp_path):
@@ -747,7 +868,10 @@ def test_coverage_requires_and_selects_exact_profile_manifest(tmp_path):
     )
 
     missing = registry.volume_coverage(
-        {}, runtime={}, tenant="default", profile_fingerprint=fingerprint({"missing": 1})
+        {},
+        runtime={},
+        tenant="default",
+        profile_fingerprint=fingerprint({"missing": 1}),
     )[0]
     assert not missing["complete"]
     assert missing["manifest_ids"] == []
@@ -856,7 +980,9 @@ def test_scheduler_normalizes_pinned_image_but_keeps_unknown_abi_as_miss(tmp_pat
     )
     logical = [custom_node_requirement_key("pack")]
     unknown = registry.volume_coverage(
-        {}, runtime=runtime, tenant="default",
+        {},
+        runtime=runtime,
+        tenant="default",
         profile_fingerprint=manifest["profile_fingerprint"],
         logical_required=logical,
     )[0]
@@ -934,9 +1060,7 @@ class MissingObject(Exception):
 
 
 class RunPodMissingObject(Exception):
-    response = {
-        "Error": {"Code": "InvalidArgument", "Message": "object not found"}
-    }
+    response = {"Error": {"Code": "InvalidArgument", "Message": "object not found"}}
 
 
 class MemoryS3:
@@ -990,11 +1114,15 @@ class MemoryS3:
 def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp_path):
     client = MemoryS3()
     first = RunPodS3PreparedStore(
-        volume_id="vol", datacenter_id="US-KS-2", client=client,
+        volume_id="vol",
+        datacenter_id="US-KS-2",
+        client=client,
         endpoint_url="https://s3api-us-ks-2.runpod.io/",
     )
     second = RunPodS3PreparedStore(
-        volume_id="vol", datacenter_id="US-KS-2", client=client,
+        volume_id="vol",
+        datacenter_id="US-KS-2",
+        client=client,
         endpoint_url="https://s3api-us-ks-2.runpod.io/",
     )
     assert first.publication_lock is second.publication_lock
@@ -1005,10 +1133,14 @@ def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp
         source.write_bytes(f"model {index}".encode())
         artifact = portable_artifact(source.read_bytes())
         store.upload_verified(source, artifact["digest"])
-        manifests.append((store, signed_manifest(signer, [artifact], fingerprint({"p": index}))))
+        manifests.append(
+            (store, signed_manifest(signer, [artifact], fingerprint({"p": index})))
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        list(pool.map(lambda pair: pair[0].publish_manifest(pair[1], signer), manifests))
+        list(
+            pool.map(lambda pair: pair[0].publish_manifest(pair[1], signer), manifests)
+        )
     index = first.load_index()
     assert {item["manifest_id"] for item in index["manifests"]} == {
         item[1]["manifest_id"] for item in manifests
@@ -1020,7 +1152,9 @@ def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp
 def test_s3_probe_exercises_write_read_and_delete():
     client = MemoryS3()
     store = RunPodS3PreparedStore(
-        volume_id="vol", datacenter_id="US-MD-1", client=client,
+        volume_id="vol",
+        datacenter_id="US-MD-1",
+        client=client,
         endpoint_url="https://s3api-us-md-1.runpod.io/",
     )
 
@@ -1034,7 +1168,9 @@ def test_runpod_invalid_argument_object_not_found_is_an_empty_index():
             raise RunPodMissingObject()
 
     store = RunPodS3PreparedStore(
-        volume_id="vol", datacenter_id="US-MD-1", client=RunPodMemoryS3(),
+        volume_id="vol",
+        datacenter_id="US-MD-1",
+        client=RunPodMemoryS3(),
         endpoint_url="https://s3api-us-md-1.runpod.io/",
     )
 
@@ -1056,18 +1192,44 @@ class PlacementProvider(CloudConnector):
     def name(self):
         return "runpod"
 
-    def list_available(self, gpu_type=None, min_gpu_ram=None, max_hourly_rate=None, placement=None):
-        return [{
-            "id": "gpu", "provider": "runpod", "gpu_type": "GPU",
-            "gpu_ram_gb": 24, "hourly_rate": .4,
-            **({"datacenter_ids": list(placement.datacenter_ids)} if placement else {}),
-        }]
+    def list_available(
+        self, gpu_type=None, min_gpu_ram=None, max_hourly_rate=None, placement=None
+    ):
+        return [
+            {
+                "id": "gpu",
+                "provider": "runpod",
+                "gpu_type": "GPU",
+                "gpu_ram_gb": 24,
+                "hourly_rate": 0.4,
+                **(
+                    {"datacenter_ids": list(placement.datacenter_ids)}
+                    if placement
+                    else {}
+                ),
+            }
+        ]
 
-    def launch(self, offer_id, docker_image, env_vars=None, startup_script=None, disk_gb=None, placement=None):
+    def launch(
+        self,
+        offer_id,
+        docker_image,
+        env_vars=None,
+        startup_script=None,
+        disk_gb=None,
+        placement=None,
+    ):
         self.launches.append(placement)
         if placement and self.fail_cached:
             raise PlacementError("cached datacenter capacity disappeared")
-        return Instance("worker-cold" if not placement else "worker-cache", "runpod", "GPU", 1, .4, "running")
+        return Instance(
+            "worker-cold" if not placement else "worker-cache",
+            "runpod",
+            "GPU",
+            1,
+            0.4,
+            "running",
+        )
 
     def get_storage(self, storage_id):
         return self.volume if self.volume and self.volume.id == storage_id else None
@@ -1149,8 +1311,12 @@ def test_deleted_adopted_volume_falls_back_only_under_smart(
     provider = PlacementProvider(volume=None)
     dispatcher = Dispatcher(config, provider=provider)
     dispatcher.cache_registry.upsert_volume(
-        provider="runpod", provider_volume_id="vol-1", datacenter_id="US-KS-2",
-        ownership="adopted", capacity_bytes=10, policy=config.prepared_storage,
+        provider="runpod",
+        provider_volume_id="vol-1",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=10,
+        policy=config.prepared_storage,
     )
     decision = dispatcher._choose_cache_placement(
         connector=provider,
@@ -1197,19 +1363,27 @@ def test_smart_launch_capacity_race_immediately_retries_cold(tmp_path):
     provider = PlacementProvider(volume=volume, fail_cached=True)
     dispatcher = Dispatcher(config, provider=provider)
     dispatcher.cache_registry.upsert_volume(
-        provider="runpod", provider_volume_id="vol-1", datacenter_id="US-KS-2",
-        ownership="adopted", capacity_bytes=100, policy=config.prepared_storage,
+        provider="runpod",
+        provider_volume_id="vol-1",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
     )
     job = dispatcher.queue.create(
-        "comfyui-workflow", "inline://request",
+        "comfyui-workflow",
+        "inline://request",
         params={"runtime_profile": "comfy"},
-        request={"workflow": {}}, provider="runpod",
+        request={"workflow": {}},
+        provider="runpod",
     )
     instance = dispatcher._launch_worker("runpod", "comfy", [job])
     assert instance and instance.id == "worker-cold"
     assert provider.launches[0] is not None
     assert provider.launches[1] is None
-    event_types = [item["event"]["type"] for item in dispatcher.queue.list_events(job.id)]
+    event_types = [
+        item["event"]["type"] for item in dispatcher.queue.list_events(job.id)
+    ]
     assert "cache_cold_fallback" in event_types
     provider_events = [
         event_type
@@ -1235,9 +1409,7 @@ def test_worker_manifest_announcement_drives_next_exact_cache_placement(
         "size": len(content),
     }
     config = dispatcher_config(tmp_path, policy())
-    provider_volume = ProviderStorage(
-        "vol-1", "runpod", "cache", 100, "US-KS-2", True
-    )
+    provider_volume = ProviderStorage("vol-1", "runpod", "cache", 100, "US-KS-2", True)
     provider = PlacementProvider(volume=provider_volume)
     queue = JobQueue(config.queue_db_path)
     registry = CacheRegistry(config.queue_db_path)
@@ -1356,9 +1528,7 @@ def test_worker_manifest_announcement_drives_next_exact_cache_placement(
 
 def test_result_available_phase_precedes_job_completion(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
-    job = queue.create(
-        "comfyui-workflow", "inline://request", request={"workflow": {}}
-    )
+    job = queue.create("comfyui-workflow", "inline://request", request={"workflow": {}})
     worker = Worker.__new__(Worker)
     worker.queue = queue
     worker._stage_custom_nodes = lambda active: None
@@ -1370,7 +1540,8 @@ def test_result_available_phase_precedes_job_completion(tmp_path):
     worker._process_job(job)
 
     phases = [
-        item["event"].get("phase") for item in queue.list_events(job.id)
+        item["event"].get("phase")
+        for item in queue.list_events(job.id)
         if item["event"].get("type") == "phase_timing"
     ]
     assert phases[-1] == "result_available"
@@ -1381,15 +1552,20 @@ def cache_worker(cas, profile_fingerprint, worker_id):
     worker = Worker.__new__(Worker)
     worker.prepared_cache = cas
     worker.cache_policy = {
-        "tenant": "default", "cache_private_assets": False, "cold_fallback": "allow"
+        "tenant": "default",
+        "cache_private_assets": False,
+        "cold_fallback": "allow",
     }
     worker.cache_requirements = {"profile_fingerprint": profile_fingerprint}
     worker.cache_manifest_instruction = profile_fingerprint
     worker._latest_prepared_manifest = None
     worker.cache_runtime = {
         "image_digest": "sha256:" + "a" * 64,
-        "python_abi": "cp311", "platform": "linux-x86_64",
-        "dependency_lock": fingerprint({}), "torch": "", "cuda": "",
+        "python_abi": "cp311",
+        "platform": "linux-x86_64",
+        "dependency_lock": fingerprint({}),
+        "torch": "",
+        "cuda": "",
     }
     worker.worker_id = worker_id
     worker.cache_receipt = None
@@ -1397,7 +1573,9 @@ def cache_worker(cas, profile_fingerprint, worker_id):
     return worker
 
 
-def test_two_jobs_accumulate_manifest_and_second_fresh_worker_never_fetches_origin(tmp_path):
+def test_two_jobs_accumulate_manifest_and_second_fresh_worker_never_fetches_origin(
+    tmp_path,
+):
     signer = ManifestSigner(b"w" * 32)
     cas = PreparedStateCAS(tmp_path / "volume", signer)
     profile = fingerprint({"aggregate": ["a", "b"]})
@@ -1411,7 +1589,8 @@ def test_two_jobs_accumulate_manifest_and_second_fresh_worker_never_fetches_orig
     first._fetch_declared_asset = fetch
     assets = [
         {
-            "category": "checkpoints", "filename": f"{name}.safetensors",
+            "category": "checkpoints",
+            "filename": f"{name}.safetensors",
             "sha256": portable_artifact(payload)["digest"].removeprefix("sha256:"),
             "payload": payload,
         }
@@ -1432,8 +1611,7 @@ def test_two_jobs_accumulate_manifest_and_second_fresh_worker_never_fetches_orig
         second._stage_declared_asset(asset, second_root, None)
     assert fetches == ["a.safetensors", "b.safetensors"]
     assert [
-        (second_root / "checkpoints" / item["filename"]).read_bytes()
-        for item in assets
+        (second_root / "checkpoints" / item["filename"]).read_bytes() for item in assets
     ] == [b"model-a", b"model-b"]
 
 
@@ -1583,8 +1761,8 @@ def test_portable_digest_is_shared_across_profiles_without_origin_or_extra_artif
     profile_a = fingerprint({"profile": "A"})
     profile_b = fingerprint({"profile": "B"})
     first = cache_worker(cas, profile_a, "profile-a")
-    first._fetch_declared_asset = (
-        lambda asset, target, token: target.write_bytes(asset["payload"])
+    first._fetch_declared_asset = lambda asset, target, token: target.write_bytes(
+        asset["payload"]
     )
     shared = {
         "category": "checkpoints",
@@ -1616,7 +1794,9 @@ def test_portable_digest_is_shared_across_profiles_without_origin_or_extra_artif
     ).read_bytes() == b"shared-model"
 
 
-def test_cross_profile_bytes_affect_coverage_without_selecting_foreign_manifest(tmp_path):
+def test_cross_profile_bytes_affect_coverage_without_selecting_foreign_manifest(
+    tmp_path,
+):
     registry = CacheRegistry(tmp_path / "queue.db")
     volume = registered_volume(registry, "shared-volume", "A")
     shared = portable_artifact(b"shared")
