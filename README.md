@@ -542,7 +542,13 @@ python -m pytest
 
 ## Roadmap
 
-Two load balancers are designed and queued behind the current release:
+The canonical direction is documented in **[Cloud Offload product goal and
+delivery plan](docs/cloud-offload-product-goal.md)**: GPU recommendation and
+rental confirmation, preflight before paid work, persistent progress, provider-
+confirmed billing closure, and prepared-state acceleration. The storage subsystem
+is specified separately in **[Storage-aware Cloud Offload](docs/storage-aware-cloud-offload.md)**.
+
+Two additional load balancers are designed and queued behind the current release:
 
 - **[Fleet provider](docs/fleet-provider.md)** — your own machines (a studio's
   workstations, a home user's second PC) as a zero-cost provider, with lease
