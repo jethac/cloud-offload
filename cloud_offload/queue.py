@@ -354,6 +354,17 @@ class JobQueue:
         if not job:
             return None
 
+        # Terminal states are immutable. In particular, a worker may finish a
+        # blocking download just after the user cancels; its late `running`,
+        # `complete`, or `fail` callback must not resurrect the job or enqueue
+        # another retry behind the user's back.
+        if job.status in {
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.DEAD_LETTER,
+        }:
+            return job
+
         job.status = status
         if error is not None:
             job.error = error
@@ -515,6 +526,12 @@ class JobQueue:
         job = self.get(job_id)
         if not job:
             return None
+        if job.status in {
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.DEAD_LETTER,
+        }:
+            return job
         job.progress = max(0, min(100, int(progress)))
         self.update(job)
         return job
@@ -582,7 +599,11 @@ class JobQueue:
             result=result,
             progress=100,
         )
-        cache_key = completed.params.get("partition_cache_key") if completed else None
+        cache_key = (
+            completed.params.get("partition_cache_key")
+            if completed and completed.status == JobStatus.COMPLETED
+            else None
+        )
         if cache_key:
             self.put_partition_cache(str(cache_key), result)
         return completed
@@ -715,6 +736,12 @@ class JobQueue:
         job = self.get(job_id)
         if not job:
             return None
+        if job.status in {
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.DEAD_LETTER,
+        }:
+            return job
 
         job.error = error
         job.worker_id = None

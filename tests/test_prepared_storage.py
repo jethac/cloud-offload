@@ -210,6 +210,30 @@ def test_concurrent_writers_cannot_publish_partial_or_invalid_objects(tmp_path):
         volume.publish_blob(bad, digest, writer_id="bad-writer")
 
 
+def test_blob_publication_reports_copy_progress_without_rehashing_verified_source(
+    tmp_path,
+):
+    volume = PreparedStateCAS(tmp_path / "volume", ManifestSigner(b"p" * 32))
+    source = tmp_path / "source"
+    source.write_bytes(os.urandom(17 * 1024 * 1024))
+    digest = portable_artifact(source.read_bytes())["digest"]
+    updates = []
+
+    published = volume.publish_blob(
+        source,
+        digest,
+        writer_id="progress-writer",
+        source_verified=True,
+        progress_callback=lambda completed, total: updates.append((completed, total)),
+    )
+
+    assert published.read_bytes() == source.read_bytes()
+    assert updates[-1] == (source.stat().st_size, source.stat().st_size)
+    assert [completed for completed, _ in updates] == sorted(
+        completed for completed, _ in updates
+    )
+
+
 def test_independent_cas_publishers_merge_inventory_without_lost_updates(tmp_path):
     signer = ManifestSigner(b"i" * 32)
     root = tmp_path / "shared-volume"
@@ -909,6 +933,12 @@ class MissingObject(Exception):
     response = {"Error": {"Code": "NoSuchKey"}}
 
 
+class RunPodMissingObject(Exception):
+    response = {
+        "Error": {"Code": "InvalidArgument", "Message": "object not found"}
+    }
+
+
 class MemoryS3:
     def __init__(self):
         self.objects = {}
@@ -985,6 +1015,34 @@ def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp
     }
     assert client.copy_calls == 0
     assert client.download_calls >= 2
+
+
+def test_s3_probe_exercises_write_read_and_delete():
+    client = MemoryS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol", datacenter_id="US-MD-1", client=client,
+        endpoint_url="https://s3api-us-md-1.runpod.io/",
+    )
+
+    assert store.probe()
+    assert client.objects == {}
+
+
+def test_runpod_invalid_argument_object_not_found_is_an_empty_index():
+    class RunPodMemoryS3(MemoryS3):
+        def get_object(self, Bucket, Key):
+            raise RunPodMissingObject()
+
+    store = RunPodS3PreparedStore(
+        volume_id="vol", datacenter_id="US-MD-1", client=RunPodMemoryS3(),
+        endpoint_url="https://s3api-us-md-1.runpod.io/",
+    )
+
+    assert store.load_index() == {
+        "schema": "cloud-offload.prepared-state.index.v1",
+        "generation": None,
+        "manifests": [],
+    }
 
 
 class PlacementProvider(CloudConnector):
@@ -1377,6 +1435,30 @@ def test_two_jobs_accumulate_manifest_and_second_fresh_worker_never_fetches_orig
         (second_root / "checkpoints" / item["filename"]).read_bytes()
         for item in assets
     ] == [b"model-a", b"model-b"]
+
+
+def test_same_pod_retry_finishes_cache_population_for_an_already_downloaded_asset(
+    tmp_path,
+):
+    cas = PreparedStateCAS(tmp_path / "volume", ManifestSigner(b"r" * 32))
+    worker = cache_worker(cas, fingerprint({"retry": True}), "retry-worker")
+    payload = b"download-succeeded-publication-failed"
+    artifact = portable_artifact(payload)
+    asset = {
+        "category": "checkpoints",
+        "filename": "retry.safetensors",
+        "sha256": artifact["digest"].removeprefix("sha256:"),
+    }
+    target = tmp_path / "models" / "checkpoints" / asset["filename"]
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+
+    worker._fetch_declared_asset = lambda *args: pytest.fail("origin was called")
+    worker._stage_declared_asset(asset, tmp_path / "models", None)
+
+    manifest = worker._selected_prepared_manifest()
+    assert manifest
+    assert [item["digest"] for item in manifest["artifacts"]] == [artifact["digest"]]
 
 
 def test_hf_snapshot_profile_is_restored_on_a_fresh_worker_without_origin(

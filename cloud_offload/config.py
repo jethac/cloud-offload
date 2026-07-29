@@ -350,7 +350,12 @@ class CloudConfig:
             data = json.load(f)
         cloud_data = data.get("cloud", data)
         allowed = {item.name for item in fields(cls)}
-        return cls(**{key: value for key, value in cloud_data.items() if key in allowed})
+        config = cls(**{key: value for key, value in cloud_data.items() if key in allowed})
+        # Runtime services may refresh mutable policy while they run. Keep the
+        # exact source private so an explicitly supplied config never starts
+        # reading unrelated preferences from the default user config.
+        config._source_path = Path(path)
+        return config
 
     @classmethod
     def from_env(cls) -> "CloudConfig":
@@ -429,6 +434,7 @@ class CloudConfig:
         """Load persisted preferences and overlay environment-owned secrets/settings."""
         config_path = Path(path) if path else CONFIG_DIR / "config.json"
         config = cls.from_file(config_path) if config_path.exists() else cls()
+        config._source_path = config_path
         env_map: dict[str, tuple[str, Any]] = {
             "CLOUD_OFFLOAD_ENABLED": ("enabled", lambda value: value.lower() == "true"),
             "CLOUD_OFFLOAD_MIN_QUEUE_DEPTH": ("min_queue_depth", int),

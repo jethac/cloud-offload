@@ -11,6 +11,7 @@ import logging
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -411,6 +412,7 @@ class Worker:
         try:
             self._stage_custom_nodes(job)
             self._stage_profile_weights(job)
+            self._flush_prepared_manifest(job)
         finally:
             self._complete_cache_restore(job)
 
@@ -437,6 +439,48 @@ class Worker:
                     **fields,
                 },
             )
+
+    def _run_with_feedback(
+        self,
+        job: Job,
+        event_type: str,
+        operation,
+        *,
+        interval_seconds: float = 5.0,
+        **fields,
+    ):
+        """Run blocking setup work while keeping the job visibly alive.
+
+        Hugging Face and provider SDK calls are blocking and do not expose a
+        stable progress callback. Run the operation in one helper thread so
+        the worker's main thread can emit elapsed-time heartbeats through the
+        normal coordinator channel. The operation's exception is re-raised in
+        the caller exactly as before.
+        """
+        outcome: dict[str, object] = {}
+
+        def run() -> None:
+            try:
+                outcome["value"] = operation()
+            except BaseException as exc:  # re-raised on the worker thread
+                outcome["error"] = exc
+
+        started = time.monotonic()
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            thread.join(timeout=max(1.0, float(interval_seconds)))
+            if thread.is_alive():
+                self._cache_event(
+                    job,
+                    event_type,
+                    elapsed_seconds=round(time.monotonic() - started, 1),
+                    indeterminate=True,
+                    **fields,
+                )
+        if "error" in outcome:
+            raise outcome["error"]  # type: ignore[misc]
+        return outcome.get("value")
 
     def _stage_custom_nodes(self, job: Job | None) -> None:
         """Install the profile's declared node packs, once per runner.
@@ -950,12 +994,18 @@ class Worker:
                         continue
                     publish(repo_id, filename)
                     try:
-                        huggingface_hub.hf_hub_download(
+                        self._run_with_feedback(
+                            job,
+                            "weight_download_progress",
+                            lambda: huggingface_hub.hf_hub_download(
+                                repo_id=repo_id,
+                                filename=filename,
+                                revision=revision,
+                                local_dir=str(target_dir),
+                                token=token,
+                            ),
                             repo_id=repo_id,
-                            filename=filename,
-                            revision=revision,
-                            local_dir=str(target_dir),
-                            token=token,
+                            file=filename,
                         )
                     except Exception as exc:
                         raise RuntimeError(
@@ -969,11 +1019,17 @@ class Worker:
                     continue
                 publish(repo_id, None)
                 try:
-                    huggingface_hub.snapshot_download(
+                    self._run_with_feedback(
+                        job,
+                        "weight_download_progress",
+                        lambda: huggingface_hub.snapshot_download(
+                            repo_id=repo_id,
+                            revision=revision,
+                            local_dir=str(target_dir),
+                            token=token,
+                        ),
                         repo_id=repo_id,
-                        revision=revision,
-                        local_dir=str(target_dir),
-                        token=token,
+                        file=None,
                     )
                 except Exception as exc:
                     raise RuntimeError(
@@ -988,7 +1044,7 @@ class Worker:
                 str(asset.get("filename") or ""),
                 str(asset.get("category") or ""),
             )
-            self._stage_declared_asset(asset, models_dir, token)
+            self._stage_declared_asset(asset, models_dir, token, job)
             downloaded += 1
 
         publish(None, None)
@@ -1105,7 +1161,18 @@ class Worker:
         self._cache_event(
             job, "cache_population_started", kind="profile-weight", digest="sha256:" + digest
         )
-        cache.publish_blob(target, digest, writer_id=self.worker_id)
+        cache.publish_blob(
+            target,
+            digest,
+            writer_id=self.worker_id,
+            source_verified=True,
+            progress_callback=self._cache_population_reporter(
+                job,
+                "sha256:" + digest,
+                target.stat().st_size,
+                file=filename,
+            ),
+        )
         existing = self._selected_prepared_manifest()
         artifacts = list(existing.get("artifacts") or []) if existing else []
         source = {
@@ -1400,7 +1467,7 @@ class Worker:
             )
 
     def _stage_declared_asset(
-        self, asset: dict, models_dir: Path, token: str | None
+        self, asset: dict, models_dir: Path, token: str | None, job: Job | None = None
     ) -> None:
         """Place one job-declared model file, verified by content digest.
 
@@ -1429,6 +1496,20 @@ class Worker:
             present = sha256_file(target)
             if present == expected:
                 logger.info("Declared asset already staged, skipping %s", target.name)
+                # A previous cache publication can fail after the origin file
+                # has been verified. A same-pod retry must finish publishing
+                # that durable state instead of treating the container-local
+                # copy as evidence that the volume has it.
+                manifest = self._selected_prepared_manifest()
+                represented = bool(
+                    manifest
+                    and any(
+                        item.get("digest") == "sha256:" + expected
+                        for item in manifest.get("artifacts") or []
+                    )
+                )
+                if getattr(self, "prepared_cache", None) is not None and not represented:
+                    self._populate_declared_asset(asset, target)
                 return
             quarantine = models_dir / QUARANTINE_DIRNAME / present / filename
             quarantine.parent.mkdir(parents=True, exist_ok=True)
@@ -1444,7 +1525,12 @@ class Worker:
             shutil.move(str(target), str(quarantine))
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        self._fetch_declared_asset(asset, target, token)
+        if job is None:
+            # Preserve the small test/integration seam that supplies a simple
+            # three-argument fetcher.
+            self._fetch_declared_asset(asset, target, token)
+        else:
+            self._fetch_declared_asset(asset, target, token, job)
         written = sha256_file(target)
         if written != expected:
             raise RuntimeError(
@@ -1570,6 +1656,8 @@ class Worker:
 
     def _begin_cache_restore(self, job: Job) -> None:
         self._active_cache_job = job
+        self._pending_prepared_artifacts = []
+        self._verified_prepared_digests = set()
         if getattr(self, "prepared_cache", None) is None:
             return
         import os
@@ -1696,11 +1784,17 @@ class Worker:
                 tenant=str(self.cache_policy.get("tenant") or "default"),
                 allow_private=bool(self.cache_policy.get("cache_private_assets")),
             )
+            self._verified_prepared_digests = set(
+                getattr(self, "_verified_prepared_digests", set())
+            )
+            self._verified_prepared_digests.add(digest)
             self._record_cache_result(asset, "hit", "verified", started, target.stat().st_size)
             if shared:
                 # Publish a profile-B reference only after policy and digest
                 # verification. The immutable blob is reused; no origin call.
-                self._populate_declared_asset(asset, target)
+                self._populate_declared_asset(
+                    asset, target, blob_already_verified=True
+                )
             return True
         except CacheCorruptionError as exc:
             cache.quarantine(
@@ -1730,6 +1824,8 @@ class Worker:
         entry = {
             "digest": "sha256:" + str(asset.get("sha256") or "").removeprefix("sha256:"),
             "kind": "model-weight",
+            "file": str(asset.get("filename") or ""),
+            "category": str(asset.get("category") or ""),
             "result": result,
             "reason": reason,
             "bytes": int(size),
@@ -1747,7 +1843,13 @@ class Worker:
             }.get(result, "cache_artifact_miss")
             self._cache_event(job, event_type, **entry)
 
-    def _populate_declared_asset(self, asset: dict, target: Path) -> None:
+    def _populate_declared_asset(
+        self,
+        asset: dict,
+        target: Path,
+        *,
+        blob_already_verified: bool = False,
+    ) -> None:
         cache = getattr(self, "prepared_cache", None)
         if cache is None:
             return
@@ -1770,35 +1872,78 @@ class Worker:
             return
         from cloud_offload.prepared_state import (
             blob_key,
-            build_manifest,
             normalize_digest,
         )
-        from cloud_offload.service_config import VERSION
 
         digest = normalize_digest(str(asset.get("sha256") or ""))
         job = getattr(self, "_active_cache_job", None)
         if job:
-            self._cache_event(job, "cache_population_started", digest="sha256:" + digest)
-        cache.publish_blob(target, digest, writer_id=self.worker_id)
+            self._cache_event(
+                job,
+                "cache_population_started",
+                digest="sha256:" + digest,
+                file=str(asset.get("filename") or target.name),
+                category=str(asset.get("category") or ""),
+                bytes_total=target.stat().st_size,
+            )
+        if not blob_already_verified:
+            cache.publish_blob(
+                target,
+                digest,
+                writer_id=self.worker_id,
+                source_verified=True,
+                progress_callback=self._cache_population_reporter(
+                    job,
+                    "sha256:" + digest,
+                    target.stat().st_size,
+                    file=str(asset.get("filename") or target.name),
+                    category=str(asset.get("category") or ""),
+                ) if job else None,
+                commit_callback=self._cache_commit_reporter(
+                    job,
+                    "sha256:" + digest,
+                    file=str(asset.get("filename") or target.name),
+                ) if job else None,
+            )
+        self._verified_prepared_digests = set(
+            getattr(self, "_verified_prepared_digests", set())
+        )
+        self._verified_prepared_digests.add("sha256:" + digest)
+        artifact = {
+            "digest": "sha256:" + digest,
+            "kind": "model-weight",
+            "size": target.stat().st_size,
+            "storage_key": blob_key(digest),
+            "portability": "portable",
+            "requirements": {},
+            "policy": policy,
+            "destination": {
+                "category": str(asset.get("category") or ""),
+                "filename": str(asset.get("filename") or target.name),
+            },
+        }
+        if job:
+            self._pending_prepared_artifacts.append(artifact)
+            return
+        self._publish_prepared_artifacts([artifact], None)
+
+    def _publish_prepared_artifacts(
+        self, additions: list[dict], job: Job | None
+    ) -> None:
+        if not additions:
+            return
+        from cloud_offload.prepared_state import build_manifest
+        from cloud_offload.service_config import VERSION
+
+        cache = self.prepared_cache
         profile = str(self.cache_requirements.get("profile_fingerprint") or "")
         existing = self._selected_prepared_manifest()
         artifacts = list(existing.get("artifacts") or []) if existing else []
-        artifacts = [item for item in artifacts if item.get("digest") != "sha256:" + digest]
-        artifacts.append(
-            {
-                "digest": "sha256:" + digest,
-                "kind": "model-weight",
-                "size": target.stat().st_size,
-                "storage_key": blob_key(digest),
-                "portability": "portable",
-                "requirements": {},
-                "policy": policy,
-                "destination": {
-                    "category": str(asset.get("category") or ""),
-                    "filename": str(asset.get("filename") or target.name),
-                },
-            }
-        )
+        addition_digests = {item["digest"] for item in additions}
+        artifacts = [
+            item for item in artifacts if item.get("digest") not in addition_digests
+        ]
+        artifacts.extend(additions)
         manifest = build_manifest(
             profile_fingerprint=profile,
             producer={
@@ -1812,18 +1957,77 @@ class Worker:
             artifacts=artifacts,
             signer=cache.signer,
         )
-        cache.publish_manifest(manifest)
+        cache.publish_manifest(
+            manifest,
+            verified_digests=set(
+                getattr(self, "_verified_prepared_digests", set())
+            ),
+        )
         self._latest_prepared_manifest = manifest
         if job:
+            for artifact in additions:
+                destination = artifact.get("destination") or {}
+                self._cache_event(
+                    job,
+                    "cache_population_completed",
+                    digest=artifact["digest"],
+                    manifest_id=manifest["manifest_id"],
+                    bytes=artifact["size"],
+                    file=str(destination.get("filename") or ""),
+                    category=str(destination.get("category") or ""),
+                )
+
+    def _flush_prepared_manifest(self, job: Job) -> None:
+        additions = list(getattr(self, "_pending_prepared_artifacts", []))
+        if not additions:
+            return
+        self._publish_prepared_artifacts(additions, job)
+        self._pending_prepared_artifacts = []
+
+    def _cache_population_reporter(
+        self, job: Job, digest: str, total: int, **fields
+    ):
+        started = time.monotonic()
+        last_emit = 0.0
+
+        def report(completed: int, measured_total: int) -> None:
+            nonlocal last_emit
+            now = time.monotonic()
+            actual_total = int(measured_total or total)
+            if completed < actual_total and now - last_emit < 2.0:
+                return
+            last_emit = now
             self._cache_event(
                 job,
-                "cache_population_completed",
-                digest="sha256:" + digest,
-                manifest_id=manifest["manifest_id"],
-                bytes=target.stat().st_size,
+                "cache_population_progress",
+                digest=digest,
+                bytes_completed=int(completed),
+                bytes_total=actual_total,
+                percent=round(100 * completed / max(1, actual_total), 1),
+                elapsed_seconds=round(now - started, 1),
+                **fields,
             )
 
-    def _fetch_declared_asset(self, asset: dict, target: Path, token: str | None) -> None:
+        return report
+
+    def _cache_commit_reporter(self, job: Job, digest: str, **fields):
+        started = time.monotonic()
+
+        def report(stage: str) -> None:
+            self._cache_event(
+                job,
+                "cache_population_commit",
+                digest=digest,
+                commit_stage=stage,
+                elapsed_seconds=round(time.monotonic() - started, 1),
+                **fields,
+            )
+
+        return report
+
+    def _fetch_declared_asset(
+        self, asset: dict, target: Path, token: str | None, job: Job | None = None
+    ) -> None:
         """Fetch one declared asset from the origin the coordinator resolved."""
         source = asset.get("source") or {}
         label = f"{asset.get('category')}/{asset.get('filename')}"
@@ -1841,12 +2045,24 @@ class Worker:
                 staging = target.parent / ".cloud-offload-fetch"
                 staging.mkdir(parents=True, exist_ok=True)
                 try:
-                    fetched = huggingface_hub.hf_hub_download(
-                        repo_id=str(source["repo_id"]),
-                        filename=str(source.get("filename") or asset.get("filename")),
-                        revision=str(source.get("revision") or ""),
-                        local_dir=str(staging),
-                        token=token,
+                    download = lambda: huggingface_hub.hf_hub_download(
+                            repo_id=str(source["repo_id"]),
+                            filename=str(source.get("filename") or asset.get("filename")),
+                            revision=str(source.get("revision") or ""),
+                            local_dir=str(staging),
+                            token=token,
+                    )
+                    fetched = (
+                        self._run_with_feedback(
+                            job,
+                            "weight_download_progress",
+                            download,
+                            repo_id=str(source["repo_id"]),
+                            file=str(asset.get("filename") or ""),
+                            bytes_total=int(asset.get("size") or 0),
+                        )
+                        if job is not None
+                        else download()
                     )
                     shutil.move(str(fetched), str(target))
                 finally:

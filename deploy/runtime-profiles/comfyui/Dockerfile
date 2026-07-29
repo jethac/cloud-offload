@@ -10,7 +10,6 @@ ARG CLOUD_OFFLOAD_SOURCE_REVISION=working-tree
 ARG COMFYUI_REVISION=03978e1e81475f19eebd7edc065cc55cb4e15e10
 
 LABEL org.opencontainers.image.title="Cloud Offload ComfyUI runner"
-LABEL org.opencontainers.image.revision="${CLOUD_OFFLOAD_SOURCE_REVISION}"
 LABEL ai.cloud-offload.comfyui-source-revision="${COMFYUI_REVISION}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -46,6 +45,11 @@ RUN python -m pip install --no-cache-dir "/opt/cloud-offload/source[cloud]" \
     && sed -i 's/\r$//' /opt/cloud-offload/entrypoint.sh \
     && chmod +x /opt/cloud-offload/entrypoint.sh \
     && python -c "import cloud_offload; print('Cloud Offload runner import OK')"
+
+# Revision metadata belongs after the expensive immutable runtime layers. A new
+# source revision must not force apt, ComfyUI, and its Python dependencies to be
+# rebuilt from scratch.
+LABEL org.opencontainers.image.revision="${CLOUD_OFFLOAD_SOURCE_REVISION}"
 
 WORKDIR /opt/ComfyUI
 ENTRYPOINT ["/opt/cloud-offload/entrypoint.sh"]
