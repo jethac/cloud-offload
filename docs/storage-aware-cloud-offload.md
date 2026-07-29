@@ -1,5 +1,10 @@
 # Storage-aware Cloud Offload — persistent prepared state
 
+> **Product context:** This is the storage subsystem PRD. The canonical product
+> goal, promise stack, preflight and GPU recommendation experience, lifecycle
+> guarantees, and delivery milestones live in
+> [Cloud Offload product goal and delivery plan](cloud-offload-product-goal.md).
+
 > Status: **initial RunPod storage-aware MVP implemented** — opt-in volume
 > lifecycle, signed prepared-state manifests/CAS, storage-aware placement,
 > worker restore/population, status telemetry, and the ComfyUI settings flow are
