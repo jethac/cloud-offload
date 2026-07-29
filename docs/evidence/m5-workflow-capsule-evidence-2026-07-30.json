@@ -1,0 +1,132 @@
+{
+  "schema": "cloud-offload.m5-production-evidence.v1",
+  "milestone": "M5",
+  "accepted": true,
+  "captured_at": "2026-07-30T08:46:26+09:00",
+  "merged_stack": {
+    "backend_merge_commit": "b197c91a4a9a9ee83c2c5da522573ba162a4f5c3",
+    "worker_image": "ghcr.io/jethac/cloud-offload-worker-comfyui",
+    "worker_image_digest": "sha256:c4c85999c3d2824fcedcae6f0fb26c6903bfc66cdd174d650c9ccfaead210c16",
+    "worker_image_revision": "b197c91",
+    "runner_platform": "linux-x86_64",
+    "python_abi": "cp311"
+  },
+  "automated_verification": {
+    "backend": {
+      "passed": 624,
+      "failed": 0
+    },
+    "canonical_capsule_digest": true,
+    "free_deterministic_blockers": true,
+    "undeclared_dynamic_behavior_is_uncertain": true,
+    "signed_reproducible_runtime_bundles": true,
+    "runtime_identity_is_exact": true,
+    "boot_restore_report_is_manifest_bound": true,
+    "duplicate_bundle_publication_is_blocked": true
+  },
+  "free_restore_preflight": {
+    "accepted": true,
+    "status": "ready",
+    "provider_mutation": false,
+    "prepared_volume": true,
+    "preparation_complete": true,
+    "coverage_percent": 100.0,
+    "missing_bytes": 0,
+    "gpu_type": "A100 SXM",
+    "region": "US-MD-1",
+    "hourly_rate_usd": 1.49
+  },
+  "paid_runpod_campaign": {
+    "accepted": true,
+    "scenario_spend_limit_usd": 0.3,
+    "total_estimated_compute_cost_upper_usd": 0.343975,
+    "manual_cleanup": false,
+    "final_provider_resource_count": 0,
+    "orphan_audit_error_count": 0,
+    "bounded_incident": {
+      "kind": "worker_registration_not_observed",
+      "accepted_as_success": false,
+      "terminal_status": "failed",
+      "fresh_instance": true,
+      "duration_seconds": 641.688,
+      "estimated_compute_cost_upper_usd": 0.265588,
+      "provider_absent": true,
+      "orphan_count": 0
+    },
+    "population": {
+      "accepted": true,
+      "terminal_status": "completed",
+      "fresh_instance": true,
+      "duration_seconds": 132.047,
+      "estimated_compute_cost_upper_usd": 0.054653,
+      "provider_absent": true,
+      "orphan_count": 0,
+      "cache_hit_count": 0,
+      "population_count": 2,
+      "artifacts": [
+        {
+          "kind": "custom-node-bundle",
+          "bytes": 419840
+        },
+        {
+          "kind": "environment-bundle",
+          "bytes": 3420160
+        }
+      ]
+    },
+    "restore": {
+      "accepted": true,
+      "terminal_status": "completed",
+      "fresh_instance": true,
+      "duration_seconds": 57.344,
+      "estimated_compute_cost_upper_usd": 0.023734,
+      "provider_absent": true,
+      "orphan_count": 0,
+      "cache_hit_count": 2,
+      "population_count": 0,
+      "restored_before_claim_count": 2,
+      "receipt_artifact_count": 2,
+      "artifacts": [
+        {
+          "kind": "custom-node-bundle",
+          "bytes": 419840,
+          "verification_mode": "full_digest",
+          "verification_bytes": 419840,
+          "restored_before_claim": true
+        },
+        {
+          "kind": "environment-bundle",
+          "bytes": 3420160,
+          "verification_mode": "full_digest",
+          "verification_bytes": 3420160,
+          "restored_before_claim": true
+        }
+      ],
+      "workflow_result": {
+        "schema": "comfy.workflow.result.v1",
+        "artifact_count": 1,
+        "output_count": 1,
+        "output_kind": "image",
+        "mime_type": "image/png",
+        "digest_present": true
+      }
+    }
+  },
+  "m5_exit_audit": {
+    "deterministic_missing_requirements_fail_free": true,
+    "fresh_pod_model_restore_is_covered_by_m4": true,
+    "fresh_pod_custom_node_restore_passed": true,
+    "fresh_pod_environment_restore_passed": true,
+    "identical_closures_have_identical_digests": true,
+    "undeclared_dynamic_behavior_remains_visible": true,
+    "all_exits_passed": true
+  },
+  "privacy": {
+    "raw_request_included": false,
+    "raw_workflow_included": false,
+    "raw_prompt_included": false,
+    "private_asset_location_included": false,
+    "credential_or_secret_endpoint_included": false,
+    "job_or_provider_resource_id_included": false
+  }
+}

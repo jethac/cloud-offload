@@ -2,7 +2,7 @@
 
 > Status: **canonical product goal**
 > Last updated: **2026-07-30**
-> Program status: **in progress — Milestone 4 is complete and Milestone 5 prepared workflow capsules are the current gate**
+> Program status: **in progress — Milestone 5 is complete and Milestone 6 regional replication is the current gate**
 > Scope: the end-to-end Cloud Offload product across the coordinator, dispatcher,
 > workers, provider connectors, prepared storage, and ComfyUI extension.
 >
@@ -31,12 +31,12 @@ requests:
 4. **What happens next?** The current execution state and the first unmet exit
    criterion in milestone order.
 
-The active program gate is **M4 fast trusted restore**. M0 through M3 are
-complete. M5 through M7 remain part of this same goal; they are not a backlog
-that can be silently deferred or a new goal that must be rediscovered later. M4
-may close only after trusted hot restore avoids complete artifact reads without
-weakening first-seen integrity, corruption stays quarantined, and the measured
-hot preparation target passes.
+The active program gate is **M6 regional replication**. M0 through M5 are
+complete. M6 and M7 remain part of this same goal; they are not a backlog that
+can be silently deferred or a new goal that must be rediscovered later. M6 may
+close only after shadow recommendations prove that another prepared region has
+measured value, replication stays inside budget and TTL, and placement and
+cleanup remain safe.
 
 Raw benchmark plans, workflows, hooks, support bundles, and service logs remain
 local under `.runlogs/`. The durable record committed to the repository contains
@@ -122,17 +122,11 @@ not a production-readiness claim.
 
 The remaining beta gaps are:
 
-- job status is still too coupled to transient canvas state;
-- reload and reconnect do not yet reconstruct one authoritative lifecycle;
-- Hugging Face progress lacks reliable bytes, throughput, and ETA;
-- overall percentages do not yet represent the real critical path;
-- logical cancellation does not yet cooperatively abort every phase or prove
-  provider billing closure;
-- trusted cache hits may still pay expensive verification I/O;
-- dependency failures can still be discovered after the rental boundary;
-- custom-node prepared bundles are incomplete;
-- regional replication is not yet demand- and budget-controlled; and
-- validation is not yet a continuous cold/hot/failure-injection matrix.
+- regional demand and measured replication benefit are not yet recorded;
+- multi-region prepared-state placement and shadow replication are incomplete;
+- replication budget, TTL, and automatic deletion controls are incomplete;
+- adaptive placement does not yet use safe multi-region replica state; and
+- validation is not yet a continuous cold, hot, and failure-injection matrix.
 
 ## Why these requirements exist
 
@@ -181,7 +175,7 @@ validate the product journey.
 | `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Complete; backend PR #34 and extension PR #8 implement the contract, and the accepted paid RunPod cancellation and restart matrix proves exact provider-confirmed closure. |
 | `STORAGE-1` | Opt into or adopt RunPod storage before cached rental and attach it to compatible future Pods. | M4 foundation | Initial managed/adopted-volume MVP merged. |
 | `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
-| `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Durable population/restore baseline merged; fast trust and capsules pending. |
+| `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Complete; signed trusted restore, canonical workflow capsules, and fresh-Pod runtime-bundle restore have paid production proof. |
 | `REPLICA-1` | Replicate prepared state only for measured benefit, within budget and TTL. | M6 | Planned; shadow mode first. |
 | `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Complete; all seven scenarios are accepted and the compact redacted projection is committed. |
 | `RELEASE-1` | Pass the continuous production matrix and budget gates. | M7 | Pending. |
@@ -652,6 +646,17 @@ This ledger records merged implementation evidence across both repositories.
 | [#36](https://github.com/jethac/cloud-offload/pull/36) | Adds coordinator-signed prepared-cache trust receipts, exact manifest/artifact/provider-volume/runtime/generation binding, a rotating sampled hot path, full-verification fallbacks, sensitive-asset policy, and safe verification telemetry. | 599 tests passed. A 6 MiB eligible hot artifact reads one 1 MiB signed sample instead of a complete digest; tampering, metadata change, expiry, audit due state, and private policy return to full verification. Background scrub enforcement and paid M4 performance proof remain. |
 | [#37](https://github.com/jethac/cloud-offload/pull/37) | Adds a second signed cache sample during materialization, blocks return of a corrupt target, degrades affected cache volumes, and restores placement eligibility only after a new full digest verification. | 600 tests passed. The focused corruption test places damage only in the background-selected range and proves that the target is removed before return. The registry test proves that corruption removes the volume from placement and that full verification restores it. The paid M4 performance proof remains. |
 | [#38](https://github.com/jethac/cloud-offload/pull/38) | Records the redacted paid M4 preparation evidence, exact trusted-read telemetry, complete first-seen verification, bounded campaign incidents, and provider closure. It marks M4 complete and makes M5 active. | 601 tests passed. Four cold samples have a 176.482397-second median. Three hot samples have a 15.179662-second median. Hot is 8.601% of cold. Two trusted restores each materialized 36,664,522,522 bytes with 12,582,912 verification bytes, six background scrubs, zero full-digest hits, and provider-confirmed absence. |
+| [#39](https://github.com/jethac/cloud-offload/pull/39) | Adds canonical prepared workflow capsules, full-workflow preflight and confirmed submit, prepared inputs, result artifacts, readiness identities, and cooperative cancellation. | Merged as `13048da`; capsule digest and blocker tests pass. |
+| [#40](https://github.com/jethac/cloud-offload/pull/40) | Adds reproducible signed custom-node and Python environment bundles, exact profile/runtime binding, first-rent publication, and later-Pod restore before ComfyUI starts. | Merged as `e7afc73`; paid production proof follows in this evidence change. |
+| [#41](https://github.com/jethac/cloud-offload/pull/41) | Filters RunPod offers against current stock in the prepared-storage data center. | Merged as `6a41b66`; stale region-only offers no longer cause a known paid launch failure. |
+| [#42](https://github.com/jethac/cloud-offload/pull/42) | Preserves the first-runner registration lease after provider binding. | Merged as `7adf4e5`; long image pulls can register against the same paid launch. |
+| [#43](https://github.com/jethac/cloud-offload/pull/43) | Splits the runner image into parallel pull layers. | Merged as `c084014`; large independent layers can transfer in parallel. |
+| [#44](https://github.com/jethac/cloud-offload/pull/44) | Adds explicit runner image profile aliases. | Merged as `28658f2`; capsule capability names can select a pinned image profile. |
+| [#45](https://github.com/jethac/cloud-offload/pull/45) | Aligns the RunPod S3 cache namespace and identifies runtime bundle population events by artifact kind. | Merged as `a6d52b0`; 617 tests passed. |
+| [#46](https://github.com/jethac/cloud-offload/pull/46) | Declares and validates the pinned runner platform and Python ABI. | Merged as `253d4cc`; 622 tests passed. |
+| [#47](https://github.com/jethac/cloud-offload/pull/47) | Projects manifest-checked pre-ComfyUI boot restores into the claimed job event stream and restore receipt. | Merged as `d1e462e`; 623 tests passed. |
+| [#48](https://github.com/jethac/cloud-offload/pull/48) | Moves the boot-report setting after stable image layers so the evidence fix does not invalidate the large apt, ComfyUI, PyTorch, and CUDA cache layers. | Merged as `b197c91`; 30 focused image and shell checks passed. |
+| [#49](https://github.com/jethac/cloud-offload/pull/49) | Records the redacted paid M5 population and fresh-Pod restore proof, exact image identity, result transport, bounded incident, and provider closure. It marks M5 complete and makes M6 active. | 624 tests passed. Both runtime bundles restored before job claim with complete digest checks, no duplicate population, and zero final provider resources. |
 
 ### ComfyUI extension repository
 
@@ -1191,7 +1196,7 @@ provider payloads.
 
 The backend passed 579 tests. The extension passed 82 Python tests with 3 skips
 and 67 JavaScript tests. Syntax checks also passed. All M2 exits pass. M2 is
-complete. M3 is the first unmet milestone.
+complete. M3 was the next milestone at the time of this evidence.
 
 ### M3 evidence and exit audit
 
@@ -1251,8 +1256,38 @@ aggregate timings, immutable build identity, and provider-closure conclusions.
 The campaign scorecards also record two post-preparation workflow outcomes: one
 execution failure and one scenario cost limit. They do not change the completed
 preparation measurements, integrity observations, or provider closure. They remain
-visible for the production release gate. All M4 exits pass. M4 is complete. M5 is
-the first unmet milestone.
+visible for the production release gate. All M4 exits pass. M4 is complete. M5
+was the next milestone at the time of this evidence.
+
+### M5 evidence and exit audit
+
+The safe evidence projection is
+[M5 workflow capsule evidence](evidence/m5-workflow-capsule-evidence-2026-07-30.json).
+It records the exact merged backend and worker image, free restore preflight,
+paid first-rent bundle population, paid fresh-Pod restore, result transport,
+cost bounds, one bounded image-start incident, and provider cleanup. It contains
+no job ID, provider resource ID, raw workflow, private path, endpoint, or secret.
+
+1. **Free blockers:** automated tests cover deterministic credential, artifact,
+   disk, and node blockers. The accepted restore preflight was ready, reported a
+   complete prepared volume with 100% coverage, and made no provider mutation.
+2. **Canonical closure:** identical capsules have identical digests. Undeclared
+   dynamic behavior remains explicit uncertainty.
+3. **First rent:** a fresh Pod built and published one custom-node bundle and one
+   Python environment bundle. The accepted job completed in 132.047 seconds with
+   an estimated compute cost upper bound of USD 0.054653.
+4. **Later rent:** a different fresh Pod restored both bundles before it claimed
+   the job. Both complete digests passed. The worker emitted two cache hits, no
+   population event, and a restore receipt with both artifacts. The workflow
+   returned one digested PNG result in 57.344 seconds with an estimated compute
+   cost upper bound of USD 0.023734.
+5. **Bounded incident:** an earlier exact-image attempt did not reach worker
+   registration. It is not accepted as a successful population. Its estimated
+   compute cost upper bound was USD 0.265588. Cleanup left no provider resource.
+6. **Closure:** all three attributed attempts left zero orphaned resources. The
+   independent final provider inventory was empty. No manual cleanup was needed.
+
+All M5 exits pass. M5 is complete. M6 is the first unmet milestone.
 
 ### Operational safety rules
 
@@ -1281,8 +1316,8 @@ the first unmet milestone.
 | M2 — persistent visibility | **Complete** | All exits passed; the persistent Cloud Jobs surface, reload reconstruction, complete safe telemetry, and compact evidence are durable. |
 | M3 — leases and billing closure | **Complete** | The automated five-phase matrix and the bounded paid RunPod cancellation/restart campaign pass with provider-confirmed closure and zero final resources. |
 | M4 — fast trusted restore | **Complete** | Signed trust receipts, complete first-seen verification, foreground and background corruption handling, safe fallback, and the paid 8.601% hot-to-cold preparation result are durable. |
-| M5 — workflow capsules | **In progress** | Schema, full-workflow preflight, prepared assets, custom-node readiness, cooperative cancellation, and artifact results are the current gate. |
-| M6 — regional replication | **Not started** | Shadow recommendations precede automation. |
+| M5 — workflow capsules | **Complete** | Canonical capsules, free blockers, signed runtime bundles, exact runtime identity, first-rent publication, paid fresh-Pod restore, result transport, and compact redacted evidence are durable. |
+| M6 — regional replication | **In progress** | Shadow recommendations precede automation. |
 | M7 — production release gate | **Not started** | Requires all prior exits and continuous canaries. |
 
 ### Milestone 0 — Measurement contract and production scorecard
@@ -1401,14 +1436,20 @@ Exit:
 - Build reproducible signed custom-node and environment bundles.
 - Promote capsules using measured reuse and cold-start cost.
 
-Implementation status: active. The canonical `comfy.workflow.capsule.v1`
+Implementation status: complete. The canonical `comfy.workflow.capsule.v1`
 closure, stable capsule digest, full-workflow preflight, confirmed submission,
 artifact input and result transport, environment readiness identities, and
 cooperative whole-workflow cancellation are implemented. First-rent workers now
 build reproducible custom-node and Python environment bundles. The coordinator
 binds them to exact profile and runtime identities before it signs the prepared
 manifest. Later Pods restore both before ComfyUI starts. Paid fresh-Pod proof
-remains before this milestone can close.
+passed on the exact pinned image. The accepted population created both bundles.
+The accepted restore used a different fresh Pod, verified both complete digests
+before job claim, emitted two cache hits and no new population event, returned a
+digested workflow result, and left zero provider resources. A separate bounded
+image-start incident is retained in the evidence with its cost and clean provider
+closure. The redacted evidence is in
+`docs/evidence/m5-workflow-capsule-evidence-2026-07-30.json`.
 
 Exit:
 
