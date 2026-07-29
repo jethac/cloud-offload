@@ -1649,15 +1649,28 @@ class RunPodS3PreparedStore:
         datacenter_id: str,
         client: Any,
         endpoint_url: str,
+        prefix: str = "",
         publication_lock: Any | None = None,
     ):
         self.volume_id = str(volume_id)
         self.datacenter_id = str(datacenter_id).upper()
         self.client = client
         self.endpoint_url = str(endpoint_url)
-        self.publication_lock = publication_lock or _s3_publication_lock(
-            self.endpoint_url, self.volume_id
+        self.prefix = str(prefix).strip("/")
+        if any(part in {".", ".."} for part in self.prefix.split("/") if part):
+            raise ValueError("RunPod S3 prefix cannot contain relative path segments")
+        lock_namespace = (
+            f"{self.volume_id}/{self.prefix}" if self.prefix else self.volume_id
         )
+        self.publication_lock = publication_lock or _s3_publication_lock(
+            self.endpoint_url, lock_namespace
+        )
+
+    def _key(self, key: str) -> str:
+        logical_key = str(key).lstrip("/")
+        if not logical_key:
+            raise ValueError("RunPod S3 object key cannot be empty")
+        return f"{self.prefix}/{logical_key}" if self.prefix else logical_key
 
     @classmethod
     def from_environment(
@@ -1666,6 +1679,7 @@ class RunPodS3PreparedStore:
         volume_id: str,
         datacenter_id: str,
         endpoint_url: str,
+        prefix: str = "",
         client_factory: Callable[..., Any] | None = None,
     ) -> "RunPodS3PreparedStore":
         access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
@@ -1700,6 +1714,7 @@ class RunPodS3PreparedStore:
             datacenter_id=datacenter_id,
             client=client,
             endpoint_url=endpoint_url,
+            prefix=prefix,
         )
 
     def probe(self) -> bool:
@@ -1708,7 +1723,7 @@ class RunPodS3PreparedStore:
         # volume.  Prepared-state verification needs the exact permissions it
         # will use later, so exercise a tiny write/read/delete lifecycle under
         # the staging namespace and always clean it up.
-        key = f"staging/probes/{uuid.uuid4().hex}"
+        key = self._key(f"staging/probes/{uuid.uuid4().hex}")
         payload = os.urandom(32)
         try:
             self.client.put_object(Bucket=self.volume_id, Key=key, Body=payload)
@@ -1724,7 +1739,7 @@ class RunPodS3PreparedStore:
 
     def exists(self, key: str, size: int | None = None) -> bool:
         try:
-            head = self.client.head_object(Bucket=self.volume_id, Key=str(key))
+            head = self.client.head_object(Bucket=self.volume_id, Key=self._key(key))
         except Exception:
             return False
         return size is None or int(head.get("ContentLength") or -1) == int(size)
@@ -1750,7 +1765,7 @@ class RunPodS3PreparedStore:
         # canonical key. A single CopyObject promotion would fail for common
         # >5GB weights; duplicate digest writers are safe because their bytes
         # were verified locally and are identical by definition.
-        self.client.upload_file(str(source), self.volume_id, key)
+        self.client.upload_file(str(source), self.volume_id, self._key(key))
         if not self.exists(key, source.stat().st_size):
             raise CacheCorruptionError("RunPod S3 published object has the wrong size")
         self._download_verify(key, digest, source.stat().st_size)
@@ -1773,7 +1788,9 @@ class RunPodS3PreparedStore:
             generation = f"{time.time_ns()}-{uuid.uuid4().hex}"
             key = f"manifests/{profile}/{generation}.json"
             payload = canonical_json(manifest)
-            self.client.put_object(Bucket=self.volume_id, Key=key, Body=payload)
+            self.client.put_object(
+                Bucket=self.volume_id, Key=self._key(key), Body=payload
+            )
             if not self.exists(key, len(payload)):
                 raise CacheCorruptionError(
                     "RunPod S3 manifest publication was incomplete"
@@ -1813,7 +1830,9 @@ class RunPodS3PreparedStore:
             index_payload = canonical_json(index)
             index_key = f"indexes/{generation}.json"
             self.client.put_object(
-                Bucket=self.volume_id, Key=index_key, Body=index_payload
+                Bucket=self.volume_id,
+                Key=self._key(index_key),
+                Body=index_payload,
             )
             if not self.exists(index_key, len(index_payload)):
                 raise CacheCorruptionError(
@@ -1824,7 +1843,7 @@ class RunPodS3PreparedStore:
             # published last under a coordinator-side critical section; every
             # referenced generation remains immutable and independently valid.
             self.client.put_object(
-                Bucket=self.volume_id, Key="indexes/latest", Body=pointer
+                Bucket=self.volume_id, Key=self._key("indexes/latest"), Body=pointer
             )
             return key
 
@@ -1834,11 +1853,12 @@ class RunPodS3PreparedStore:
     def load_index(self) -> dict[str, Any]:
         try:
             response = self.client.get_object(
-                Bucket=self.volume_id, Key="indexes/latest"
+                Bucket=self.volume_id, Key=self._key("indexes/latest")
             )
             generation = response["Body"].read().decode("utf-8").strip()
             response = self.client.get_object(
-                Bucket=self.volume_id, Key=f"indexes/{generation}.json"
+                Bucket=self.volume_id,
+                Key=self._key(f"indexes/{generation}.json"),
             )
             index = json.loads(response["Body"].read())
             if index.get("schema") != INDEX_SCHEMA:
@@ -1860,12 +1880,12 @@ class RunPodS3PreparedStore:
             raise
 
     def read_json(self, key: str) -> dict[str, Any]:
-        response = self.client.get_object(Bucket=self.volume_id, Key=str(key))
+        response = self.client.get_object(Bucket=self.volume_id, Key=self._key(key))
         return json.loads(response["Body"].read())
 
     def download_verified(self, key: str, digest: str, destination: str | Path) -> Path:
         destination = Path(destination)
-        self.client.download_file(self.volume_id, str(key), str(destination))
+        self.client.download_file(self.volume_id, self._key(key), str(destination))
         if sha256_file(destination) != normalize_digest(digest):
             destination.unlink(missing_ok=True)
             raise CacheCorruptionError(f"RunPod S3 object {key} failed verification")
@@ -1876,7 +1896,7 @@ class RunPodS3PreparedStore:
         os.close(descriptor)
         temporary = Path(temporary_name)
         try:
-            self.client.download_file(self.volume_id, key, str(temporary))
+            self.client.download_file(self.volume_id, self._key(key), str(temporary))
             if (
                 temporary.stat().st_size != int(size)
                 or sha256_file(temporary) != digest

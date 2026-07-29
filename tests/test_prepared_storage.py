@@ -1514,6 +1514,35 @@ def test_s3_probe_exercises_write_read_and_delete():
     assert client.objects == {}
 
 
+def test_s3_prefix_matches_mounted_cache_namespace(tmp_path):
+    client = MemoryS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="US-MD-1",
+        client=client,
+        endpoint_url="https://s3api-us-md-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    signer = ManifestSigner(b"n" * 32)
+    source = tmp_path / "bundle.tar"
+    source.write_bytes(b"prepared runtime bundle")
+    artifact = portable_artifact(source.read_bytes())
+
+    logical_key = store.upload_verified(source, artifact["digest"])
+    manifest = signed_manifest(signer, [artifact])
+    logical_manifest_key = store.publish_manifest(manifest, signer)
+
+    assert logical_key == artifact["storage_key"]
+    assert logical_manifest_key.startswith("manifests/")
+    assert all(key.startswith("cloud-offload/") for key in client.objects)
+    index = store.load_index()
+    assert index["manifests"][0]["storage_key"] == logical_manifest_key
+    assert (
+        store.read_json(logical_manifest_key)["manifest_id"]
+        == manifest["manifest_id"]
+    )
+
+
 def test_runpod_invalid_argument_object_not_found_is_an_empty_index():
     class RunPodMemoryS3(MemoryS3):
         def get_object(self, Bucket, Key):

@@ -2428,6 +2428,7 @@ class Worker:
                 self._cache_event(
                     job,
                     "cache_population_completed",
+                    kind=str(artifact.get("kind") or ""),
                     digest=artifact["digest"],
                     manifest_id=manifest["manifest_id"],
                     bytes=artifact["size"],

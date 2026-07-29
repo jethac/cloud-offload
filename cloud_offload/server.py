@@ -313,6 +313,7 @@ def _runpod_s3_store(volume, connector):
         volume_id=volume.provider_volume_id,
         datacenter_id=volume.datacenter_id,
         endpoint_url=endpoint,
+        prefix="cloud-offload",
     )
 
 
