@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -129,6 +130,8 @@ class Dispatcher:
         self.last_activity: dict[str, datetime] = {}
         self.launched_at: dict[str, datetime] = {}
         self.runner_feedback_at: dict[str, datetime] = {}
+        self.event_producer_id = f"dispatcher:{uuid.uuid4()}"
+        self.event_producer_sequence = 0
         self.launch_failures: dict[tuple[str, str], int] = {}
         self.next_launch_at: dict[tuple[str, str], float] = {}
         # (provider, offer_id) -> monotonic expiry. A host that refuses a launch
@@ -897,9 +900,15 @@ class Dispatcher:
         }
 
     def _publish_launch_event(self, jobs: list | None, event: dict) -> None:
+        self.event_producer_sequence += 1
         for job in jobs or []:
             try:
-                self.queue.append_event(job.id, event)
+                self.queue.append_event(
+                    job.id,
+                    event,
+                    producer_id=self.event_producer_id,
+                    producer_sequence=self.event_producer_sequence,
+                )
             except (KeyError, ValueError):
                 logger.debug("Could not append provisioning event for %s", job.id)
 

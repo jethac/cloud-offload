@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from cloud_offload.config import CloudConfig
+from cloud_offload.coordinator import CoordinatorQueue
 from cloud_offload.dispatcher import Dispatcher
 from cloud_offload.providers.base import CloudProvider
 from cloud_offload.queue import JobQueue, JobStatus
@@ -209,8 +210,45 @@ def test_queue_migrates_legacy_schema(tmp_path):
             )
             """
         )
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, model, status, input_path, params, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-job",
+                "comfyui-workflow",
+                "queued",
+                "inline://legacy",
+                "{}",
+                "2026-07-28T23:59:00",
+                "2026-07-28T23:59:00",
+            ),
+        )
+        conn.execute(
+            """
+            CREATE TABLE job_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO job_events (job_id, event_json, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                "legacy-job",
+                '{"type":"progress","phase":"execution","value":1,"max":4}',
+                "2026-07-29T00:00:00",
+            ),
+        )
 
-    JobQueue(db_path)
+    queue = JobQueue(db_path)
 
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
@@ -227,7 +265,27 @@ def test_queue_migrates_legacy_schema(tmp_path):
         "result_json",
         "progress",
     } <= columns
-    assert version == "5"
+    with sqlite3.connect(db_path) as conn:
+        event_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(job_events)").fetchall()
+        }
+
+    assert {
+        "producer_id",
+        "producer_sequence",
+        "occurred_at",
+        "observed_at",
+        "event_type",
+        "phase",
+    } <= event_columns
+    assert version == "6"
+    legacy_event = queue.list_events("legacy-job")[0]
+    assert legacy_event["schema"] == "cloud-offload.job-event.v2"
+    assert legacy_event["producer"] == {"id": "legacy", "sequence": None}
+    assert legacy_event["occurred_at"] == "2026-07-29T00:00:00"
+    assert legacy_event["observed_at"] == "2026-07-29T00:00:00"
+    assert legacy_event["type"] == "progress"
+    assert legacy_event["phase"] == "execution"
 
 
 def test_job_events_are_ordered_and_resumable(tmp_path):
@@ -243,6 +301,101 @@ def test_job_events_are_ordered_and_resumable(tmp_path):
         "progress",
     ]
     assert queue.list_events(job.id, after=first["sequence"]) == [second]
+
+
+def test_job_event_v2_is_idempotent_per_producer_sequence(tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = queue.create("comfyui-workflow", "partition://input")
+    event = {
+        "type": "weight_download_progress",
+        "phase": "dependency_preparation",
+        "bytes": 1024,
+        "total_bytes": 4096,
+        "provider": "runpod",
+    }
+
+    first = queue.append_event(
+        job.id,
+        event,
+        producer_id="worker:one:process-a",
+        producer_sequence=7,
+        occurred_at="2026-07-29T00:00:00",
+    )
+    duplicate = queue.append_event(
+        job.id,
+        event,
+        producer_id="worker:one:process-a",
+        producer_sequence=7,
+        occurred_at="2026-07-29T00:00:01",
+    )
+
+    assert duplicate == first
+    assert first["schema"] == "cloud-offload.job-event.v2"
+    assert first["producer"] == {"id": "worker:one:process-a", "sequence": 7}
+    assert first["metrics"] == {"bytes": 1024, "total_bytes": 4096}
+    assert first["resources"] == {"provider": "runpod"}
+    assert len(queue.list_events(job.id)) == 1
+
+    with pytest.raises(ValueError, match="reused with different data"):
+        queue.append_event(
+            job.id,
+            {**event, "bytes": 2048},
+            producer_id="worker:one:process-a",
+            producer_sequence=7,
+        )
+
+
+def test_job_event_snapshot_projects_cursor_phase_and_monotonic_progress(tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = queue.create("comfyui-workflow", "partition://input")
+    queue.append_event(
+        job.id,
+        {"type": "runner_starting", "phase": "worker_boot", "overall_progress": 2},
+    )
+    last = queue.append_event(
+        job.id,
+        {
+            "type": "weight_download_progress",
+            "phase": "dependency_preparation",
+            "overall_progress": 24,
+        },
+    )
+
+    snapshot = queue.event_snapshot(job.id)
+
+    assert snapshot["schema"] == "cloud-offload.job-snapshot.v1"
+    assert snapshot["event_cursor"] == last["sequence"]
+    assert snapshot["event_count"] == 2
+    assert snapshot["lifecycle_phase"] == "dependency_preparation"
+    assert snapshot["progress"] == 24
+    assert snapshot["last_event"] == last
+
+    queue.update_status(job.id, JobStatus.COMPLETED)
+    assert queue.event_snapshot(job.id)["progress"] == 100
+
+
+def test_coordinator_queue_publishes_process_scoped_monotonic_event_ids(monkeypatch):
+    queue = CoordinatorQueue(
+        "https://coordinator.invalid",
+        "worker-secret",
+        "runpod",
+        "worker-7",
+    )
+    requests = []
+
+    def record(path, payload):
+        requests.append((path, payload))
+        return payload
+
+    monkeypatch.setattr(queue, "_post", record)
+
+    first = queue.append_event("job-1", {"type": "runner_starting"})
+    second = queue.append_event("job-1", {"type": "runner_ready"})
+
+    assert first["producer_id"] == second["producer_id"]
+    assert first["producer_id"].startswith("worker:worker-7:")
+    assert [item[1]["producer_sequence"] for item in requests] == [1, 2]
+    assert all(item[1]["occurred_at"] for item in requests)
 
 
 def test_claim_increments_attempts_and_assigns_worker(tmp_path):
@@ -528,7 +681,8 @@ def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_
     dispatcher._tick()
     dispatcher._tick()
 
-    events = [item["event"] for item in queue.list_events(job.id)]
+    envelopes = queue.list_events(job.id)
+    events = [item["event"] for item in envelopes]
     assert provider.launch_count == 1
     assert [item["type"] for item in events] == [
         "provisioning_started",
@@ -538,6 +692,10 @@ def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_
     ]
     assert events[-1]["retry_seconds"] == 10
     assert events[-1]["error"] == "private image cannot be pulled"
+    assert all(
+        item["producer"]["id"].startswith("dispatcher:") for item in envelopes
+    )
+    assert [item["producer"]["sequence"] for item in envelopes] == [1, 2, 3, 4]
 
 
 def test_worker_token_required_when_queue_is_configured(tmp_path):

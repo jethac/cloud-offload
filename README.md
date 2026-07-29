@@ -520,8 +520,17 @@ Client (node-pack) routes:
 | POST | `/api/artifacts` | upload a `.part` bundle (sha256 content-addressed) |
 | GET  | `/api/artifacts/{id}` | download a bundle (digest-verified) |
 | GET  | `/api/jobs/{id}` | job status (+ `result` when completed) |
+| GET  | `/api/jobs/{id}/snapshot` | projected state + resumable event cursor |
+| GET  | `/api/jobs/{id}/support-bundle` | bounded, redacted diagnostic evidence |
 | POST | `/api/jobs/{id}/cancel` | request cancellation |
 | GET  | `/api/jobs/{id}/events?after=N&limit=M` | resumable event page (`next_after`) |
+
+New journal entries use the versioned `cloud-offload.job-event.v2` envelope.
+Workers and dispatchers attach a process-scoped producer ID and local sequence,
+making retried delivery idempotent; conflicting reuse is rejected. Existing event
+payloads remain under `event` while clients migrate to the normalized `type`,
+`phase`, `metrics`, `resources`, and `evidence` fields. See the
+**[JobEventV2 contract](docs/job-event-v2.md)** for replay and privacy rules.
 
 Worker channel (separate `Bearer <worker_token>`, exempt from the LAN token):
 `POST /api/workers/claim`, `POST /api/workers/status`, `GET /api/workers/policy`,

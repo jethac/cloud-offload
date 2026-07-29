@@ -1,6 +1,9 @@
 """HTTP client used by remote Cloud Offload workers."""
 
 import hashlib
+import threading
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,11 @@ class CoordinatorQueue:
         self.worker_id = worker_id
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
+        # A process-scoped producer id prevents a restarted worker process from
+        # reusing sequence numbers under the stable Pod-level worker id.
+        self._event_producer_id = f"worker:{worker_id}:{uuid.uuid4()}"
+        self._event_sequence = 0
+        self._event_sequence_lock = threading.Lock()
 
     def _post(self, path: str, payload: dict[str, Any] | None = None) -> Any:
         response = self.session.post(
@@ -157,9 +165,18 @@ class CoordinatorQueue:
         return Job.from_dict(data)
 
     def append_event(self, job_id: str, event: dict[str, Any]) -> dict[str, Any]:
-        """Publish an incremental remote execution event."""
+        """Publish an incremental remote execution event idempotently."""
+        with self._event_sequence_lock:
+            self._event_sequence += 1
+            producer_sequence = self._event_sequence
         return self._post(
-            f"/api/workers/jobs/{job_id}/events", {"event": event}
+            f"/api/workers/jobs/{job_id}/events",
+            {
+                "event": event,
+                "producer_id": self._event_producer_id,
+                "producer_sequence": producer_sequence,
+                "occurred_at": datetime.utcnow().isoformat(),
+            },
         )
 
     def sign_prepared_manifest(

@@ -1841,6 +1841,28 @@ async def get_job(job_id: str):
     return job.to_dict()
 
 
+@app.get("/api/jobs/{job_id}/snapshot")
+async def get_job_snapshot(job_id: str):
+    """Return current lifecycle state plus the resumable event cursor."""
+    _, queue = _queue()
+    snapshot = queue.event_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return snapshot
+
+
+@app.get("/api/jobs/{job_id}/support-bundle")
+async def get_job_support_bundle(job_id: str):
+    """Return bounded, redacted evidence for diagnostics and replay."""
+    from cloud_offload.support_bundle import build_support_bundle
+
+    _, queue = _queue()
+    job = queue.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return build_support_bundle(queue, job)
+
+
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
     """Cancel a job."""
@@ -2406,13 +2428,31 @@ async def worker_event(job_id: str, request: Request, payload: dict[str, Any] = 
     from cloud_offload.queue import JobStatus
 
     queue, job = _authorize_worker_job(request, job_id)
-    if job.status in {JobStatus.FAILED, JobStatus.DEAD_LETTER}:
+    if job.status in {
+        JobStatus.COMPLETED,
+        JobStatus.FAILED,
+        JobStatus.DEAD_LETTER,
+    }:
         return {"job_id": job.id, "ignored": True, "status": job.status.value}
     event = payload.get("event")
     if not isinstance(event, dict):
         raise HTTPException(status_code=400, detail="event object is required")
+    producer_id = payload.get("producer_id")
+    if producer_id and job.worker_id:
+        expected_prefix = f"worker:{job.worker_id}:"
+        if not str(producer_id).startswith(expected_prefix):
+            raise HTTPException(
+                status_code=403,
+                detail="Worker event producer does not match the claimed job",
+            )
     try:
-        return queue.append_event(job.id, event)
+        return queue.append_event(
+            job.id,
+            event,
+            producer_id=str(producer_id or f"worker:{job.worker_id or 'legacy'}"),
+            producer_sequence=payload.get("producer_sequence"),
+            occurred_at=payload.get("occurred_at"),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
