@@ -5,8 +5,10 @@ import pytest
 
 from cloud_offload.benchmark_faults import (
     _benchmark_context,
-    inject_corruption,
+    cleanup_corruption,
     inject_storage_unavailable,
+    observe_corruption,
+    prepare_corruption,
 )
 
 
@@ -155,14 +157,35 @@ def test_corruption_fault_chooses_smallest_required_object_and_restores_backup()
     s3 = FakeS3Client()
     store = SimpleNamespace(volume_id="provider-volume", client=s3)
 
-    receipt = inject_corruption(
+    declared = {"a" * 64, "b" * 64}
+    prepared = prepare_corruption(
+        client,
+        "corruption-scenario",
+        declared,
+        store_factory=lambda volume: store,
+        settle_seconds=0,
+    )
+
+    assert prepared == {
+        "kind": "corruption",
+        "stage": "prepare",
+        "backup_verified": True,
+        "canary_verified": True,
+        "artifact_size": 100,
+    }
+    assert s3.objects["blobs/b"] != 100
+
+    observed = observe_corruption(
         client,
         "job-corruption",
+        "corruption-scenario",
+        declared,
         store_factory=lambda volume: store,
     )
 
-    assert receipt == {
+    assert observed == {
         "kind": "corruption",
+        "stage": "observe",
         "quarantine_observed": True,
         "canonical_size_restored": True,
         "backup_deleted": True,
@@ -171,3 +194,13 @@ def test_corruption_fault_chooses_smallest_required_object_and_restores_backup()
     assert s3.objects["blobs/b"] == 100
     assert len(s3.deleted) == 1
     assert s3.deleted[0].startswith("staging/benchmark-corruption/")
+
+    assert (
+        cleanup_corruption(
+            client,
+            "corruption-scenario",
+            declared,
+            store_factory=lambda volume: store,
+        )["changed"]
+        is False
+    )

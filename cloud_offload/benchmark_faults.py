@@ -7,6 +7,7 @@ still gated by the campaign's explicit ``--allow-hooks`` acknowledgement.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -33,15 +34,23 @@ from cloud_offload.service_config import (
 FAULT_KINDS = {"storage", "corruption", "restart"}
 
 
-def _benchmark_context(expected_kind: str) -> tuple[str, str]:
+def _benchmark_context(expected_kind: str) -> tuple[str, str, str]:
     kind = os.environ.get("CLOUD_OFFLOAD_BENCHMARK_FAILURE_KIND", "").strip()
     job_id = os.environ.get("CLOUD_OFFLOAD_BENCHMARK_JOB_ID", "").strip()
     scenario = os.environ.get("CLOUD_OFFLOAD_BENCHMARK_SCENARIO", "").strip()
-    if kind != expected_kind or not job_id or not scenario:
+    stage = (
+        os.environ.get("CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE", "observe").strip().lower()
+    )
+    if (
+        kind != expected_kind
+        or not scenario
+        or stage not in {"prepare", "observe", "cleanup"}
+        or (stage == "observe" and not job_id)
+    ):
         raise RuntimeError(
             "Benchmark fault canaries run only inside a matching benchmark hook"
         )
-    return job_id, scenario
+    return job_id, scenario, stage
 
 
 class CoordinatorFaultClient:
@@ -172,7 +181,10 @@ def inject_storage_unavailable(
 
 
 def _corruption_target(
-    client: CoordinatorFaultClient, job_id: str
+    client: CoordinatorFaultClient,
+    job_id: str | None = None,
+    *,
+    declared_digests: set[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     prepared = client.prepared_storage()
     provider_volume_id = str(prepared.get("existing_volume_id") or "")
@@ -190,14 +202,18 @@ def _corruption_target(
     if not volume or not volume.get("s3_compatible"):
         raise RuntimeError("Bound prepared volume has no S3 canary path")
 
-    job = client.job(job_id)
     declared = {
-        "sha256:" + normalize_digest(str(item.get("sha256") or ""))
-        for item in ((job.get("request") or {}).get("partition") or {}).get(
-            "assets", []
-        )
-        if item.get("sha256")
+        "sha256:" + normalize_digest(item) for item in (declared_digests or set())
     }
+    if not declared and job_id:
+        job = client.job(job_id)
+        declared = {
+            "sha256:" + normalize_digest(str(item.get("sha256") or ""))
+            for item in ((job.get("request") or {}).get("partition") or {}).get(
+                "assets", []
+            )
+            if item.get("sha256")
+        }
     if not declared:
         raise RuntimeError("Benchmark job declares no digest-addressed assets")
     manifests = list(client.get("/api/cache/manifests").get("manifests") or [])
@@ -230,36 +246,56 @@ def _prepared_store(volume: dict[str, Any]) -> RunPodS3PreparedStore:
     )
 
 
-def inject_corruption(
+def _corruption_canary(
     client: CoordinatorFaultClient,
-    job_id: str,
+    scenario: str,
+    declared_digests: set[str],
+    *,
+    store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore],
+) -> tuple[RunPodS3PreparedStore, dict[str, Any], str]:
+    volume, artifact = _corruption_target(client, declared_digests=declared_digests)
+    store = store_factory(volume)
+    digest = normalize_digest(str(artifact["digest"]))
+    scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
+    backup = f"staging/benchmark-corruption/{scenario_tag}/{digest}.backup"
+    return store, artifact, backup
+
+
+def _object_size(store: RunPodS3PreparedStore, key: str) -> int | None:
+    try:
+        head = store.client.head_object(Bucket=store.volume_id, Key=key)
+    except Exception:
+        return None
+    return int(head.get("ContentLength") or -1)
+
+
+def prepare_corruption(
+    client: CoordinatorFaultClient,
+    scenario: str,
+    declared_digests: set[str],
     *,
     store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
+    settle_seconds: float = 5,
 ) -> dict[str, Any]:
-    """Replace the smallest required object with a canary and recover it.
+    """Back up and corrupt a required object before a Pod can be submitted."""
 
-    A server-side backup is made first. The worker must observe and quarantine
-    the wrong-sized canonical object. The hook restores the verified-size backup
-    if the worker has not already repopulated it, then always removes the backup.
-    """
-
-    volume, artifact = _corruption_target(client, job_id)
-    store = store_factory(volume)
+    store, artifact, backup = _corruption_canary(
+        client, scenario, declared_digests, store_factory=store_factory
+    )
     key = str(artifact["storage_key"])
     expected_size = int(artifact["size"])
-    digest = normalize_digest(str(artifact["digest"]))
-    backup = f"staging/benchmark-corruption/{job_id}/{digest}.backup"
+    if _object_size(store, key) != expected_size:
+        raise RuntimeError("Corruption target is not valid before canary preparation")
+    if _object_size(store, backup) is not None:
+        raise RuntimeError("A stale corruption canary backup already exists")
     copied = False
-    quarantine_observed = False
-    canonical_restored = False
     try:
         store.client.copy_object(
             Bucket=store.volume_id,
             CopySource={"Bucket": store.volume_id, "Key": key},
             Key=backup,
         )
-        backup_head = store.client.head_object(Bucket=store.volume_id, Key=backup)
-        if int(backup_head.get("ContentLength") or -1) != expected_size:
+        if _object_size(store, backup) != expected_size:
             raise RuntimeError("Corruption canary backup has the wrong size")
         copied = True
         store.client.put_object(
@@ -267,6 +303,104 @@ def inject_corruption(
             Key=key,
             Body=b"cloud-offload-benchmark-corruption-canary",
         )
+        canary_size = _object_size(store, key)
+        if canary_size is None or canary_size == expected_size:
+            raise RuntimeError("Corruption canary did not replace the canonical object")
+        # Give the provider gateway a bounded propagation window before the Pod
+        # and its fresh volume mount are created.
+        time.sleep(max(0.0, settle_seconds))
+        if _object_size(store, key) != canary_size:
+            raise RuntimeError("Corruption canary was not stable before submission")
+    except Exception:
+        if copied:
+            store.client.copy_object(
+                Bucket=store.volume_id,
+                CopySource={"Bucket": store.volume_id, "Key": backup},
+                Key=key,
+            )
+            store.client.delete_object(Bucket=store.volume_id, Key=backup)
+        raise
+    return {
+        "kind": "corruption",
+        "stage": "prepare",
+        "backup_verified": True,
+        "canary_verified": True,
+        "artifact_size": expected_size,
+    }
+
+
+def cleanup_corruption(
+    client: CoordinatorFaultClient,
+    scenario: str,
+    declared_digests: set[str],
+    *,
+    store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
+) -> dict[str, Any]:
+    """Idempotently restore the canonical object and remove the canary backup."""
+
+    store, artifact, backup = _corruption_canary(
+        client, scenario, declared_digests, store_factory=store_factory
+    )
+    key = str(artifact["storage_key"])
+    expected_size = int(artifact["size"])
+    backup_size = _object_size(store, backup)
+    changed = False
+    if backup_size is None:
+        if _object_size(store, key) != expected_size:
+            raise RuntimeError("Corruption backup is absent and canonical is invalid")
+        return {
+            "kind": "corruption",
+            "stage": "cleanup",
+            "canonical_size_restored": True,
+            "backup_deleted": True,
+            "changed": False,
+        }
+    if backup_size != expected_size:
+        raise RuntimeError("Corruption backup has the wrong size during cleanup")
+    if _object_size(store, key) != expected_size:
+        store.client.copy_object(
+            Bucket=store.volume_id,
+            CopySource={"Bucket": store.volume_id, "Key": backup},
+            Key=key,
+        )
+        changed = True
+    if _object_size(store, key) != expected_size:
+        raise RuntimeError("Corruption cleanup did not restore canonical size")
+    store.client.delete_object(Bucket=store.volume_id, Key=backup)
+    return {
+        "kind": "corruption",
+        "stage": "cleanup",
+        "canonical_size_restored": True,
+        "backup_deleted": True,
+        "changed": changed,
+    }
+
+
+def observe_corruption(
+    client: CoordinatorFaultClient,
+    job_id: str,
+    scenario: str,
+    declared_digests: set[str],
+    *,
+    store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
+) -> dict[str, Any]:
+    """Require worker quarantine, then recover the pre-submission canary.
+
+    The cleanup path is unconditional, so a timeout, terminal job, or callback
+    error cannot strand either corrupted canonical bytes or the backup.
+    """
+
+    store, artifact, backup = _corruption_canary(
+        client, scenario, declared_digests, store_factory=store_factory
+    )
+    key = str(artifact["storage_key"])
+    expected_size = int(artifact["size"])
+    quarantine_observed = False
+    if _object_size(store, backup) != expected_size:
+        raise RuntimeError("Prepared corruption backup is missing")
+    if _object_size(store, key) == expected_size:
+        raise RuntimeError("Prepared corruption canary is no longer present")
+    try:
         observed = _wait_for_event(
             client,
             job_id,
@@ -275,33 +409,17 @@ def inject_corruption(
         )
         quarantine_observed = observed == "cache_artifact_quarantined"
     finally:
-        if copied:
-            try:
-                canonical_head = store.client.head_object(
-                    Bucket=store.volume_id, Key=key
-                )
-                canonical_restored = (
-                    int(canonical_head.get("ContentLength") or -1) == expected_size
-                )
-            except Exception:
-                canonical_restored = False
-            if not canonical_restored:
-                store.client.copy_object(
-                    Bucket=store.volume_id,
-                    CopySource={"Bucket": store.volume_id, "Key": backup},
-                    Key=key,
-                )
-                canonical_head = store.client.head_object(
-                    Bucket=store.volume_id, Key=key
-                )
-                canonical_restored = (
-                    int(canonical_head.get("ContentLength") or -1) == expected_size
-                )
-            store.client.delete_object(Bucket=store.volume_id, Key=backup)
-    if not quarantine_observed or not canonical_restored:
+        cleanup = cleanup_corruption(
+            client,
+            scenario,
+            declared_digests,
+            store_factory=store_factory,
+        )
+    if not quarantine_observed or not cleanup.get("canonical_size_restored"):
         raise RuntimeError("Corruption canary did not quarantine and recover cleanly")
     return {
         "kind": "corruption",
+        "stage": "observe",
         "quarantine_observed": True,
         "canonical_size_restored": True,
         "backup_deleted": True,
@@ -392,10 +510,27 @@ def run_fault(kind: str) -> dict[str, Any]:
     normalized = str(kind).strip().lower()
     if normalized not in FAULT_KINDS:
         raise ValueError("Unknown benchmark fault kind")
-    job_id, _ = _benchmark_context(normalized)
+    job_id, scenario, stage = _benchmark_context(normalized)
     client = CoordinatorFaultClient()
     if normalized == "storage":
+        if stage != "observe":
+            raise RuntimeError("Storage canary supports only the observe stage")
         return inject_storage_unavailable(client, job_id)
     if normalized == "corruption":
-        return inject_corruption(client, job_id)
+        declared = {
+            normalize_digest(item)
+            for item in os.environ.get(
+                "CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS", ""
+            ).split(",")
+            if item.strip()
+        }
+        if not declared:
+            raise RuntimeError("Corruption canary received no declared asset digests")
+        if stage == "prepare":
+            return prepare_corruption(client, scenario, declared)
+        if stage == "cleanup":
+            return cleanup_corruption(client, scenario, declared)
+        return observe_corruption(client, job_id, scenario, declared)
+    if stage != "observe":
+        raise RuntimeError("Restart canary supports only the observe stage")
     return restart_coordinator(client, job_id)
