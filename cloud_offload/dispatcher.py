@@ -630,10 +630,7 @@ class Dispatcher:
             hourly_rate=float(offer.get("hourly_rate") or 0),
             max_runtime_seconds=max_runtime_seconds,
             max_cost_usd=max_cost_usd,
-            ttl_seconds=max(
-                self.config.lease_ttl_seconds,
-                RUNNER_REGISTRATION_TIMEOUT_SECONDS + self.config.poll_interval_seconds,
-            ),
+            ttl_seconds=self._runner_registration_lease_ttl_seconds(),
         )
         env_vars["CLOUD_OFFLOAD_LEASE_ID"] = lease.id
 
@@ -751,11 +748,7 @@ class Dispatcher:
                         hourly_rate=float(cold_offer.get("hourly_rate") or 0),
                         max_runtime_seconds=max_runtime_seconds,
                         max_cost_usd=max_cost_usd,
-                        ttl_seconds=max(
-                            self.config.lease_ttl_seconds,
-                            RUNNER_REGISTRATION_TIMEOUT_SECONDS
-                            + self.config.poll_interval_seconds,
-                        ),
+                        ttl_seconds=self._runner_registration_lease_ttl_seconds(),
                     )
                     cold_env["CLOUD_OFFLOAD_LEASE_ID"] = cold_lease.id
                     for queued_job in queued_jobs or []:
@@ -857,7 +850,7 @@ class Dispatcher:
             self.queue.bind_lease(
                 lease_id,
                 instance.id,
-                ttl_seconds=self.config.lease_ttl_seconds,
+                ttl_seconds=self._runner_registration_lease_ttl_seconds(),
             )
             self.instance_leases[instance.id] = lease_id
         self.active_instances[instance.id] = instance
@@ -905,6 +898,13 @@ class Dispatcher:
             except (TypeError, ValueError):
                 pass
         return min(runtime_limits), (min(cost_limits) if cost_limits else None)
+
+    def _runner_registration_lease_ttl_seconds(self) -> int:
+        """Keep provider ownership valid for the full first-runner start window."""
+        return max(
+            self.config.lease_ttl_seconds,
+            RUNNER_REGISTRATION_TIMEOUT_SECONDS + self.config.poll_interval_seconds,
+        )
 
     @staticmethod
     def _instance_resource_name(instance: Instance) -> str:
@@ -1067,7 +1067,7 @@ class Dispatcher:
                 lease = self.queue.bind_lease(
                     lease.id,
                     instance.id,
-                    ttl_seconds=self.config.lease_ttl_seconds,
+                    ttl_seconds=self._runner_registration_lease_ttl_seconds(),
                 )
 
             if instance is None or instance.status == "terminated":

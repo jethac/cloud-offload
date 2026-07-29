@@ -312,3 +312,28 @@ def test_uncertain_launch_is_recovered_by_durable_resource_name(tmp_path):
     assert len(leases) == 1
     assert leases[0].instance_id == instance.id
     assert leases[0].status == "active"
+
+
+def test_bound_launch_keeps_full_runner_registration_lease_window(
+    tmp_path, monkeypatch
+):
+    config = lease_config(
+        tmp_path,
+        lease_ttl_seconds=900,
+        poll_interval_seconds=5,
+    )
+    queue = JobQueue(config.queue_db_path)
+    job = queued_job(queue)
+    monkeypatch.setattr(
+        "cloud_offload.dispatcher.RUNNER_REGISTRATION_TIMEOUT_SECONDS", 3600
+    )
+
+    instance = Dispatcher(
+        config, queue=queue, provider=LeaseProvider()
+    )._launch_worker("runpod", "comfyui", [job])
+
+    assert instance is not None
+    lease = queue.leases_for_job(job.id)[0]
+    created_at = datetime.fromisoformat(lease.created_at)
+    expires_at = datetime.fromisoformat(lease.expires_at)
+    assert (expires_at - created_at).total_seconds() >= 3600
