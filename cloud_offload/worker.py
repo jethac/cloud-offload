@@ -343,6 +343,7 @@ class Worker:
                     runtime_profile=self.runtime_profile,
                     gpu_vram_gb=self.gpu_vram_gb,
                     gpu_name=self.gpu_name,
+                    cache_volume_id=self.cache_volume_id,
                 )
 
                 if jobs:
@@ -1580,6 +1581,9 @@ class Worker:
         import os
 
         self.prepared_cache = None
+        self.cache_volume_id = os.environ.get(
+            "CLOUD_OFFLOAD_CACHE_VOLUME_ID", ""
+        ).strip()
         self.cache_policy: dict = {}
         self.cache_requirements: dict = {}
         self.cache_runtime: dict = {}

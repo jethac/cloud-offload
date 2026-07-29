@@ -1456,6 +1456,49 @@ def test_smart_launch_capacity_race_immediately_retries_cold(tmp_path):
     ]
 
 
+def test_confirmed_prepared_launch_does_not_silently_fall_back_cold(tmp_path):
+    volume = ProviderStorage("vol-1", "runpod", "cache", 100, "US-KS-2", True)
+    config = dispatcher_config(tmp_path, policy())
+    provider = PlacementProvider(volume=volume, fail_cached=True)
+    dispatcher = Dispatcher(config, provider=provider)
+    registered = dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-1",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    job = dispatcher.queue.create(
+        "comfyui-workflow",
+        "inline://request",
+        params={
+            "runtime_profile": "comfy",
+            "preflight": {
+                "candidate_id": "sha256:" + "c" * 64,
+                "provider": "runpod",
+                "offer_id": "gpu",
+                "gpu_type": "GPU",
+                "gpu_ram_gb": 24,
+                "hourly_rate": 0.4,
+                "region": "US-KS-2",
+                "prepared_volume_id": registered.id,
+                "expires_at": "2099-01-01T00:00:00Z",
+                "request_policy": {"max_hourly_rate": 1.0},
+            },
+        },
+        request={"workflow": {}},
+        provider="runpod",
+    )
+
+    instance = dispatcher._launch_worker("runpod", "comfy", [job])
+
+    assert instance is None
+    assert len(provider.launches) == 1
+    assert provider.launches[0] is not None
+    assert all(placement is not None for placement in provider.launches)
+
+
 def test_worker_manifest_announcement_drives_next_exact_cache_placement(
     monkeypatch, tmp_path
 ):

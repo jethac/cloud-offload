@@ -7,11 +7,12 @@ when enough jobs are waiting.
 
 import json
 import logging
+import math
 import os
 import secrets
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cloud_offload.config import CloudConfig, estimate_runpod_storage_monthly
@@ -258,38 +259,44 @@ class Dispatcher:
                     )
                     continue
                 profile_name = resolved["name"]
-                launch_key = (provider_name, profile_name)
-                profile_queued = sum(
-                    job.params.get("runtime_profile") == requested_profile
+                matching_jobs = [
+                    job
                     for job in queued_jobs
-                )
-                profile_running = any(
-                    self.instance_providers.get(instance_id) == provider_name
-                    and self.instance_profiles.get(instance_id) == profile_name
-                    for instance_id in self.active_instances
-                )
-                profile_running = profile_running or any(
-                    worker.get("provider") == provider_name
-                    and worker.get("runtime_profile") == profile_name
-                    for worker in self.queue.list_active_workers()
-                )
-                if profile_queued < self.config.min_queue_depth or profile_running:
-                    continue
-                if time.monotonic() < self.next_launch_at.get(launch_key, 0):
-                    continue
-                logger.info(
-                    f"{provider_name}/{profile_name} queue depth {profile_queued} >= "
-                    f"{self.config.min_queue_depth}, launching worker"
-                )
-                self._launch_worker(
-                    provider_name,
-                    profile_name,
-                    [
-                        job
-                        for job in queued_jobs
-                        if job.params.get("runtime_profile") == requested_profile
-                    ],
-                )
+                    if job.params.get("runtime_profile") == requested_profile
+                ]
+                launch_groups: dict[str, list] = {}
+                for job in matching_jobs:
+                    confirmed = job.params.get("preflight") or {}
+                    group = str(confirmed.get("candidate_id") or "unconfirmed")
+                    launch_groups.setdefault(group, []).append(job)
+                for candidate_id, launch_jobs in launch_groups.items():
+                    launch_key = (provider_name, profile_name)
+                    profile_queued = len(launch_jobs)
+                    required_depth = (
+                        1
+                        if candidate_id != "unconfirmed"
+                        else self.config.min_queue_depth
+                    )
+                    profile_running = any(
+                        self.instance_providers.get(instance_id) == provider_name
+                        and self.instance_profiles.get(instance_id) == profile_name
+                        for instance_id in self.active_instances
+                    )
+                    profile_running = profile_running or any(
+                        worker.get("provider") == provider_name
+                        and worker.get("runtime_profile") == profile_name
+                        for worker in self.queue.list_active_workers()
+                    )
+                    if profile_queued < required_depth or profile_running:
+                        continue
+                    if time.monotonic() < self.next_launch_at.get(launch_key, 0):
+                        continue
+                    logger.info(
+                        f"{provider_name}/{profile_name} queue depth {profile_queued} >= "
+                        f"{required_depth}, launching worker for "
+                        f"candidate {candidate_id}"
+                    )
+                    self._launch_worker(provider_name, profile_name, launch_jobs)
 
         # Update worker tracking
         self._update_workers()
@@ -351,8 +358,83 @@ class Dispatcher:
         requirements = resolve_prepared_requirements(
             profile_name, profile, queued_jobs or []
         )
+        confirmed = self._shared_preflight(queued_jobs)
+        if confirmed and self._preflight_expired(confirmed):
+            self._refuse_preflight_launch(
+                queued_jobs,
+                "The confirmed GPU quote expired before provider launch.",
+            )
+            return None
+        if confirmed and confirmed.get("provider") != provider_name:
+            self._refuse_preflight_launch(
+                queued_jobs,
+                "The confirmed provider no longer matches the queued route.",
+            )
+            return None
         placement_decision = None
-        if self.config.prepared_storage.get("enabled"):
+        if confirmed and confirmed.get("prepared_volume_id"):
+            placement_decision = self._confirmed_cache_placement(
+                connector=connector,
+                provider_name=provider_name,
+                gpu_type=gpu_type,
+                minimum_vram=minimum_vram,
+                cooling=cooling,
+                requirements=requirements,
+                confirmed=confirmed,
+            )
+            self._publish_launch_event(
+                queued_jobs,
+                {
+                    "type": "cache_placement_considered",
+                    **placement_decision.explanation(),
+                },
+            )
+            if (
+                placement_decision.action != "launch"
+                or not placement_decision.candidate
+            ):
+                self._refuse_preflight_launch(
+                    queued_jobs,
+                    "The confirmed prepared placement is no longer available.",
+                )
+                return None
+            offer = placement_decision.candidate.offer
+            self._publish_launch_event(
+                queued_jobs,
+                {
+                    "type": "cache_placement_selected",
+                    **placement_decision.explanation(),
+                },
+            )
+        elif confirmed:
+            try:
+                offers = connector.list_available(
+                    gpu_type=gpu_type,
+                    min_gpu_ram=minimum_vram,
+                    max_hourly_rate=float(
+                        (confirmed.get("request_policy") or {}).get(
+                            "max_hourly_rate", self.config.max_hourly_rate
+                        )
+                    ),
+                )
+            except Exception:
+                offers = []
+            offer = next(
+                (
+                    item
+                    for item in offers
+                    if str(item.get("id")) == str(confirmed.get("offer_id"))
+                    and str(item.get("id")) not in cooling
+                ),
+                None,
+            )
+            if not offer or not self._confirmed_offer_matches(confirmed, offer):
+                self._refuse_preflight_launch(
+                    queued_jobs,
+                    "The confirmed GPU offer or price changed before provider launch.",
+                )
+                return None
+        elif self.config.prepared_storage.get("enabled"):
             placement_decision = self._choose_cache_placement(
                 connector=connector,
                 provider_name=provider_name,
@@ -580,6 +662,7 @@ class Dispatcher:
             if (
                 placement is not None
                 and placement_decision is not None
+                and confirmed is None
                 and self.config.prepared_storage.get("policy") == "smart"
                 and self.config.prepared_storage.get("cold_fallback") == "allow"
             ):
@@ -696,6 +779,175 @@ class Dispatcher:
             },
         )
         return instance
+
+    @staticmethod
+    def _shared_preflight(jobs: list | None) -> dict | None:
+        entries = [
+            job.params.get("preflight")
+            for job in (jobs or [])
+            if isinstance(job.params.get("preflight"), dict)
+        ]
+        if not entries:
+            return None
+        candidate_ids = {str(item.get("candidate_id") or "") for item in entries}
+        if len(candidate_ids) != 1 or "" in candidate_ids:
+            return None
+        return entries[0]
+
+    @staticmethod
+    def _preflight_expired(confirmed: dict) -> bool:
+        try:
+            expires = datetime.fromisoformat(
+                str(confirmed.get("expires_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            return True
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires <= datetime.now(timezone.utc)
+
+    @staticmethod
+    def _confirmed_offer_matches(confirmed: dict, offer: dict) -> bool:
+        try:
+            return (
+                str(offer.get("id")) == str(confirmed.get("offer_id"))
+                and str(offer.get("gpu_type")) == str(confirmed.get("gpu_type"))
+                and float(offer.get("gpu_ram_gb") or 0)
+                == float(confirmed.get("gpu_ram_gb") or 0)
+                and math.isclose(
+                    float(offer.get("hourly_rate")),
+                    float(confirmed.get("hourly_rate")),
+                    rel_tol=0,
+                    abs_tol=1e-9,
+                )
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _confirmed_cache_placement(
+        self,
+        *,
+        connector: CloudConnector,
+        provider_name: str,
+        gpu_type: str,
+        minimum_vram: int,
+        cooling: set[str],
+        requirements: dict,
+        confirmed: dict,
+    ) -> PlacementDecision:
+        if not self.config.prepared_storage.get("enabled"):
+            return PlacementDecision(
+                "unavailable", None, "confirmed_prepared_storage_disabled", ()
+            )
+        volume = self.cache_registry.get_volume(
+            str(confirmed.get("prepared_volume_id") or "")
+        )
+        if (
+            volume is None
+            or volume.status != "ready"
+            or volume.provider != provider_name
+            or volume.datacenter_id != confirmed.get("region")
+        ):
+            return PlacementDecision(
+                "unavailable", None, "confirmed_prepared_volume_changed", ()
+            )
+        try:
+            actual = connector.get_storage(volume.provider_volume_id)
+        except Exception:
+            actual = None
+        if actual is None or actual.datacenter_id != volume.datacenter_id:
+            return PlacementDecision(
+                "unavailable", None, "confirmed_provider_volume_unavailable", ()
+            )
+        placement = PlacementConstraints(
+            datacenter_ids=(volume.datacenter_id,),
+            storage_attachments=(
+                StorageAttachment(
+                    provider_volume_id=volume.provider_volume_id,
+                    mount_path="/workspace",
+                    datacenter_id=volume.datacenter_id,
+                ),
+            ),
+        )
+        try:
+            offers = connector.list_available(
+                gpu_type=gpu_type,
+                min_gpu_ram=minimum_vram,
+                max_hourly_rate=float(
+                    (confirmed.get("request_policy") or {}).get(
+                        "max_hourly_rate", self.config.max_hourly_rate
+                    )
+                ),
+                placement=placement,
+            )
+        except Exception:
+            offers = []
+        offer = next(
+            (
+                item
+                for item in offers
+                if str(item.get("id")) == str(confirmed.get("offer_id"))
+                and str(item.get("id")) not in cooling
+            ),
+            None,
+        )
+        if not offer or not self._confirmed_offer_matches(confirmed, offer):
+            return PlacementDecision(
+                "unavailable", None, "confirmed_offer_changed", ()
+            )
+        runtime = scheduler_runtime(requirements)
+        coverage = next(
+            (
+                item
+                for item in self.cache_registry.volume_coverage(
+                    requirements["required"],
+                    runtime=runtime,
+                    tenant=str(
+                        self.config.prepared_storage.get("tenant") or "default"
+                    ),
+                    profile_fingerprint=str(requirements["profile_fingerprint"]),
+                    allow_private=bool(
+                        self.config.prepared_storage.get("cache_private_assets")
+                    ),
+                    logical_required=requirements.get("logical_required") or [],
+                )
+                if item["volume"].id == volume.id
+            ),
+            None,
+        ) or {
+            "cached_bytes": 0,
+            "required_bytes": sum(requirements["required"].values()),
+            "complete": False,
+            "manifest_ids": [],
+        }
+        candidate = PlacementCandidate(
+            offer=offer,
+            volume=volume,
+            cached_bytes=int(coverage["cached_bytes"]),
+            required_bytes=int(coverage["required_bytes"]),
+            complete=bool(coverage["complete"]),
+            manifest_ids=tuple(coverage["manifest_ids"]),
+        )
+        return PlacementDecision(
+            "launch", candidate, "confirmed_preflight_candidate", ()
+        )
+
+    def _refuse_preflight_launch(self, jobs: list | None, reason: str) -> None:
+        self._publish_launch_event(
+            jobs,
+            {
+                "type": "preflight_confirmation_required",
+                "phase": "preflight",
+                "reason": reason,
+                "overall_progress": 0,
+            },
+        )
+        for job in jobs or []:
+            self.queue.update_status(
+                job.id,
+                JobStatus.FAILED,
+                error=f"Preflight confirmation required: {reason}",
+            )
 
     def _choose_cache_placement(
         self,

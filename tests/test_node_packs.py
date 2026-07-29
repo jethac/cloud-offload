@@ -41,6 +41,7 @@ from cloud_offload.profiles import (
 from cloud_offload.providers.base import CloudProvider
 from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.worker import Worker
+from tests.preflight_helpers import accept_test_preflight
 
 
 PACK_SOURCE = b"NODE_CLASS_MAPPINGS = {}\n"
@@ -113,6 +114,7 @@ def packs_client(monkeypatch, config):
     queue = JobQueue(config.queue_db_path)
     monkeypatch.setattr(server, "_queue", lambda: (config, queue))
     monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    accept_test_preflight(monkeypatch, server, config)
     return TestClient(server.app), queue
 
 
@@ -381,7 +383,15 @@ def test_a_partition_without_node_packs_behaves_exactly_as_before(
     response = client.post("/api/partitions", json=partition_request())
 
     assert response.status_code == 202
-    assert response.json().keys() == {"job_id", "status", "status_url", "storage"}
+    assert response.json().keys() == {
+        "job_id",
+        "status",
+        "status_url",
+        "storage",
+        "preflight_id",
+        "manifest_digest",
+        "candidate_id",
+    }
     job = queue.get(response.json()["job_id"])
     assert "node_packs" not in job.request
     assert job.provider == "runpod"

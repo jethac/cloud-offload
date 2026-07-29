@@ -39,6 +39,7 @@ from cloud_offload.storage_plan import (
     plan_storage,
     weight_key,
 )
+from tests.preflight_helpers import accept_test_preflight
 from cloud_offload.weight_sizes import (
     cached_weight_sizes,
     huggingface_file_sizes,
@@ -597,6 +598,7 @@ def storage_client(monkeypatch, config):
     queue = JobQueue(config.queue_db_path)
     monkeypatch.setattr(server, "_queue", lambda: (config, queue))
     monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    accept_test_preflight(monkeypatch, server, config)
     return TestClient(server.app), queue
 
 

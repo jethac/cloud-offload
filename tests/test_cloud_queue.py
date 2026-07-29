@@ -536,6 +536,25 @@ def test_coordinator_queue_publishes_process_scoped_monotonic_event_ids(monkeypa
     assert all(item[1]["occurred_at"] for item in requests)
 
 
+def test_coordinator_queue_reports_its_prepared_volume_when_claiming(monkeypatch):
+    queue = CoordinatorQueue(
+        "https://coordinator.invalid",
+        "worker-secret",
+        "runpod",
+        "worker-7",
+    )
+    requests = []
+
+    def record(path, payload):
+        requests.append((path, payload))
+        return []
+
+    monkeypatch.setattr(queue, "_post", record)
+
+    assert queue.claim_jobs("worker-7", cache_volume_id="volume-1") == []
+    assert requests[0][1]["cache_volume_id"] == "volume-1"
+
+
 def test_claim_increments_attempts_and_assigns_worker(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
     job = queue.create("comfyui-workflow", "input.json")
@@ -915,6 +934,43 @@ def test_claim_jobs_matches_normalized_gpu_name(tmp_path):
     assert [item.id for item in claimed] == [job.id]
 
 
+def test_prepared_job_can_only_be_claimed_by_its_confirmed_volume(tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={
+            "gpu_type": "any",
+            "preflight": {"prepared_volume_id": "volume-1"},
+        },
+        status=JobStatus.QUEUED,
+    )
+
+    cold = queue.claim_jobs(
+        "worker-cold",
+        provider="runpod",
+        models=["comfyui-partition-v1"],
+        cache_volume_id="",
+    )
+    wrong = queue.claim_jobs(
+        "worker-wrong",
+        provider="runpod",
+        models=["comfyui-partition-v1"],
+        cache_volume_id="volume-2",
+    )
+    correct = queue.claim_jobs(
+        "worker-right",
+        provider="runpod",
+        models=["comfyui-partition-v1"],
+        cache_volume_id="volume-1",
+    )
+
+    assert cold == []
+    assert wrong == []
+    assert [item.id for item in correct] == [job.id]
+
+
 def test_fail_job_requeues_then_dead_letters(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
     job = queue.create("comfyui-workflow", "input.json")
@@ -1069,6 +1125,80 @@ def test_failed_offer_cools_down_and_next_launch_routes_around_it(tmp_path):
     instance = dispatcher._launch_worker("runpod", "comfyui")
     assert instance is not None and instance.id == "pod-1"
     assert provider.launch_attempts == ["offer-dead", "offer-good"]
+
+
+def _confirmed_job(queue, *, rate=0.30):
+    return queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={
+            "runtime_profile": "comfyui",
+            "gpu_type": "RTX 2000 Ada",
+            "preflight": {
+                "candidate_id": "sha256:" + "c" * 64,
+                "provider": "runpod",
+                "offer_id": "offer-good",
+                "gpu_type": "RTX 2000 Ada",
+                "gpu_ram_gb": 0,
+                "hourly_rate": rate,
+                "region": None,
+                "prepared_volume_id": None,
+                "expires_at": "2099-01-01T00:00:00Z",
+                "request_policy": {"max_hourly_rate": 0.5},
+            },
+        },
+        status=JobStatus.QUEUED,
+    )
+
+
+def test_dispatcher_launches_only_the_exact_confirmed_offer(tmp_path):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    job = _confirmed_job(dispatcher.queue)
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert instance is not None
+    assert provider.launch_attempts == ["offer-good"]
+
+
+def test_dispatcher_refuses_changed_confirmed_price_before_launch(tmp_path):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    job = _confirmed_job(dispatcher.queue, rate=0.29)
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert instance is None
+    assert provider.launch_attempts == []
+    failed = dispatcher.queue.get(job.id)
+    assert failed.status == JobStatus.FAILED
+    assert "Preflight confirmation required" in failed.error
+    events = dispatcher.queue.list_events(job.id)
+    assert any(
+        item["event"]["type"] == "preflight_confirmation_required"
+        for item in events
+    )
+
+
+def test_confirmed_job_launches_without_waiting_for_queue_batch(
+    monkeypatch, tmp_path
+):
+    provider = TwoOfferProvider()
+    config = _profile_config(tmp_path)
+    config.coordinator_url = "https://coordinator.invalid"
+    config.min_queue_depth = 3
+    queue = JobQueue(config.queue_db_path)
+    _confirmed_job(queue)
+    dispatcher = Dispatcher(config, queue=queue, provider=provider)
+    monkeypatch.setattr(
+        "cloud_offload.dispatcher.CloudConfig.load", lambda *a, **k: config
+    )
+
+    dispatcher._tick()
+
+    assert provider.launch_attempts == ["offer-good"]
 
 
 def test_offer_cooldown_expires_and_is_pruned(tmp_path):

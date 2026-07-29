@@ -22,6 +22,7 @@ from cloud_offload.providers import connector_metadata, register_connector
 from cloud_offload.providers.base import CloudConnector
 from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.router import select_profile_provider
+from tests.preflight_helpers import accept_test_preflight
 
 
 NO_ON_PREM_BACKEND = (
@@ -102,6 +103,7 @@ def partition_client(monkeypatch, config):
     queue = JobQueue(config.queue_db_path)
     monkeypatch.setattr(server, "_queue", lambda: (config, queue))
     monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    accept_test_preflight(monkeypatch, server, config)
     return TestClient(server.app), queue
 
 

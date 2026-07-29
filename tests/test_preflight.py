@@ -6,7 +6,9 @@ from cloud_offload import preflight, server
 from cloud_offload.cache_registry import CacheRegistry, CacheVolume
 from cloud_offload.config import CloudConfig
 from cloud_offload.preflight import build_partition_preflight, finite_report
+from cloud_offload.preflight_store import PreflightStore
 from cloud_offload.providers.base import ProviderStorage
+from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.storage import LocalStorage
 
 
@@ -15,6 +17,7 @@ class ReadOnlyConnector:
         self.offer_reads = 0
         self.mutations = []
         self.storage = {}
+        self.rate_multiplier = 1.0
 
     def list_available(
         self,
@@ -31,7 +34,7 @@ class ReadOnlyConnector:
                 "gpu_type": "L40",
                 "gpu_count": 1,
                 "gpu_ram_gb": 48,
-                "hourly_rate": 0.75,
+                "hourly_rate": 0.75 * self.rate_multiplier,
                 "raw": {"private_provider_payload": "must-not-leak"},
             },
             {
@@ -40,7 +43,7 @@ class ReadOnlyConnector:
                 "gpu_type": "A100 80 GB",
                 "gpu_count": 1,
                 "gpu_ram_gb": 80,
-                "hourly_rate": 1.49,
+                "hourly_rate": 1.49 * self.rate_multiplier,
                 "raw": {"private_provider_payload": "must-not-leak"},
             },
         ]
@@ -294,6 +297,127 @@ def test_manual_policy_returns_ranked_choices_without_auto_selection(tmp_path):
     assert report["execution_plan"]["offer_id"] is None
 
 
+def test_preflight_store_persists_only_the_safe_report(tmp_path):
+    config = config_for_preflight(tmp_path)
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        storage=LocalStorage(config.storage_path),
+        cache_registry=CacheRegistry(config.queue_db_path),
+        connector_factory=lambda provider, config: ReadOnlyConnector(),
+    )
+    store = PreflightStore(config.queue_db_path)
+
+    store.put(report)
+    restored = store.get(report["preflight_id"])
+
+    assert restored == report
+    assert "CloudPartitionInput" not in str(restored)
+    assert store.get("missing") is None
+
+
+def test_paid_partition_requires_preflight_identity(monkeypatch, tmp_path):
+    config = config_for_preflight(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+
+    response = TestClient(server.app).post(
+        "/api/partitions",
+        json={"partition": partition(), "provider": "runpod"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "cloud_offload.preflight_required"
+    assert queue.count_by_status(*list(JobStatus)) == 0
+
+
+def test_preflight_identity_is_revalidated_and_bound_to_job(
+    monkeypatch, tmp_path
+):
+    config = config_for_preflight(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    connector = ReadOnlyConnector()
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(
+        preflight,
+        "create_connector",
+        lambda provider, config: connector,
+    )
+    client = TestClient(server.app)
+
+    checked = client.post(
+        "/api/preflight",
+        json={"partition": partition(), "provider": "runpod"},
+    )
+    assert checked.status_code == 200
+    report = checked.json()
+    candidate_id = report["recommendation"]["candidate_id"]
+
+    created = client.post(
+        "/api/partitions",
+        json={
+            "partition": partition(),
+            "provider": "runpod",
+            "preflight_id": report["preflight_id"],
+            "manifest_digest": report["manifest_digest"],
+            "candidate_id": candidate_id,
+        },
+    )
+
+    assert created.status_code == 202
+    job = queue.get(created.json()["job_id"])
+    assert job.params["preflight"]["candidate_id"] == candidate_id
+    assert job.params["preflight"]["offer_id"] == "gpu-l40"
+    assert job.provider == "runpod"
+    assert connector.offer_reads == 2
+    assert connector.mutations == []
+
+
+def test_price_change_returns_revised_preflight_without_queueing(
+    monkeypatch, tmp_path
+):
+    config = config_for_preflight(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    connector = ReadOnlyConnector()
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(
+        preflight,
+        "create_connector",
+        lambda provider, config: connector,
+    )
+    client = TestClient(server.app)
+    report = client.post(
+        "/api/preflight",
+        json={"partition": partition(), "provider": "runpod"},
+    ).json()
+    connector.rate_multiplier = 1.1
+
+    response = client.post(
+        "/api/partitions",
+        json={
+            "partition": partition(),
+            "provider": "runpod",
+            "preflight_id": report["preflight_id"],
+            "manifest_digest": report["manifest_digest"],
+            "candidate_id": report["recommendation"]["candidate_id"],
+        },
+    )
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["code"] == "cloud_offload.preflight_changed"
+    assert "hourly_rate" in error["details"]["changes"]
+    assert error["details"]["revised_preflight"]["schema"] == (
+        "cloud-offload.preflight.v1"
+    )
+    assert queue.count_by_status(*list(JobStatus)) == 0
+    assert connector.mutations == []
+
+
 def test_preflight_endpoint_returns_report(monkeypatch, tmp_path):
     config = config_for_preflight(tmp_path)
     expected = {
@@ -301,6 +425,8 @@ def test_preflight_endpoint_returns_report(monkeypatch, tmp_path):
         "status": "blocked",
         "preflight_id": "preflight-1",
         "manifest_digest": "sha256:" + "b" * 64,
+        "created_at": "2026-07-29T00:00:00Z",
+        "expires_at": "2026-07-29T00:01:00Z",
         "blockers": [{"code": "test", "message": "Test blocker"}],
         "warnings": [],
         "unknowns": [],

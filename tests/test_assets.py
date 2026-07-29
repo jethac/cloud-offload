@@ -30,6 +30,7 @@ from cloud_offload.config import CloudConfig
 from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.storage import LocalStorage, partition_artifact_key
 from cloud_offload.worker import Worker
+from tests.preflight_helpers import accept_test_preflight
 
 
 CHECKPOINT_BYTES = b"checkpoint weights"
@@ -113,6 +114,7 @@ def assets_client(monkeypatch, config):
     queue = JobQueue(config.queue_db_path)
     monkeypatch.setattr(server, "_queue", lambda: (config, queue))
     monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    accept_test_preflight(monkeypatch, server, config)
     return TestClient(server.app), queue
 
 
@@ -432,7 +434,15 @@ def test_a_partition_without_assets_behaves_exactly_as_before(monkeypatch, tmp_p
     assert response.status_code == 202
     # ``storage`` is reported for every submission, including this one: a
     # partition that declares nothing still stages a runner image.
-    assert response.json().keys() == {"job_id", "status", "status_url", "storage"}
+    assert response.json().keys() == {
+        "job_id",
+        "status",
+        "status_url",
+        "storage",
+        "preflight_id",
+        "manifest_digest",
+        "candidate_id",
+    }
     job = queue.get(response.json()["job_id"])
     assert "assets" not in job.request
     assert job.provider == "runpod"

@@ -14,6 +14,7 @@ from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.router import select_profile_provider
 from cloud_offload.worker import Worker
 from cloud_offload.profiles import configured_worker_profiles, load_worker_manifest
+from tests.preflight_helpers import accept_test_preflight
 
 
 class Response:
@@ -246,6 +247,7 @@ def test_partition_artifact_and_job_endpoints(monkeypatch, tmp_path):
     queue = JobQueue(config.queue_db_path)
     monkeypatch.setattr(server, "_queue", lambda: (config, queue))
     monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    accept_test_preflight(monkeypatch, server, config)
     client = TestClient(server.app)
     content = b"safe-partition-bundle"
     digest = hashlib.sha256(content).hexdigest()

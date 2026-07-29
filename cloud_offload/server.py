@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
@@ -93,6 +94,9 @@ class PartitionSubmitRequest(BaseModel):
     input_artifacts: dict[str, str] = Field(default_factory=dict)
     provider: str = "auto"
     timeout_seconds: int = Field(default=3600, ge=1, le=86400)
+    preflight_id: str | None = None
+    manifest_digest: str | None = None
+    candidate_id: str | None = None
     # Production benchmarking must exercise a fresh Pod rather than silently
     # accepting an already-computed partition result.
     force_execution: bool = False
@@ -248,6 +252,13 @@ def _cache_registry(config=None):
 
     config = config or _config(resolve_secrets=False)
     return CacheRegistry(config.queue_db_path)
+
+
+def _preflight_store(config=None):
+    from cloud_offload.preflight_store import PreflightStore
+
+    config = config or _config(resolve_secrets=False)
+    return PreflightStore(config.queue_db_path)
 
 
 def _cache_connector(config, provider: str):
@@ -2024,7 +2035,153 @@ async def preflight_partition(request: PreflightRequest):
             status_code=500,
             detail="Preflight produced a non-finite numeric value",
         )
+    await asyncio.to_thread(_preflight_store(config).put, report)
     return report
+
+
+def _report_candidate(
+    report: dict[str, Any], candidate_id: str
+) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in report.get("candidates") or []
+            if item.get("candidate_id") == candidate_id
+        ),
+        None,
+    )
+
+
+def _preflight_changes(
+    previous: dict[str, Any], current: dict[str, Any]
+) -> list[str]:
+    fields = (
+        "provider",
+        "offer_id",
+        "gpu_type",
+        "gpu_ram_gb",
+        "hourly_rate",
+        "region",
+        "prepared_volume_id",
+    )
+    changes = [field for field in fields if previous.get(field) != current.get(field)]
+    if previous.get("preparation") != current.get("preparation"):
+        changes.append("preparation")
+    if previous.get("estimate") != current.get("estimate"):
+        changes.append("estimate")
+    return changes
+
+
+def _expired(timestamp: str) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed <= datetime.now(timezone.utc)
+
+
+def _revalidate_partition_preflight(
+    *,
+    request: PartitionSubmitRequest,
+    config: Any,
+    storage: Any,
+) -> dict[str, Any]:
+    """Rebuild volatile facts and accept only the exact confirmed candidate."""
+    from cloud_offload.preflight import build_partition_preflight, finite_report
+
+    if not request.preflight_id or not request.manifest_digest or not request.candidate_id:
+        return {
+            "accepted": False,
+            "code": "cloud_offload.preflight_required",
+            "message": "A current preflight report and confirmed GPU choice are required before paid launch.",
+            "details": {"action": "Run preflight and confirm one candidate."},
+        }
+    store = _preflight_store(config)
+    previous = store.get(request.preflight_id)
+    if previous is None:
+        return {
+            "accepted": False,
+            "code": "cloud_offload.preflight_not_found",
+            "message": "The preflight report was not found.",
+            "details": {"action": "Run preflight again."},
+        }
+    if request.manifest_digest != previous.get("manifest_digest"):
+        return {
+            "accepted": False,
+            "code": "cloud_offload.preflight_manifest_mismatch",
+            "message": "The submitted partition does not match the confirmed preflight identity.",
+            "details": {"action": "Run preflight again for this partition."},
+        }
+    previous_candidate = _report_candidate(previous, request.candidate_id)
+    if previous_candidate is None:
+        return {
+            "accepted": False,
+            "code": "cloud_offload.preflight_candidate_mismatch",
+            "message": "The confirmed GPU choice is not in the preflight report.",
+            "details": {"action": "Choose one candidate from the current report."},
+        }
+    if previous.get("status") not in {"ready", "ready_with_preparation"}:
+        return {
+            "accepted": False,
+            "code": "cloud_offload.preflight_not_ready",
+            "message": "The preflight report is not ready for paid launch.",
+            "details": {"action": "Resolve its blockers or unknown provider state."},
+        }
+
+    policy = previous.get("request_policy") or {}
+    current = build_partition_preflight(
+        config=config,
+        partition=request.partition,
+        input_artifacts=request.input_artifacts,
+        provider=str(policy.get("provider") or request.provider),
+        recommendation_policy=str(policy.get("recommendation_policy") or "balanced"),
+        max_hourly_rate=policy.get("max_hourly_rate"),
+        max_total_job_cost=policy.get("max_total_job_cost"),
+        allowed_regions=list(policy.get("allowed_regions") or []),
+        storage=storage,
+        cache_registry=_cache_registry(config),
+    )
+    if not finite_report(current):
+        return {
+            "accepted": False,
+            "code": "cloud_offload.preflight_invalid",
+            "message": "Preflight revalidation produced an invalid report.",
+            "details": {"action": "Check coordinator logs and run preflight again."},
+        }
+    store.put(current)
+    current_candidate = _report_candidate(current, request.candidate_id)
+    changes = (
+        ["manifest_digest"]
+        if current.get("manifest_digest") != previous.get("manifest_digest")
+        else []
+    )
+    if current_candidate is None:
+        changes.append("candidate_availability")
+    else:
+        changes.extend(_preflight_changes(previous_candidate, current_candidate))
+    if _expired(str(previous.get("expires_at") or "")):
+        changes.append("quote_expired")
+    if current.get("status") not in {"ready", "ready_with_preparation"}:
+        changes.append("readiness")
+    changes = list(dict.fromkeys(changes))
+    if changes:
+        return {
+            "accepted": False,
+            "code": "cloud_offload.preflight_changed",
+            "message": "The confirmed plan changed before launch.",
+            "details": {
+                "action": "Review and confirm the revised preflight report.",
+                "changes": changes,
+                "revised_preflight": current,
+            },
+        }
+    return {
+        "accepted": True,
+        "report": current,
+        "candidate": current_candidate,
+    }
 
 
 @app.post("/api/workflows", status_code=202)
@@ -2245,14 +2402,54 @@ async def submit_partition(request: PartitionSubmitRequest):
                 **_asset_warnings(assets),
                 **_node_pack_warnings(pack_warnings),
             }
+
+    preflight_binding = await asyncio.to_thread(
+        _revalidate_partition_preflight,
+        request=request,
+        config=config,
+        storage=storage,
+    )
+    if not preflight_binding["accepted"]:
+        return error_response(
+            409,
+            preflight_binding["code"],
+            preflight_binding["message"],
+            preflight_binding["details"],
+        )
+    confirmed_report = preflight_binding["report"]
+    confirmed_candidate = preflight_binding["candidate"]
+    confirmed_offer = {
+        "id": confirmed_candidate["offer_id"],
+        "provider": confirmed_candidate["provider"],
+        "gpu_type": confirmed_candidate["gpu_type"],
+        "gpu_count": confirmed_candidate["gpu_count"],
+        "gpu_ram_gb": confirmed_candidate["gpu_ram_gb"],
+        "hourly_rate": confirmed_candidate["hourly_rate"],
+    }
+    confirmed_launch = {
+        "preflight_id": confirmed_report["preflight_id"],
+        "manifest_digest": confirmed_report["manifest_digest"],
+        "candidate_id": confirmed_candidate["candidate_id"],
+        "expires_at": confirmed_report["expires_at"],
+        "provider": confirmed_candidate["provider"],
+        "offer_id": confirmed_candidate["offer_id"],
+        "gpu_type": confirmed_candidate["gpu_type"],
+        "gpu_ram_gb": confirmed_candidate["gpu_ram_gb"],
+        "hourly_rate": confirmed_candidate["hourly_rate"],
+        "region": confirmed_candidate.get("region"),
+        "prepared_volume_id": confirmed_candidate.get("prepared_volume_id"),
+        "estimate": confirmed_candidate["estimate"],
+        "request_policy": confirmed_report["request_policy"],
+    }
     job = queue.create(
         model="comfyui-partition-v1",
         input_path="artifacts://comfyui-partition",
         params={
-            **({"offer": route.offer} if route.offer else {}),
+            "offer": confirmed_offer,
+            "preflight": confirmed_launch,
             "runtime_profile": profile_name,
             "partition_cache_key": cache_key,
-            "gpu_type": gpu_type,
+            "gpu_type": confirmed_candidate["gpu_type"],
             "min_gpu_ram_gb": min_gpu_ram_gb,
             # The dispatcher rents at least this much container disk, so the
             # pod that stages these bytes has somewhere to put them.
@@ -2269,13 +2466,16 @@ async def submit_partition(request: PartitionSubmitRequest):
             # the worker falls back to its profile's static weights list.
             **({"assets": assets} if assets else {}),
         },
-        provider=route.provider,
+        provider=confirmed_candidate["provider"],
         status=JobStatus.QUEUED,
     )
     return {
         "job_id": job.id,
         "status": job.status.value,
         "status_url": f"/api/jobs/{job.id}",
+        "preflight_id": confirmed_report["preflight_id"],
+        "manifest_digest": confirmed_report["manifest_digest"],
+        "candidate_id": confirmed_candidate["candidate_id"],
         **({"cache_bypassed": True} if request.force_execution else {}),
         "storage": storage_summary,
         **_asset_warnings(assets),
@@ -2316,6 +2516,7 @@ async def worker_claim(request: Request, payload: dict[str, Any] = Body(...)):
             runtime_profile=str(payload.get("runtime_profile") or ""),
             gpu_vram_gb=float(payload.get("gpu_vram_gb") or 0),
             gpu_name=str(payload.get("gpu_name") or ""),
+            cache_volume_id=str(payload.get("cache_volume_id") or ""),
         )
         queue.record_worker(
             str(payload["worker_id"]),

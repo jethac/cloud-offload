@@ -269,11 +269,12 @@ def build_partition_preflight(
     allowed_regions: list[str] | None = None,
     storage: Any,
     cache_registry: CacheRegistry,
-    connector_factory: Callable[[str, Any], Any] = create_connector,
+    connector_factory: Callable[[str, Any], Any] | None = None,
     now: Callable[[], datetime] = _utc_now,
 ) -> dict[str, Any]:
     """Build a versioned report without creating or changing paid resources."""
 
+    connector_factory = connector_factory or create_connector
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     unknowns: list[dict[str, Any]] = []
@@ -282,8 +283,9 @@ def build_partition_preflight(
     region_allowlist = sorted(
         {str(item).strip() for item in (allowed_regions or []) if str(item).strip()}
     )
+    configured_rate_limit = float(config.max_hourly_rate)
     rate_limit = float(
-        config.max_hourly_rate if max_hourly_rate is None else max_hourly_rate
+        configured_rate_limit if max_hourly_rate is None else max_hourly_rate
     )
     if not math.isfinite(rate_limit) or rate_limit <= 0:
         blockers.append(
@@ -293,10 +295,17 @@ def build_partition_preflight(
                 field="max_hourly_rate",
             )
         )
-        rate_limit = float(config.max_hourly_rate)
-    if max_total_job_cost is not None and (
-        not math.isfinite(float(max_total_job_cost))
-        or float(max_total_job_cost) <= 0
+        rate_limit = (
+            configured_rate_limit
+            if math.isfinite(configured_rate_limit) and configured_rate_limit > 0
+            else 0.5
+        )
+    total_cost_limit = (
+        None if max_total_job_cost is None else float(max_total_job_cost)
+    )
+    if total_cost_limit is not None and (
+        not math.isfinite(total_cost_limit)
+        or total_cost_limit <= 0
     ):
         blockers.append(
             _issue(
@@ -305,6 +314,7 @@ def build_partition_preflight(
                 field="max_total_job_cost",
             )
         )
+        total_cost_limit = None
 
     if policy not in RECOMMENDATION_POLICIES:
         blockers.append(
@@ -785,8 +795,8 @@ def build_partition_preflight(
                     cached_bytes=cached,
                 )
                 if (
-                    max_total_job_cost is not None
-                    and estimate["total_job_cost_usd"][1] > float(max_total_job_cost)
+                    total_cost_limit is not None
+                    and estimate["total_job_cost_usd"][1] > total_cost_limit
                 ):
                     continue
                 coverage_percent = (
@@ -872,7 +882,7 @@ def build_partition_preflight(
         "provider": requested_provider,
         "recommendation_policy": policy,
         "max_hourly_rate": rate_limit,
-        "max_total_job_cost": max_total_job_cost,
+        "max_total_job_cost": total_cost_limit,
         "allowed_regions": region_allowlist,
         "resolved_asset_digests": sorted(asset["sha256"] for asset in resolved_assets),
         "required_node_pack_digests": sorted(pack["digest"] for pack in declared_packs),
@@ -894,6 +904,13 @@ def build_partition_preflight(
         "blockers": blockers,
         "warnings": warnings,
         "unknowns": unknowns,
+        "request_policy": {
+            "provider": requested_provider,
+            "recommendation_policy": policy,
+            "max_hourly_rate": rate_limit,
+            "max_total_job_cost": total_cost_limit,
+            "allowed_regions": region_allowlist,
+        },
         "execution_plan": {
             "profile": profile.get("name") or profile_name,
             "image_digest": image_digest,
