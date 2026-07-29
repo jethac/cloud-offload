@@ -124,14 +124,21 @@ class FailureInjection:
         before_submit = bool(value.get("before_submit", False))
         if before_submit and kind not in {"storage", "corruption", "restart"}:
             raise ValueError("failure.before_submit requires an external hook kind")
+        trigger_event = (
+            str(value["trigger_event"]) if value.get("trigger_event") else None
+        )
+        if (
+            kind == "corruption"
+            and not value.get("trigger_phase")
+            and not trigger_event
+        ):
+            trigger_event = "cache_mount_ready"
         return cls(
             kind=kind,
             trigger_phase=(
                 str(value["trigger_phase"]) if value.get("trigger_phase") else None
             ),
-            trigger_event=(
-                str(value["trigger_event"]) if value.get("trigger_event") else None
-            ),
+            trigger_event=trigger_event,
             after_seconds=_bounded_positive(
                 value.get("after_seconds", 0),
                 "failure.after_seconds",
@@ -950,6 +957,12 @@ class BenchmarkRunner:
                 scenario.request
             ),
             "CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS": ",".join(digests),
+            "CLOUD_OFFLOAD_BENCHMARK_PROFILE": str(
+                ((scenario.request.get("partition") or {}).get("runner") or {}).get(
+                    "profile"
+                )
+                or "comfyui-partition-v1"
+            ),
             "CLOUD_OFFLOAD_BENCHMARK_INSTANCE_IDS": ",".join(
                 meter.id for meter in resources.values()
             ),

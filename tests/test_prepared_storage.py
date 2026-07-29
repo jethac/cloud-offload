@@ -34,8 +34,10 @@ from cloud_offload.prepared_state import (
     blob_key,
     bundle_key,
     build_manifest,
+    canonical_json,
     custom_node_requirement_key,
     fingerprint,
+    manifest_by_id_key,
     profile_weight_requirement_key,
 )
 from cloud_offload.providers.base import (
@@ -205,6 +207,29 @@ def test_two_fresh_worker_roots_consume_one_verified_object(tmp_path):
         )
         destinations.append(destination)
     assert [item.read_bytes() for item in destinations] == [source.read_bytes()] * 2
+
+
+def test_exact_manifest_id_falls_back_to_immutable_direct_object(tmp_path):
+    signer = ManifestSigner(b"m" * 32)
+    volume = PreparedStateCAS(tmp_path / "volume", signer)
+    manifest = signed_manifest(signer, [portable_artifact(b"direct")])
+    direct = volume.root / manifest_by_id_key(manifest["manifest_id"])
+    direct.parent.mkdir(parents=True, exist_ok=True)
+    direct.write_bytes(canonical_json(manifest))
+
+    assert volume.load_index()["manifests"] == []
+    selected = volume.find_manifest(
+        profile_fingerprint=manifest["profile_fingerprint"],
+        manifest_id=manifest["manifest_id"],
+    )
+    assert selected and selected["manifest_id"] == manifest["manifest_id"]
+    assert (
+        volume.find_manifest(
+            profile_fingerprint=fingerprint({"profile": "other"}),
+            manifest_id=manifest["manifest_id"],
+        )
+        is None
+    )
 
 
 def test_concurrent_writers_cannot_publish_partial_or_invalid_objects(tmp_path):

@@ -31,6 +31,7 @@ from cloud_offload.prepared_state import (
     build_manifest,
     canonical_json,
     load_or_create_manifest_signer,
+    manifest_by_id_key,
     normalize_digest,
     utc_now,
 )
@@ -302,6 +303,33 @@ def _cache_registry() -> CacheRegistry:
     return CacheRegistry(CloudConfig.load(resolve_secrets=False).queue_db_path)
 
 
+def _corruption_profile_fingerprint(
+    profile_name: str, declared_digests: set[str]
+) -> str:
+    from types import SimpleNamespace
+
+    from cloud_offload.cache_scheduler import resolve_prepared_requirements
+    from cloud_offload.router import resolve_worker_profile
+
+    config = CloudConfig.load(resolve_secrets=False)
+    profile = resolve_worker_profile(config, profile_name)
+    requirement = resolve_prepared_requirements(
+        profile_name,
+        profile,
+        [
+            SimpleNamespace(
+                request={
+                    "assets": [
+                        {"sha256": normalize_digest(digest), "size": 0}
+                        for digest in sorted(declared_digests)
+                    ]
+                }
+            )
+        ],
+    )
+    return str(requirement["profile_fingerprint"])
+
+
 def _coordinator_storage():
     return create_storage(CloudConfig.load())
 
@@ -387,6 +415,7 @@ def prepare_corruption(
     signer_factory: Callable[[], Any] = _manifest_signer,
     registry_factory: Callable[[], CacheRegistry] = _cache_registry,
     coordinator_storage_factory: Callable[[], Any] = _coordinator_storage,
+    profile_fingerprint: str | None = None,
     settle_seconds: float = 5,
 ) -> dict[str, Any]:
     """Publish then corrupt an object no prior mount could have cached."""
@@ -437,7 +466,9 @@ def prepare_corruption(
         },
     }
     canary_manifest = build_manifest(
-        profile_fingerprint=str(base_manifest["profile_fingerprint"]),
+        profile_fingerprint=(
+            profile_fingerprint or str(base_manifest["profile_fingerprint"])
+        ),
         producer=dict(base_manifest.get("producer") or {}),
         artifacts=[
             item
@@ -450,8 +481,7 @@ def prepare_corruption(
     )
     scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
     generation = f"{time.time_ns()}-benchmark-{scenario_tag}"
-    profile = normalize_digest(str(canary_manifest["profile_fingerprint"]))
-    manifest_key = f"manifests/{profile}/{generation}.json"
+    manifest_key = manifest_by_id_key(str(canary_manifest["manifest_id"]))
     index_key = f"indexes/{generation}.json"
     state = {
         "schema": CORRUPTION_STATE_SCHEMA,
@@ -830,7 +860,19 @@ def run_fault(kind: str) -> dict[str, Any]:
         if not declared:
             raise RuntimeError("Corruption canary received no declared asset digests")
         if stage == "prepare":
-            return prepare_corruption(client, scenario, declared)
+            profile_name = (
+                os.environ.get("CLOUD_OFFLOAD_BENCHMARK_PROFILE", "").strip()
+                or "comfyui-partition-v1"
+            )
+            profile_fingerprint = _corruption_profile_fingerprint(
+                profile_name, declared
+            )
+            return prepare_corruption(
+                client,
+                scenario,
+                declared,
+                profile_fingerprint=profile_fingerprint,
+            )
         if stage == "cleanup":
             return cleanup_corruption(client, scenario, declared)
         return observe_corruption(client, job_id, scenario, declared)
