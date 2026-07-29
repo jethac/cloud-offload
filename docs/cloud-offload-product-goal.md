@@ -630,6 +630,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#16](https://github.com/jethac/cloud-offload/pull/16) | Made restart canaries prove journal replay and persist cancellation through the replacement coordinator instead of depending on unrelated image startup. | Merged as `7fdc37c`; 526 tests passed and the production restart canary passed. |
 | [#17](https://github.com/jethac/cloud-offload/pull/17) | Made corruption canaries inject an isolated tiny artifact, publish a temporary signed manifest, provide a valid coordinator fallback, and remove all synthetic state during idempotent cleanup. | Merged as `0ea1754`; 527 tests passed. The first production run proved fresh-object isolation and cleanup but exposed stale manifest discovery, so corruption is not yet accepted. |
 | [#18](https://github.com/jethac/cloud-offload/pull/18) | Recomputes the injected requirement profile, publishes signed manifests by immutable exact ID, falls back to that verified object when a mounted index is stale, and starts corruption observation at `cache_mount_ready`; also brings this goal record through the fresh-object campaign. | Merged as `f4d9cf9`; 529 tests passed. A bounded replay proved that the hook must fingerprint the configured launch profile name, not its requested capability name. |
+| [#19](https://github.com/jethac/cloud-offload/pull/19) | Resolves the requested worker capability to the normalized configured launch profile before computing the corruption canary fingerprint and records the bounded failed exact-ID replay. | 530 tests pass; a post-merge bounded replay remains the evidence gate. |
 
 ### ComfyUI extension repository
 
@@ -792,8 +793,8 @@ Status snapshot as of 2026-07-29:
   identity. PR #18 merged the direct manifest path and produced the pinned
   worker image above. Its first replay showed that the hook and dispatcher used
   different names for the same profile. The launch-profile-name correction now
-  passes 530 tests but remains unaccepted production evidence until merge and a
-  bounded production replay complete.
+  passes 530 tests in PR #19 but remains unaccepted production evidence until
+  merge and a bounded production replay complete.
 - The first unmet M0 work is therefore: compute the corruption manifest from the
   actual injected requirement profile; publish and resolve it through an
   immutable manifest-by-ID path when a mounted mutable index is stale; trigger
