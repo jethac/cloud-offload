@@ -1,10 +1,14 @@
+import ctypes
 import json
 from types import SimpleNamespace
 
 import pytest
 
+import cloud_offload.benchmark_faults as benchmark_faults
 from cloud_offload.benchmark_faults import (
     _benchmark_context,
+    _process_exists,
+    _windows_process_exists,
     cleanup_corruption,
     inject_storage_unavailable,
     observe_corruption,
@@ -125,6 +129,27 @@ class FakeS3Client:
         self.objects.pop(Key, None)
 
 
+class FakeKernel32:
+    def __init__(self, *, handle=42, exit_code=259, query_succeeds=True):
+        self.handle = handle
+        self.exit_code = exit_code
+        self.query_succeeds = query_succeeds
+        self.closed = []
+
+    def OpenProcess(self, access, inherit, pid):
+        return self.handle
+
+    def GetExitCodeProcess(self, handle, output):
+        if not self.query_succeeds:
+            return 0
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_ulong))[0] = self.exit_code
+        return 1
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return 1
+
+
 def test_fault_hook_refuses_direct_invocation(monkeypatch):
     monkeypatch.delenv("CLOUD_OFFLOAD_BENCHMARK_FAILURE_KIND", raising=False)
     monkeypatch.delenv("CLOUD_OFFLOAD_BENCHMARK_JOB_ID", raising=False)
@@ -132,6 +157,33 @@ def test_fault_hook_refuses_direct_invocation(monkeypatch):
 
     with pytest.raises(RuntimeError, match="only inside"):
         _benchmark_context("storage")
+
+
+def test_windows_process_probe_reports_only_live_processes_and_closes_handles():
+    live = FakeKernel32(exit_code=259)
+    exited = FakeKernel32(exit_code=0)
+
+    assert _windows_process_exists(123, kernel32=live) is True
+    assert _windows_process_exists(123, kernel32=exited) is False
+    assert live.closed == [42]
+    assert exited.closed == [42]
+
+
+def test_windows_process_probe_handles_absent_and_failed_queries():
+    assert _windows_process_exists(123, kernel32=FakeKernel32(handle=0)) is False
+    failed = FakeKernel32(query_succeeds=False)
+    assert _windows_process_exists(123, kernel32=failed) is False
+    assert failed.closed == [42]
+
+
+def test_process_exists_uses_native_windows_probe(monkeypatch):
+    monkeypatch.setattr(benchmark_faults.os, "name", "nt")
+    monkeypatch.setattr(
+        benchmark_faults, "_windows_process_exists", lambda pid: pid == 123
+    )
+
+    assert _process_exists(123) is True
+    assert _process_exists(456) is False
 
 
 def test_storage_fault_is_observed_without_mutating_provider_storage():

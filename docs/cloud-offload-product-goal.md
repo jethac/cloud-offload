@@ -16,6 +16,33 @@ Supporting design documents may add implementation detail but may not weaken an
 acceptance criterion here. A milestone is complete only when its exit criteria
 have evidence; merged code alone is not completion.
 
+## Goal control
+
+This document is also the program control surface. It answers four questions
+without requiring reconstruction from chat history, local logs, or merged pull
+requests:
+
+1. **What outcome are we pursuing?** The product contract and promise stack
+   below.
+2. **What has already been decided?** The decisions, non-goals, requirements,
+   and milestone exits in this document.
+3. **What has actually been proved?** The delivery ledger and validation record,
+   which distinguish merged implementation from accepted production evidence.
+4. **What happens next?** The current execution state and the first unmet exit
+   criterion in milestone order.
+
+The active program gate is **M0 production evidence**. M1 through M7 remain part
+of this same goal; they are not a backlog that can be silently deferred or a new
+goal that must be rediscovered later. The next implementation milestone may
+start only after M0 evidence is durable, redacted, comparable, and orphan-free.
+
+Raw benchmark plans, workflows, hooks, support bundles, and service logs remain
+local under `.runlogs/`. The durable record committed to the repository contains
+only safe request digests, aggregate timings and cost, opaque resource/job IDs,
+test results, cleanup receipts, and explicit pass/fail conclusions. Credential
+values, raw prompts/workflows, private paths, signed URLs, hook commands, and
+secret endpoints are never goal-document evidence.
+
 ## Product goal
 
 Cloud Offload rents and operates the right cloud GPU for a ComfyUI workflow. It
@@ -154,7 +181,7 @@ validate the product journey.
 | `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
 | `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Durable population/restore baseline merged; fast trust and capsules pending. |
 | `REPLICA-1` | Replicate prepared state only for measured benefit, within budget and TTL. | M6 | Planned; shadow mode first. |
-| `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Harness merged; live campaign pending. |
+| `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Cold/hot accepted; cancellation, provider, and storage canaries accepted; corruption and restart evidence remain. |
 | `RELEASE-1` | Pass the continuous production matrix and budget gates. | M7 | Pending. |
 
 ## Product principles
@@ -595,6 +622,10 @@ This ledger records merged implementation evidence across both repositories.
 | [#8](https://github.com/jethac/cloud-offload/pull/8) | Spend-capped production benchmark/scorecard, provider attribution and cleanup, cold/hot validation, and five-class failure injection. | Merged as `c1383fe`; 513 tests passed at merge. |
 | [#9](https://github.com/jethac/cloud-offload/pull/9) | Explicit `force_execution` for fresh-Pod partition benchmarks without disabling prepared-state caching. | Merged as `781f212`; 513 tests passed at merge. |
 | [#10](https://github.com/jethac/cloud-offload/pull/10) | Runtime `keyring` dependency required for Windows credential resolution. | Merged as `ce20543`; credential tests passed. |
+| [#11](https://github.com/jethac/cloud-offload/pull/11) | Consolidated the full product goal, promise hierarchy, traceable requirements, M0–M7 exits, decisions, and release gate into this canonical document. | Merged as `3e42f61`; documentation is authoritative, but its milestones still require evidence. |
+| [#12](https://github.com/jethac/cloud-offload/pull/12) | Made benchmark cache state authoritative: cold forces prepared storage off, hot requires an existing confirmed volume, full configuration is restored, and exact Pods are cleaned up. | Merged as `9675fdf`; 517 tests passed. |
+| [#13](https://github.com/jethac/cloud-offload/pull/13) | Added reversible storage, corruption, and coordinator-restart production canaries plus health PID identity. | Merged as `429d405`; 520 tests passed. |
+| [#14](https://github.com/jethac/cloud-offload/pull/14) | Added two-phase pre-submit failure hooks so reviewed corruption setup settles before job submission and Pod creation, with unconditional idempotent cleanup. | Merged as `4900aa6`; 522 tests passed. |
 
 ### ComfyUI extension repository
 
@@ -623,17 +654,45 @@ not blanket production-readiness claims:
 - Replay, snapshot, support-bundle, journal-authority, concurrency, rollback,
   benchmark validation, force-execution, and credential-resolution tests pass in
   the merged backend history shown above.
+- A spend-capped fresh-Pod cold/hot campaign used the same safe request digest,
+  `db85d75dd5ee549db250d27fdf1679a7b1ddea16a01e0afcba4ade0a53afa527`,
+  for jobs `34172fcd-4a6b-4ffb-aa6e-562ff709f841` and
+  `c431bfb2-98df-490a-a7d5-bde3a950e485`. It passed configuration restoration,
+  exact-Pod cleanup, final empty provider inventory, and redaction audit. Cold
+  took 432.500 seconds at a conservative $0.179007; hot took 394.531 seconds at
+  $0.163292, for a conservative campaign total of $0.342299.
+- The cold run spent 80.864 seconds in weight download. The hot run produced six
+  prepared-artifact hits with no misses or downloads, but still spent 64.425
+  seconds reading and verifying prepared artifacts. This is an accepted M0
+  baseline and evidence that current prepared state works. An 8.8% end-to-end
+  improvement from one pair does **not** satisfy the M4 acceleration target.
+- A spend-capped five-class failure campaign conservatively accounted for
+  $0.920037 and ended with prepared-storage policy restored, empty provider
+  inventory, and no orphan audit errors. It accepted three canaries:
+  cancellation removed the exact Pod in 34.500 seconds; a terminated provider
+  Pod was replaced and the job completed in 347.391 seconds; and a deliberately
+  missing strict storage binding failed before provider launch, restored the
+  valid binding, then launched and completed in 395.375 seconds.
+- That same campaign did **not** accept its corruption or coordinator-restart
+  cases. The corruption mutation reached object storage but the mounted path
+  served previously cached valid bytes, so no quarantine event was observed and
+  the original object was restored. The restart case encountered an unusually
+  long worker startup and reached its $0.30 scenario ceiling before execution,
+  so the restart hook never fired. Both exact Pods were removed. These outcomes
+  are retained as failed evidence rather than rewritten as passes.
 
-No production cold/hot scorecard or five-class failure campaign has yet been
-accepted. The two successful jobs above therefore prove that the connected path
-can work, but not that it is fast, continuously reliable, or leak-free.
+The accepted cold/hot scorecard and three accepted failure canaries prove a
+larger part of M0, but M0 is not complete until the corruption and restart
+canaries pass and a compact redacted evidence projection is committed.
 
 ## Current execution state and immediate next work
 
 Status snapshot as of 2026-07-29:
 
 - M0 journal transport and lifecycle authority are merged.
-- M0 benchmark and scorecard automation are merged.
+- M0 benchmark and scorecard automation are merged, including authoritative
+  cold/hot policy orchestration, exact-Pod cleanup, and reversible failure
+  hooks.
 - The coordinator and dispatcher were restarted from merged `main`; coordinator
   health and `/api/active-workers` passed at restart, and provider inventory was
   empty. This is an operational handoff observation, not durable acceptance
@@ -642,33 +701,43 @@ Status snapshot as of 2026-07-29:
   configured environment/keychain paths without logging their values.
 - Local runtime plans, scorecards, and service logs belong under `.runlogs/` and
   must never be committed because they may contain workflow or operational data.
-- The current implementation task is benchmark scenario-level prepared-storage
-  policy orchestration: run a cold scenario with policy `off`, run the matching
-  hot scenario with policy `smart`, and restore the user's complete prior
-  prepared-storage configuration in every success or failure path.
-- After that change, run a spend-capped alternating fresh-Pod cold/hot campaign
-  against the same forced-execution partition, verify exact provider cleanup,
-  and retain only the redacted scorecard as evidence.
-- Then run cancellation, provider, storage, corruption, and restart injections
-  with narrow, reviewed, idempotent hooks and again prove final provider
-  inventory is empty.
+- The cold/hot campaign is accepted. Cancellation, provider recovery, and
+  storage failure canaries are accepted. The first corruption and restart
+  attempts failed safely and were cleaned up exactly.
+- A focused corruption/restart rerun against merged PR #14 stayed within its
+  $1.00 campaign and $0.50 scenario ceilings and conservatively accounted for
+  $0.257885. It ended with empty provider inventory and both exact Pods absent,
+  but both cases correctly remained failed. The fresh Pod again served valid
+  cached bytes rather than the pre-submit corruption canary, so no quarantine
+  event occurred. The restart canary stopped the exact healthy coordinator but
+  a Windows process-liveness probe raised while that process was exiting, so the
+  replacement was not launched. Manual recovery restored a healthy coordinator
+  with a new PID; prepared-storage policy remained `smart`.
+- The first unmet M0 work is therefore: fix the Windows restart probe; redesign
+  the corruption canary so it cannot alias a previously cached object; rerun
+  both cases to direct accepted evidence; generate one compact
+  redacted evidence projection for the accepted campaigns; merge that record;
+  and audit every M0 exit before starting M1.
 
 ### M0 evidence still required
 
-1. A validated benchmark plan whose safe summary identifies the same workload
-   by request digest while keeping the workflow body local.
-2. At least one alternating fresh-Pod cold/hot campaign with explicit campaign,
-   scenario, runtime, and cleanup ceilings.
-3. Separate startup, preparation, execution, closure, and conservative compute
-   cost distributions.
-4. Confirmed policy restoration after every benchmark scenario.
-5. Successful cancellation, provider, storage, corruption, and restart failure
-   cases with redacted support bundles.
-6. An empty final provider inventory and provider-absence receipts for every
-   attributable Pod.
-7. A committed redacted scorecard or durable CI artifact reference that can be
-   compared with future runs without exposing prompts, asset paths, hook
-   arguments, credentials, or secret endpoints.
+1. **Proved:** a validated safe summary identifies the repeated workload by
+   request digest while its workflow body stays local.
+2. **Proved:** one alternating fresh-Pod cold/hot campaign ran within explicit
+   campaign, scenario, runtime, spend, and cleanup ceilings.
+3. **Proved for the accepted pair:** startup, preparation, execution, closure,
+   and conservative compute cost are separately represented in its scorecard.
+4. **Proved:** the full prepared-storage configuration was restored and verified
+   after every completed scenario and campaign cleanup.
+5. **Partial:** cancellation, provider, and storage canaries passed. Corruption
+   and coordinator restart still require direct accepted evidence.
+6. **Proved for completed campaigns:** final provider inventory was empty and
+   attributable Pods had provider-absence receipts. The active rerun must meet
+   the same condition before its evidence can be used.
+7. **Required:** commit a compact redacted scorecard projection or durable CI
+   artifact reference that is comparable across runs and contains no prompts,
+   raw workflow, asset paths, hook arguments/output, credentials, or secret
+   endpoints.
 
 ### Operational safety rules
 
@@ -692,7 +761,7 @@ Status snapshot as of 2026-07-29:
 
 | Milestone | Status on 2026-07-29 | Gate |
 | --- | --- | --- |
-| M0 — measurement and scorecard | **In progress** | Live cold/hot and five-class failure evidence remains. |
+| M0 — measurement and scorecard | **In progress** | Cold/hot plus three failure classes accepted; corruption, restart, and durable redacted evidence remain. |
 | M1 — preflight, recommendation, confirmation | **Not started** | Begins after M0 evidence is trustworthy. |
 | M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
