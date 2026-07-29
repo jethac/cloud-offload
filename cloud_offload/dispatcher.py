@@ -553,6 +553,7 @@ class Dispatcher:
             "CLOUD_OFFLOAD_WORKER_WHEELHOUSE_URL": wheelhouse_url,
             "CLOUD_OFFLOAD_WORKER_WHEELHOUSE_SHA256": wheelhouse_sha256,
             "CLOUD_OFFLOAD_WORKER_PROFILE": profile_name,
+            "CLOUD_OFFLOAD_WORKER_IMAGE_PROFILE": profile["image_profile"],
             "CLOUD_OFFLOAD_WORKER_MODELS": ",".join(profile["models"]),
         }
         if profile.get("weights"):

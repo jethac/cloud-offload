@@ -31,6 +31,11 @@ removes the former single 3.28 GB compressed download from the paid worker start
 path. The Dockerfile uses `COPY --exclude`, so it selects Dockerfile syntax 1.19
 at the top of the file.
 
+A configured routing profile can use a compatible image family under another
+name. Set `image_profile` to the `profile` value in the image's baked
+`runtime-profile.json`. The worker keeps the configured routing name for leases
+and queue claims, but it rejects an image from another declared family.
+
 Push the image, resolve its registry digest, and configure a worker profile with
 the digest:
 

@@ -44,6 +44,11 @@ def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
             continue
         result[str(name)] = {
             "name": str(name),
+            # A configured profile is a routing name. It can use a compatible
+            # immutable image whose baked manifest has a different family name.
+            # Default to exact matching unless the operator declares the image
+            # identity explicitly.
+            "image_profile": str(value.get("image_profile") or "").strip() or str(name),
             "image": image,
             "models": models,
             "providers": list(dict.fromkeys(providers)),

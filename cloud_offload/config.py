@@ -201,6 +201,9 @@ class CloudConfig:
     worker_profile: str = field(
         default_factory=lambda: os.environ.get("CLOUD_OFFLOAD_WORKER_PROFILE", "")
     )
+    worker_image_profile: str = field(
+        default_factory=lambda: os.environ.get("CLOUD_OFFLOAD_WORKER_IMAGE_PROFILE", "")
+    )
     worker_models: list[str] = field(
         default_factory=lambda: [
             item.strip()
@@ -491,6 +494,9 @@ class CloudConfig:
             worker_wheelhouse_sha256=os.environ.get("CLOUD_OFFLOAD_WORKER_WHEELHOUSE_SHA256", ""),
             worker_profiles=json.loads(os.environ.get("CLOUD_OFFLOAD_WORKER_PROFILES_JSON", "{}")),
             worker_profile=os.environ.get("CLOUD_OFFLOAD_WORKER_PROFILE", ""),
+            worker_image_profile=os.environ.get(
+                "CLOUD_OFFLOAD_WORKER_IMAGE_PROFILE", ""
+            ),
             worker_models=[
                 item.strip()
                 for item in os.environ.get("CLOUD_OFFLOAD_WORKER_MODELS", "").split(",")
@@ -588,6 +594,7 @@ class CloudConfig:
             "CLOUD_OFFLOAD_WORKER_WHEELHOUSE_SHA256": ("worker_wheelhouse_sha256", str),
             "CLOUD_OFFLOAD_WORKER_PROFILES_JSON": ("worker_profiles", json.loads),
             "CLOUD_OFFLOAD_WORKER_PROFILE": ("worker_profile", str),
+            "CLOUD_OFFLOAD_WORKER_IMAGE_PROFILE": ("worker_image_profile", str),
             "CLOUD_OFFLOAD_WORKER_MODELS": (
                 "worker_models",
                 lambda value: [item.strip() for item in value.split(",") if item.strip()],
@@ -650,6 +657,7 @@ class CloudConfig:
             "worker_wheelhouse_configured": bool(self.worker_wheelhouse_url),
             "worker_profiles": self.worker_profiles,
             "worker_profile": self.worker_profile,
+            "worker_image_profile": self.worker_image_profile,
             "worker_models": self.worker_models,
             "worker_manifest_path": self.worker_manifest_path,
             "coordinator_configured": bool(self.coordinator_url),
