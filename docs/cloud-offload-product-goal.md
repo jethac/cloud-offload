@@ -629,6 +629,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#15](https://github.com/jethac/cloud-offload/pull/15) | Consolidated the complete program record and replaced the unsafe Windows signal-zero PID probe with native process-state inspection. | Merged as `79faa25`; 525 tests and real live/absent PID probes passed. |
 | [#16](https://github.com/jethac/cloud-offload/pull/16) | Made restart canaries prove journal replay and persist cancellation through the replacement coordinator instead of depending on unrelated image startup. | Merged as `7fdc37c`; 526 tests passed and the production restart canary passed. |
 | [#17](https://github.com/jethac/cloud-offload/pull/17) | Made corruption canaries inject an isolated tiny artifact, publish a temporary signed manifest, provide a valid coordinator fallback, and remove all synthetic state during idempotent cleanup. | Merged as `0ea1754`; 527 tests passed. The first production run proved fresh-object isolation and cleanup but exposed stale manifest discovery, so corruption is not yet accepted. |
+| [#18](https://github.com/jethac/cloud-offload/pull/18) | Recomputes the injected requirement profile, publishes signed manifests by immutable exact ID, falls back to that verified object when a mounted index is stale, and starts corruption observation at `cache_mount_ready`; also brings this goal record through the fresh-object campaign. | 529 tests pass; bounded production replay with a worker image containing the change remains the evidence gate. |
 
 ### ComfyUI extension repository
 
@@ -765,9 +766,9 @@ Status snapshot as of 2026-07-29:
   journal replay, replacement-owned cancellation, and exact provider cleanup.
 - PR #17 removed cached-object aliasing from the corruption canary. Its first
   production run narrowed the remaining failure to an exact-profile mismatch and
-  stale mutable-index discovery. The direct-manifest correction remains
-  intentionally unaccepted production evidence until review, tests, merge, and
-  a bounded production replay complete.
+  stale mutable-index discovery. PR #18 implements the direct-manifest
+  correction and passes 529 tests; it remains intentionally unaccepted
+  production evidence until merge and a bounded production replay complete.
 - The first unmet M0 work is therefore: compute the corruption manifest from the
   actual injected requirement profile; publish and resolve it through an
   immutable manifest-by-ID path when a mounted mutable index is stale; trigger
