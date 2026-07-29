@@ -676,6 +676,49 @@ def test_worker_live_policy_can_keep_an_idle_worker_alive():
     assert worker._should_shutdown() is False
 
 
+def test_worker_idle_time_starts_after_a_job_ends():
+    class SingleJobQueue:
+        failed = []
+
+        def claim_jobs(self, *args, **kwargs):
+            return [SimpleNamespace(id="job-1")]
+
+        def fail_job(self, job_id, error):
+            self.failed.append((job_id, error))
+
+    worker = Worker.__new__(Worker)
+    worker.config = CloudConfig(poll_interval_seconds=1)
+    worker.queue = SingleJobQueue()
+    worker.worker_id = "worker-1"
+    worker.runtime_profile = "comfyui"
+    worker.capabilities = ["comfyui-partition-v1"]
+    worker.gpu_vram_gb = 80
+    worker.gpu_name = "A100"
+    worker.cache_volume_id = None
+    old_time = datetime.utcnow() - timedelta(hours=1)
+
+    def complete_long_job(job):
+        worker.last_job_time = old_time
+
+    worker._process_job = complete_long_job
+    worker.run(once=True)
+
+    assert worker.last_job_time > old_time
+
+
+def test_live_idle_policy_cannot_remove_dispatcher_cleanup_grace():
+    class PolicyQueue:
+        def worker_policy(self):
+            return {"keep_warm": False, "idle_shutdown_seconds": 1}
+
+    worker = Worker.__new__(Worker)
+    worker.config = CloudConfig(idle_shutdown_seconds=61)
+    worker.queue = PolicyQueue()
+    worker.last_job_time = datetime.utcnow() - timedelta(seconds=30)
+
+    assert worker._should_shutdown() is False
+
+
 def test_dispatcher_does_not_terminate_pinned_workers(tmp_path):
     config = CloudConfig(
         queue_db_path=str(tmp_path / "queue.db"),
@@ -804,6 +847,44 @@ def test_dispatcher_launches_legacy_workers_with_effectively_indefinite_timeout(
     assert (
         int(provider.env_vars["CLOUD_OFFLOAD_IDLE_SHUTDOWN"]) == 10 * 365 * 24 * 60 * 60
     )
+
+
+def test_dispatcher_gives_worker_idle_fail_safe_a_cleanup_grace(tmp_path):
+    class LaunchProvider(DummyProvider):
+        def __init__(self):
+            self.env_vars = None
+
+        def find_cheapest(self, **kwargs):
+            return {"id": "offer-1", "gpu_type": "A100", "hourly_rate": 1.49}
+
+        def launch(self, *args, **kwargs):
+            self.env_vars = kwargs["env_vars"]
+            return SimpleNamespace(
+                id="pod-1",
+                provider="runpod",
+                gpu_type="A100",
+                hourly_rate=1.49,
+                status="running",
+            )
+
+    provider = LaunchProvider()
+    config = CloudConfig(
+        queue_db_path=str(tmp_path / "queue.db"),
+        coordinator_url="https://coordinator.invalid",
+        idle_shutdown_seconds=300,
+        provider="runpod",
+        worker_profiles={
+            "comfyui": {
+                "image": "ghcr.io/example/comfyui@sha256:abc",
+                "models": ["comfyui-partition-v1"],
+                "providers": ["runpod"],
+            }
+        },
+    )
+
+    Dispatcher(config, provider=provider)._launch_worker("runpod", "comfyui")
+
+    assert int(provider.env_vars["CLOUD_OFFLOAD_IDLE_SHUTDOWN"]) == 360
 
 
 def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_path):
@@ -1557,6 +1638,21 @@ def test_a_runner_that_is_still_starting_is_not_terminated_as_idle(tmp_path):
     dispatcher._check_idle_workers()
 
     assert "pod-1" in dispatcher.active_instances
+
+
+def test_a_restarted_runner_does_not_reset_paid_resource_cleanup(tmp_path):
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    dispatcher = long_idle_dispatcher(config, queue)
+    dispatcher.runner_ready_instances.add("pod-1")
+    queue.record_worker(
+        "worker-restarted", "runpod", status="starting", runtime_profile="comfyui"
+    )
+
+    dispatcher._check_idle_workers()
+
+    assert "pod-1" not in dispatcher.active_instances
+    assert dispatcher.provider.terminated is True
 
 
 def test_a_pod_is_not_killed_as_idle_while_its_own_work_is_queued(tmp_path):
