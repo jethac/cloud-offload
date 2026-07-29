@@ -36,6 +36,8 @@ CACHE_STATES = {"cold", "hot", "failure"}
 PREPARED_STORAGE_POLICIES = {"off", "smart", "strict", "pinned"}
 SUBMISSION_ENDPOINTS = {"/api/partitions", "/api/workflows"}
 MANAGED_INSTANCE_PREFIX = "cloud-offload-worker-"
+DEFAULT_HOOK_TIMEOUT_SECONDS = 120
+CORRUPTION_OBSERVE_HOOK_TIMEOUT_SECONDS = 270
 
 
 def _utc_now() -> str:
@@ -1384,12 +1386,18 @@ class CoordinatorBenchmarkDriver:
         started = time.monotonic()
         environment = os.environ.copy()
         environment.update(context)
+        timeout_seconds = (
+            CORRUPTION_OBSERVE_HOOK_TIMEOUT_SECONDS
+            if injection.kind == "corruption"
+            and context.get("CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE") == "observe"
+            else DEFAULT_HOOK_TIMEOUT_SECONDS
+        )
         completed = subprocess.run(
             list(injection.hook_argv),
             env=environment,
             capture_output=True,
             check=False,
-            timeout=120,
+            timeout=timeout_seconds,
         )
         return {
             "exit_code": completed.returncode,

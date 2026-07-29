@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import pytest
 
 from cloud_offload.benchmark import (
+    CORRUPTION_OBSERVE_HOOK_TIMEOUT_SECONDS,
+    DEFAULT_HOOK_TIMEOUT_SECONDS,
     PLAN_SCHEMA,
     BenchmarkPlan,
     BenchmarkRunner,
@@ -481,6 +483,11 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
     assert result["failure_injection"]["preparation_hook"]["exit_code"] == 0
     assert result["failure_injection"]["hook"]["exit_code"] == 0
     assert result["failure_injection"]["cleanup_hook"]["exit_code"] == 0
+
+
+def test_corruption_observation_hook_has_a_longer_bounded_timeout():
+    assert DEFAULT_HOOK_TIMEOUT_SECONDS == 120
+    assert CORRUPTION_OBSERVE_HOOK_TIMEOUT_SECONDS == 270
 
 
 def test_corruption_plan_load_creates_a_new_canary_for_each_campaign():
