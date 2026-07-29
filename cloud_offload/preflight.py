@@ -192,7 +192,9 @@ def _estimate(
         cached / RESTORE_THROUGHPUT_RANGE_BPS[0]
         + missing / DOWNLOAD_THROUGHPUT_RANGE_BPS[0]
     )
-    if timing_history:
+    history_sample_count = int((timing_history or {}).get("sample_count") or 0)
+    history_used = timing_history is not None and history_sample_count >= 2
+    if history_used:
         startup_range = list(timing_history["startup_seconds"])
         preparation_range = list(timing_history["preparation_seconds"])
         execution_range = list(timing_history["execution_seconds"])
@@ -299,9 +301,13 @@ def _estimate(
             compute_cost[0] + transfer_cost[0] + storage_cost[0],
             compute_cost[1] + transfer_cost[1] + storage_cost[1],
         ]
-    if timing_history:
+    if history_used:
         assumptions.append(
-            f"Timing uses {int(timing_history['sample_count'])} matched completed job observations."
+            f"Timing uses {history_sample_count} matched completed job observations."
+        )
+    elif timing_history:
+        assumptions.append(
+            "One matched job observation is available; two are required before history changes timing or ranking."
         )
     else:
         assumptions.append(
@@ -355,7 +361,8 @@ def _estimate(
             if existing_storage_monthly_usd is not None
             else None
         ),
-        "history_sample_count": int((timing_history or {}).get("sample_count") or 0),
+        "history_sample_count": history_sample_count,
+        "history_used": history_used,
         "confidence": confidence,
         "assumptions": assumptions,
     }
@@ -1143,8 +1150,7 @@ def build_partition_preflight(
         else ranked
     )
     if relevant_candidates and not any(
-        int(item["estimate"].get("history_sample_count") or 0) > 0
-        for item in relevant_candidates
+        bool(item["estimate"].get("history_used")) for item in relevant_candidates
     ):
         unknowns.append(
             _issue(

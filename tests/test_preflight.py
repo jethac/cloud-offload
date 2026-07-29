@@ -236,6 +236,43 @@ def test_unknown_provider_costs_are_not_reported_as_zero():
     assert estimate["cost_complete"] is False
 
 
+def test_one_history_sample_does_not_change_gpu_ranking(tmp_path):
+    config = config_for_preflight(tmp_path)
+
+    def one_sample(_workload, performance_class):
+        return {
+            "sample_count": 1,
+            "startup_seconds": [1.0, 2.0],
+            "preparation_seconds": [1.0, 2.0],
+            "execution_seconds": (
+                [1.0, 2.0]
+                if performance_class["gpu_type"] == "a10080gb"
+                else [500.0, 600.0]
+            ),
+            "confidence": "low",
+        }
+
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        provider="runpod",
+        recommendation_policy="fastest",
+        storage=LocalStorage(config.storage_path),
+        cache_registry=CacheRegistry(config.queue_db_path),
+        connector_factory=lambda provider, config: ReadOnlyConnector(),
+        history_lookup=one_sample,
+    )
+
+    assert report["execution_plan"]["offer_id"] == "gpu-l40"
+    assert report["estimate"]["history_sample_count"] == 1
+    assert report["estimate"]["history_used"] is False
+    assert report["estimate"]["execution_seconds"] == [120.0, 300.0]
+    assert "execution_history_unavailable" in {
+        item["code"] for item in report["unknowns"]
+    }
+
+
 def test_deterministic_blocker_stops_before_provider_read(tmp_path):
     config = config_for_preflight(tmp_path)
     connector = ReadOnlyConnector()
