@@ -105,13 +105,14 @@ The durable settings are:
 | `recommendation_policy` | `balanced` by default, `cheapest`, `fastest`, or `manual`. |
 | `max_hourly_rate` | Hard positive hourly limit. |
 | `max_total_job_cost` | Optional hard positive total-cost limit. |
+| `max_job_runtime_seconds` | Hard paid-resource runtime limit; 7200 seconds by default. |
 | `allowed_regions` | Optional hard region allowlist. |
 | `material_price_change_percent` | Price-change tolerance; 5% by default. |
 | `material_cost_change_percent` | Estimated total-cost tolerance; 10% by default. |
 
 `POST /api/config` validates and persists these non-secret settings. Skipping
-normal confirmation does not disable price, total-cost, region, residency, GPU,
-or provider constraints.
+normal confirmation does not disable price, total-cost, runtime, region,
+residency, GPU, or provider constraints.
 
 ## Status
 

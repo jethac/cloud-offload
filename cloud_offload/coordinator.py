@@ -15,12 +15,23 @@ from cloud_offload.queue import Job, JobStatus
 class CoordinatorQueue:
     """JobQueue-like adapter backed by the Cloud Offload coordinator API."""
 
-    def __init__(self, base_url: str, token: str, provider: str, worker_id: str):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        provider: str,
+        worker_id: str,
+        lease_id: str | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.provider = provider
         self.worker_id = worker_id
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
+        self.session.headers["X-Cloud-Offload-Worker-ID"] = worker_id
+        if lease_id:
+            self.session.headers["X-Cloud-Offload-Lease-ID"] = lease_id
+        self.lease_id = lease_id
         # A process-scoped producer id prevents a restarted worker process from
         # reusing sequence numbers under the stable Pod-level worker id.
         self._event_producer_id = f"worker:{worker_id}:{uuid.uuid4()}"
@@ -43,6 +54,7 @@ class CoordinatorQueue:
         capabilities: list[str] | None = None,
         idle: bool = False,
         detail: str | None = None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         """Report this worker's own state, claiming nothing.
 
@@ -61,6 +73,7 @@ class CoordinatorQueue:
                 "models": capabilities or [],
                 "idle": idle,
                 "detail": detail,
+                "lease_id": lease_id or self.lease_id,
             },
         )
 
@@ -122,6 +135,8 @@ class CoordinatorQueue:
         gpu_vram_gb: float | None = None,
         gpu_name: str | None = None,
         cache_volume_id: str | None = None,
+        lease_id: str | None = None,
+        lease_ttl_seconds: int = 300,
     ) -> list[Job]:
         data = self._post(
             "/api/workers/claim",
@@ -134,6 +149,7 @@ class CoordinatorQueue:
                 "gpu_vram_gb": gpu_vram_gb,
                 "gpu_name": gpu_name,
                 "cache_volume_id": cache_volume_id or "",
+                "lease_id": lease_id or self.lease_id,
             },
         )
         return [Job.from_dict(item) for item in data]

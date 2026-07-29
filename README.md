@@ -36,10 +36,11 @@ ComfyUI node pack ──HTTP──▶ Coordinator (FastAPI + SQLite queue)
   separate `Bearer <worker_token>` channel (`/api/workers/*`) is exempt from the
   LAN token.
 - **JobQueue** (`cloud_offload.queue`): SQLite store for jobs, resumable
-  `job_events`, `partition_cache`, and worker tokens/heartbeats.
+  `job_events`, durable provider-resource leases, `partition_cache`, and worker
+  tokens/heartbeats.
 - **Dispatcher** (`cloud_offload.dispatcher`): watches queue depth per
-  provider/profile, provisions workers past a threshold, emits provisioning
-  events, and enforces idle-shutdown / keep-warm.
+  provider/profile, provisions workers past a threshold, reconciles durable
+  leases, proves provider closure, and enforces idle, runtime, and dollar limits.
 - **Worker** (`cloud_offload.worker`): claims jobs and runs the
   `ComfyUIWorkflowExecutor` for `comfyui-workflow` and `comfyui-partition-v1`.
 - **Providers** (`cloud_offload.providers`): pluggable connector registry;
@@ -568,6 +569,10 @@ is specified separately in **[Storage-aware Cloud Offload](docs/storage-aware-cl
 The read-only **[partition preflight contract](docs/preflight.md)** checks
 deterministic requirements and returns safe current GPU choices before a job or
 paid provider resource is created.
+
+The **[job lease and provider closure contract](docs/job-leases.md)** binds every
+paid resource before launch, survives dispatcher restarts, and does not claim
+billing stopped until the provider confirms exact resource removal.
 
 Two additional load balancers are designed and queued behind the current release:
 

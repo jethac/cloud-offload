@@ -28,7 +28,7 @@ from cloud_offload.credentials import huggingface_token
 from cloud_offload.providers import create_connector
 from cloud_offload.providers.base import CloudConnector, CloudProvider, Instance
 from cloud_offload.providers.base import PlacementConstraints, StorageAttachment
-from cloud_offload.queue import JobQueue, JobStatus
+from cloud_offload.queue import JobLease, JobQueue, JobStatus
 from cloud_offload.profiles import (
     configured_worker_profiles,
     profile_providing,
@@ -135,6 +135,7 @@ class Dispatcher:
         self.active_instances: dict[str, Instance] = {}
         self.instance_providers: dict[str, str] = {}
         self.instance_profiles: dict[str, str] = {}
+        self.instance_leases: dict[str, str] = {}
         self.last_activity: dict[str, datetime] = {}
         self.launched_at: dict[str, datetime] = {}
         self.runner_ready_instances: set[str] = set()
@@ -219,6 +220,9 @@ class Dispatcher:
             self.config.min_queue_depth = persisted.min_queue_depth
             self.config.gpu_type = persisted.gpu_type
             self.config.max_hourly_rate = persisted.max_hourly_rate
+            self.config.max_total_job_cost = persisted.max_total_job_cost
+            self.config.max_job_runtime_seconds = persisted.max_job_runtime_seconds
+            self.config.lease_ttl_seconds = persisted.lease_ttl_seconds
             self.config.worker_profiles = persisted.worker_profiles
             self.config.runpod_registry_auth_id = persisted.runpod_registry_auth_id
             # Prepared storage can create paid durable resources. Only refresh
@@ -231,6 +235,10 @@ class Dispatcher:
                 runpod.registry_auth_id = persisted.runpod_registry_auth_id.strip()
         except Exception as exc:
             logger.warning("Could not refresh cloud runtime policy: %s", exc)
+
+        # Restore durable provider ownership before any decision can rent a
+        # second resource. This also executes cancellation and hard limits.
+        self._reconcile_leases()
 
         # Count queued jobs
         queued_count = self.queue.count_by_status(JobStatus.QUEUED)
@@ -292,6 +300,11 @@ class Dispatcher:
                         worker.get("provider") == provider_name
                         and worker.get("runtime_profile") == profile_name
                         for worker in self.queue.list_active_workers()
+                    )
+                    profile_running = profile_running or any(
+                        lease.provider == provider_name
+                        and lease.runtime_profile == profile_name
+                        for lease in self.queue.list_open_leases()
                     )
                     if profile_queued < required_depth or profile_running:
                         continue
@@ -609,6 +622,20 @@ class Dispatcher:
             )
 
         disk_gb = self._planned_disk_gb(profile_name, queued_jobs)
+        max_runtime_seconds, max_cost_usd = self._lease_limits(queued_jobs)
+        lease = self.queue.create_lease(
+            provider=provider_name,
+            runtime_profile=profile_name,
+            job_ids=[job.id for job in (queued_jobs or [])],
+            hourly_rate=float(offer.get("hourly_rate") or 0),
+            max_runtime_seconds=max_runtime_seconds,
+            max_cost_usd=max_cost_usd,
+            ttl_seconds=max(
+                self.config.lease_ttl_seconds,
+                RUNNER_REGISTRATION_TIMEOUT_SECONDS + self.config.poll_interval_seconds,
+            ),
+        )
+        env_vars["CLOUD_OFFLOAD_LEASE_ID"] = lease.id
 
         try:
             launch_arguments = dict(
@@ -617,6 +644,7 @@ class Dispatcher:
                 env_vars=env_vars,
                 startup_script=startup_script,
                 disk_gb=disk_gb,
+                resource_name=lease.resource_name,
             )
             if placement is not None:
                 launch_arguments["placement"] = placement
@@ -647,7 +675,7 @@ class Dispatcher:
                 },
             )
             return self._remember_launched_instance(
-                instance, provider_name, profile_name, queued_jobs
+                instance, provider_name, profile_name, queued_jobs, lease.id
             )
 
         except Exception as e:
@@ -665,6 +693,29 @@ class Dispatcher:
                 },
             )
             logger.error(f"Failed to launch worker: {e}")
+            recovered, provider_checked = self._recover_provisioning_lease(lease)
+            if recovered is not None:
+                self._publish_launch_event(
+                    queued_jobs,
+                    {
+                        "type": "provider_request_recovered",
+                        "phase": "provider_request",
+                        "provider": provider_name,
+                        "worker_instance_id": recovered.id,
+                        "lease_id": lease.id,
+                    },
+                )
+                return self._remember_launched_instance(
+                    recovered, provider_name, profile_name, queued_jobs, lease.id
+                )
+            if not provider_checked:
+                self._record_launch_failure(
+                    provider_name,
+                    profile_name,
+                    queued_jobs,
+                    "Provider launch result is uncertain; reconciliation will continue.",
+                )
+                return None
             if (
                 placement is not None
                 and placement_decision is not None
@@ -693,6 +744,20 @@ class Dispatcher:
                         for key, value in env_vars.items()
                         if not key.startswith("CLOUD_OFFLOAD_CACHE_")
                     }
+                    cold_lease = self.queue.create_lease(
+                        provider=provider_name,
+                        runtime_profile=profile_name,
+                        job_ids=[job.id for job in (queued_jobs or [])],
+                        hourly_rate=float(cold_offer.get("hourly_rate") or 0),
+                        max_runtime_seconds=max_runtime_seconds,
+                        max_cost_usd=max_cost_usd,
+                        ttl_seconds=max(
+                            self.config.lease_ttl_seconds,
+                            RUNNER_REGISTRATION_TIMEOUT_SECONDS
+                            + self.config.poll_interval_seconds,
+                        ),
+                    )
+                    cold_env["CLOUD_OFFLOAD_LEASE_ID"] = cold_lease.id
                     for queued_job in queued_jobs or []:
                         for key in (
                             "prepared_requirement",
@@ -722,6 +787,7 @@ class Dispatcher:
                             env_vars=cold_env,
                             startup_script=startup_script,
                             disk_gb=disk_gb,
+                            resource_name=cold_lease.resource_name,
                         )
                         self._publish_launch_event(
                             queued_jobs,
@@ -737,9 +803,32 @@ class Dispatcher:
                             },
                         )
                         return self._remember_launched_instance(
-                            instance, provider_name, profile_name, queued_jobs
+                            instance,
+                            provider_name,
+                            profile_name,
+                            queued_jobs,
+                            cold_lease.id,
                         )
                     except Exception as cold_exc:
+                        recovered, provider_checked = self._recover_provisioning_lease(
+                            cold_lease
+                        )
+                        if recovered is not None:
+                            return self._remember_launched_instance(
+                                recovered,
+                                provider_name,
+                                profile_name,
+                                queued_jobs,
+                                cold_lease.id,
+                            )
+                        if not provider_checked:
+                            self._record_launch_failure(
+                                provider_name,
+                                profile_name,
+                                queued_jobs,
+                                "Cold fallback result is uncertain; reconciliation will continue.",
+                            )
+                            return None
                         e = RuntimeError(
                             f"cached placement failed ({e}); cold fallback failed ({cold_exc})"
                         )
@@ -762,7 +851,15 @@ class Dispatcher:
         provider_name: str,
         profile_name: str,
         queued_jobs: list | None,
+        lease_id: str | None = None,
     ) -> Instance:
+        if lease_id:
+            self.queue.bind_lease(
+                lease_id,
+                instance.id,
+                ttl_seconds=self.config.lease_ttl_seconds,
+            )
+            self.instance_leases[instance.id] = lease_id
         self.active_instances[instance.id] = instance
         self.instance_providers[instance.id] = provider_name
         self.instance_profiles[instance.id] = profile_name
@@ -781,10 +878,235 @@ class Dispatcher:
                 "worker_instance_id": instance.id,
                 "gpu_type": instance.gpu_type,
                 "hourly_rate": instance.hourly_rate,
+                "lease_id": lease_id,
                 "overall_progress": 2,
             },
         )
         return instance
+
+    def _lease_limits(self, jobs: list | None) -> tuple[int, float | None]:
+        runtime_limits = [int(self.config.max_job_runtime_seconds)]
+        cost_limits: list[float] = []
+        if self.config.max_total_job_cost is not None:
+            cost_limits.append(float(self.config.max_total_job_cost))
+        for job in jobs or []:
+            preflight = job.params.get("preflight") or {}
+            policy = preflight.get("request_policy") or {}
+            try:
+                runtime = int(policy.get("max_job_runtime_seconds") or 0)
+                if runtime > 0:
+                    runtime_limits.append(runtime)
+            except (TypeError, ValueError):
+                pass
+            try:
+                cost = float(policy.get("max_total_job_cost") or 0)
+                if cost > 0:
+                    cost_limits.append(cost)
+            except (TypeError, ValueError):
+                pass
+        return min(runtime_limits), (min(cost_limits) if cost_limits else None)
+
+    @staticmethod
+    def _instance_resource_name(instance: Instance) -> str:
+        candidate = getattr(instance, "metadata", None)
+        metadata = candidate if isinstance(candidate, dict) else {}
+        return str(metadata.get("name") or "")
+
+    def _recover_provisioning_lease(
+        self, lease: JobLease
+    ) -> tuple[Instance | None, bool]:
+        """Resolve an uncertain launch by its pre-mutation provider name."""
+        connector = self.connectors.get(lease.provider)
+        if connector is None:
+            return None, False
+        try:
+            instances = connector.list_instances()
+        except Exception as exc:
+            logger.warning(
+                "Could not reconcile provisioning lease %s: %s", lease.id, exc
+            )
+            return None, False
+        recovered = next(
+            (
+                item
+                for item in instances
+                if self._instance_resource_name(item) == lease.resource_name
+            ),
+            None,
+        )
+        if recovered is not None:
+            return recovered, True
+        self.queue.close_unbound_lease(lease.id, "provider_confirmed_no_resource")
+        return None, True
+
+    def _forget_instance(self, instance_id: str) -> None:
+        self.active_instances.pop(instance_id, None)
+        self.instance_providers.pop(instance_id, None)
+        self.instance_profiles.pop(instance_id, None)
+        self.instance_leases.pop(instance_id, None)
+        self.last_activity.pop(instance_id, None)
+        self.launched_at.pop(instance_id, None)
+        self.runner_ready_instances.discard(instance_id)
+        self.runner_feedback_at.pop(instance_id, None)
+
+    def _restore_lease_instance(self, lease: JobLease, instance: Instance) -> None:
+        self.active_instances[instance.id] = instance
+        self.instance_providers[instance.id] = lease.provider
+        self.instance_profiles[instance.id] = lease.runtime_profile
+        self.instance_leases[instance.id] = lease.id
+        try:
+            created = datetime.fromisoformat(lease.created_at)
+        except ValueError:
+            created = datetime.utcnow()
+        self.launched_at.setdefault(instance.id, created)
+        self.last_activity.setdefault(instance.id, created)
+
+    def _fail_lease_jobs(self, lease: JobLease, reason: str) -> None:
+        safe_reason = str(reason).replace("_", " ")
+        for job in self.queue.jobs_for_lease(lease.id):
+            if job.status not in {
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.DEAD_LETTER,
+            }:
+                self.queue.append_event(
+                    job.id,
+                    {
+                        "type": "circuit_breaker_triggered",
+                        "phase": "resource_closure",
+                        "lease_id": lease.id,
+                        "provider": lease.provider,
+                        "worker_instance_id": lease.instance_id,
+                        "reason": reason,
+                    },
+                    producer_id="dispatcher:lease-control",
+                )
+                self.queue.update_status(
+                    job.id,
+                    JobStatus.FAILED,
+                    error=f"Cancelled: {safe_reason}",
+                )
+
+    def _requeue_lost_lease_jobs(self, lease: JobLease) -> None:
+        for job in self.queue.jobs_for_lease(lease.id):
+            if job.status not in {
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.DEAD_LETTER,
+            }:
+                self.queue.append_event(
+                    job.id,
+                    {
+                        "type": "provider_resource_lost",
+                        "phase": "resource_closure",
+                        "lease_id": lease.id,
+                        "provider": lease.provider,
+                        "worker_instance_id": lease.instance_id,
+                    },
+                    producer_id="dispatcher:lease-control",
+                )
+                self.queue.fail_job(job.id, "Provider resource ended before completion")
+
+    def _terminate_lease(self, lease: JobLease) -> None:
+        if not lease.instance_id:
+            return
+        connector = self.connectors.get(lease.provider)
+        if connector is None:
+            logger.error("No connector can close lease %s", lease.id)
+            return
+        attempted = self.queue.record_termination_attempt(lease.id)
+        try:
+            connector.terminate(str(lease.instance_id))
+        except Exception as exc:
+            logger.warning(
+                "Provider termination attempt %s failed for lease %s: %s",
+                attempted.termination_attempts,
+                lease.id,
+                exc,
+            )
+        try:
+            observed = connector.get_instance(str(lease.instance_id))
+        except Exception as exc:
+            logger.warning("Could not verify closure for lease %s: %s", lease.id, exc)
+            return
+        if observed is None:
+            self.queue.confirm_lease_termination(
+                lease.id, observed_state="absent", provider_absent=True
+            )
+            self._forget_instance(str(lease.instance_id))
+        elif observed.status == "terminated":
+            self.queue.confirm_lease_termination(
+                lease.id,
+                observed_state=observed.status,
+                provider_absent=False,
+            )
+            self._forget_instance(str(lease.instance_id))
+
+    def _reconcile_leases(self) -> None:
+        """Rebuild ownership and close every expired or revoked paid resource."""
+        now = datetime.utcnow()
+        for initial in self.queue.list_open_leases():
+            lease = self.queue.get_lease(initial.id) or initial
+            connector = self.connectors.get(lease.provider)
+            if connector is None:
+                logger.error("No connector is configured for open lease %s", lease.id)
+                continue
+            instance = None
+            if lease.instance_id:
+                try:
+                    instance = connector.get_instance(lease.instance_id)
+                except Exception as exc:
+                    logger.warning("Could not inspect lease %s: %s", lease.id, exc)
+                    continue
+            else:
+                instance, checked = self._recover_provisioning_lease(lease)
+                if not checked:
+                    continue
+                if instance is None:
+                    continue
+                lease = self.queue.bind_lease(
+                    lease.id,
+                    instance.id,
+                    ttl_seconds=self.config.lease_ttl_seconds,
+                )
+
+            if instance is None or instance.status == "terminated":
+                if lease.status == "active" and not lease.termination_requested_at:
+                    self._requeue_lost_lease_jobs(lease)
+                self.queue.confirm_lease_termination(
+                    lease.id,
+                    observed_state="absent" if instance is None else instance.status,
+                    provider_absent=instance is None,
+                )
+                if lease.instance_id:
+                    self._forget_instance(lease.instance_id)
+                continue
+
+            self._restore_lease_instance(lease, instance)
+            reason = None
+            if lease.status in {"revocation_requested", "terminating"}:
+                reason = lease.reason or "lease_revoked"
+            elif instance.status == "stopped":
+                reason = "provider_stopped_resource_remains"
+            else:
+                try:
+                    if datetime.fromisoformat(lease.expires_at) <= now:
+                        reason = "lease_expired"
+                    elif lease.runtime_deadline and datetime.fromisoformat(
+                        lease.runtime_deadline
+                    ) <= now:
+                        reason = "runtime_limit"
+                    elif lease.cost_deadline and datetime.fromisoformat(
+                        lease.cost_deadline
+                    ) <= now:
+                        reason = "cost_limit"
+                except ValueError:
+                    reason = "invalid_lease_deadline"
+            if reason:
+                if lease.status not in {"revocation_requested", "terminating"}:
+                    lease = self.queue.request_lease_revocation(lease.id, reason)
+                    self._fail_lease_jobs(lease, reason)
+                self._terminate_lease(lease)
 
     @staticmethod
     def _shared_preflight(jobs: list | None) -> dict | None:
@@ -1270,15 +1592,29 @@ cloud-offload worker --poll 10
             provider_name = self.instance_providers[instance_id]
             instance = self.connectors[provider_name].get_instance(instance_id)
 
-            if not instance or instance.status in ("stopped", "terminated"):
+            if not instance or instance.status == "terminated":
                 logger.info(f"Worker {instance_id} no longer active")
-                del self.active_instances[instance_id]
-                self.instance_providers.pop(instance_id, None)
-                self.instance_profiles.pop(instance_id, None)
-                self.last_activity.pop(instance_id, None)
-                self.launched_at.pop(instance_id, None)
-                self.runner_ready_instances.discard(instance_id)
-                self.runner_feedback_at.pop(instance_id, None)
+                lease_id = self.instance_leases.get(instance_id)
+                if lease_id:
+                    lease = self.queue.get_lease(lease_id)
+                    if (
+                        lease
+                        and lease.status == "active"
+                        and not lease.termination_requested_at
+                    ):
+                        self._requeue_lost_lease_jobs(lease)
+                    self.queue.confirm_lease_termination(
+                        lease_id,
+                        observed_state="absent" if not instance else instance.status,
+                        provider_absent=not instance,
+                    )
+                self._forget_instance(instance_id)
+            elif instance.status == "stopped" and self.instance_leases.get(instance_id):
+                lease = self.queue.request_lease_revocation(
+                    self.instance_leases[instance_id],
+                    "provider_stopped_resource_remains",
+                )
+                self._terminate_lease(lease)
             else:
                 self.active_instances[instance_id] = instance
 
@@ -1351,7 +1687,7 @@ cloud-offload worker --poll 10
             self._record_launch_failure(
                 provider_name, profile_name, queued_jobs, detail
             )
-            self._terminate_worker(instance_id)
+            self._terminate_worker(instance_id, reason="registration_timeout")
 
     @staticmethod
     def _job_profile_name(job, profiles: dict) -> str:
@@ -1421,22 +1757,22 @@ cloud-offload worker --poll 10
                     f"Worker {instance_id} idle for "
                     f"{self.config.idle_shutdown_seconds}s, terminating"
                 )
-                self._terminate_worker(instance_id)
+                self._terminate_worker(instance_id, reason="idle_timeout")
 
-    def _terminate_worker(self, instance_id: str):
+    def _terminate_worker(self, instance_id: str, *, reason: str = "dispatcher_shutdown"):
         """Terminate a worker instance."""
+        lease_id = self.instance_leases.get(instance_id)
+        if lease_id:
+            lease = self.queue.request_lease_revocation(lease_id, reason)
+            self._terminate_lease(lease)
+            return
         provider_name = self.instance_providers[instance_id]
         if self.connectors[provider_name].terminate(instance_id):
             logger.info(f"Terminated worker {instance_id}")
         else:
             logger.warning(f"Failed to terminate worker {instance_id}")
 
-        self.active_instances.pop(instance_id, None)
-        self.instance_providers.pop(instance_id, None)
-        self.instance_profiles.pop(instance_id, None)
-        self.last_activity.pop(instance_id, None)
-        self.launched_at.pop(instance_id, None)
-        self.runner_ready_instances.discard(instance_id)
+        self._forget_instance(instance_id)
 
     def shutdown(self):
         """Terminate all workers and shut down."""

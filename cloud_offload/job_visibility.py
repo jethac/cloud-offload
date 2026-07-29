@@ -54,10 +54,15 @@ EVENT_STAGES = {
     "provider_request_progress": "provisioning",
     "provider_request_completed": "provisioning",
     "provider_request_failed": "provisioning",
+    "lease_created": "provisioning",
+    "lease_bound": "provisioning",
+    "lease_job_attached": "provisioning",
+    "lease_closed_without_resource": "provisioning",
     "provisioning_failed": "provisioning",
     "runner_starting": "worker_boot",
     "runner_starting_progress": "worker_boot",
     "runner_ready": "worker_boot",
+    "lease_job_claimed": "worker_boot",
     "cache_mount_ready": "dependency_preparation",
     "cache_restore_started": "dependency_preparation",
     "cache_restore_completed": "dependency_preparation",
@@ -87,6 +92,9 @@ EVENT_STAGES = {
     "provider_termination_completed": "resource_closure",
     "resource_terminated": "resource_closure",
     "worker_termination_confirmed": "resource_closure",
+    "lease_revoked": "resource_closure",
+    "circuit_breaker_triggered": "resource_closure",
+    "provider_resource_lost": "resource_closure",
 }
 
 TERMINATION_RECEIPTS = {
@@ -107,6 +115,11 @@ EVENT_LABELS = {
     "provider_request_completed": "GPU allocated",
     "provider_request_failed": "GPU request failed",
     "provisioning_failed": "GPU start failed; retry is pending",
+    "lease_created": "GPU resource lease created",
+    "lease_bound": "GPU resource lease is active",
+    "lease_job_attached": "Job attached to GPU resource lease",
+    "lease_job_claimed": "Cloud worker claimed the leased job",
+    "lease_closed_without_resource": "GPU request closed without a resource",
     "runner_starting": "Cloud worker is starting",
     "runner_starting_progress": "Cloud worker is still starting",
     "runner_ready": "Cloud worker is ready",
@@ -141,6 +154,9 @@ EVENT_LABELS = {
     "provider_termination_completed": "Cloud resource closed",
     "resource_terminated": "Cloud resource closed",
     "worker_termination_confirmed": "Cloud resource closed",
+    "lease_revoked": "GPU resource lease revoked",
+    "circuit_breaker_triggered": "Cloud safety limit reached",
+    "provider_resource_lost": "Cloud GPU resource ended before completion",
 }
 
 
@@ -446,6 +462,7 @@ def _resources(job: Job, events: list[dict[str, Any]], preflight: dict[str, Any]
         "pod_id": None,
         "volume_id": preflight.get("prepared_volume_id"),
         "hourly_rate_usd": _finite_number(preflight.get("hourly_rate")),
+        "lease_id": None,
     }
     for envelope in events:
         event = _raw_event(envelope)
@@ -466,6 +483,11 @@ def _resources(job: Job, events: list[dict[str, Any]], preflight: dict[str, Any]
             or event.get("pod_id")
             or event.get("worker_instance_id")
             or values["pod_id"]
+        )
+        values["lease_id"] = (
+            resources.get("lease_id")
+            or event.get("lease_id")
+            or values["lease_id"]
         )
         values["volume_id"] = (
             resources.get("cache_provider_volume_id")
@@ -596,7 +618,15 @@ def project_job_visibility(
             None,
         )
         paid_start_basis = "first_pod_observation"
-    termination_confirmed = any(_event_type(item) in TERMINATION_RECEIPTS for item in event_list)
+    termination_receipt = next(
+        (
+            item
+            for item in reversed(event_list)
+            if _event_type(item) in TERMINATION_RECEIPTS
+        ),
+        None,
+    )
+    termination_confirmed = termination_receipt is not None
     if not resources["pod_id"]:
         billing_state = "not_started"
     elif termination_confirmed:
@@ -605,13 +635,10 @@ def project_job_visibility(
         billing_state = "termination_unconfirmed"
     else:
         billing_state = "accruing"
-    paid_elapsed = _seconds(provider_started, now) if provider_started else None
-    paid_lifetime = _finite_range(estimate.get("paid_lifetime_seconds"))
+    paid_end = _event_time(termination_receipt) if termination_receipt else now
+    paid_elapsed = _seconds(provider_started, paid_end) if provider_started else None
     spend_seconds = paid_elapsed
     spend_basis = f"{paid_start_basis}_elapsed"
-    if terminal and spend_seconds is not None and paid_lifetime:
-        spend_seconds = min(spend_seconds, paid_lifetime[1])
-        spend_basis = "measured_elapsed_capped_by_preflight"
     hourly_rate = resources["hourly_rate_usd"]
     estimated_spend = (
         round(hourly_rate * spend_seconds / 3600, 6)
@@ -720,6 +747,11 @@ def project_job_visibility(
         "billing": {
             "state": billing_state,
             "termination_confirmed": termination_confirmed,
+            "termination_confirmed_at": (
+                _event_time(termination_receipt).isoformat()
+                if termination_receipt and _event_time(termination_receipt)
+                else None
+            ),
         },
         "event_cursor": int(event_list[-1].get("sequence") or 0) if event_list else 0,
         "event_count": len(event_list),

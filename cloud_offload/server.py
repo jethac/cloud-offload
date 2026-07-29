@@ -71,12 +71,14 @@ _HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
 _PREFLIGHT_POLICY_CONFIG_FIELDS = {
     "max_hourly_rate",
     "max_total_job_cost",
+    "max_job_runtime_seconds",
     "recommendation_policy",
     "rental_confirmation",
     "confirmation_countdown_seconds",
     "allowed_regions",
     "material_price_change_percent",
     "material_cost_change_percent",
+    "lease_ttl_seconds",
 }
 
 
@@ -309,6 +311,12 @@ def _runpod_s3_store(volume, connector):
 def _worker_token(request: Request) -> str | None:
     authorization = request.headers.get("Authorization", "")
     return authorization[7:] if authorization.startswith("Bearer ") else None
+
+
+def _worker_identity(request: Request) -> tuple[str | None, str | None]:
+    worker_id = request.headers.get("X-Cloud-Offload-Worker-ID", "").strip() or None
+    lease_id = request.headers.get("X-Cloud-Offload-Lease-ID", "").strip() or None
+    return worker_id, lease_id
 
 
 def _partition_artifact_key(digest: str) -> str:
@@ -668,14 +676,23 @@ def _provider_statuses(config) -> list[dict[str, Any]]:
 
 
 def _authorize_worker_job(request: Request, job_id: str):
-    _, queue = _queue()
+    config, queue = _queue()
     try:
         queue.authorize_worker(_worker_token(request))
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
-    job = queue.get(job_id)
-    if not job:
+    worker_id, lease_id = _worker_identity(request)
+    try:
+        job = queue.authorize_worker_job(
+            job_id,
+            worker_id=worker_id,
+            lease_id=lease_id,
+            lease_ttl_seconds=config.lease_ttl_seconds,
+        )
+    except KeyError:
         raise HTTPException(status_code=404, detail="Job not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     return queue, job
 
 
@@ -2034,6 +2051,7 @@ async def cancel_job(job_id: str):
             ),
         },
     )
+    queue.request_job_lease_revocation(job_id, "user_cancelled")
     job = queue.update_status(job_id, JobStatus.FAILED, error="Cancelled")
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -2703,7 +2721,7 @@ async def download_artifact(artifact_id: str):
 @app.post("/api/workers/claim")
 async def worker_claim(request: Request, payload: dict[str, Any] = Body(...)):
     """Claim provider-scoped jobs from a remote worker."""
-    _, queue = _queue()
+    config, queue = _queue()
     token = _worker_token(request)
     try:
         queue.authorize_worker(token)
@@ -2717,6 +2735,8 @@ async def worker_claim(request: Request, payload: dict[str, Any] = Body(...)):
             gpu_vram_gb=float(payload.get("gpu_vram_gb") or 0),
             gpu_name=str(payload.get("gpu_name") or ""),
             cache_volume_id=str(payload.get("cache_volume_id") or ""),
+            lease_id=str(payload.get("lease_id") or "") or None,
+            lease_ttl_seconds=config.lease_ttl_seconds,
         )
         queue.record_worker(
             str(payload["worker_id"]),
@@ -2724,6 +2744,8 @@ async def worker_claim(request: Request, payload: dict[str, Any] = Body(...)):
             runtime_profile=str(payload.get("runtime_profile") or ""),
             capabilities=[str(item) for item in payload.get("models", [])],
             idle=not jobs,
+            lease_id=str(payload.get("lease_id") or "") or None,
+            lease_ttl_seconds=config.lease_ttl_seconds,
         )
     except (KeyError, PermissionError, ValueError) as exc:
         raise HTTPException(status_code=401, detail=str(exc))
@@ -2743,7 +2765,7 @@ async def worker_status(request: Request, payload: dict[str, Any] = Body(...)):
     """
     from cloud_offload.queue import WORKER_STATUSES
 
-    _, queue = _queue()
+    config, queue = _queue()
     try:
         queue.authorize_worker(_worker_token(request))
     except PermissionError as exc:
@@ -2763,15 +2785,20 @@ async def worker_status(request: Request, payload: dict[str, Any] = Body(...)):
             + ", ".join(WORKER_STATUSES),
         )
     detail = payload.get("detail")
-    queue.record_worker(
-        worker_id,
-        provider,
-        status=status,
-        runtime_profile=str(payload.get("runtime_profile") or ""),
-        capabilities=[str(item) for item in payload.get("models", [])],
-        idle=bool(payload.get("idle", False)),
-        detail=str(detail)[:MAX_WORKER_DETAIL_CHARS] if detail else None,
-    )
+    try:
+        queue.record_worker(
+            worker_id,
+            provider,
+            status=status,
+            runtime_profile=str(payload.get("runtime_profile") or ""),
+            capabilities=[str(item) for item in payload.get("models", [])],
+            idle=bool(payload.get("idle", False)),
+            detail=str(detail)[:MAX_WORKER_DETAIL_CHARS] if detail else None,
+            lease_id=str(payload.get("lease_id") or "") or None,
+            lease_ttl_seconds=config.lease_ttl_seconds,
+        )
+    except (KeyError, PermissionError) as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"worker_id": worker_id, "status": status}
 
 
@@ -2788,6 +2815,7 @@ async def worker_policy(request: Request):
         "keep_warm": config.keep_warm,
         "idle_shutdown_seconds": config.idle_shutdown_seconds,
         "keep_warm_warning_seconds": config.keep_warm_warning_seconds,
+        "lease_ttl_seconds": config.lease_ttl_seconds,
     }
 
 

@@ -143,7 +143,8 @@ def test_projection_combines_identity_progress_transfer_eta_and_spend_without_ra
         "region": "US-MD-1",
         "pod_id": "pod-safe",
         "volume_id": "volume-safe",
-        "hourly_rate_usd": 0.72,
+            "hourly_rate_usd": 0.72,
+            "lease_id": None,
     }
     assert view["transfer"]["bytes_completed"] == 400
     assert view["transfer"]["bytes_total"] == 500
@@ -161,6 +162,7 @@ def test_projection_combines_identity_progress_transfer_eta_and_spend_without_ra
     assert view["billing"] == {
         "state": "accruing",
         "termination_confirmed": False,
+        "termination_confirmed_at": None,
     }
     encoded = json.dumps(view)
     for private_value in (
@@ -233,7 +235,11 @@ def test_terminal_success_is_100_but_billing_waits_for_a_termination_receipt(tmp
     confirmed = project_job_visibility(
         queue.get(job.id), queue.list_events(job.id), now=start + timedelta(seconds=30)
     )
-    assert confirmed["billing"] == {"state": "stopped", "termination_confirmed": True}
+    assert confirmed["billing"] == {
+        "state": "stopped",
+        "termination_confirmed": True,
+        "termination_confirmed_at": (start + timedelta(seconds=25)).isoformat(),
+    }
     assert "must-not-return" not in json.dumps(confirmed)
 
 
