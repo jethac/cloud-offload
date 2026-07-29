@@ -108,9 +108,9 @@ class PartitionSubmitRequest(BaseModel):
     preflight_id: str | None = None
     manifest_digest: str | None = None
     candidate_id: str | None = None
-    confirmation_action: Literal[
-        "start_now", "countdown_elapsed", "policy_skip"
-    ] | None = None
+    confirmation_action: (
+        Literal["start_now", "countdown_elapsed", "policy_skip"] | None
+    ) = None
     # Production benchmarking must exercise a fresh Pod rather than silently
     # accepting an already-computed partition result.
     force_execution: bool = False
@@ -279,9 +279,10 @@ def _worker_auth_configured(config) -> bool:
     """Include the stable token that the dispatcher stores in the shared queue."""
     from cloud_offload.queue import JobQueue
 
-    return bool(config.worker_token) or JobQueue(
-        config.queue_db_path
-    ).worker_auth_configured()
+    return (
+        bool(config.worker_token)
+        or JobQueue(config.queue_db_path).worker_auth_configured()
+    )
 
 
 def _cache_connector(config, provider: str):
@@ -2047,9 +2048,11 @@ async def job_events(job_id: str, after: int = 0, limit: int = 250):
 async def preflight_partition(request: PreflightRequest):
     """Prove readiness and recommend a current offer without paid mutation."""
     from cloud_offload.preflight import build_partition_preflight, finite_report
+    from cloud_offload.recommendation_history import RecommendationHistory
     from cloud_offload.storage import create_storage
 
     config = _config()
+    history = RecommendationHistory(config.queue_db_path)
     report = await asyncio.to_thread(
         build_partition_preflight,
         config=config,
@@ -2063,6 +2066,7 @@ async def preflight_partition(request: PreflightRequest):
         storage=create_storage(config),
         cache_registry=_cache_registry(config),
         worker_auth_configured=_worker_auth_configured(config),
+        history_lookup=history.lookup,
     )
     if not finite_report(report):
         raise HTTPException(
@@ -2150,9 +2154,7 @@ def _expired(timestamp: str) -> bool:
     return parsed <= datetime.now(timezone.utc)
 
 
-def _confirmation_gate(
-    report: dict[str, Any], action: str | None
-) -> dict[str, Any]:
+def _confirmation_gate(report: dict[str, Any], action: str | None) -> dict[str, Any]:
     confirmation = report.get("confirmation") or {
         "policy": "always",
         "required": True,
@@ -2237,8 +2239,13 @@ def _revalidate_partition_preflight(
 ) -> dict[str, Any]:
     """Rebuild volatile facts and accept only the exact confirmed candidate."""
     from cloud_offload.preflight import build_partition_preflight, finite_report
+    from cloud_offload.recommendation_history import RecommendationHistory
 
-    if not request.preflight_id or not request.manifest_digest or not request.candidate_id:
+    if (
+        not request.preflight_id
+        or not request.manifest_digest
+        or not request.candidate_id
+    ):
         return {
             "accepted": False,
             "code": "cloud_offload.preflight_required",
@@ -2282,6 +2289,7 @@ def _revalidate_partition_preflight(
         return confirmation
 
     policy = previous.get("request_policy") or {}
+    history = RecommendationHistory(config.queue_db_path)
     current = build_partition_preflight(
         config=config,
         partition=request.partition,
@@ -2294,6 +2302,7 @@ def _revalidate_partition_preflight(
         storage=storage,
         cache_registry=_cache_registry(config),
         worker_auth_configured=_worker_auth_configured(config),
+        history_lookup=history.lookup,
     )
     if not finite_report(current):
         return {
@@ -2321,7 +2330,9 @@ def _revalidate_partition_preflight(
     previous_confirmation = previous.get("confirmation") or {}
     current_confirmation = current.get("confirmation") or {}
     for field_name in ("policy", "countdown_seconds"):
-        if previous_confirmation.get(field_name) != current_confirmation.get(field_name):
+        if previous_confirmation.get(field_name) != current_confirmation.get(
+            field_name
+        ):
             changes.append("confirmation_policy")
     changes = list(dict.fromkeys(changes))
     if changes:
@@ -2605,6 +2616,7 @@ async def submit_partition(request: PartitionSubmitRequest):
     confirmed_launch = {
         "preflight_id": confirmed_report["preflight_id"],
         "manifest_digest": confirmed_report["manifest_digest"],
+        "workload_digest": confirmed_report.get("workload_digest"),
         "candidate_id": confirmed_candidate["candidate_id"],
         "expires_at": confirmed_report["expires_at"],
         "provider": confirmed_candidate["provider"],
@@ -2614,6 +2626,7 @@ async def submit_partition(request: PartitionSubmitRequest):
         "hourly_rate": confirmed_candidate["hourly_rate"],
         "region": confirmed_candidate.get("region"),
         "prepared_volume_id": confirmed_candidate.get("prepared_volume_id"),
+        "preparation_class": confirmed_candidate.get("preparation_class"),
         "estimate": confirmed_candidate["estimate"],
         "request_policy": confirmed_report["request_policy"],
         "confirmation": confirmation_evidence,
@@ -2631,7 +2644,7 @@ async def submit_partition(request: PartitionSubmitRequest):
             # The dispatcher rents at least this much container disk, so the
             # pod that stages these bytes has somewhere to put them.
             "container_disk_gb": disk_gb,
-            "keep_warm": bool(runner.get("keep_warm", False)),
+            "keep_warm": bool(config.keep_warm),
         },
         request={
             "kind": "comfyui-partition",
