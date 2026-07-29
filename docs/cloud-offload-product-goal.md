@@ -1,8 +1,8 @@
 # Cloud Offload product goal and delivery plan
 
 > Status: **canonical product goal**
-> Last updated: **2026-07-29**
-> Program status: **in progress — Milestone 1 end-to-end evidence and recommendation accuracy are the current gate**
+> Last updated: **2026-07-30**
+> Program status: **in progress — Milestone 1 is complete and Milestone 2 persistent visibility is the current gate**
 > Scope: the end-to-end Cloud Offload product across the coordinator, dispatcher,
 > workers, provider connectors, prepared storage, and ComfyUI extension.
 >
@@ -31,11 +31,11 @@ requests:
 4. **What happens next?** The current execution state and the first unmet exit
    criterion in milestone order.
 
-The active program gate is **M1 preflight, recommendation, and confirmation**.
-M0 is complete. M2 through M7 remain part of this same goal; they are not a
-backlog that can be silently deferred or a new goal that must be rediscovered
-later. M1 may close only after preflight is bound to paid launch, the user can
-confirm the recommendation, and every M1 exit has durable evidence.
+The active program gate is **M2 persistent visibility**. M0 and M1 are complete.
+M3 through M7 remain part of this same goal; they are not a backlog that can be
+silently deferred or a new goal that must be rediscovered later. M2 may close
+only after the Cloud Jobs surface reconstructs authoritative state and every M2
+exit has durable evidence.
 
 Raw benchmark plans, workflows, hooks, support bundles, and service logs remain
 local under `.runlogs/`. The durable record committed to the repository contains
@@ -170,11 +170,11 @@ validate the product journey.
 
 | ID | Requirement | Primary milestone | Current state |
 | --- | --- | --- | --- |
-| `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; confirmed launch now binds to the selected offer and prepared volume. |
+| `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Complete for the M1 contract; the accepted merged-stack journey used the confirmed offer and prepared volume and returned the result. |
 | `READY-1` | Prove deterministic requirements before provider mutation. | M1 | Accepted merged-stack production evidence proves free preflight, exact paid binding, and launch-time revalidation. |
-| `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Initial explainable ranking exists; measured history and complete cost components remain. |
-| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Implemented across backend PRs #25–#27 and extension PR #5; accepted production replay proves the default confirmation. |
-| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Implemented in extension PR #5 with persistent coordinator policy from backend PR #27; merged-stack production evidence remains. |
+| `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Complete; two matched production runs now produce medium-confidence measured timing, prepared-local ranking, and complete RunPod compute, transfer, and container-storage cost. |
+| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Complete across backend PRs #25–#27 and extension PR #5; the accepted production replay proves the default confirmation. |
+| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Complete; extension PR #5, backend PR #27, and the accepted merged-stack journey prove the interaction and persistent policy. |
 | `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
 | `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Initial canvas feedback merged; durable drawer pending. |
 | `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Logical cancellation baseline exists; leases and provider receipt pending. |
@@ -643,6 +643,8 @@ This ledger records merged implementation evidence across both repositories.
 | [#28](https://github.com/jethac/cloud-offload/pull/28) | Records the merged ComfyUI confirmation delivery and updates the active M1 handoff. | Merged as `5d71637`; extension PR #5 is part of the canonical delivery record. |
 | [#29](https://github.com/jethac/cloud-offload/pull/29) | Makes free preflight accept the stable worker credential that the dispatcher stores beside the shared queue database. | Merged as `2ab4db4`; 76 focused tests and 559 full tests passed. The failed preflight created no job or provider resource. |
 | [#30](https://github.com/jethac/cloud-offload/pull/30) | Starts worker idle time after each job, gives dispatcher cleanup a 60-second margin, and prevents a provider-restarted container from resetting the paid resource idle clock. It also records the first controlled M1 run. | Merged as `8193bfa`; 63 focused tests and 563 full tests passed. The bounded replay below proves automatic exact-Pod cleanup. |
+| [#31](https://github.com/jethac/cloud-offload/pull/31) | Records the accepted merged-stack replay and its automatic exact-Pod cleanup receipt. | Merged as `de49afa`; the accepted replay below closes the paid journey and cleanup evidence. |
+| [#32](https://github.com/jethac/cloud-offload/pull/32) | Adds private-data-free workload identity, read-only matched timing history, candidate-class measurement, full RunPod compute/transfer/container-storage estimates, the paid idle window, and the compact M1 evidence record. | 25 focused tests and 571 full tests passed; two repeated live free preflights were stable and created no job or Pod. M1 is complete. |
 
 ### ComfyUI extension repository
 
@@ -703,6 +705,19 @@ not blanket production-readiness claims:
   and a fresh RunPod lookup proved `shx3qb2m66iyeg` absent at 00:26:18. No
   manual cleanup occurred. The coordinator then reported zero queued, running,
   or pending jobs. Worker identity did not change during the idle window.
+- Two repeated free inpainting preflights against the measured-history
+  implementation returned the same safe workload digest and manifest digest.
+  Both calls were `ready`, selected the prepared-local RunPod A100 SXM in
+  `US-MD-1`, created no job, and left provider resource count and identity
+  unchanged. The recommendation matched two completed jobs, raised confidence
+  to medium, and used measured startup, preparation, and execution ranges.
+- The corrected estimate includes 300 seconds of paid idle time. Its expected
+  paid lifetime is 539.283-721.679 seconds. Compute is $0.223203-$0.298695,
+  RunPod ingress and egress are a known $0.00, prorated container storage is
+  $0.001352-$0.001810, and expected total job cost is
+  $0.224556-$0.300505. No history or cost unknown remains for the selected
+  candidate. The compact redacted record is committed as
+  [M1 production evidence](evidence/m1-production-evidence-2026-07-30.json).
 - Replay, snapshot, support-bundle, journal-authority, concurrency, rollback,
   benchmark validation, force-execution, and credential-resolution tests pass in
   the merged backend history shown above.
@@ -927,7 +942,7 @@ operational data.
 
 ## Current execution state and immediate next work
 
-Status snapshot as of 2026-07-29:
+Status snapshot as of 2026-07-30:
 
 - M0 journal transport and lifecycle authority are merged.
 - M0 benchmark and scorecard automation are merged, including authoritative
@@ -973,13 +988,12 @@ Status snapshot as of 2026-07-29:
   then extended only the bounded corruption observation window. The accepted
   replay proved exact manifest authority, quarantine, safe terminal behavior,
   and complete automated cleanup in production.
-- M0 is complete. M1 now has the versioned report, recommendation, paid-submit
-  binding, exact launch revalidation, persistent backend policy, and the merged
-  ten-second ComfyUI confirmation surface. One merged-stack paid run proved the
-  recommendation, confirmation, exact launch, prepared restore, execution, and
-  result return. The bounded PR #30 replay also proved automatic exact-Pod
-  closure. Measured history and complete cost components remain before M1 can
-  close.
+- M0 and M1 are complete. The accepted merged-stack paid run proves the
+  recommendation, confirmation, exact launch, prepared restore, execution,
+  result return, and automatic exact-Pod closure. Two repeated free preflights
+  prove stable identity, two-sample measured timing, medium confidence,
+  complete RunPod compute/transfer/container-storage cost, and no provider
+  mutation. M2 persistent visibility is now the active gate.
 
 ### Completed M0 corruption contract
 
@@ -1105,11 +1119,41 @@ Both defects failed before job creation. With both fixes merged, controlled job
 exact offer launch, exact prepared-volume restore, graph execution, and result
 return. It also exposed the cleanup race recorded above.
 
-The merged-stack journey is now accepted. The active slice is recommendation
-accuracy. Persist measured execution history by workload and candidate class,
-use it in ranking and time ranges, and include the missing transfer and prepared
-storage cost components. The initial low-confidence recommendation must improve
-without hiding uncertainty before M1 closes.
+The merged-stack journey and recommendation-accuracy slice are now accepted.
+Equivalent workflow shapes share history without hashing node IDs, prompts,
+seeds, artifact IDs, or private paths. History is matched by provider, GPU,
+region, and prepared/cold class. One observation remains visible but cannot
+change ranking; two through four observations give medium confidence, and five
+or more give high confidence. M2 now starts with the authoritative journal and
+initial canvas feedback already in place. Its first delivery is the persistent
+Cloud Jobs surface and reload reconstruction.
+
+### M1 evidence and exit audit
+
+The safe evidence projection is
+[M1 production evidence](evidence/m1-production-evidence-2026-07-30.json).
+It contains only safe digests, aggregate timings and cost, opaque lifecycle
+identifiers, cleanup state, test counts, and pass conclusions.
+
+1. **Deterministic blockers create no Pod:** provider-mutation guard tests pass;
+   failed readiness and revalidation paths create no job or provider resource;
+   two live free reference preflights also left both counts and provider
+   identity unchanged.
+2. **Stable manifest:** two consecutive live reference preflights produced the
+   same `manifest_digest` and the same private-data-free `workload_digest`.
+3. **Explainable recommendation:** the selected prepared-local RunPod A100 SXM
+   carries provider, GPU, region, price, preparation coverage, policy rationale,
+   matched history count, confidence, timing range, and complete cost parts.
+4. **Confirmation boundary:** coordinator tests reject missing or early
+   confirmation without queue or provider mutation. The accepted paid journey
+   used the default ten-second confirmation before exact launch.
+5. **Launch revalidation:** price, cost, storage, capacity, quote, and policy
+   change tests force a revised report and mandatory fresh confirmation.
+6. **Healthy-path friction:** the extension runs free preflight automatically,
+   displays one short confirmation, and submits the exact choice. The accepted
+   inpainting journey required no provider infrastructure action from the user.
+
+All M1 exits pass. M1 is complete. M2 is the first unmet milestone.
 
 ### Operational safety rules
 
@@ -1131,11 +1175,11 @@ without hiding uncertainty before M1 closes.
 
 ## Delivery milestones
 
-| Milestone | Status on 2026-07-29 | Gate |
+| Milestone | Status on 2026-07-30 | Gate |
 | --- | --- | --- |
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
-| M1 — preflight, recommendation, confirmation | **In progress** | Backend and ComfyUI paths and one merged-stack paid journey are accepted; measured history and complete cost components remain. |
-| M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
+| M1 — preflight, recommendation, confirmation | **Complete** | All exits passed; the merged-stack paid journey, automatic cleanup, stable free preflight, measured recommendation history, and complete RunPod cost are durable. |
+| M2 — persistent visibility | **In progress** | Journal and initial canvas feedback exist; Cloud Jobs drawer, reload reconstruction, and complete telemetry are the current gate. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
 | M5 — workflow capsules | **Not started** | Schema and custom-node readiness contracts remain. |
@@ -1334,6 +1378,8 @@ These are product targets to validate and tighten with baseline data:
 - Material recommendation changes force a fresh decision when required by
   safety policy.
 - Total estimated job cost matters more than hourly price alone.
+- One timing observation cannot change ranking. Two through four matched
+  observations give medium confidence; five or more give high confidence.
 - The coordinator event journal is the authoritative lifecycle record.
 - Billing closure requires provider acknowledgement.
 - Cache fast paths require explicit trust evidence and background integrity work.
@@ -1350,18 +1396,16 @@ These are product targets to validate and tighten with baseline data:
    change?
 3. Should `material_changes` rather than `always` become the long-term default
    confirmation setting after a user establishes history?
-4. What minimum observation count and confidence are required before historical
-   execution timings affect GPU recommendation?
-5. How should per-job storage and transfer cost be attributed when a replica
+4. How should per-job storage and transfer cost be attributed when a replica
    serves many future jobs?
-6. Which custom nodes can provide complete readiness declarations, and how should
+5. Which custom nodes can provide complete readiness declarations, and how should
    undeclared runtime downloads be sandboxed or detected?
-7. What cryptographic and object-generation evidence is sufficient to skip a
+6. What cryptographic and object-generation evidence is sufficient to skip a
    complete hot-path read for each supported storage backend?
-8. What provider-specific cancellation and orphan-reconciliation SLOs are
+7. What provider-specific cancellation and orphan-reconciliation SLOs are
    realistic?
-9. When should a frequently used preflight manifest be promoted into a capsule?
-10. What measured avoided-GPU-idle threshold justifies a regional replica?
+8. When should a frequently used preflight manifest be promoted into a capsule?
+9. What measured avoided-GPU-idle threshold justifies a regional replica?
 
 ## Delivery shape
 
