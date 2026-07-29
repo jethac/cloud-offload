@@ -574,6 +574,11 @@ The **[job lease and provider closure contract](docs/job-leases.md)** binds ever
 paid resource before launch, survives dispatcher restarts, and does not claim
 billing stopped until the provider confirms exact resource removal.
 
+The **[prepared cache trust contract](docs/cache-trust.md)** lets a recent,
+coordinator-signed verification use metadata plus a rotating byte sample instead
+of another complete hot-path digest read. Missing, expired, changed, private, or
+sensitive state still receives full verification.
+
 Two additional load balancers are designed and queued behind the current release:
 
 - **[Fleet provider](docs/fleet-provider.md)** — your own machines (a studio's

@@ -215,6 +215,44 @@ class CoordinatorQueue:
         """Verify through the coordinator; the signing key stays control-plane-only."""
         return self._post("/api/workers/cache/manifests/verify", {"manifest": manifest})
 
+    def sign_cache_trust_receipt(
+        self,
+        proposal: dict[str, Any],
+        *,
+        manifest: dict[str, Any],
+        job_id: str,
+        volume_id: str,
+    ) -> dict[str, Any]:
+        """Ask the coordinator to sign a full-verification trust receipt."""
+        return self._post(
+            "/api/workers/cache/trust-receipts/sign",
+            {
+                "receipt": proposal,
+                "manifest": manifest,
+                "job_id": job_id,
+                "volume_id": volume_id,
+                "worker_id": self.worker_id,
+            },
+        )
+
+    def verify_cache_trust_receipt(
+        self,
+        receipt: dict[str, Any],
+        *,
+        job_id: str,
+        volume_id: str,
+    ) -> dict[str, Any]:
+        """Verify a receipt for this worker's active job and exact volume."""
+        return self._post(
+            "/api/workers/cache/trust-receipts/verify",
+            {
+                "receipt": receipt,
+                "job_id": job_id,
+                "volume_id": volume_id,
+                "worker_id": self.worker_id,
+            },
+        )
+
     def fetch_prepared_manifest(
         self, manifest_id: str, *, job_id: str, volume_id: str
     ) -> dict[str, Any]:

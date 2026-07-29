@@ -1339,6 +1339,14 @@ Exit:
 - Add sampled background scrubbing and scheduled complete audits.
 - Quarantine mismatches and preserve safe cold fallback.
 
+Implementation status: the signed trust-receipt and metadata/sample fast path is
+implemented. It binds the exact manifest signature, artifact, volume,
+compatibility contract, object generation, expiry, and audit policy. Private and
+sensitive artifacts stay on full verification. Invalid, changed, expired, or
+audit-due receipts also return to a complete digest read. Background sampling,
+volume degradation, and the paid 25% cold/hot performance proof remain before M4
+can close.
+
 Exit:
 
 - trusted hot restore performs no complete artifact read;

@@ -20,7 +20,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
@@ -29,6 +29,11 @@ MANIFEST_SCHEMA = "cloud-offload.prepared-state.v1"
 INDEX_SCHEMA = "cloud-offload.prepared-state.index.v1"
 RECEIPT_SCHEMA = "cloud-offload.restore-receipt.v1"
 OBSERVATION_SCHEMA = "cloud-offload.restore-observation.v1"
+TRUST_RECEIPT_SCHEMA = "cloud-offload.cache-trust-receipt.v1"
+DEFAULT_TRUST_RECEIPT_TTL_SECONDS = 7 * 24 * 3600
+DEFAULT_FULL_AUDIT_INTERVAL_SECONDS = 24 * 3600
+DEFAULT_TRUST_SAMPLE_BYTES = 1024 * 1024
+DEFAULT_TRUST_SAMPLE_COUNT = 5
 PORTABILITY_TIERS = {
     "portable",
     "runtime-bound",
@@ -113,6 +118,29 @@ def fingerprint(value: Any) -> str:
     return digest_id(sha256_bytes(canonical_json(value)))
 
 
+def manifest_signature_digest(manifest: dict[str, Any]) -> str:
+    """Bind a receipt to the exact authority signature, not only its payload."""
+    signature = manifest.get("signature")
+    if not isinstance(signature, dict):
+        raise ManifestError("Manifest has no signature")
+    return digest_id(sha256_bytes(canonical_json(signature)))
+
+
+def artifact_runtime_compatibility_key(artifact: dict[str, Any]) -> str:
+    """Bind a receipt to the signed portability and runtime requirements."""
+    return fingerprint(
+        {
+            "portability": artifact.get("portability"),
+            "requirements": artifact.get("requirements"),
+        }
+    )
+
+
+def trust_receipt_key(digest: str) -> str:
+    normalized = normalize_digest(digest)
+    return f"trust-receipts/sha256/{normalized[:2]}/{normalized}.json"
+
+
 class CoordinatorManifestAuthority:
     """Worker facade: proposals and verification go to the coordinator.
 
@@ -167,6 +195,37 @@ class CoordinatorManifestAuthority:
             job_id=self.job_id,
             volume_id=self.volume_id,
             generation=generation,
+        )
+
+    def sign_trust_receipt(
+        self, proposal: dict[str, Any], *, manifest: dict[str, Any]
+    ) -> dict[str, Any]:
+        signer = getattr(self.channel, "sign_cache_trust_receipt", None)
+        if not callable(signer):
+            raise RuntimeError("Coordinator channel cannot sign cache trust receipts")
+        if not self.job_id or not self.volume_id:
+            raise RuntimeError(
+                "Cache trust receipts require an active coordinator job and volume"
+            )
+        return signer(
+            proposal,
+            manifest=manifest,
+            job_id=self.job_id,
+            volume_id=self.volume_id,
+        )
+
+    def verify_trust_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        verifier = getattr(self.channel, "verify_cache_trust_receipt", None)
+        if not callable(verifier):
+            raise RuntimeError("Coordinator channel cannot verify cache trust receipts")
+        if not self.job_id or not self.volume_id:
+            raise RuntimeError(
+                "Cache trust receipts require an active coordinator job and volume"
+            )
+        return verifier(
+            receipt,
+            job_id=self.job_id,
+            volume_id=self.volume_id,
         )
 
 
@@ -383,6 +442,72 @@ class ManifestSigner:
         validate_manifest_shape(manifest)
         return manifest
 
+    @staticmethod
+    def _trust_payload(receipt: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in receipt.items()
+            if key not in {"signature", "receipt_id"}
+        }
+
+    def _trust_key(self) -> bytes:
+        return hmac.new(
+            self.key,
+            b"cloud-offload.cache-trust-receipt.v1",
+            hashlib.sha256,
+        ).digest()
+
+    def sign_trust_receipt(
+        self,
+        proposal: dict[str, Any],
+        *,
+        manifest: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = self._trust_payload(proposal)
+        if payload.get("schema") != TRUST_RECEIPT_SCHEMA:
+            raise ManifestError(
+                f"Unsupported trust receipt schema: {payload.get('schema')}"
+            )
+        encoded = canonical_json({"domain": TRUST_RECEIPT_SCHEMA, "payload": payload})
+        receipt_id = digest_id(sha256_bytes(encoded))
+        signature = hmac.new(self._trust_key(), encoded, hashlib.sha256).hexdigest()
+        signed = {
+            **payload,
+            "receipt_id": receipt_id,
+            "signature": {
+                "algorithm": self.algorithm,
+                "key_id": self.key_id,
+                "value": signature,
+            },
+        }
+        validate_trust_receipt_shape(signed)
+        return signed
+
+    def verify_trust_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(receipt, dict):
+            raise ManifestError("Cache trust receipt must be an object")
+        signature = receipt.get("signature")
+        if not isinstance(signature, dict):
+            raise ManifestError("Cache trust receipt has no signature")
+        if signature.get("algorithm") != self.algorithm:
+            raise ManifestError("Cache trust receipt signature is not trusted")
+        if signature.get("key_id") != self.key_id:
+            raise ManifestError("Cache trust receipt signing key is not trusted")
+        payload = self._trust_payload(receipt)
+        encoded = canonical_json({"domain": TRUST_RECEIPT_SCHEMA, "payload": payload})
+        expected_id = digest_id(sha256_bytes(encoded))
+        if not hmac.compare_digest(str(receipt.get("receipt_id")), expected_id):
+            raise ManifestError("Cache trust receipt ID does not match its payload")
+        expected_signature = hmac.new(
+            self._trust_key(), encoded, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(
+            str(signature.get("value") or ""), expected_signature
+        ):
+            raise ManifestError("Cache trust receipt signature verification failed")
+        validate_trust_receipt_shape(receipt)
+        return receipt
+
 
 def load_or_create_manifest_signer(
     key_path: str | Path, *, key_id: str = "coordinator-v1"
@@ -448,6 +573,75 @@ def validate_manifest_shape(manifest: dict[str, Any]) -> None:
             raise ManifestError(f"Artifact {digest} has non-canonical storage key")
         if artifact.get("portability") not in PORTABILITY_TIERS:
             raise ManifestError(f"Artifact {digest} has unknown portability")
+
+
+def _parse_utc_timestamp(value: Any, field_name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ManifestError(f"Cache trust receipt {field_name} is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ManifestError(f"Cache trust receipt {field_name} has no timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def validate_trust_receipt_shape(receipt: dict[str, Any]) -> None:
+    if receipt.get("schema") != TRUST_RECEIPT_SCHEMA:
+        raise ManifestError(
+            f"Unsupported trust receipt schema: {receipt.get('schema')}"
+        )
+    digest = digest_id(str(receipt.get("artifact_digest") or ""))
+    digest_id(str(receipt.get("manifest_id") or ""))
+    digest_id(str(receipt.get("manifest_signature_digest") or ""))
+    digest_id(str(receipt.get("runtime_compatibility") or ""))
+    size = int(receipt.get("artifact_size") or -1)
+    if size < 0:
+        raise ManifestError(f"Cache trust receipt {digest} has invalid size")
+    storage_key = str(receipt.get("storage_key") or "")
+    if storage_key not in {blob_key(digest), bundle_key(digest)}:
+        raise ManifestError(
+            f"Cache trust receipt {digest} has non-canonical storage key"
+        )
+    if not str(receipt.get("volume_id") or ""):
+        raise ManifestError("Cache trust receipt has no volume identity")
+    if not str(receipt.get("provider_volume_id") or ""):
+        raise ManifestError("Cache trust receipt has no provider volume identity")
+    generation = receipt.get("object_generation")
+    if not isinstance(generation, dict):
+        raise ManifestError("Cache trust receipt has no object generation")
+    if str(generation.get("storage_key") or "") != storage_key:
+        raise ManifestError("Cache trust receipt object identity is inconsistent")
+    if int(generation.get("size") or -1) != size:
+        raise ManifestError("Cache trust receipt object size is inconsistent")
+    if int(generation.get("modified_ns") or -1) < 0:
+        raise ManifestError("Cache trust receipt object generation is invalid")
+    verified_at = _parse_utc_timestamp(receipt.get("verified_at"), "verified_at")
+    expires_at = _parse_utc_timestamp(receipt.get("expires_at"), "expires_at")
+    if expires_at <= verified_at:
+        raise ManifestError("Cache trust receipt expiry is not after verification")
+    scrub = receipt.get("scrub")
+    if not isinstance(scrub, dict):
+        raise ManifestError("Cache trust receipt has no scrub policy")
+    audit_due = _parse_utc_timestamp(
+        scrub.get("full_audit_due_at"), "full_audit_due_at"
+    )
+    if audit_due < verified_at:
+        raise ManifestError("Cache trust receipt full audit predates verification")
+    samples = scrub.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ManifestError("Cache trust receipt has no byte samples")
+    previous = -1
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ManifestError("Cache trust receipt sample is not an object")
+        offset = int(sample.get("offset") or 0)
+        sample_size = int(sample.get("size") or 0)
+        if offset < 0 or sample_size <= 0 or offset + sample_size > size:
+            raise ManifestError("Cache trust receipt sample is outside the object")
+        if offset <= previous:
+            raise ManifestError("Cache trust receipt samples are not ordered")
+        previous = offset
+        digest_id(str(sample.get("sha256") or ""))
 
 
 def build_manifest(
@@ -518,9 +712,13 @@ class PreparedStateCAS:
             "quarantine",
             "leases",
             "pending-announcements",
+            "trust-receipts",
         ):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         self._index_thread_lock = _local_publication_lock(self.root)
+        self._full_verified_objects: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
 
     @contextmanager
     def _index_publication_lock(self):
@@ -552,6 +750,220 @@ class PreparedStateCAS:
         except ValueError as exc:
             raise ValueError(f"Prepared-state key escapes cache root: {key!r}") from exc
         return path
+
+    @staticmethod
+    def _object_generation(path: Path, storage_key: str) -> dict[str, Any]:
+        stat = path.stat()
+        return {
+            "storage_key": str(storage_key),
+            "size": int(stat.st_size),
+            "modified_ns": int(stat.st_mtime_ns),
+        }
+
+    @staticmethod
+    def _sample_layout(
+        path: Path,
+        *,
+        sample_bytes: int = DEFAULT_TRUST_SAMPLE_BYTES,
+        sample_count: int = DEFAULT_TRUST_SAMPLE_COUNT,
+    ) -> list[dict[str, Any]]:
+        size = int(path.stat().st_size)
+        if size <= 0:
+            return []
+        width = min(size, max(4096, int(sample_bytes)))
+        maximum_offset = size - width
+        count = max(1, min(int(sample_count), 16))
+        offsets = sorted(
+            {
+                round(maximum_offset * index / max(1, count - 1))
+                for index in range(count)
+            }
+        )
+        samples: list[dict[str, Any]] = []
+        with path.open("rb") as handle:
+            for offset in offsets:
+                handle.seek(offset)
+                value = handle.read(width)
+                if len(value) != width:
+                    raise CacheCorruptionError(
+                        "Prepared object changed while trust samples were read"
+                    )
+                samples.append(
+                    {
+                        "offset": int(offset),
+                        "size": len(value),
+                        "sha256": digest_id(sha256_bytes(value)),
+                    }
+                )
+        return samples
+
+    @staticmethod
+    def _receipt_eligible(artifact: dict[str, Any]) -> bool:
+        policy = artifact.get("policy") or {}
+        return not bool(
+            policy.get("private")
+            or policy.get("sensitive")
+            or policy.get("verification") == "full"
+        )
+
+    def _receipt_path(self, digest: str) -> Path:
+        return self._resolve(trust_receipt_key(digest))
+
+    def _write_trust_receipt(self, receipt: dict[str, Any]) -> None:
+        target = self._receipt_path(receipt["artifact_digest"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._resolve(
+            f"staging/trust-receipt-{uuid.uuid4().hex}.partial"
+        )
+        temporary.write_bytes(canonical_json(receipt))
+        os.replace(temporary, target)
+
+    def _issue_trust_receipt(
+        self,
+        manifest: dict[str, Any],
+        artifact: dict[str, Any],
+        *,
+        volume_id: str,
+        provider_volume_id: str,
+    ) -> dict[str, Any] | None:
+        if not self._receipt_eligible(artifact):
+            return None
+        size = int(artifact.get("size") or 0)
+        if size <= 0:
+            return None
+        digest = normalize_digest(artifact["digest"])
+        storage_key = str(artifact["storage_key"])
+        source = self._resolve(storage_key)
+        generation = self._object_generation(source, storage_key)
+        verified_generation = self._full_verified_objects.get((digest, storage_key))
+        if verified_generation != generation:
+            return None
+        samples = self._sample_layout(source)
+        verified_at = datetime.now(timezone.utc)
+        proposal = {
+            "schema": TRUST_RECEIPT_SCHEMA,
+            "manifest_id": manifest["manifest_id"],
+            "manifest_signature_digest": manifest_signature_digest(manifest),
+            "artifact_digest": digest_id(digest),
+            "artifact_size": size,
+            "storage_key": storage_key,
+            "volume_id": str(volume_id),
+            "provider_volume_id": str(provider_volume_id),
+            "runtime_compatibility": artifact_runtime_compatibility_key(artifact),
+            "object_generation": generation,
+            "verified_at": verified_at.isoformat().replace("+00:00", "Z"),
+            "expires_at": (
+                verified_at + timedelta(seconds=DEFAULT_TRUST_RECEIPT_TTL_SECONDS)
+            ).isoformat().replace("+00:00", "Z"),
+            "scrub": {
+                "mode": "rotating-sample-and-scheduled-full-audit",
+                "full_audit_due_at": (
+                    verified_at
+                    + timedelta(seconds=DEFAULT_FULL_AUDIT_INTERVAL_SECONDS)
+                ).isoformat().replace("+00:00", "Z"),
+                "samples": samples,
+            },
+        }
+        signer = getattr(self.signer, "sign_trust_receipt", None)
+        if not callable(signer):
+            return None
+        signed = signer(proposal, manifest=manifest)
+        self._write_trust_receipt(signed)
+        return signed
+
+    def _load_trust_receipt(self, digest: str) -> dict[str, Any] | None:
+        path = self._receipt_path(digest)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _verify_trust_receipt(
+        self,
+        receipt: dict[str, Any],
+        manifest: dict[str, Any],
+        artifact: dict[str, Any],
+        *,
+        volume_id: str,
+        provider_volume_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        verifier = getattr(self.signer, "verify_trust_receipt", None)
+        if not callable(verifier):
+            return None
+        try:
+            verified = verifier(receipt)
+        except (ManifestError, RuntimeError, ValueError):
+            return None
+        digest = digest_id(str(artifact["digest"]))
+        storage_key = str(artifact["storage_key"])
+        if any(
+            (
+                verified.get("manifest_id") != manifest.get("manifest_id"),
+                verified.get("manifest_signature_digest")
+                != manifest_signature_digest(manifest),
+                verified.get("artifact_digest") != digest,
+                int(verified.get("artifact_size") or -1)
+                != int(artifact.get("size") or -2),
+                verified.get("storage_key") != storage_key,
+                verified.get("volume_id") != str(volume_id),
+                verified.get("provider_volume_id") != str(provider_volume_id),
+                verified.get("runtime_compatibility")
+                != artifact_runtime_compatibility_key(artifact),
+            )
+        ):
+            return None
+        current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if _parse_utc_timestamp(verified["expires_at"], "expires_at") <= current_time:
+            return None
+        audit_due = _parse_utc_timestamp(
+            (verified.get("scrub") or {}).get("full_audit_due_at"),
+            "full_audit_due_at",
+        )
+        if audit_due <= current_time:
+            return None
+        source = self._resolve(storage_key)
+        try:
+            generation = self._object_generation(source, storage_key)
+        except (FileNotFoundError, OSError):
+            return None
+        if generation != verified.get("object_generation"):
+            return None
+        samples = list((verified.get("scrub") or {}).get("samples") or [])
+        if not samples:
+            return None
+        bucket = int(current_time.timestamp() // 3600)
+        selector = sha256_bytes(
+            f"{verified['receipt_id']}:{bucket}".encode("utf-8")
+        )
+        sample = samples[int(selector[:8], 16) % len(samples)]
+        offset = int(sample["offset"])
+        size = int(sample["size"])
+        with source.open("rb") as handle:
+            handle.seek(offset)
+            value = handle.read(size)
+        if len(value) != size or digest_id(sha256_bytes(value)) != sample["sha256"]:
+            raise CacheCorruptionError(
+                f"Prepared object {digest} failed a signed trust sample"
+            )
+        return {
+            "mode": "trusted_metadata_sample",
+            "bytes_read": size,
+            "receipt_id": verified["receipt_id"],
+            "full_audit_due_at": (verified.get("scrub") or {}).get(
+                "full_audit_due_at"
+            ),
+        }
+
+    def _remember_full_verification(self, digest: str, path: Path) -> None:
+        try:
+            storage_key = path.resolve().relative_to(self.root).as_posix()
+        except ValueError:
+            return
+        self._full_verified_objects[(normalize_digest(digest), storage_key)] = (
+            self._object_generation(path, storage_key)
+        )
 
     def verify_mount(self, expected_volume_id: str | None = None) -> None:
         if not self.root.is_dir():
@@ -669,6 +1081,8 @@ class PreparedStateCAS:
             # no additional integrity and doubles first-run publication time.
             if not target.samefile(staging):
                 self.verify_object(digest, target=target)
+            else:
+                self._remember_full_verification(digest, target)
             if commit_callback:
                 commit_callback("committed")
             return target
@@ -710,12 +1124,16 @@ class PreparedStateCAS:
             raise CacheCorruptionError(
                 f"Prepared object sha256:{normalized} hashes as sha256:{actual}"
             )
+        self._remember_full_verification(normalized, path)
         return path
 
     def quarantine(
         self, digest: str, reason: str, *, storage_key: str | None = None
     ) -> Path | None:
         normalized = normalize_digest(digest)
+        self._receipt_path(normalized).unlink(missing_ok=True)
+        for key in [item for item in self._full_verified_objects if item[0] == normalized]:
+            self._full_verified_objects.pop(key, None)
         candidates = (
             [self._resolve(storage_key)]
             if storage_key
@@ -785,6 +1203,23 @@ class PreparedStateCAS:
                     canonical_json({"manifest": verified, "generation": generation})
                 )
                 os.replace(temporary_pending, pending)
+        volume_id = str(verified.get("cache_volume_id") or "")
+        provider_volume_id = str(
+            verified.get("cache_provider_volume_id") or ""
+        )
+        if volume_id and provider_volume_id:
+            for artifact in verified["artifacts"]:
+                try:
+                    self._issue_trust_receipt(
+                        verified,
+                        artifact,
+                        volume_id=volume_id,
+                        provider_volume_id=provider_volume_id,
+                    )
+                except (ManifestError, RuntimeError, ValueError, OSError):
+                    # Trust receipts are an optimization. A missing receipt
+                    # always returns the next restore to complete verification.
+                    pass
         return target
 
     def retry_pending_announcements(self) -> tuple[int, int]:
@@ -978,6 +1413,12 @@ class PreparedStateCAS:
         tenant: str,
         allow_private: bool = False,
         symlink_portable: bool = True,
+        manifest: dict[str, Any] | None = None,
+        volume_id: str | None = None,
+        provider_volume_id: str | None = None,
+        trust_receipts: bool = True,
+        verification_callback: Callable[[dict[str, Any]], None] | None = None,
+        now: datetime | None = None,
     ) -> Path:
         compatible = artifact_compatibility(artifact, runtime)
         if not compatible.accepted:
@@ -988,11 +1429,58 @@ class PreparedStateCAS:
         policy = artifact_policy(artifact, tenant=tenant, allow_private=allow_private)
         if not policy.accepted:
             raise CachePolicyError(f"Prepared artifact refused: {policy.reason}")
-        source = self.verify_object(
-            artifact["digest"],
-            target=self._resolve(artifact["storage_key"]),
-            expected_size=int(artifact["size"]),
+        source = self._resolve(artifact["storage_key"])
+        selected_volume = str(
+            volume_id or (manifest or {}).get("cache_volume_id") or ""
         )
+        selected_provider_volume = str(
+            provider_volume_id
+            or (manifest or {}).get("cache_provider_volume_id")
+            or ""
+        )
+        verification: dict[str, Any] | None = None
+        can_trust = bool(
+            trust_receipts
+            and manifest
+            and selected_volume
+            and selected_provider_volume
+            and self._receipt_eligible(artifact)
+        )
+        if can_trust:
+            receipt = self._load_trust_receipt(artifact["digest"])
+            if receipt:
+                verification = self._verify_trust_receipt(
+                    receipt,
+                    manifest or {},
+                    artifact,
+                    volume_id=selected_volume,
+                    provider_volume_id=selected_provider_volume,
+                    now=now,
+                )
+        if verification is None:
+            source = self.verify_object(
+                artifact["digest"],
+                target=source,
+                expected_size=int(artifact["size"]),
+            )
+            verification = {
+                "mode": "full_digest",
+                "bytes_read": int(artifact["size"]),
+                "receipt_issued": False,
+            }
+            if can_trust:
+                try:
+                    issued = self._issue_trust_receipt(
+                        manifest or {},
+                        artifact,
+                        volume_id=selected_volume,
+                        provider_volume_id=selected_provider_volume,
+                    )
+                    verification["receipt_issued"] = issued is not None
+                except (ManifestError, RuntimeError, ValueError, OSError):
+                    pass
+        if verification_callback:
+            verification_callback(dict(verification))
         destination = Path(destination).resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
         if (

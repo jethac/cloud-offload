@@ -499,6 +499,147 @@ def _validate_manifest_proposal(
         "cloud_offload_version": VERSION,
     }
     proposal["cache_volume_id"] = str(volume_id)
+    proposal["cache_provider_volume_id"] = str(
+        job.params.get("cache_provider_volume_id") or ""
+    )
+
+
+def _validate_trust_receipt_proposal(
+    config,
+    proposal: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    job,
+    volume_id: str,
+) -> dict[str, Any]:
+    """Bind a worker verification claim to signed manifest and launch state."""
+    from datetime import datetime, timedelta, timezone
+
+    from cloud_offload.prepared_state import (
+        DEFAULT_FULL_AUDIT_INTERVAL_SECONDS,
+        DEFAULT_TRUST_RECEIPT_TTL_SECONDS,
+        DEFAULT_TRUST_SAMPLE_BYTES,
+        TRUST_RECEIPT_SCHEMA,
+        artifact_runtime_compatibility_key,
+        digest_id,
+        manifest_signature_digest,
+    )
+
+    allowed = {
+        "schema",
+        "manifest_id",
+        "manifest_signature_digest",
+        "artifact_digest",
+        "artifact_size",
+        "storage_key",
+        "volume_id",
+        "provider_volume_id",
+        "runtime_compatibility",
+        "object_generation",
+        "verified_at",
+        "expires_at",
+        "scrub",
+    }
+    unknown = set(proposal) - allowed
+    if unknown:
+        raise ValueError(
+            "Cache trust receipt has unknown claims: "
+            + ", ".join(sorted(unknown))
+        )
+    signer = _prepared_manifest_signer(config)
+    verified_manifest = signer.verify(manifest)
+    if str(job.params.get("cache_volume_id") or "") != str(volume_id):
+        raise ValueError("Cache trust receipt volume is outside the job launch plan")
+    if str(verified_manifest.get("cache_volume_id") or "") != str(volume_id):
+        raise ValueError("Cache trust receipt manifest belongs to another volume")
+    provider_volume_id = str(job.params.get("cache_provider_volume_id") or "")
+    if not provider_volume_id:
+        raise ValueError("Cache trust receipt has no provider volume identity")
+    if (
+        str(verified_manifest.get("cache_provider_volume_id") or "")
+        != provider_volume_id
+    ):
+        raise ValueError("Cache trust receipt manifest provider volume changed")
+    requested_digest = digest_id(str(proposal.get("artifact_digest") or ""))
+    artifact = next(
+        (
+            item
+            for item in verified_manifest.get("artifacts") or []
+            if item.get("digest") == requested_digest
+        ),
+        None,
+    )
+    if not artifact:
+        raise ValueError("Cache trust receipt artifact is outside the signed manifest")
+    policy = artifact.get("policy") or {}
+    if (
+        policy.get("private")
+        or policy.get("sensitive")
+        or policy.get("verification") == "full"
+    ):
+        raise ValueError("Cache trust receipt policy requires full verification")
+    artifact_size = int(artifact.get("size") or -1)
+    if artifact_size <= 0:
+        raise ValueError("Cache trust receipt artifact size is invalid")
+    storage_key = str(artifact.get("storage_key") or "")
+    generation = proposal.get("object_generation")
+    if not isinstance(generation, dict):
+        raise ValueError("Cache trust receipt has no object generation")
+    if str(generation.get("storage_key") or "") != storage_key:
+        raise ValueError("Cache trust receipt object identity is not signed")
+    if int(generation.get("size") or -1) != artifact_size:
+        raise ValueError("Cache trust receipt object size is not signed")
+    if int(generation.get("modified_ns") or -1) < 0:
+        raise ValueError("Cache trust receipt object generation is invalid")
+    scrub = proposal.get("scrub")
+    samples = (scrub or {}).get("samples") if isinstance(scrub, dict) else None
+    if not isinstance(samples, list) or not 1 <= len(samples) <= 16:
+        raise ValueError("Cache trust receipt sample set is invalid")
+    sample_bytes = 0
+    previous = -1
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("Cache trust receipt sample is invalid")
+        offset = int(sample.get("offset") or 0)
+        size = int(sample.get("size") or 0)
+        if offset < 0 or size <= 0 or offset + size > artifact_size:
+            raise ValueError("Cache trust receipt sample is outside the artifact")
+        if offset <= previous:
+            raise ValueError("Cache trust receipt samples are not ordered")
+        previous = offset
+        sample_bytes += size
+        digest_id(str(sample.get("sha256") or ""))
+    if sample_bytes > DEFAULT_TRUST_SAMPLE_BYTES * 16:
+        raise ValueError("Cache trust receipt sample set is too large")
+    verified_at = datetime.now(timezone.utc)
+    return {
+        "schema": TRUST_RECEIPT_SCHEMA,
+        "manifest_id": verified_manifest["manifest_id"],
+        "manifest_signature_digest": manifest_signature_digest(verified_manifest),
+        "artifact_digest": artifact["digest"],
+        "artifact_size": artifact_size,
+        "storage_key": storage_key,
+        "volume_id": str(volume_id),
+        "provider_volume_id": provider_volume_id,
+        "runtime_compatibility": artifact_runtime_compatibility_key(artifact),
+        "object_generation": {
+            "storage_key": storage_key,
+            "size": artifact_size,
+            "modified_ns": int(generation["modified_ns"]),
+        },
+        "verified_at": verified_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": (
+            verified_at + timedelta(seconds=DEFAULT_TRUST_RECEIPT_TTL_SECONDS)
+        ).isoformat().replace("+00:00", "Z"),
+        "scrub": {
+            "mode": "rotating-sample-and-scheduled-full-audit",
+            "full_audit_due_at": (
+                verified_at
+                + timedelta(seconds=DEFAULT_FULL_AUDIT_INTERVAL_SECONDS)
+            ).isoformat().replace("+00:00", "Z"),
+            "samples": samples,
+        },
+    }
 
 
 def _trusted_huggingface_digest(repo_id: str, revision: str, filename: str) -> str:
@@ -2883,6 +3024,84 @@ async def worker_verify_prepared_manifest(
         raise HTTPException(status_code=400, detail="manifest must be an object")
     try:
         return _prepared_manifest_signer(config).verify(manifest)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workers/cache/trust-receipts/sign")
+async def worker_sign_cache_trust_receipt(
+    request: Request, payload: dict[str, Any] = Body(...)
+):
+    """Sign a bounded full-verification claim for an active worker and volume."""
+    config, queue = _queue()
+    try:
+        queue.authorize_worker(_worker_token(request))
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    job = queue.get(str(payload.get("job_id") or ""))
+    worker_id = str(payload.get("worker_id") or "")
+    volume_id = str(payload.get("volume_id") or "")
+    proposal = payload.get("receipt")
+    manifest = payload.get("manifest")
+    if not _is_active_worker_job(job, worker_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Cache trust receipt is not bound to this worker's active job",
+        )
+    if not isinstance(proposal, dict) or not isinstance(manifest, dict):
+        raise HTTPException(
+            status_code=400, detail="receipt and manifest must be objects"
+        )
+    try:
+        validated = _validate_trust_receipt_proposal(
+            config,
+            proposal,
+            manifest,
+            job=job,
+            volume_id=volume_id,
+        )
+        signer = _prepared_manifest_signer(config)
+        return signer.verify_trust_receipt(
+            signer.sign_trust_receipt(validated, manifest=manifest)
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workers/cache/trust-receipts/verify")
+async def worker_verify_cache_trust_receipt(
+    request: Request, payload: dict[str, Any] = Body(...)
+):
+    """Verify a receipt only for the active worker's exact launch volume."""
+    config, queue = _queue()
+    try:
+        queue.authorize_worker(_worker_token(request))
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    job = queue.get(str(payload.get("job_id") or ""))
+    worker_id = str(payload.get("worker_id") or "")
+    volume_id = str(payload.get("volume_id") or "")
+    receipt = payload.get("receipt")
+    if not _is_active_worker_job(job, worker_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Cache trust receipt is not bound to this worker's active job",
+        )
+    if str(job.params.get("cache_volume_id") or "") != volume_id:
+        raise HTTPException(
+            status_code=403, detail="Cache trust receipt volume is outside launch plan"
+        )
+    if not isinstance(receipt, dict):
+        raise HTTPException(status_code=400, detail="receipt must be an object")
+    try:
+        verified = _prepared_manifest_signer(config).verify_trust_receipt(receipt)
+        if str(verified.get("volume_id") or "") != volume_id:
+            raise ValueError("Cache trust receipt belongs to another volume")
+        if str(verified.get("provider_volume_id") or "") != str(
+            job.params.get("cache_provider_volume_id") or ""
+        ):
+            raise ValueError("Cache trust receipt provider volume changed")
+        return verified
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
