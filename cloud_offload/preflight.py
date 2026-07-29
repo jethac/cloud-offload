@@ -263,7 +263,7 @@ def build_partition_preflight(
     partition: dict[str, Any],
     input_artifacts: dict[str, str],
     provider: str = "auto",
-    recommendation_policy: str = "balanced",
+    recommendation_policy: str | None = None,
     max_hourly_rate: float | None = None,
     max_total_job_cost: float | None = None,
     allowed_regions: list[str] | None = None,
@@ -279,15 +279,35 @@ def build_partition_preflight(
     warnings: list[dict[str, Any]] = []
     unknowns: list[dict[str, Any]] = []
     requested_provider = _provider_name(provider)
-    policy = str(recommendation_policy or "balanced").strip().lower()
-    region_allowlist = sorted(
-        {str(item).strip() for item in (allowed_regions or []) if str(item).strip()}
-    )
+    policy = str(
+        recommendation_policy or config.recommendation_policy or "balanced"
+    ).strip().lower()
+    configured_regions = {
+        str(item).strip()
+        for item in (getattr(config, "allowed_regions", None) or [])
+        if str(item).strip()
+    }
+    requested_regions = {
+        str(item).strip()
+        for item in (allowed_regions or [])
+        if str(item).strip()
+    }
+    if configured_regions and requested_regions:
+        effective_regions = configured_regions.intersection(requested_regions)
+        region_allowlist = sorted(effective_regions)
+        if not effective_regions:
+            blockers.append(
+                _issue(
+                    "region_policy_conflict",
+                    "The requested regions are outside the configured region allowlist.",
+                    action="Choose one configured region or change the hard allowlist.",
+                    field="allowed_regions",
+                )
+            )
+    else:
+        region_allowlist = sorted(configured_regions or requested_regions)
     configured_rate_limit = float(config.max_hourly_rate)
-    rate_limit = float(
-        configured_rate_limit if max_hourly_rate is None else max_hourly_rate
-    )
-    if not math.isfinite(rate_limit) or rate_limit <= 0:
+    if not math.isfinite(configured_rate_limit) or configured_rate_limit <= 0:
         blockers.append(
             _issue(
                 "invalid_hourly_rate_limit",
@@ -295,17 +315,33 @@ def build_partition_preflight(
                 field="max_hourly_rate",
             )
         )
-        rate_limit = (
-            configured_rate_limit
-            if math.isfinite(configured_rate_limit) and configured_rate_limit > 0
-            else 0.5
+        configured_rate_limit = 0.5
+    try:
+        requested_rate_limit = (
+            configured_rate_limit if max_hourly_rate is None else float(max_hourly_rate)
         )
-    total_cost_limit = (
-        None if max_total_job_cost is None else float(max_total_job_cost)
-    )
-    if total_cost_limit is not None and (
-        not math.isfinite(total_cost_limit)
-        or total_cost_limit <= 0
+    except (TypeError, ValueError):
+        requested_rate_limit = float("nan")
+    if not math.isfinite(requested_rate_limit) or requested_rate_limit <= 0:
+        blockers.append(
+            _issue(
+                "invalid_hourly_rate_limit",
+                "The hourly price limit must be a positive finite number.",
+                field="max_hourly_rate",
+            )
+        )
+        requested_rate_limit = configured_rate_limit
+    rate_limit = min(configured_rate_limit, requested_rate_limit)
+    configured_total_cost_limit = getattr(config, "max_total_job_cost", None)
+    try:
+        requested_total_cost_limit = (
+            None if max_total_job_cost is None else float(max_total_job_cost)
+        )
+    except (TypeError, ValueError):
+        requested_total_cost_limit = float("nan")
+    if requested_total_cost_limit is not None and (
+        not math.isfinite(requested_total_cost_limit)
+        or requested_total_cost_limit <= 0
     ):
         blockers.append(
             _issue(
@@ -314,7 +350,13 @@ def build_partition_preflight(
                 field="max_total_job_cost",
             )
         )
-        total_cost_limit = None
+        requested_total_cost_limit = None
+    total_cost_limits = [
+        float(value)
+        for value in (configured_total_cost_limit, requested_total_cost_limit)
+        if value is not None
+    ]
+    total_cost_limit = min(total_cost_limits) if total_cost_limits else None
 
     if policy not in RECOMMENDATION_POLICIES:
         blockers.append(
@@ -868,6 +910,16 @@ def build_partition_preflight(
         status = "ready"
 
     created_at = now()
+    confirmation_policy = str(
+        getattr(config, "rental_confirmation", "always") or "always"
+    )
+    countdown_seconds = int(
+        getattr(config, "confirmation_countdown_seconds", 10)
+    )
+    confirmation_required = (
+        status in {"ready", "ready_with_preparation"}
+        and confirmation_policy == "always"
+    )
     manifest = {
         "partition": partition,
         "input_artifacts": input_artifacts,
@@ -910,6 +962,28 @@ def build_partition_preflight(
             "max_hourly_rate": rate_limit,
             "max_total_job_cost": total_cost_limit,
             "allowed_regions": region_allowlist,
+            "material_price_change_percent": float(
+                getattr(config, "material_price_change_percent", 5.0)
+            ),
+            "material_cost_change_percent": float(
+                getattr(config, "material_cost_change_percent", 10.0)
+            ),
+        },
+        "confirmation": {
+            "policy": confirmation_policy,
+            "required": confirmation_required,
+            "mandatory": False,
+            "reason": (
+                "policy_always"
+                if confirmation_required
+                else f"policy_{confirmation_policy}"
+            ),
+            "countdown_seconds": countdown_seconds,
+            "not_before": (
+                _iso(created_at + timedelta(seconds=countdown_seconds))
+                if confirmation_required
+                else None
+            ),
         },
         "execution_plan": {
             "profile": profile.get("name") or profile_name,

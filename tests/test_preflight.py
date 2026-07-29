@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 
 from fastapi.testclient import TestClient
 
@@ -128,6 +129,14 @@ def test_preflight_recommends_a_safe_offer_without_provider_mutation(tmp_path):
     assert report["candidates"][0]["offer_id"] == "gpu-l40"
     assert report["execution_plan"]["offer_id"] == "gpu-l40"
     assert report["expires_at"] == "2026-07-29T00:01:00Z"
+    assert report["confirmation"] == {
+        "policy": "always",
+        "required": True,
+        "mandatory": False,
+        "reason": "policy_always",
+        "countdown_seconds": 10,
+        "not_before": "2026-07-29T00:00:10Z",
+    }
     assert connector.offer_reads == 1
     assert connector.mutations == []
     assert "private_provider_payload" not in str(report)
@@ -364,6 +373,7 @@ def test_preflight_identity_is_revalidated_and_bound_to_job(
             "preflight_id": report["preflight_id"],
             "manifest_digest": report["manifest_digest"],
             "candidate_id": candidate_id,
+            "confirmation_action": "start_now",
         },
     )
 
@@ -371,9 +381,129 @@ def test_preflight_identity_is_revalidated_and_bound_to_job(
     job = queue.get(created.json()["job_id"])
     assert job.params["preflight"]["candidate_id"] == candidate_id
     assert job.params["preflight"]["offer_id"] == "gpu-l40"
+    assert job.params["preflight"]["confirmation"]["action"] == "start_now"
     assert job.provider == "runpod"
     assert connector.offer_reads == 2
     assert connector.mutations == []
+
+
+def test_request_cannot_loosen_configured_cost_or_region_limits(tmp_path):
+    config = config_for_preflight(tmp_path)
+    config.max_hourly_rate = 0.8
+    config.max_total_job_cost = 0.2
+    config.allowed_regions = ["US-MD-1"]
+    config.__post_init__()
+    connector = ReadOnlyConnector()
+
+    conflict = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        max_hourly_rate=10,
+        max_total_job_cost=1,
+        allowed_regions=["EU-RO-1"],
+        storage=LocalStorage(config.storage_path),
+        cache_registry=CacheRegistry(config.queue_db_path),
+        connector_factory=lambda *args: connector,
+    )
+
+    assert conflict["status"] == "blocked"
+    assert conflict["request_policy"]["max_hourly_rate"] == 0.8
+    assert conflict["request_policy"]["max_total_job_cost"] == 0.2
+    assert any(
+        item["code"] == "region_policy_conflict"
+        for item in conflict["blockers"]
+    )
+    assert connector.offer_reads == 0
+
+
+def test_paid_partition_waits_for_confirmation_without_creating_a_job(
+    monkeypatch, tmp_path
+):
+    config = config_for_preflight(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    connector = ReadOnlyConnector()
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(preflight, "create_connector", lambda *args: connector)
+    client = TestClient(server.app)
+    report = client.post(
+        "/api/preflight", json={"partition": partition(), "provider": "runpod"}
+    ).json()
+    identity = {
+        "partition": partition(),
+        "provider": "runpod",
+        "preflight_id": report["preflight_id"],
+        "manifest_digest": report["manifest_digest"],
+        "candidate_id": report["recommendation"]["candidate_id"],
+    }
+
+    missing = client.post("/api/partitions", json=identity)
+    early = client.post(
+        "/api/partitions",
+        json={**identity, "confirmation_action": "countdown_elapsed"},
+    )
+
+    assert missing.status_code == 409
+    assert missing.json()["error"]["code"] == "cloud_offload.confirmation_required"
+    assert early.status_code == 409
+    assert early.json()["error"]["code"] == (
+        "cloud_offload.confirmation_countdown_active"
+    )
+    assert early.json()["error"]["details"]["remaining_seconds"] >= 1
+    assert queue.count_by_status(*list(JobStatus)) == 0
+    assert connector.mutations == []
+
+
+def test_elapsed_countdown_and_never_policy_can_start_without_manual_action(
+    monkeypatch, tmp_path
+):
+    config = config_for_preflight(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    connector = ReadOnlyConnector()
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(preflight, "create_connector", lambda *args: connector)
+    client = TestClient(server.app)
+    elapsed = client.post(
+        "/api/preflight", json={"partition": partition(), "provider": "runpod"}
+    ).json()
+    elapsed["confirmation"]["not_before"] = "2000-01-01T00:00:00Z"
+    PreflightStore(config.queue_db_path).put(elapsed)
+
+    started = client.post(
+        "/api/partitions",
+        json={
+            "partition": partition(),
+            "provider": "runpod",
+            "preflight_id": elapsed["preflight_id"],
+            "manifest_digest": elapsed["manifest_digest"],
+            "candidate_id": elapsed["recommendation"]["candidate_id"],
+            "confirmation_action": "countdown_elapsed",
+        },
+    )
+    assert started.status_code == 202
+    assert started.json()["confirmation_action"] == "countdown_elapsed"
+
+    config.rental_confirmation = "never"
+    config.__post_init__()
+    skipped = client.post(
+        "/api/preflight", json={"partition": partition(), "provider": "runpod"}
+    ).json()
+    assert skipped["confirmation"]["required"] is False
+    accepted = client.post(
+        "/api/partitions",
+        json={
+            "partition": partition(),
+            "provider": "runpod",
+            "preflight_id": skipped["preflight_id"],
+            "manifest_digest": skipped["manifest_digest"],
+            "candidate_id": skipped["recommendation"]["candidate_id"],
+            "force_execution": True,
+        },
+    )
+    assert accepted.status_code == 202
+    assert accepted.json()["confirmation_action"] == "policy_skip"
 
 
 def test_price_change_returns_revised_preflight_without_queueing(
@@ -404,6 +534,7 @@ def test_price_change_returns_revised_preflight_without_queueing(
             "preflight_id": report["preflight_id"],
             "manifest_digest": report["manifest_digest"],
             "candidate_id": report["recommendation"]["candidate_id"],
+            "confirmation_action": "start_now",
         },
     )
 
@@ -414,8 +545,89 @@ def test_price_change_returns_revised_preflight_without_queueing(
     assert error["details"]["revised_preflight"]["schema"] == (
         "cloud-offload.preflight.v1"
     )
+    assert error["details"]["revised_preflight"]["confirmation"]["required"] is True
+    assert error["details"]["revised_preflight"]["confirmation"]["mandatory"] is True
     assert queue.count_by_status(*list(JobStatus)) == 0
     assert connector.mutations == []
+
+
+def test_price_change_within_tolerance_uses_current_price_without_reconfirmation(
+    monkeypatch, tmp_path
+):
+    config = config_for_preflight(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    connector = ReadOnlyConnector()
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(preflight, "create_connector", lambda *args: connector)
+    client = TestClient(server.app)
+    report = client.post(
+        "/api/preflight", json={"partition": partition(), "provider": "runpod"}
+    ).json()
+    connector.rate_multiplier = 1.04
+
+    response = client.post(
+        "/api/partitions",
+        json={
+            "partition": partition(),
+            "provider": "runpod",
+            "preflight_id": report["preflight_id"],
+            "manifest_digest": report["manifest_digest"],
+            "candidate_id": report["recommendation"]["candidate_id"],
+            "confirmation_action": "start_now",
+        },
+    )
+
+    assert response.status_code == 202
+    job = queue.get(response.json()["job_id"])
+    assert job.params["preflight"]["hourly_rate"] == 0.78
+    assert connector.mutations == []
+
+
+def test_material_change_forces_confirmation_when_normal_policy_is_never(
+    monkeypatch, tmp_path
+):
+    config = config_for_preflight(tmp_path)
+    config.rental_confirmation = "never"
+    config.__post_init__()
+    queue = JobQueue(config.queue_db_path)
+    connector = ReadOnlyConnector()
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(preflight, "create_connector", lambda *args: connector)
+    client = TestClient(server.app)
+    report = client.post(
+        "/api/preflight", json={"partition": partition(), "provider": "runpod"}
+    ).json()
+    connector.rate_multiplier = 1.1
+
+    changed = client.post(
+        "/api/partitions",
+        json={
+            "partition": partition(),
+            "provider": "runpod",
+            "preflight_id": report["preflight_id"],
+            "manifest_digest": report["manifest_digest"],
+            "candidate_id": report["recommendation"]["candidate_id"],
+        },
+    )
+    revised = changed.json()["error"]["details"]["revised_preflight"]
+    refused = client.post(
+        "/api/partitions",
+        json={
+            "partition": partition(),
+            "provider": "runpod",
+            "preflight_id": revised["preflight_id"],
+            "manifest_digest": revised["manifest_digest"],
+            "candidate_id": report["recommendation"]["candidate_id"],
+        },
+    )
+
+    assert changed.status_code == 409
+    assert revised["confirmation"]["mandatory"] is True
+    assert refused.status_code == 409
+    assert refused.json()["error"]["code"] == "cloud_offload.confirmation_required"
+    assert queue.count_by_status(*list(JobStatus)) == 0
 
 
 def test_preflight_endpoint_returns_report(monkeypatch, tmp_path):
@@ -449,3 +661,42 @@ def test_preflight_endpoint_returns_report(monkeypatch, tmp_path):
     assert response.json() == expected
     assert len(calls) == 1
     assert calls[0]["partition"]["partition_id"] == "part-1"
+
+
+def test_confirmation_policy_settings_are_validated_and_persisted(
+    monkeypatch, tmp_path
+):
+    from cloud_offload import config as config_module
+
+    monkeypatch.setattr(config_module, "CONFIG_DIR", tmp_path)
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/config",
+        json={
+            "rental_confirmation": "material_changes",
+            "confirmation_countdown_seconds": 15,
+            "recommendation_policy": "fastest",
+            "max_total_job_cost": 0.75,
+            "allowed_regions": ["US-MD-1", "EU-RO-1", "US-MD-1"],
+            "material_price_change_percent": 7.5,
+            "material_cost_change_percent": 12,
+        },
+    )
+
+    assert response.status_code == 200
+    public = response.json()["config"]
+    assert public["rental_confirmation"] == "material_changes"
+    assert public["confirmation_countdown_seconds"] == 15
+    assert public["recommendation_policy"] == "fastest"
+    assert public["max_total_job_cost"] == 0.75
+    assert public["allowed_regions"] == ["US-MD-1", "EU-RO-1"]
+    persisted = json.loads((tmp_path / "config.json").read_text())
+    assert persisted["rental_confirmation"] == "material_changes"
+
+    invalid = client.post(
+        "/api/config", json={"confirmation_countdown_seconds": 61}
+    )
+    assert invalid.status_code == 400
+    assert json.loads((tmp_path / "config.json").read_text())[
+        "confirmation_countdown_seconds"
+    ] == 15

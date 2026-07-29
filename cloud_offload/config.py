@@ -1,6 +1,7 @@
 """Cloud Offload configuration."""
 
 import json
+import math
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -170,6 +171,15 @@ class CloudConfig:
     routing_policy: Literal["preferred", "cheapest"] = "preferred"
     gpu_type: str = "RTX_4090"
     max_hourly_rate: float = 0.50  # USD, skip instances above this
+    max_total_job_cost: float | None = None
+    recommendation_policy: Literal["balanced", "cheapest", "fastest", "manual"] = (
+        "balanced"
+    )
+    rental_confirmation: Literal["always", "material_changes", "never"] = "always"
+    confirmation_countdown_seconds: int = 10
+    allowed_regions: list[str] = field(default_factory=list)
+    material_price_change_percent: float = 5.0
+    material_cost_change_percent: float = 10.0
 
     # Worker settings
     idle_shutdown_seconds: int = 300  # Shut down worker after idle
@@ -299,6 +309,55 @@ class CloudConfig:
             self.provider_order.insert(0, self.provider)
         if self.routing_policy not in {"preferred", "cheapest"}:
             raise ValueError("routing_policy must be preferred or cheapest")
+        self.max_hourly_rate = float(self.max_hourly_rate)
+        if not math.isfinite(self.max_hourly_rate) or self.max_hourly_rate <= 0:
+            raise ValueError("max_hourly_rate must be greater than zero")
+        if self.max_total_job_cost is not None:
+            self.max_total_job_cost = float(self.max_total_job_cost)
+            if (
+                not math.isfinite(self.max_total_job_cost)
+                or self.max_total_job_cost <= 0
+            ):
+                raise ValueError("max_total_job_cost must be greater than zero")
+        self.recommendation_policy = str(self.recommendation_policy).strip().lower()
+        if self.recommendation_policy not in {
+            "balanced",
+            "cheapest",
+            "fastest",
+            "manual",
+        }:
+            raise ValueError(
+                "recommendation_policy must be balanced, cheapest, fastest, or manual"
+            )
+        self.rental_confirmation = str(self.rental_confirmation).strip().lower()
+        if self.rental_confirmation not in {
+            "always",
+            "material_changes",
+            "never",
+        }:
+            raise ValueError(
+                "rental_confirmation must be always, material_changes, or never"
+            )
+        self.confirmation_countdown_seconds = int(
+            self.confirmation_countdown_seconds
+        )
+        if not 0 <= self.confirmation_countdown_seconds <= 60:
+            raise ValueError("confirmation_countdown_seconds must be from 0 to 60")
+        self.allowed_regions = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in self.allowed_regions or []
+                if str(item).strip()
+            )
+        )
+        for field_name in (
+            "material_price_change_percent",
+            "material_cost_change_percent",
+        ):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or not 0 <= value <= 100:
+                raise ValueError(f"{field_name} must be from 0 to 100")
+            setattr(self, field_name, value)
         if self.ingress not in {"none", "cloudflared"}:
             raise ValueError("ingress must be none or cloudflared")
         self.on_prem_assets = _normalized_on_prem_assets(self.on_prem_assets)
@@ -376,6 +435,31 @@ class CloudConfig:
             ).lower(),
             gpu_type=os.environ.get("CLOUD_OFFLOAD_GPU_TYPE", "RTX_4090"),
             max_hourly_rate=float(os.environ.get("CLOUD_OFFLOAD_MAX_HOURLY_RATE", "0.50")),
+            max_total_job_cost=(
+                float(os.environ["CLOUD_OFFLOAD_MAX_TOTAL_JOB_COST"])
+                if os.environ.get("CLOUD_OFFLOAD_MAX_TOTAL_JOB_COST")
+                else None
+            ),
+            recommendation_policy=os.environ.get(
+                "CLOUD_OFFLOAD_RECOMMENDATION_POLICY", "balanced"
+            ),
+            rental_confirmation=os.environ.get(
+                "CLOUD_OFFLOAD_RENTAL_CONFIRMATION", "always"
+            ),
+            confirmation_countdown_seconds=int(
+                os.environ.get("CLOUD_OFFLOAD_CONFIRMATION_COUNTDOWN", "10")
+            ),
+            allowed_regions=[
+                item.strip()
+                for item in os.environ.get("CLOUD_OFFLOAD_ALLOWED_REGIONS", "").split(",")
+                if item.strip()
+            ],
+            material_price_change_percent=float(
+                os.environ.get("CLOUD_OFFLOAD_MATERIAL_PRICE_CHANGE_PERCENT", "5")
+            ),
+            material_cost_change_percent=float(
+                os.environ.get("CLOUD_OFFLOAD_MATERIAL_COST_CHANGE_PERCENT", "10")
+            ),
             idle_shutdown_seconds=int(os.environ.get("CLOUD_OFFLOAD_IDLE_SHUTDOWN", "300")),
             keep_warm=os.environ.get("CLOUD_OFFLOAD_KEEP_WARM", "").lower() == "true",
             keep_warm_warning_seconds=int(
@@ -446,6 +530,27 @@ class CloudConfig:
             "CLOUD_OFFLOAD_ROUTING_POLICY": ("routing_policy", str),
             "CLOUD_OFFLOAD_GPU_TYPE": ("gpu_type", str),
             "CLOUD_OFFLOAD_MAX_HOURLY_RATE": ("max_hourly_rate", float),
+            "CLOUD_OFFLOAD_MAX_TOTAL_JOB_COST": ("max_total_job_cost", float),
+            "CLOUD_OFFLOAD_RECOMMENDATION_POLICY": ("recommendation_policy", str),
+            "CLOUD_OFFLOAD_RENTAL_CONFIRMATION": ("rental_confirmation", str),
+            "CLOUD_OFFLOAD_CONFIRMATION_COUNTDOWN": (
+                "confirmation_countdown_seconds",
+                int,
+            ),
+            "CLOUD_OFFLOAD_ALLOWED_REGIONS": (
+                "allowed_regions",
+                lambda value: [
+                    item.strip() for item in value.split(",") if item.strip()
+                ],
+            ),
+            "CLOUD_OFFLOAD_MATERIAL_PRICE_CHANGE_PERCENT": (
+                "material_price_change_percent",
+                float,
+            ),
+            "CLOUD_OFFLOAD_MATERIAL_COST_CHANGE_PERCENT": (
+                "material_cost_change_percent",
+                float,
+            ),
             "CLOUD_OFFLOAD_IDLE_SHUTDOWN": ("idle_shutdown_seconds", int),
             "CLOUD_OFFLOAD_KEEP_WARM": (
                 "keep_warm",
@@ -503,6 +608,13 @@ class CloudConfig:
             "huggingface_configured": self.huggingface_configured,
             "gpu_type": self.gpu_type,
             "max_hourly_rate": self.max_hourly_rate,
+            "max_total_job_cost": self.max_total_job_cost,
+            "recommendation_policy": self.recommendation_policy,
+            "rental_confirmation": self.rental_confirmation,
+            "confirmation_countdown_seconds": self.confirmation_countdown_seconds,
+            "allowed_regions": self.allowed_regions,
+            "material_price_change_percent": self.material_price_change_percent,
+            "material_cost_change_percent": self.material_cost_change_percent,
             "idle_shutdown_seconds": self.idle_shutdown_seconds,
             "keep_warm": self.keep_warm,
             "keep_warm_warning_seconds": self.keep_warm_warning_seconds,

@@ -1347,6 +1347,7 @@ class CoordinatorBenchmarkDriver:
                     "preflight_id": preflight["preflight_id"],
                     "manifest_digest": preflight["manifest_digest"],
                     "candidate_id": candidate_id,
+                    "confirmation_action": "start_now",
                 }
             )
         response = self._request(
