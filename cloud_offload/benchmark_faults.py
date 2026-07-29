@@ -195,27 +195,52 @@ def inject_storage_unavailable(
 
 
 CORRUPTION_STATE_SCHEMA = "cloud-offload.benchmark-corruption-state.v1"
+CORRUPTION_NONCE_FIELD = "_cloud_offload_benchmark_nonce"
 
 
-def corruption_canary_asset(scenario: str) -> dict[str, Any]:
-    """Return the synthetic asset unique to one corruption scenario."""
+def _normalize_canary_nonce(nonce: str | None) -> str:
+    normalized = str(nonce or "").strip()
+    if len(normalized) > 64 or any(
+        character
+        not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        for character in normalized
+    ):
+        raise ValueError("Corruption canary nonce contains unsafe characters")
+    return normalized
+
+
+def corruption_canary_asset(
+    scenario: str, *, nonce: str | None = None
+) -> dict[str, Any]:
+    """Return the synthetic asset unique to one corruption campaign."""
 
     scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
-    payload = f"cloud-offload-benchmark-valid-v1:{scenario_tag}".encode("utf-8")
-    return {
+    normalized_nonce = _normalize_canary_nonce(nonce)
+    payload = _corruption_valid_payload(scenario, normalized_nonce)
+    nonce_tag = (
+        "_" + hashlib.sha256(normalized_nonce.encode("utf-8")).hexdigest()[:12]
+        if normalized_nonce
+        else ""
+    )
+    asset = {
         "category": "vae",
-        "filename": f"cloud_offload_benchmark_canary_{scenario_tag}.bin",
+        "filename": (f"cloud_offload_benchmark_canary_{scenario_tag}{nonce_tag}.bin"),
         "format": "other",
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size": len(payload),
         "cacheable": True,
         "private": False,
     }
+    if normalized_nonce:
+        asset[CORRUPTION_NONCE_FIELD] = normalized_nonce
+    return asset
 
 
-def _corruption_valid_payload(scenario: str) -> bytes:
+def _corruption_valid_payload(scenario: str, nonce: str | None = None) -> bytes:
     scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
-    return f"cloud-offload-benchmark-valid-v1:{scenario_tag}".encode("utf-8")
+    normalized_nonce = _normalize_canary_nonce(nonce)
+    suffix = f":{normalized_nonce}" if normalized_nonce else ""
+    return f"cloud-offload-benchmark-valid-v1:{scenario_tag}{suffix}".encode("utf-8")
 
 
 def _corruption_target(
@@ -223,6 +248,7 @@ def _corruption_target(
     scenario: str,
     *,
     declared_digests: set[str],
+    canary_nonce: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     prepared = client.prepared_storage()
     provider_volume_id = str(prepared.get("existing_volume_id") or "")
@@ -241,7 +267,9 @@ def _corruption_target(
         raise RuntimeError("Bound prepared volume has no S3 canary path")
 
     declared = {"sha256:" + normalize_digest(item) for item in declared_digests}
-    canary_digest = "sha256:" + corruption_canary_asset(scenario)["sha256"]
+    canary_digest = (
+        "sha256:" + corruption_canary_asset(scenario, nonce=canary_nonce)["sha256"]
+    )
     if canary_digest not in declared:
         raise RuntimeError("Benchmark request is missing its fresh corruption asset")
     ordinary = declared - {canary_digest}
@@ -339,10 +367,14 @@ def _coordinator_storage():
     return create_storage(CloudConfig.load())
 
 
-def _corruption_keys(scenario: str) -> dict[str, str]:
-    digest = normalize_digest(str(corruption_canary_asset(scenario)["sha256"]))
+def _corruption_keys(
+    scenario: str, *, canary_nonce: str | None = None
+) -> dict[str, str]:
+    digest = normalize_digest(
+        str(corruption_canary_asset(scenario, nonce=canary_nonce)["sha256"])
+    )
     scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
-    prefix = f"staging/benchmark-corruption/{scenario_tag}"
+    prefix = f"staging/benchmark-corruption/{scenario_tag}/{digest[:16]}"
     return {
         "digest": digest,
         "blob_key": blob_key(digest),
@@ -421,15 +453,19 @@ def prepare_corruption(
     registry_factory: Callable[[], CacheRegistry] = _cache_registry,
     coordinator_storage_factory: Callable[[], Any] = _coordinator_storage,
     profile_fingerprint: str | None = None,
+    canary_nonce: str | None = None,
     settle_seconds: float = 5,
 ) -> dict[str, Any]:
     """Publish then corrupt an object no prior mount could have cached."""
 
     volume, base_manifest = _corruption_target(
-        client, scenario, declared_digests=declared_digests
+        client,
+        scenario,
+        declared_digests=declared_digests,
+        canary_nonce=canary_nonce,
     )
     store = store_factory(volume)
-    keys = _corruption_keys(scenario)
+    keys = _corruption_keys(scenario, canary_nonce=canary_nonce)
     if _object_size(store, keys["state_key"]) is not None:
         raise RuntimeError("A stale fresh-object corruption canary is still active")
     if _object_size(store, keys["blob_key"]) is not None:
@@ -438,8 +474,8 @@ def prepare_corruption(
     original_generation = str(original_index.get("generation") or "")
     if not original_generation:
         raise RuntimeError("Prepared storage has no restorable inventory generation")
-    asset = corruption_canary_asset(scenario)
-    valid_payload = _corruption_valid_payload(scenario)
+    asset = corruption_canary_asset(scenario, nonce=canary_nonce)
+    valid_payload = _corruption_valid_payload(scenario, canary_nonce)
     coordinator_storage = coordinator_storage_factory()
     coordinator_artifact_key = partition_artifact_key(keys["digest"])
     if coordinator_storage.exists(coordinator_artifact_key):
@@ -570,6 +606,7 @@ def prepare_corruption(
             store_factory=store_factory,
             registry_factory=registry_factory,
             coordinator_storage_factory=coordinator_storage_factory,
+            canary_nonce=canary_nonce,
         )
         raise
     return {
@@ -590,12 +627,18 @@ def cleanup_corruption(
     store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
     registry_factory: Callable[[], CacheRegistry] = _cache_registry,
     coordinator_storage_factory: Callable[[], Any] = _coordinator_storage,
+    canary_nonce: str | None = None,
 ) -> dict[str, Any]:
     """Remove the synthetic generation without touching ordinary artifacts."""
 
-    volume, _ = _corruption_target(client, scenario, declared_digests=declared_digests)
+    volume, _ = _corruption_target(
+        client,
+        scenario,
+        declared_digests=declared_digests,
+        canary_nonce=canary_nonce,
+    )
     store = store_factory(volume)
-    keys = _corruption_keys(scenario)
+    keys = _corruption_keys(scenario, canary_nonce=canary_nonce)
     state_payload = _object_bytes(store, keys["state_key"])
     if state_payload is None:
         if _object_size(store, keys["blob_key"]) is not None:
@@ -667,19 +710,25 @@ def observe_corruption(
     declared_digests: set[str],
     *,
     store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
+    canary_nonce: str | None = None,
 ) -> dict[str, Any]:
     """Require quarantine, then restore the tiny valid blob for a job retry."""
 
-    volume, _ = _corruption_target(client, scenario, declared_digests=declared_digests)
+    volume, _ = _corruption_target(
+        client,
+        scenario,
+        declared_digests=declared_digests,
+        canary_nonce=canary_nonce,
+    )
     store = store_factory(volume)
-    keys = _corruption_keys(scenario)
+    keys = _corruption_keys(scenario, canary_nonce=canary_nonce)
     state_payload = _object_bytes(store, keys["state_key"])
     if state_payload is None:
         raise RuntimeError("Fresh corruption canary state is absent")
     state = json.loads(state_payload)
     if state.get("schema") != CORRUPTION_STATE_SCHEMA:
         raise RuntimeError("Fresh corruption canary state is invalid")
-    valid_payload = _corruption_valid_payload(scenario)
+    valid_payload = _corruption_valid_payload(scenario, canary_nonce)
     if _object_bytes(store, str(state["blob_key"])) == valid_payload:
         raise RuntimeError("Fresh corruption canary is no longer corrupt")
     observed = _wait_for_event(
@@ -857,6 +906,11 @@ def run_fault(kind: str) -> dict[str, Any]:
         }
         if not declared:
             raise RuntimeError("Corruption canary received no declared asset digests")
+        canary_nonce = _normalize_canary_nonce(
+            os.environ.get("CLOUD_OFFLOAD_BENCHMARK_CANARY_NONCE")
+        )
+        if not canary_nonce:
+            raise RuntimeError("Corruption canary received no campaign nonce")
         if stage == "prepare":
             profile_name = (
                 os.environ.get("CLOUD_OFFLOAD_BENCHMARK_PROFILE", "").strip()
@@ -870,10 +924,19 @@ def run_fault(kind: str) -> dict[str, Any]:
                 scenario,
                 declared,
                 profile_fingerprint=profile_fingerprint,
+                canary_nonce=canary_nonce,
             )
         if stage == "cleanup":
-            return cleanup_corruption(client, scenario, declared)
-        return observe_corruption(client, job_id, scenario, declared)
+            return cleanup_corruption(
+                client, scenario, declared, canary_nonce=canary_nonce
+            )
+        return observe_corruption(
+            client,
+            job_id,
+            scenario,
+            declared,
+            canary_nonce=canary_nonce,
+        )
     if stage != "observe":
         raise RuntimeError("Restart canary supports only the observe stage")
     return restart_coordinator(client, job_id)

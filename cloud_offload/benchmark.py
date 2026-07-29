@@ -15,6 +15,7 @@ import os
 import statistics
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -213,7 +214,10 @@ class BenchmarkScenario:
                 raise ValueError(
                     f"scenarios[{index}] corruption requires a pre-submit partition hook"
                 )
-            from cloud_offload.benchmark_faults import corruption_canary_asset
+            from cloud_offload.benchmark_faults import (
+                CORRUPTION_NONCE_FIELD,
+                corruption_canary_asset,
+            )
 
             request = json.loads(json.dumps(request, allow_nan=False))
             partition = request.get("partition")
@@ -226,13 +230,20 @@ class BenchmarkScenario:
                 raise ValueError(
                     f"scenarios[{index}] corruption requires partition.assets"
                 )
-            canary_asset = corruption_canary_asset(name)
-            if not any(
-                isinstance(item, dict)
-                and str(item.get("sha256") or "") == canary_asset["sha256"]
+            assets[:] = [
+                item
                 for item in assets
-            ):
-                assets.append(canary_asset)
+                if not (
+                    isinstance(item, dict)
+                    and (
+                        item.get(CORRUPTION_NONCE_FIELD)
+                        or str(item.get("filename") or "").startswith(
+                            "cloud_offload_benchmark_canary_"
+                        )
+                    )
+                )
+            ]
+            assets.append(corruption_canary_asset(name, nonce=uuid.uuid4().hex))
             _canonical_digest(request)
         raw_storage_policy = value.get("prepared_storage_policy")
         storage_policy = (
@@ -946,6 +957,20 @@ class BenchmarkRunner:
                 )
             }
         )
+        canary_nonce = ""
+        if injection and injection.kind == "corruption":
+            from cloud_offload.benchmark_faults import CORRUPTION_NONCE_FIELD
+
+            canary_nonces = {
+                str(item.get(CORRUPTION_NONCE_FIELD) or "")
+                for item in assets
+                if isinstance(item, dict) and item.get(CORRUPTION_NONCE_FIELD)
+            }
+            if len(canary_nonces) != 1:
+                raise RuntimeError(
+                    "Corruption benchmark requires exactly one campaign nonce"
+                )
+            canary_nonce = next(iter(canary_nonces))
         return {
             "CLOUD_OFFLOAD_BENCHMARK_JOB_ID": job_id or "",
             "CLOUD_OFFLOAD_BENCHMARK_SCENARIO": scenario.name,
@@ -957,6 +982,7 @@ class BenchmarkRunner:
                 scenario.request
             ),
             "CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS": ",".join(digests),
+            "CLOUD_OFFLOAD_BENCHMARK_CANARY_NONCE": canary_nonce,
             "CLOUD_OFFLOAD_BENCHMARK_PROFILE": str(
                 ((scenario.request.get("partition") or {}).get("runner") or {}).get(
                     "profile"
