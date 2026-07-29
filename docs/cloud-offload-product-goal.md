@@ -2,7 +2,7 @@
 
 > Status: **canonical product goal**
 > Last updated: **2026-07-30**
-> Program status: **in progress — Milestone 2 is complete and Milestone 3 leases and billing closure is the current gate**
+> Program status: **in progress — Milestone 3 is complete and Milestone 4 fast trusted restore is the current gate**
 > Scope: the end-to-end Cloud Offload product across the coordinator, dispatcher,
 > workers, provider connectors, prepared storage, and ComfyUI extension.
 >
@@ -31,12 +31,12 @@ requests:
 4. **What happens next?** The current execution state and the first unmet exit
    criterion in milestone order.
 
-The active program gate is **M3 revocable leases and billing closure**. M0, M1,
-and M2 are complete. M4 through M7 remain part of this same goal; they are not a
-backlog that can be silently deferred or a new goal that must be rediscovered
-later. M3 may close only after every paid resource has a persisted lease,
-provider-confirmed termination, bounded reconciliation, and durable evidence for
-every M3 exit.
+The active program gate is **M4 fast trusted restore**. M0 through M3 are
+complete. M5 through M7 remain part of this same goal; they are not a backlog
+that can be silently deferred or a new goal that must be rediscovered later. M4
+may close only after trusted hot restore avoids complete artifact reads without
+weakening first-seen integrity, corruption stays quarantined, and the measured
+hot preparation target passes.
 
 Raw benchmark plans, workflows, hooks, support bundles, and service logs remain
 local under `.runlogs/`. The durable record committed to the repository contains
@@ -178,7 +178,7 @@ validate the product journey.
 | `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Complete; extension PR #5, backend PR #27, and the accepted merged-stack journey prove the interaction and persistent policy. |
 | `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
 | `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Complete; the persistent Cloud Jobs surface reconstructs safe authoritative state after reload and exposes complete M2 telemetry. |
-| `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Implementation is complete in backend PR #34 and extension PR #8; the bounded paid cancellation and restart matrix remains before acceptance. |
+| `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Complete; backend PR #34 and extension PR #8 implement the contract, and the accepted paid RunPod cancellation and restart matrix proves exact provider-confirmed closure. |
 | `STORAGE-1` | Opt into or adopt RunPod storage before cached rental and attach it to compatible future Pods. | M4 foundation | Initial managed/adopted-volume MVP merged. |
 | `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
 | `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Durable population/restore baseline merged; fast trust and capsules pending. |
@@ -647,7 +647,8 @@ This ledger records merged implementation evidence across both repositories.
 | [#31](https://github.com/jethac/cloud-offload/pull/31) | Records the accepted merged-stack replay and its automatic exact-Pod cleanup receipt. | Merged as `de49afa`; the accepted replay below closes the paid journey and cleanup evidence. |
 | [#32](https://github.com/jethac/cloud-offload/pull/32) | Adds private-data-free workload identity, read-only matched timing history, candidate-class measurement, full RunPod compute/transfer/container-storage estimates, the paid idle window, and the compact M1 evidence record. | 25 focused tests and 571 full tests passed; two repeated live free preflights were stable and created no job or Pod. M1 is complete. |
 | [#33](https://github.com/jethac/cloud-offload/pull/33) | Adds a reloadable safe job projection with lifecycle phase, monotonic progress, transfer telemetry, ETA confidence, resource identity, estimated spend, cache results, cancellation state, billing state, and bounded event summaries. It also records the compact M2 evidence. | 579 full tests passed. A live same-origin read returned 20 jobs in 350.7 ms, and privacy tests reject raw requests, workflows, prompts, paths, URLs, and provider payloads. M2 is complete. |
-| [#34](https://github.com/jethac/cloud-offload/pull/34) | Adds durable pre-mutation provider-resource leases, worker renewal and identity binding, exact cancellation revocation, restart and uncertain-launch reconciliation, independent idempotent termination, provider closure receipts, hard runtime and dollar limits, and cancelled-cache publication guards. | 593 tests passed. The automated M3 matrix covers five cancellation phases, delayed closure, a stopped but present resource, provider loss, restart recovery, both circuit breakers, late state, and cache safety. Paid RunPod proof remains. |
+| [#34](https://github.com/jethac/cloud-offload/pull/34) | Adds durable pre-mutation provider-resource leases, worker renewal and identity binding, exact cancellation revocation, restart and uncertain-launch reconciliation, independent idempotent termination, provider closure receipts, hard runtime and dollar limits, and cancelled-cache publication guards. | 593 tests passed. The automated M3 matrix covers five cancellation phases, delayed closure, a stopped but present resource, provider loss, restart recovery, both circuit breakers, late state, and cache safety. |
+| [#35](https://github.com/jethac/cloud-offload/pull/35) | Records the accepted bounded paid RunPod worker-boot cancellation and coordinator-restart campaign, exact lease closure receipts, empty final provider inventory, and the compact redacted M3 evidence. | 594 tests passed. Both exact Pods became provider-absent, both leases received provider termination confirmation, the conservative cost upper bound was USD 0.033868, and no manual cleanup was required. M3 is complete. |
 
 ### ComfyUI extension repository
 
@@ -993,14 +994,17 @@ Status snapshot as of 2026-07-30:
   then extended only the bounded corruption observation window. The accepted
   replay proved exact manifest authority, quarantine, safe terminal behavior,
   and complete automated cleanup in production.
-- M0, M1, and M2 are complete. The accepted merged-stack paid run proves the
+- M0 through M3 are complete. The accepted merged-stack paid run proves the
   recommendation, confirmation, exact launch, prepared restore, execution,
   result return, and automatic exact-Pod closure. Two repeated free preflights
   prove stable identity, two-sample measured timing, medium confidence,
   complete RunPod compute/transfer/container-storage cost, and no provider
   mutation. The persistent Cloud Jobs surface now reconstructs safe lifecycle,
   transfer, ETA, resource, cost, cache, cancellation, and billing state after a
-  reload. M3 revocable leases and billing closure is now the active gate.
+  reload. The M3 paid matrix then proved worker-boot cancellation, coordinator
+  restart after provider creation, persisted leases, provider-confirmed closure,
+  and empty final RunPod inventory. M4 fast trusted restore is now the active
+  gate.
 
 ### Completed M0 corruption contract
 
@@ -1186,6 +1190,32 @@ The backend passed 579 tests. The extension passed 82 Python tests with 3 skips
 and 67 JavaScript tests. Syntax checks also passed. All M2 exits pass. M2 is
 complete. M3 is the first unmet milestone.
 
+### M3 evidence and exit audit
+
+The safe evidence projection is
+[M3 lease closure evidence](evidence/m3-lease-closure-evidence-2026-07-30.json).
+It combines the complete automated phase matrix with a spend-capped merged-stack
+RunPod campaign. It contains only safe counts, limits, timings, immutable build
+identity, opaque job/lease/resource IDs, and provider-closure receipts.
+
+1. **Cancellation phases:** automated tests cover provisioning, worker boot,
+   dependency preparation, execution, and result transfer. The paid campaign
+   directly cancelled during worker boot and removed exact Pod `ha9hgesfdxgey9`.
+2. **Provider truth:** both paid jobs show `termination_confirmed: true` and a
+   provider confirmation time. Paid elapsed time freezes at that receipt.
+3. **Restart recovery:** the second paid case restarted the coordinator after
+   RunPod created Pod `k4qg73i4szqq33`. The replacement coordinator became
+   healthy, cancellation persisted, and exact cleanup completed.
+4. **No orphan:** the two-case campaign passed with no manual cleanup, no orphan
+   audit error, and zero RunPod resources in the final independent inventory.
+5. **Terminal and cache safety:** automated late-callback and cancelled-cache
+   publication tests pass. A stopped but still present provider resource does
+   not count as closure.
+
+The campaign had a USD 0.30 total limit and a USD 0.15 per-case limit. Its
+conservative compute-cost upper bound was USD 0.033868. All M3 exits pass. M3 is
+complete. M4 is the first unmet milestone.
+
 ### Operational safety rules
 
 - A paid benchmark never starts without explicit spend confirmation and finite
@@ -1211,8 +1241,8 @@ complete. M3 is the first unmet milestone.
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
 | M1 — preflight, recommendation, confirmation | **Complete** | All exits passed; the merged-stack paid journey, automatic cleanup, stable free preflight, measured recommendation history, and complete RunPod cost are durable. |
 | M2 — persistent visibility | **Complete** | All exits passed; the persistent Cloud Jobs surface, reload reconstruction, complete safe telemetry, and compact evidence are durable. |
-| M3 — leases and billing closure | **In progress** | The complete implementation and automated matrix pass; bounded paid RunPod cancellation, restart, exact-removal, and callback/cache evidence are the current gate. |
-| M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
+| M3 — leases and billing closure | **Complete** | The automated five-phase matrix and the bounded paid RunPod cancellation/restart campaign pass with provider-confirmed closure and zero final resources. |
+| M4 — fast trusted restore | **In progress** | Durable prepared storage exists; trust receipts, background scrubbing, and the hot-path performance target are the current gate. |
 | M5 — workflow capsules | **Not started** | Schema and custom-node readiness contracts remain. |
 | M6 — regional replication | **Not started** | Shadow recommendations precede automation. |
 | M7 — production release gate | **Not started** | Requires all prior exits and continuous canaries. |
@@ -1286,11 +1316,13 @@ Exit:
 - Reconcile non-closed leases on startup.
 - Add runtime and dollar circuit breakers.
 
-Implementation status: backend PR #34 and extension PR #8 deliver every listed
+Completion status: backend PR #34 and extension PR #8 deliver every listed
 mechanism. The automated matrix passes with 593 backend tests, 82 extension
-Python tests with 3 skips, and 68 extension JavaScript tests. M3 remains open
-until the bounded paid RunPod matrix proves exact resource removal and closure
-receipts through the merged stack.
+Python tests with 3 skips, and 68 extension JavaScript tests. The bounded paid
+RunPod matrix passed worker-boot cancellation and coordinator restart after
+provider creation. Both exact Pods became provider-absent, both leases received
+provider closure confirmation, no manual cleanup was required, and final RunPod
+inventory was empty.
 
 Exit:
 
