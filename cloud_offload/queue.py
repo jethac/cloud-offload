@@ -871,6 +871,32 @@ class JobQueue:
             ).fetchall()
             return [self._row_to_job(row) for row in rows]
 
+    def list_recent(self, *, limit: int = 50, active_only: bool = False) -> list[Job]:
+        """Return active jobs first, then the newest terminal jobs."""
+        bounded_limit = max(1, min(200, int(limit)))
+        terminal = (
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.DEAD_LETTER.value,
+        )
+        where = "WHERE status NOT IN (?, ?, ?)" if active_only else ""
+        values: list[Any] = list(terminal) if active_only else []
+        values.append(bounded_limit)
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                {where}
+                ORDER BY
+                    CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END,
+                    updated_at DESC,
+                    created_at DESC
+                LIMIT ?
+                """,
+                [*terminal, *values],
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
+
     def count_by_status(self, *statuses: JobStatus, provider: str | None = None) -> int:
         """Count jobs with given status(es)."""
         placeholders = ",".join("?" * len(statuses))
@@ -1078,6 +1104,38 @@ class JobQueue:
                 (job_id, max(0, int(after)), bounded_limit),
             ).fetchall()
         return [_job_event_envelope(row) for row in rows]
+
+    def list_recent_events(
+        self, job_id: str, *, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        """Read the newest bounded event window in chronological order."""
+        bounded_limit = max(1, min(1000, int(limit)))
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT sequence, job_id, event_json, created_at,
+                       producer_id, producer_sequence, occurred_at,
+                       observed_at, event_type, phase
+                FROM job_events
+                WHERE job_id = ?
+                ORDER BY sequence DESC
+                LIMIT ?
+                """,
+                (job_id, bounded_limit),
+            ).fetchall()
+        return [_job_event_envelope(row) for row in reversed(rows)]
+
+    def event_bounds(self, job_id: str) -> tuple[int, int]:
+        """Return total event count and the latest resumable cursor."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(MAX(sequence), 0)
+                FROM job_events WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
 
     def event_snapshot(self, job_id: str) -> dict[str, Any] | None:
         """Project current replay state without making the client scan history."""

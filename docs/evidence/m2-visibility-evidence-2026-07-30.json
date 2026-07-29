@@ -1,0 +1,87 @@
+{
+  "schema": "cloud-offload.milestone-evidence.v1",
+  "milestone": "M2",
+  "accepted": true,
+  "captured_at": "2026-07-30T02:02:00+09:00",
+  "scope": [
+    "safe reloadable job projection",
+    "persistent ComfyUI Cloud Jobs panel",
+    "measured transfer progress when size and staging growth are observable",
+    "honest ETA, spend, cancellation, termination, and billing language"
+  ],
+  "automated_verification": {
+    "backend": {
+      "passed": 579,
+      "failed": 0,
+      "duration_seconds": 26.72
+    },
+    "extension_python": {
+      "passed": 82,
+      "skipped": 3,
+      "failed": 0,
+      "duration_seconds": 3.61
+    },
+    "extension_javascript": {
+      "passed": 67,
+      "failed": 0,
+      "duration_seconds": 0.321
+    },
+    "syntax_checks": [
+      "cloudJobs.js",
+      "cloudJobsModel.js"
+    ]
+  },
+  "live_same_origin_replay": {
+    "schema": "cloud-offload.job-visibility.v1",
+    "recent_jobs_returned": 20,
+    "active_jobs": 0,
+    "response_milliseconds": 350.7,
+    "target_milliseconds": 2000,
+    "reload_reconstructed_panel": true,
+    "action_bar_control_present": true,
+    "fixed_control_present": true,
+    "panel_open_state_survived_reload": true,
+    "opened_job_details_survived_one_idle_refresh": true,
+    "details_refresh_observation_seconds": 6,
+    "cloud_jobs_console_errors": 0,
+    "paid_mutation_performed": false
+  },
+  "visible_field_check": {
+    "stage_and_operation": true,
+    "elapsed_time": true,
+    "monotonic_progress_and_basis": true,
+    "bytes_and_total_bytes": true,
+    "smoothed_throughput": true,
+    "eta_range_and_confidence": true,
+    "provider_gpu_region_pod_and_volume": true,
+    "hourly_rate_estimated_spend_and_expected_total": true,
+    "cache_hits_misses_restored_bytes_and_saved_items": true,
+    "preflight_confidence_and_history_count": true,
+    "cancellation_state": true,
+    "termination_and_billing_state": true,
+    "recent_safe_event_history_and_cursor": true
+  },
+  "privacy": {
+    "projection_is_allow_listed": true,
+    "raw_workflow_returned": false,
+    "raw_prompt_returned": false,
+    "raw_request_or_params_returned": false,
+    "local_path_or_signed_url_returned": false,
+    "raw_event_or_provider_payload_returned": false,
+    "raw_error_text_returned": false,
+    "canonical_event_timestamps_only": true
+  },
+  "honesty_checks": {
+    "terminal_success_is_100_percent": true,
+    "active_stage_progress_changes_without_new_events": true,
+    "null_spend_is_not_rendered_as_zero": true,
+    "legacy_history_can_estimate_from_first_pod_observation": true,
+    "billing_stopped_requires_provider_receipt": true,
+    "unknown_gpu_region_eta_or_spend_remains_unknown": true
+  },
+  "deferred_to_m3": [
+    "authoritative persisted job lease",
+    "provider-confirmed termination receipt production",
+    "billing reconciliation and orphan recovery"
+  ]
+}

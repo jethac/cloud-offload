@@ -461,6 +461,7 @@ class Worker:
         operation,
         *,
         interval_seconds: float = 5.0,
+        progress_reader=None,
         **fields,
     ):
         """Run blocking setup work while keeping the job visibly alive.
@@ -483,18 +484,62 @@ class Worker:
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         while thread.is_alive():
-            thread.join(timeout=max(1.0, float(interval_seconds)))
+            thread.join(timeout=max(0.01, float(interval_seconds)))
             if thread.is_alive():
+                progress = {}
+                if callable(progress_reader):
+                    try:
+                        progress["bytes_completed"] = max(0, int(progress_reader()))
+                    except (OSError, TypeError, ValueError):
+                        pass
                 self._cache_event(
                     job,
                     event_type,
                     elapsed_seconds=round(time.monotonic() - started, 1),
                     indeterminate=True,
                     **fields,
+                    **progress,
                 )
         if "error" in outcome:
             raise outcome["error"]  # type: ignore[misc]
+        completed = None
+        if callable(progress_reader):
+            try:
+                completed = max(0, int(progress_reader()))
+            except (OSError, TypeError, ValueError):
+                completed = None
+        try:
+            declared_total = int(fields.get("bytes_total") or 0)
+        except (TypeError, ValueError):
+            declared_total = 0
+        if completed is None and declared_total > 0:
+            completed = declared_total
+        self._cache_event(
+            job,
+            event_type,
+            elapsed_seconds=round(time.monotonic() - started, 1),
+            indeterminate=False,
+            complete=True,
+            **fields,
+            **({"bytes_completed": completed} if completed is not None else {}),
+        )
         return outcome.get("value")
+
+    @staticmethod
+    def _observed_bytes(path: Path) -> int:
+        """Return bytes that currently exist below one download staging path."""
+        try:
+            if path.is_file():
+                return int(path.stat().st_size)
+            if not path.exists():
+                return 0
+            return sum(
+                int(item.stat().st_size)
+                for item in path.rglob("*")
+                if item.is_file()
+            )
+        except OSError:
+            return 0
 
     def _stage_custom_nodes(self, job: Job | None) -> None:
         """Install the profile's declared node packs, once per runner.
@@ -2089,11 +2134,33 @@ class Worker:
         """Fetch one declared asset from the origin the coordinator resolved."""
         source = asset.get("source") or {}
         label = f"{asset.get('category')}/{asset.get('filename')}"
+        total_bytes = int(asset.get("size") or 0)
+
+        def observed(operation, observed_path: Path):
+            if job is None:
+                return operation()
+            baseline = self._observed_bytes(observed_path)
+            return self._run_with_feedback(
+                job,
+                "weight_download_progress",
+                operation,
+                progress_reader=lambda: max(
+                    0, self._observed_bytes(observed_path) - baseline
+                ),
+                file=str(asset.get("filename") or ""),
+                bytes_total=total_bytes,
+            )
+
         try:
             if source.get("artifact_id"):
-                self._download_partition_artifact(str(source["artifact_id"]), target)
+                observed(
+                    lambda: self._download_partition_artifact(
+                        str(source["artifact_id"]), target
+                    ),
+                    target,
+                )
             elif source.get("url"):
-                self._download_asset_url(str(source["url"]), target)
+                observed(lambda: self._download_asset_url(str(source["url"]), target), target)
             elif source.get("repo_id"):
                 import huggingface_hub
 
@@ -2115,18 +2182,7 @@ class Worker:
                             token=token,
                         )
 
-                    fetched = (
-                        self._run_with_feedback(
-                            job,
-                            "weight_download_progress",
-                            download,
-                            repo_id=str(source["repo_id"]),
-                            file=str(asset.get("filename") or ""),
-                            bytes_total=int(asset.get("size") or 0),
-                        )
-                        if job is not None
-                        else download()
-                    )
+                    fetched = observed(download, staging)
                     shutil.move(str(fetched), str(target))
                 finally:
                     shutil.rmtree(staging, ignore_errors=True)
