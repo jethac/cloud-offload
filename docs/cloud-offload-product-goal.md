@@ -640,6 +640,8 @@ This ledger records merged implementation evidence across both repositories.
 | [#25](https://github.com/jethac/cloud-offload/pull/25) | Adds the read-only `cloud-offload.preflight.v1` report and endpoint, deterministic blockers, safe volatile offer reads, storage-local candidate ranking, cost/time ranges, quote expiry, and explicit unknowns. | 541 tests passed. Provider-mutation guard tests pass; submission binding is the next M1 slice. |
 | [#26](https://github.com/jethac/cloud-offload/pull/26) | Persists the safe preflight report, binds each paid cache miss to one confirmed candidate, revalidates provider facts before queue creation and launch, prevents silent offer or storage substitution, constrains prepared workers to the exact volume, and makes benchmarks use preflight. | 552 tests passed. Failed revalidation creates no job or provider resource; confirmation policy and UI remain. |
 | [#27](https://github.com/jethac/cloud-offload/pull/27) | Adds durable rental-confirmation, countdown, recommendation, hard cost, region, and material-change settings; enforces Start now or server-timed countdown completion; and makes material changes restart mandatory confirmation even under `never`. | 558 tests passed. Early or missing confirmation and disjoint region policy create no job or provider resource. |
+| [#28](https://github.com/jethac/cloud-offload/pull/28) | Records the merged ComfyUI confirmation delivery and updates the active M1 handoff. | Merged as `5d71637`; extension PR #5 is part of the canonical delivery record. |
+| [#29](https://github.com/jethac/cloud-offload/pull/29) | Makes free preflight accept the stable worker credential that the dispatcher stores beside the shared queue database. | Merged as `2ab4db4`; 76 focused tests and 559 full tests passed. The failed preflight created no job or provider resource. |
 
 ### ComfyUI extension repository
 
@@ -650,6 +652,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#3](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/3) | Prepared-storage opt-in and policy controls. | Merged as `21e66ca`; broader settings/visibility remain. |
 | [#4](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/4) | Action-bar discovery, write-only RunPod S3 credential setup, and monotonic startup/cache feedback in the partition title. | Merged as `40c3cf6`; 74 Python tests passed, 3 skipped, and 5 focused JavaScript tests passed. |
 | [#5](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/5) | Runs free preflight after final boundary upload; presents one-time GPU rental confirmation with cost, timing, prepared coverage, rationale, uncertainty, countdown, alternate GPU choice, cancellation, and persistent settings; submits only the exact confirmed plan. | Merged as `ff872b4`; 81 Python tests passed, 3 skipped, 60 JavaScript tests passed, syntax and compile checks passed, and the settings, confirmation, details, and GPU-choice states passed a 1440×1000 visual check. Cancellation during the countdown cannot retry paid submission. |
+| [#6](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/6) | Binds ComfyUI `api.fetchApi` before the one-time rental decision POST. | Merged as `5c17b31`; 81 Python tests passed, 3 skipped, and 61 JavaScript tests passed. A failed unbound POST created no paid job. |
 
 ## Validation record
 
@@ -666,6 +669,24 @@ not blanket production-readiness claims:
   seconds.
 - The validated worker artifact for that path is
   `ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:ee3c8b1e4288509c5dd6e0b9d7640933d33be86a459826c23179265b82e2b705`.
+- Controlled M1 inpainting job `596b0191-d227-4486-b055-f5bb8c8dfa0e`
+  used the merged coordinator, dispatcher, and ComfyUI extension. Free preflight
+  recommended a RunPod A100 SXM in `US-MD-1` at $1.49/hour, showed an estimated
+  total of $0.11-$0.36, reported 100% prepared coverage and zero missing bytes,
+  and required the default ten-second confirmation. The exact confirmed plan
+  launched Pod `oxdqu7hn70119x`; worker `worker-c4536488` claimed it, verified
+  the prepared manifest and cache hits, completed at 100% with two output nodes
+  and two output-artifact groups, and returned the visible ComfyUI image
+  `ComfyUI_temp_sobpc_00001_.png`. The ComfyUI queue returned to zero active
+  jobs and showed a 353.08-second run time.
+- That M1 run is a **partial pass**, not accepted end-to-end evidence. RunPod
+  restarted the container after the worker idle timer expired. A second worker
+  process delayed dispatcher cleanup, so the exact Pod required manual
+  termination. Provider lookup then proved the Pod absent. Backend PR #30 fixes
+  the race by starting worker idle time after job completion, giving dispatcher
+  cleanup a safety margin, and preventing a restarted runner from resetting the
+  paid resource idle clock. Automatic cleanup needs one bounded replay before
+  this production journey is accepted.
 - Replay, snapshot, support-bundle, journal-authority, concurrency, rollback,
   benchmark validation, force-execution, and credential-resolution tests pass in
   the merged backend history shown above.
@@ -938,8 +959,11 @@ Status snapshot as of 2026-07-29:
   and complete automated cleanup in production.
 - M0 is complete. M1 now has the versioned report, recommendation, paid-submit
   binding, exact launch revalidation, persistent backend policy, and the merged
-  ten-second ComfyUI confirmation surface. The first unmet work is a merged-stack
-  end-to-end run, followed by measured history and complete cost components.
+  ten-second ComfyUI confirmation surface. One merged-stack paid run proved the
+  recommendation, confirmation, exact launch, prepared restore, execution, and
+  result return. It exposed a paid cleanup race, so automatic provider closure
+  must pass a bounded replay. Measured history and complete cost components then
+  remain before M1 can close.
 
 ### Completed M0 corruption contract
 
@@ -1058,12 +1082,19 @@ Opening details or choosing another GPU pauses automatic start. A required
 confirmation with no active browser creates no job, and cancellation during the
 server countdown cannot retry paid submission.
 
-The active slice is merged-stack end-to-end validation. Build and pin the worker
-that understands the exact prepared-volume claim, restart the coordinator,
-dispatcher, and ComfyUI from merged revisions, then prove non-paid confirmation
-behavior and one controlled paid journey. Measured history and the missing
-transfer and storage cost components must then improve the initial low-confidence
-recommendation before M1 closes.
+Backend PR #29 made preflight use the same stable worker credential as the
+dispatcher. Extension PR #6 bound the ComfyUI decision POST to its API object.
+Both defects failed before job creation. With both fixes merged, controlled job
+`596b0191-d227-4486-b055-f5bb8c8dfa0e` proved recommendation, confirmation,
+exact offer launch, exact prepared-volume restore, graph execution, and result
+return. It also exposed the cleanup race recorded above.
+
+The active slice is automatic provider closure for that same merged-stack path.
+Merge backend PR #30, build and pin its worker, restart the dispatcher from the
+merged revision, and run one bounded paid replay. Accept the journey only when
+RunPod proves the exact Pod absent without manual action. Measured history and
+the missing transfer and storage cost components must then improve the initial
+low-confidence recommendation before M1 closes.
 
 ### Operational safety rules
 

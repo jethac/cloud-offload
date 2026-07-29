@@ -45,6 +45,11 @@ OFFER_COOLDOWN_SECONDS = 600
 # runtime. If the entrypoint never runs, no worker can report the failure home.
 RUNNER_REGISTRATION_TIMEOUT_SECONDS = 3600
 
+# A managed worker cannot destroy its provider resource when its process exits.
+# Some providers restart the container instead. Give the dispatcher time to
+# destroy the paid resource before the worker's local idle fail-safe can fire.
+WORKER_IDLE_GRACE_SECONDS = 60
+
 
 def _load_or_create_worker_token(config: CloudConfig) -> str:
     """Return a stable coordinator credential for workers across restarts.
@@ -132,6 +137,7 @@ class Dispatcher:
         self.instance_profiles: dict[str, str] = {}
         self.last_activity: dict[str, datetime] = {}
         self.launched_at: dict[str, datetime] = {}
+        self.runner_ready_instances: set[str] = set()
         self.runner_feedback_at: dict[str, datetime] = {}
         self.event_producer_id = f"dispatcher:{uuid.uuid4()}"
         self.event_producer_sequence = 0
@@ -519,7 +525,7 @@ class Dispatcher:
         worker_idle_seconds = (
             10 * 365 * 24 * 60 * 60
             if self.config.keep_warm
-            else self.config.idle_shutdown_seconds
+            else self.config.idle_shutdown_seconds + WORKER_IDLE_GRACE_SECONDS
         )
         env_vars = {
             "CLOUD_OFFLOAD_WORKER_MODE": "true",
@@ -1271,6 +1277,7 @@ cloud-offload worker --poll 10
                 self.instance_profiles.pop(instance_id, None)
                 self.last_activity.pop(instance_id, None)
                 self.launched_at.pop(instance_id, None)
+                self.runner_ready_instances.discard(instance_id)
                 self.runner_feedback_at.pop(instance_id, None)
             else:
                 self.active_instances[instance_id] = instance
@@ -1372,15 +1379,26 @@ cloud-offload worker --poll 10
         for instance_id, last_active in list(self.last_activity.items()):
             provider_name = self.instance_providers[instance_id]
             profile_name = self.instance_profiles[instance_id]
+            matching_workers = [
+                worker
+                for worker in workers
+                if worker.get("provider") == provider_name
+                and worker.get("runtime_profile") == profile_name
+            ]
+            if any(
+                worker.get("status") not in {"starting", "failed"}
+                for worker in matching_workers
+            ):
+                self.runner_ready_instances.add(instance_id)
             # A runner that has said it is still starting is not idle, it is
             # busy importing ComfyUI. Terminating it on the idle clock is how a
             # pod gets killed mid-boot and the whole rental paid for nothing.
+            # This protection applies only to the first boot. A provider can
+            # restart a container after its worker idle timer exits. That
+            # restart must not reset the paid resource's dispatcher idle clock.
             starting = any(
-                worker.get("provider") == provider_name
-                and worker.get("runtime_profile") == profile_name
-                and worker.get("status") == "starting"
-                for worker in workers
-            )
+                worker.get("status") == "starting" for worker in matching_workers
+            ) and instance_id not in self.runner_ready_instances
             running_jobs = sum(
                 self._job_profile_name(job, profiles) == profile_name
                 for job in self.queue.list_by_status(
@@ -1418,6 +1436,7 @@ cloud-offload worker --poll 10
         self.instance_profiles.pop(instance_id, None)
         self.last_activity.pop(instance_id, None)
         self.launched_at.pop(instance_id, None)
+        self.runner_ready_instances.discard(instance_id)
 
     def shutdown(self):
         """Terminate all workers and shut down."""

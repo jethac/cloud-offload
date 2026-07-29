@@ -365,6 +365,10 @@ class Worker:
                         except Exception as e:
                             logger.error(f"Job {job.id} failed: {e}")
                             self.queue.fail_job(job.id, error=str(e))
+                        finally:
+                            # Idle time starts when work ends, not when it is
+                            # claimed. A job can run longer than the idle limit.
+                            self.last_job_time = datetime.utcnow()
                 else:
                     logger.debug("No jobs available")
 
@@ -390,8 +394,9 @@ class Worker:
             try:
                 policy = policy_reader()
                 keep_warm = bool(policy.get("keep_warm", keep_warm))
-                idle_shutdown_seconds = int(
-                    policy.get("idle_shutdown_seconds", idle_shutdown_seconds)
+                idle_shutdown_seconds = max(
+                    idle_shutdown_seconds,
+                    int(policy.get("idle_shutdown_seconds", idle_shutdown_seconds)),
                 )
             except Exception as exc:
                 logger.warning("Could not refresh worker lifetime policy: %s", exc)
