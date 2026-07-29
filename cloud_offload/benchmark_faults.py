@@ -318,6 +318,7 @@ def _prepared_store(volume: dict[str, Any]) -> RunPodS3PreparedStore:
         volume_id=str(volume["provider_volume_id"]),
         datacenter_id=str(volume["datacenter_id"]),
         endpoint_url=endpoint,
+        prefix="cloud-offload",
     )
 
 

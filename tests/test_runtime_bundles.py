@@ -19,7 +19,7 @@ from cloud_offload.prepared_state import (
 )
 from cloud_offload.runtime_bundles import build_reproducible_bundle
 from cloud_offload.router import resolve_worker_profile
-from tests.test_prepared_storage import cache_worker, policy, signed_manifest
+from tests.test_prepared_storage import cache_worker, policy
 
 
 PACK = {
@@ -77,7 +77,11 @@ def test_worker_builds_and_restores_signed_runtime_bundles(monkeypatch, tmp_path
     worker.custom_nodes = [PACK]
     worker._pending_prepared_artifacts = []
     worker._verified_prepared_digests = set()
-    worker.queue = SimpleNamespace(append_event=lambda *args, **kwargs: None)
+    events = []
+    worker.queue = SimpleNamespace(
+        append_event=lambda job_id, event: events.append((job_id, event))
+    )
+    worker._raise_if_cancelled = lambda active_job: None
     job = SimpleNamespace(id="job-runtime")
     pack = tmp_path / "custom_nodes" / "example-pack"
     pack.mkdir(parents=True)
@@ -95,11 +99,16 @@ def test_worker_builds_and_restores_signed_runtime_bundles(monkeypatch, tmp_path
         "custom-node-bundle",
         "environment-bundle",
     }
-    manifest = signed_manifest(signer, artifacts, profile)
-    cas.publish_manifest(
-        manifest,
-        verified_digests={item["digest"] for item in artifacts},
-    )
+    worker._flush_prepared_manifest(job)
+    completed = [
+        event
+        for _, event in events
+        if event["type"] == "cache_population_completed"
+    ]
+    assert {event["kind"] for event in completed} == {
+        "custom-node-bundle",
+        "environment-bundle",
+    }
 
     restored_root = tmp_path / "restored-environment"
     monkeypatch.setenv("CLOUD_OFFLOAD_ENV_ROOT", str(restored_root))
