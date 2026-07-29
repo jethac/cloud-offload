@@ -50,7 +50,9 @@ PARTITION_JOB_SCHEMA = "comfy.partition.job.v1"
 # something the coordinator gets to trust the size of.
 MAX_WORKER_DETAIL_CHARS = 8000
 
-MAX_UPLOAD_BYTES = int(os.environ.get("CLOUD_OFFLOAD_MAX_UPLOAD_BYTES", str(32 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(
+    os.environ.get("CLOUD_OFFLOAD_MAX_UPLOAD_BYTES", str(32 * 1024 * 1024))
+)
 MAX_PARTITION_ARTIFACT_BYTES = int(
     os.environ.get(
         "CLOUD_OFFLOAD_MAX_PARTITION_ARTIFACT_BYTES", str(2 * 1024 * 1024 * 1024)
@@ -67,6 +69,7 @@ _HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
 
 
 # === Request/Response Models ===
+
 
 class ErrorDetail(BaseModel):
     code: str
@@ -138,7 +141,9 @@ async def handle_http_exception(request: Request, exc: HTTPException):
 
 
 @app.exception_handler(StarletteHTTPException)
-async def handle_starlette_http_exception(request: Request, exc: StarletteHTTPException):
+async def handle_starlette_http_exception(
+    request: Request, exc: StarletteHTTPException
+):
     global last_error
     detail = exc.detail
     message = detail if isinstance(detail, str) else json.dumps(detail)
@@ -211,6 +216,7 @@ async def add_request_id(request: Request, call_next):
 
 # === Helpers ===
 
+
 def _config(*, resolve_secrets: bool = True):
     from cloud_offload.config import CloudConfig
 
@@ -259,7 +265,9 @@ def _worker_token(request: Request) -> str | None:
 
 def _partition_artifact_key(digest: str) -> str:
     normalized = str(digest).lower()
-    if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+    if len(normalized) != 64 or any(
+        char not in "0123456789abcdef" for char in normalized
+    ):
         raise HTTPException(status_code=400, detail="Invalid partition artifact digest")
     return f"partition-artifacts/{normalized[:2]}/{normalized}.part"
 
@@ -285,7 +293,11 @@ def _validate_manifest_proposal(
     if not isinstance(proposal.get("artifacts"), list):
         raise ValueError("Prepared manifest artifacts must be a list")
     allowed_top_level = {
-        "schema", "profile_fingerprint", "created_at", "producer", "artifacts"
+        "schema",
+        "profile_fingerprint",
+        "created_at",
+        "producer",
+        "artifacts",
     }
     unknown_claims = set(proposal) - allowed_top_level
     if unknown_claims:
@@ -355,7 +367,9 @@ def _validate_manifest_proposal(
             if str(artifact.get("digest") or "") not in declared_digests:
                 raise ValueError("Prepared model is not declared by the authorized job")
             artifact_policy["private"] = bool(
-                declared_policies.get(str(artifact.get("digest") or ""), {}).get("private")
+                declared_policies.get(str(artifact.get("digest") or ""), {}).get(
+                    "private"
+                )
             )
         elif kind == "profile-weight":
             source = artifact.get("source") or {}
@@ -386,7 +400,9 @@ def _validate_manifest_proposal(
                 )
             ]
             if not matching_weights:
-                raise ValueError("Prepared weight is not pinned by the authorized profile")
+                raise ValueError(
+                    "Prepared weight is not pinned by the authorized profile"
+                )
             if len(identity[1]) != 40 or any(
                 character not in "0123456789abcdefABCDEF" for character in identity[1]
             ):
@@ -417,8 +433,7 @@ def _validate_manifest_proposal(
         }
     image = str(profile.get("image") or "")
     image_digest = (
-        "sha256:" + image.rsplit("@sha256:", 1)[1]
-        if "@sha256:" in image else ""
+        "sha256:" + image.rsplit("@sha256:", 1)[1] if "@sha256:" in image else ""
     )
     from cloud_offload.prepared_state import utc_now
 
@@ -430,9 +445,7 @@ def _validate_manifest_proposal(
     proposal["cache_volume_id"] = str(volume_id)
 
 
-def _trusted_huggingface_digest(
-    repo_id: str, revision: str, filename: str
-) -> str:
+def _trusted_huggingface_digest(repo_id: str, revision: str, filename: str) -> str:
     """Resolve pinned HF source bytes to a coordinator-trusted sha256 digest."""
     identity = (str(repo_id), str(revision), str(filename))
     cached = _HF_SOURCE_DIGESTS.get(identity)
@@ -494,7 +507,9 @@ async def _store_partition_artifact(
                 temporary.write(chunk)
         actual = digest.hexdigest()
         if expected_digest and actual != expected_digest.lower():
-            raise HTTPException(status_code=400, detail="Partition artifact digest mismatch")
+            raise HTTPException(
+                status_code=400, detail="Partition artifact digest mismatch"
+            )
         config = _config()
         storage = create_storage(config)
         key = _partition_artifact_key(actual)
@@ -556,7 +571,11 @@ def _node_pack_warnings(warnings: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _provider_statuses(config) -> list[dict[str, Any]]:
-    from cloud_offload.providers import connector_names, create_connector, connector_metadata
+    from cloud_offload.providers import (
+        connector_names,
+        create_connector,
+        connector_metadata,
+    )
     from cloud_offload.profiles import configured_worker_profiles
 
     profiles = configured_worker_profiles(config)
@@ -625,14 +644,25 @@ def _is_active_worker_job(job, worker_id: str) -> bool:
 
 # === Public routes ===
 
+
 @app.get("/")
 async def root():
-    return {"name": SERVICE_NAME, "version": VERSION, "api_version": API_VERSION, "status": "ok"}
+    return {
+        "name": SERVICE_NAME,
+        "version": VERSION,
+        "api_version": API_VERSION,
+        "status": "ok",
+    }
 
 
 @app.get("/api/health")
 async def health():
-    return {"name": SERVICE_NAME, "status": "ok", "version": VERSION, "api_version": API_VERSION}
+    return {
+        "name": SERVICE_NAME,
+        "status": "ok",
+        "version": VERSION,
+        "api_version": API_VERSION,
+    }
 
 
 @app.get("/api/status")
@@ -661,6 +691,14 @@ async def status():
         "providers": await asyncio.to_thread(_provider_statuses, config),
         "config": config.to_dict(),
     }
+
+
+@app.get("/api/active-workers")
+async def active_workers():
+    """Return only fresh worker heartbeats for fresh-Pod orchestration."""
+    _, queue = _queue()
+    workers = queue.list_active_workers()
+    return {"active_workers": len(workers), "workers": workers}
 
 
 @app.get("/api/config")
@@ -855,12 +893,8 @@ async def set_cache_s3_credentials(body: dict[str, Any] = Body(...)):
     previous_access = get_credential(RUNPOD_S3_ACCESS_CREDENTIAL)
     previous_secret = get_credential(RUNPOD_S3_SECRET_CREDENTIAL)
     try:
-        await asyncio.to_thread(
-            set_credential, RUNPOD_S3_ACCESS_CREDENTIAL, access_key
-        )
-        await asyncio.to_thread(
-            set_credential, RUNPOD_S3_SECRET_CREDENTIAL, secret_key
-        )
+        await asyncio.to_thread(set_credential, RUNPOD_S3_ACCESS_CREDENTIAL, access_key)
+        await asyncio.to_thread(set_credential, RUNPOD_S3_SECRET_CREDENTIAL, secret_key)
     except Exception as exc:
         # Best-effort compare-and-restore keeps a half-written pair from being
         # mistaken for usable credentials by the status surface.
@@ -903,7 +937,9 @@ async def create_or_adopt_cache_volume(body: dict[str, Any] = Body(...)):
                 "provider": "runpod",
                 "datacenter_id": region,
                 "size_gb": size_gb,
-                "published_estimated_monthly_usd": estimate_runpod_storage_monthly(size_gb),
+                "published_estimated_monthly_usd": estimate_runpod_storage_monthly(
+                    size_gb
+                ),
                 "placement_constrained": True,
                 "cold_fallback": policy.get("cold_fallback"),
                 "cache_private_assets": policy.get("cache_private_assets"),
@@ -916,10 +952,14 @@ async def create_or_adopt_cache_volume(body: dict[str, Any] = Body(...)):
     if operation == "adopt":
         provider_id = str(body.get("provider_volume_id") or "")
         if not provider_id:
-            raise HTTPException(status_code=400, detail="provider_volume_id is required")
+            raise HTTPException(
+                status_code=400, detail="provider_volume_id is required"
+            )
         volume = await asyncio.to_thread(connector.get_storage, provider_id)
         if volume is None:
-            raise HTTPException(status_code=404, detail="RunPod network volume not found")
+            raise HTTPException(
+                status_code=404, detail="RunPod network volume not found"
+            )
         expected_region = str(body.get("datacenter_id") or "")
         if expected_region and expected_region != volume.datacenter_id:
             raise HTTPException(
@@ -950,8 +990,12 @@ async def create_or_adopt_cache_volume(body: dict[str, Any] = Body(...)):
                 detail=f"RunPod network volume size must be 1-{RUNPOD_NETWORK_VOLUME_MAX_GB} GB",
             )
         budget = policy.get("max_monthly_storage_cost")
-        if budget is not None and estimate_runpod_storage_monthly(size_gb) > float(budget):
-            raise HTTPException(status_code=409, detail="Managed volume exceeds storage budget")
+        if budget is not None and estimate_runpod_storage_monthly(size_gb) > float(
+            budget
+        ):
+            raise HTTPException(
+                status_code=409, detail="Managed volume exceeds storage budget"
+            )
         volume = await asyncio.to_thread(
             connector.create_storage,
             name=str(body.get("name") or f"cloud-offload-{region.lower()}"),
@@ -1018,7 +1062,9 @@ async def delete_cache_volume(
                     volume.provider_volume_id,
                     expected_provider_volume_id=None,
                 )
-            raise HTTPException(status_code=502, detail="Provider volume deletion failed")
+            raise HTTPException(
+                status_code=502, detail="Provider volume deletion failed"
+            )
     try:
         metadata_deleted = registry.delete_metadata(volume.id)
     except Exception:
@@ -1036,7 +1082,9 @@ async def delete_cache_volume(
                 volume.provider_volume_id,
                 expected_provider_volume_id=None,
             )
-        raise HTTPException(status_code=409, detail="Cache volume metadata changed concurrently")
+        raise HTTPException(
+            status_code=409, detail="Cache volume metadata changed concurrently"
+        )
     return {
         "deleted_metadata": True,
         "deleted_provider_volume": provider_deleted,
@@ -1070,7 +1118,11 @@ async def verify_cache_volume(volume_id: str):
         index = await asyncio.to_thread(store.load_index)
         if index.get("generation") is None:
             registry.mark_volume(volume.id, "ready")
-            return {"volume_id": volume.id, "provider_verified": True, "inventory": None}
+            return {
+                "volume_id": volume.id,
+                "provider_verified": True,
+                "inventory": None,
+            }
         signer = _prepared_manifest_signer(config)
         documents = {}
         for entry in index.get("manifests") or []:
@@ -1168,7 +1220,10 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
                         and str(candidate.get("revision") or "") == identity[1]
                         and identity[2] in (candidate.get("files") or [])
                     ):
-                        profile_source = {**requested_source, "gated": candidate.get("gated")}
+                        profile_source = {
+                            **requested_source,
+                            "gated": candidate.get("gated"),
+                        }
                         break
                 if profile_source is None:
                     raise HTTPException(
@@ -1176,7 +1231,8 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
                         detail="Requested source is not pinned by the configured profile",
                     )
                 if len(identity[1]) != 40 or any(
-                    character not in "0123456789abcdefABCDEF" for character in identity[1]
+                    character not in "0123456789abcdefABCDEF"
+                    for character in identity[1]
                 ):
                     raise HTTPException(
                         status_code=409,
@@ -1206,14 +1262,18 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
                 elif resolved.get("url"):
                     import requests
 
-                    with requests.get(str(resolved["url"]), stream=True, timeout=60) as response:
+                    with requests.get(
+                        str(resolved["url"]), stream=True, timeout=60
+                    ) as response:
                         response.raise_for_status()
                         with source.open("wb") as handle:
                             for chunk in response.iter_content(1024 * 1024):
                                 if chunk:
                                     handle.write(chunk)
                 else:
-                    raise HTTPException(status_code=400, detail="Pinned source is malformed")
+                    raise HTTPException(
+                        status_code=400, detail="Pinned source is malformed"
+                    )
             else:
                 raise HTTPException(
                     status_code=404,
@@ -1230,7 +1290,9 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
             )
             cacheable = bool((registered_source or {}).get("cacheable", True))
             if not cacheable:
-                raise HTTPException(status_code=403, detail="Artifact policy forbids caching")
+                raise HTTPException(
+                    status_code=403, detail="Artifact policy forbids caching"
+                )
             if private and not config.prepared_storage.get("cache_private_assets"):
                 raise HTTPException(
                     status_code=403,
@@ -1259,15 +1321,23 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
                     "portability": "portable",
                     "requirements": {},
                     "policy": {
-                        "tenant": str(config.prepared_storage.get("tenant") or "default"),
+                        "tenant": str(
+                            config.prepared_storage.get("tenant") or "default"
+                        ),
                         "cacheable": cacheable,
                         "private": private,
                     },
-                    **({"source": {
-                        "repo_id": profile_source["repo_id"],
-                        "revision": profile_source["revision"],
-                        "filename": profile_source["filename"],
-                    }} if profile_source else {}),
+                    **(
+                        {
+                            "source": {
+                                "repo_id": profile_source["repo_id"],
+                                "revision": profile_source["revision"],
+                                "filename": profile_source["filename"],
+                            }
+                        }
+                        if profile_source
+                        else {}
+                    ),
                     "destination": {"category": category, "filename": filename},
                 }
             )
@@ -1373,7 +1443,9 @@ async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
     if not source or not target:
         raise HTTPException(status_code=404, detail="Replication volume not found")
     if not source.s3_compatible or not target.s3_compatible:
-        raise HTTPException(status_code=409, detail="Both replica volumes need RunPod S3")
+        raise HTTPException(
+            status_code=409, detail="Both replica volumes need RunPod S3"
+        )
     source_connector = _cache_connector(config, source.provider)
     target_connector = _cache_connector(config, target.provider)
     source_store = _runpod_s3_store(source, source_connector)
@@ -1382,7 +1454,8 @@ async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
     manifest_id = str(body.get("manifest_id") or "")
     entry = next(
         (
-            item for item in source_index.get("manifests") or []
+            item
+            for item in source_index.get("manifests") or []
             if item.get("manifest_id") == manifest_id
         ),
         None,
@@ -1393,19 +1466,17 @@ async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
     document = signer.verify(
         await asyncio.to_thread(source_store.read_json, entry["storage_key"])
     )
-    sizes = {
-        item["digest"]: int(item["size"]) for item in document["artifacts"]
-    }
-    plan = registry.create_replication(
-        source.id, target.id, list(sizes), sizes
-    )
+    sizes = {item["digest"]: int(item["size"]) for item in document["artifacts"]}
+    plan = registry.create_replication(source.id, target.id, list(sizes), sizes)
     try:
         with tempfile.TemporaryDirectory(prefix="cloud-offload-replica-") as directory:
             for artifact in document["artifacts"]:
                 path = Path(directory) / normalize_cache_filename(artifact["digest"])
                 await asyncio.to_thread(
                     source_store.download_verified,
-                    artifact["storage_key"], artifact["digest"], path,
+                    artifact["storage_key"],
+                    artifact["digest"],
+                    path,
                 )
                 await asyncio.to_thread(
                     target_store.upload_verified,
@@ -1421,9 +1492,7 @@ async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
         proposal["cache_volume_id"] = target.id
         replica_manifest = signer.sign(proposal)
         signer.verify(replica_manifest)
-        await asyncio.to_thread(
-            target_store.publish_manifest, replica_manifest, signer
-        )
+        await asyncio.to_thread(target_store.publish_manifest, replica_manifest, signer)
         target_index = await asyncio.to_thread(target_store.load_index)
         registry.reconcile_index(
             target.id,
@@ -1502,7 +1571,9 @@ async def set_provider_settings(provider: str, body: dict[str, Any] = Body(...))
 
     name = normalize_provider_name(provider)
     if name not in connector_names():
-        raise HTTPException(status_code=404, detail=f"Unknown cloud connector: {provider}")
+        raise HTTPException(
+            status_code=404, detail=f"Unknown cloud connector: {provider}"
+        )
     settings = body.get("settings", body)
     if not isinstance(settings, dict):
         raise HTTPException(status_code=400, detail="settings must be a JSON object")
@@ -1530,7 +1601,9 @@ async def test_provider(provider: str):
 
     name = normalize_provider_name(provider)
     if name not in connector_names():
-        raise HTTPException(status_code=404, detail=f"Unknown cloud connector: {provider}")
+        raise HTTPException(
+            status_code=404, detail=f"Unknown cloud connector: {provider}"
+        )
     config = _config()
     if not config.api_key_for(name):
         return {"provider": name, "ok": False, "error": "No credentials configured"}
@@ -1564,6 +1637,7 @@ async def test_provider(provider: str):
 # same canonicalization the credentials/settings/test routes use, which folds the
 # ``vast`` alias) and then ``spec_file_path``, which refuses anything that is not
 # a bare file stem.
+
 
 def _spec_body(body: dict[str, Any]) -> dict[str, Any]:
     """Accept either a bare spec or ``{"spec": {...}}`` as a request body."""
@@ -1780,7 +1854,10 @@ async def delete_provider_spec(name: str):
     """Delete a user provider spec. Built-in specs are not deletable."""
     from cloud_offload.config import normalize_provider_name
     from cloud_offload.providers import connector_metadata
-    from cloud_offload.providers.declarative import builtin_provider_spec, spec_file_path
+    from cloud_offload.providers.declarative import (
+        builtin_provider_spec,
+        spec_file_path,
+    )
 
     normalized = normalize_provider_name(name)
     try:
@@ -1873,14 +1950,18 @@ async def cancel_job(job_id: str):
     if not current:
         raise HTTPException(status_code=404, detail="Job not found")
     if current.status == JobStatus.COMPLETED:
-        raise HTTPException(status_code=409, detail="Completed jobs cannot be cancelled")
+        raise HTTPException(
+            status_code=409, detail="Completed jobs cannot be cancelled"
+        )
     if current.status in {JobStatus.FAILED, JobStatus.DEAD_LETTER}:
         return current.to_dict()
     queue.append_event(
         job_id,
         {
             "type": "cancellation_requested",
-            "partition_id": (current.request.get("partition") or {}).get("partition_id"),
+            "partition_id": (current.request.get("partition") or {}).get(
+                "partition_id"
+            ),
         },
     )
     job = queue.update_status(job_id, JobStatus.FAILED, error="Cancelled")
@@ -1961,7 +2042,10 @@ async def submit_partition(request: PartitionSubmitRequest):
 
     if request.partition.get("schema") != PARTITION_JOB_SCHEMA:
         raise HTTPException(status_code=400, detail="Unsupported partition job schema")
-    if not isinstance(request.partition.get("workflow"), dict) or not request.partition["workflow"]:
+    if (
+        not isinstance(request.partition.get("workflow"), dict)
+        or not request.partition["workflow"]
+    ):
         raise HTTPException(status_code=400, detail="Partition workflow is required")
     runner = request.partition.get("runner") or {}
     profile_name = str(runner.get("profile") or "comfyui").strip()[:100]
@@ -1970,7 +2054,9 @@ async def submit_partition(request: PartitionSubmitRequest):
     try:
         min_gpu_ram_gb = max(1, min(256, int(runner.get("min_gpu_ram_gb") or 16)))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid partition GPU VRAM requirement")
+        raise HTTPException(
+            status_code=400, detail="Invalid partition GPU VRAM requirement"
+        )
     gpu_type = str(runner.get("gpu_type") or "any").strip()[:100] or "any"
     # The compiler stamps residency from its taint analysis; refusing an
     # on-prem job here when only cloud backends exist is the server-side
@@ -1992,9 +2078,13 @@ async def submit_partition(request: PartitionSubmitRequest):
     storage = create_storage(config)
     for boundary_key, artifact_id in request.input_artifacts.items():
         if not boundary_key.startswith("input_"):
-            raise HTTPException(status_code=400, detail=f"Invalid input boundary key: {boundary_key}")
+            raise HTTPException(
+                status_code=400, detail=f"Invalid input boundary key: {boundary_key}"
+            )
         if not storage.exists(_partition_artifact_key(artifact_id)):
-            raise HTTPException(status_code=404, detail=f"Input artifact not found: {artifact_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Input artifact not found: {artifact_id}"
+            )
     # Declared assets and node packs resolve before routing, let alone
     # provisioning: a model file nobody can supply, or a node type that will not
     # exist on the runner, must cost a 409 rather than a rented GPU that fails on
@@ -2062,12 +2152,16 @@ async def submit_partition(request: PartitionSubmitRequest):
         "runner_image": (route.profile or {}).get("image"),
     }
     cache_key = hashlib.sha256(
-        json.dumps(cache_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(cache_identity, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
     ).hexdigest()
     cached = queue.get_partition_cache(cache_key)
     if cached:
         output_ids = (cached.get("output_artifacts") or {}).values()
-        if all(storage.exists(_partition_artifact_key(str(item))) for item in output_ids):
+        if all(
+            storage.exists(_partition_artifact_key(str(item))) for item in output_ids
+        ):
             job = queue.create(
                 model="comfyui-partition-v1",
                 input_path="artifacts://comfyui-partition-cache",
@@ -2145,7 +2239,9 @@ async def submit_partition(request: PartitionSubmitRequest):
 
 
 @app.post("/api/artifacts")
-async def upload_artifact(file: UploadFile = File(...), sha256: str | None = Form(None)):
+async def upload_artifact(
+    file: UploadFile = File(...), sha256: str | None = Form(None)
+):
     """Upload a content-addressed .part boundary bundle from local ComfyUI."""
     return await _store_partition_artifact(file, sha256)
 
@@ -2157,6 +2253,7 @@ async def download_artifact(artifact_id: str):
 
 
 # === Worker channel (separate Bearer <worker_token>, exempt from global auth) ===
+
 
 @app.post("/api/workers/claim")
 async def worker_claim(request: Request, payload: dict[str, Any] = Body(...)):
@@ -2209,7 +2306,9 @@ async def worker_status(request: Request, payload: dict[str, Any] = Body(...)):
     worker_id = str(payload.get("worker_id") or "").strip()
     provider = str(payload.get("provider") or "").strip()
     if not worker_id or not provider:
-        raise HTTPException(status_code=400, detail="worker_id and provider are required")
+        raise HTTPException(
+            status_code=400, detail="worker_id and provider are required"
+        )
     status = str(payload.get("status") or "active")
     if status not in WORKER_STATUSES:
         raise HTTPException(
@@ -2335,9 +2434,13 @@ async def worker_announce_prepared_manifest(
             detail="Prepared manifest announcement is not bound to this worker's active job",
         )
     if str(job.params.get("cache_volume_id") or "") != volume_id:
-        raise HTTPException(status_code=403, detail="Announcement volume is outside launch plan")
+        raise HTTPException(
+            status_code=403, detail="Announcement volume is outside launch plan"
+        )
     if not generation or "/" in generation or "\\" in generation:
-        raise HTTPException(status_code=400, detail="Announcement generation is invalid")
+        raise HTTPException(
+            status_code=400, detail="Announcement generation is invalid"
+        )
     if not isinstance(manifest, dict):
         raise HTTPException(status_code=400, detail="manifest must be an object")
     try:
@@ -2372,13 +2475,17 @@ async def worker_record_cache_observation(
     job = queue.get(str(payload.get("job_id") or ""))
     worker_id = str(payload.get("worker_id") or "")
     if not _is_active_worker_job(job, worker_id):
-        raise HTTPException(status_code=403, detail="Observation is not bound to this worker job")
+        raise HTTPException(
+            status_code=403, detail="Observation is not bound to this worker job"
+        )
     observation = payload.get("observation")
     if not isinstance(observation, dict):
         raise HTTPException(status_code=400, detail="observation must be an object")
     allowed_volume = str(job.params.get("cache_volume_id") or "")
     if str(observation.get("volume_id") or "") != allowed_volume:
-        raise HTTPException(status_code=403, detail="Observation volume is outside launch plan")
+        raise HTTPException(
+            status_code=403, detail="Observation volume is outside launch plan"
+        )
     try:
         observation_id = _cache_registry(config).record_observation(observation)
     except (ValueError, TypeError) as exc:
@@ -2417,13 +2524,17 @@ async def worker_running(job_id: str, request: Request):
 
 
 @app.post("/api/workers/jobs/{job_id}/progress")
-async def worker_progress(job_id: str, request: Request, payload: dict[str, Any] = Body(...)):
+async def worker_progress(
+    job_id: str, request: Request, payload: dict[str, Any] = Body(...)
+):
     queue, job = _authorize_worker_job(request, job_id)
     return queue.set_progress(job.id, int(payload.get("progress", 0))).to_dict()
 
 
 @app.post("/api/workers/jobs/{job_id}/events")
-async def worker_event(job_id: str, request: Request, payload: dict[str, Any] = Body(...)):
+async def worker_event(
+    job_id: str, request: Request, payload: dict[str, Any] = Body(...)
+):
     """Accept an authenticated incremental event from a remote runner."""
     from cloud_offload.queue import JobStatus
 
@@ -2458,7 +2569,9 @@ async def worker_event(job_id: str, request: Request, payload: dict[str, Any] = 
 
 
 @app.post("/api/workers/jobs/{job_id}/complete")
-async def worker_complete(job_id: str, request: Request, payload: dict[str, Any] = Body(...)):
+async def worker_complete(
+    job_id: str, request: Request, payload: dict[str, Any] = Body(...)
+):
     queue, job = _authorize_worker_job(request, job_id)
     result = payload.get("result")
     if not isinstance(result, dict):
@@ -2467,12 +2580,15 @@ async def worker_complete(job_id: str, request: Request, payload: dict[str, Any]
 
 
 @app.post("/api/workers/jobs/{job_id}/fail")
-async def worker_fail(job_id: str, request: Request, payload: dict[str, Any] = Body(...)):
+async def worker_fail(
+    job_id: str, request: Request, payload: dict[str, Any] = Body(...)
+):
     queue, job = _authorize_worker_job(request, job_id)
     return queue.fail_job(job.id, str(payload.get("error", "Worker failed"))).to_dict()
 
 
 # === Main ===
+
 
 def _resolve_tls(
     tls_cert: str | None, tls_key: str | None
@@ -2546,8 +2662,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Cloud Offload coordinator")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, help="Port to bind. Omit or pass 0 to auto-select.")
-    parser.add_argument("--allow-lan", action="store_true", help="Allow binding to a non-localhost address")
+    parser.add_argument(
+        "--port", type=int, help="Port to bind. Omit or pass 0 to auto-select."
+    )
+    parser.add_argument(
+        "--allow-lan",
+        action="store_true",
+        help="Allow binding to a non-localhost address",
+    )
     parser.add_argument(
         "--require-auth",
         action="store_true",
@@ -2555,6 +2677,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     try:
-        serve(args.host, args.port, allow_lan=args.allow_lan, require_auth=args.require_auth)
+        serve(
+            args.host,
+            args.port,
+            allow_lan=args.allow_lan,
+            require_auth=args.require_auth,
+        )
     except ServiceConfigError as exc:
         raise SystemExit(str(exc)) from exc

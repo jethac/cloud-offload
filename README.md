@@ -103,6 +103,7 @@ cloud-offload worker        # run a worker (normally the runner image's entrypoi
 cloud-offload runner-boot   # register and stage node packs, before ComfyUI starts
 cloud-offload runner-ready  # wait for ComfyUI, or report home why it never came up
 cloud-offload queue status  # inspect the local job queue
+cloud-offload benchmark validate --plan benchmark.json
 ```
 
 ## Provider setup
@@ -548,6 +549,13 @@ Every error uses the stable envelope `{"error":{"code","message","details"}}`.
 ```bash
 python -m pytest
 ```
+
+Production performance and failure rehearsal use the spend-capped benchmark
+harness described in **[Production benchmark and scorecard](docs/production-benchmark.md)**.
+It submits the ordinary coordinator API, meters the journal's quoted GPU rate,
+requires explicit spend confirmation, terminates exact attributable Pods after
+every scenario, and fails its scorecard if the provider inventory still contains
+an orphan.
 
 ## Roadmap
 

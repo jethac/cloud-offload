@@ -499,7 +499,7 @@ cold fallback.
 
 - Define and persist `JobEventV2`.
 - Add replay, snapshot, and support-bundle APIs.
-- Build spend-capped benchmark automation.
+- Build [spend-capped benchmark automation](production-benchmark.md).
 - Run alternating fresh-Pod cold/hot jobs.
 - Inject cancellation, provider, storage, corruption, and restart failures.
 - Record startup, preparation, execution, closure, and cost distributions.
