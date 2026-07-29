@@ -165,6 +165,15 @@ class BenchmarkScenario:
         request = value.get("request")
         if not isinstance(request, dict):
             raise ValueError(f"scenarios[{index}].request must be an object")
+        if (
+            endpoint == "/api/partitions"
+            and bool(value.get("fresh_instance", True))
+            and request.get("force_execution") is not True
+        ):
+            raise ValueError(
+                f"scenarios[{index}] requires request.force_execution=true "
+                "to prove a fresh-Pod run"
+            )
         try:
             _canonical_digest(request)
         except (TypeError, ValueError) as exc:

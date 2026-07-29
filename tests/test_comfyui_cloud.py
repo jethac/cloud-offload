@@ -292,6 +292,15 @@ def test_partition_artifact_and_job_endpoints(monkeypatch, tmp_path):
     assert cached_job.status.value == "completed"
     assert cached_job.result == cached_result
 
+    forced = client.post(
+        "/api/partitions", json={**partition_request, "force_execution": True}
+    )
+    assert forced.status_code == 202
+    assert forced.json()["cache_bypassed"] is True
+    forced_job = queue.get(forced.json()["job_id"])
+    assert forced_job.status == JobStatus.QUEUED
+    assert forced_job.result is None
+
     event_job = queue.create(
         "comfyui-partition-v1",
         "inline://event-test",

@@ -59,7 +59,10 @@ A plan uses `cloud-offload.benchmark-plan.v1`:
       "name": "fresh-pod-cold-1",
       "cache_state": "cold",
       "endpoint": "/api/partitions",
-      "request": { "partition": { "...": "ordinary request body" } },
+      "request": {
+        "partition": { "...": "ordinary request body" },
+        "force_execution": true
+      },
       "timeout_seconds": 900,
       "expected_statuses": ["completed"],
       "fresh_instance": true
@@ -68,7 +71,10 @@ A plan uses `cloud-offload.benchmark-plan.v1`:
       "name": "fresh-pod-hot-1",
       "cache_state": "hot",
       "endpoint": "/api/partitions",
-      "request": { "partition": { "...": "same manifest and inputs" } },
+      "request": {
+        "partition": { "...": "same manifest and inputs" },
+        "force_execution": true
+      },
       "timeout_seconds": 600,
       "expected_statuses": ["completed"],
       "fresh_instance": true
@@ -82,6 +88,11 @@ until the coordinator reports no active heartbeat for the selected providers;
 this prevents a recently terminated Pod's stale worker record from suppressing
 the next rental. The harness verifies that a fresh provider instance actually
 appeared, so a result-cache hit cannot masquerade as a fresh-Pod hot restore.
+Fresh partition scenarios are rejected at plan validation unless their ordinary
+submission request explicitly sets `force_execution: true`; the coordinator then
+bypasses only the completed-result cache while leaving prepared-state caching in
+place. This flag exists for measurement and intentional recomputation, not as a
+general performance setting.
 
 The request body remains local in the plan. Validation and scorecards include
 only its canonical SHA-256 digest, never the workflow, prompt, or input values.
