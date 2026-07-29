@@ -633,7 +633,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#19](https://github.com/jethac/cloud-offload/pull/19) | Resolves the requested worker capability to the normalized configured launch profile before computing the corruption canary fingerprint and records the bounded failed exact-ID replay. | Merged as `3e43ff5`; 530 tests passed. The next replay proved exact selection and direct loading, then exposed first-write object caching. |
 | [#20](https://github.com/jethac/cloud-offload/pull/20) | Writes corrupt bytes as the first and only value of the synthetic S3 key, keeps valid bytes only in coordinator fallback storage, and records the exact-selection replay. | Merged as `b1e6509`; 530 tests passed. Its bounded replay proved that a deterministic canary still reused the same digest and mounted object identity across campaigns. |
 | [#21](https://github.com/jethac/cloud-offload/pull/21) | Gives every corruption campaign a safe random nonce and uses it to create a new payload, digest, object key, file name, and state path across all hook stages. It also records the deterministic-identity replay. | Merged as `a33fd16`; 531 tests passed. Its replay proved unique identity and exact placement, but the mounted view could not read the new manifest and automated cleanup missed one fallback-created registry projection. |
-| [#22](https://github.com/jethac/cloud-offload/pull/22) | Persists the exact placement manifest on the assigned job, adds an active-job and volume-bound signed manifest fetch for stale mounted views, keeps exact placement authoritative in the worker, and removes fallback-created synthetic manifests during cleanup. It also records the unique-identity replay. | 533 tests pass; merge, a pinned worker image, and a bounded production replay remain the evidence gate. |
+| [#22](https://github.com/jethac/cloud-offload/pull/22) | Persists the exact placement manifest on the assigned job, adds an active-job and volume-bound signed manifest fetch for stale mounted views, keeps exact placement authoritative in the worker, and removes fallback-created synthetic manifests during cleanup. It also records the unique-identity replay. | Merged as `3a60f7e`; 533 tests passed. Two bounded replays proved exact fetch, quarantine, fallback, and complete cleanup, then showed that the 105-second observation window is shorter than a worst-case prepared-asset verification pass. |
 
 ### ComfyUI extension repository
 
@@ -802,6 +802,43 @@ not blanket production-readiness claims:
   synthetic manifest, artifact, invalidation, object, quarantine, fallback,
   state object, active job, worker, or provider instance. This manual repair is
   cleanup evidence, not an accepted automated canary.
+- The PR #22 worker image was pushed and pinned as
+  `ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:321f6931d08b159359ed6df15f4bac890872affff9af17252fbf3fd934320c8d`.
+  Its image label and smoke test proved merged source revision
+  `3a60f7e23da5800e2ccae8809a589f57cfdc3df3`, coordinator manifest fetch,
+  manifest authority fetch, and exact worker selection were present.
+- The first PR #22 production replay created job
+  `b2afa678-6841-475f-ba0c-6e0885d2cd0f` and exact Pod `0jpn0hsx6n4g54`.
+  The dispatcher selected and persisted exact manifest
+  `sha256:1a49ce995de9d8b79064445d1f90656377170a21570e53dc7993f1e009c6c986`.
+  The worker used that manifest for every normal artifact, emitted
+  `cache_artifact_quarantined` for unique 82-byte canary digest
+  `sha256:33d3f498b22d80f4dcac85fd092ce0e19d0142a3760d83c280a7b91e28ee89ab`,
+  populated the valid fallback, and completed cache restore. All three hooks
+  exited successfully.
+- That replay ended in `dead_letter` because the existing workload declared an
+  asset path that failed models-directory validation. This is the documented
+  explicit safe terminal behavior after quarantine, but the local plan still
+  expected only `completed`. The scorecard therefore failed after 286.953
+  seconds with a conservative $0.118767 compute upper bound. Automated cleanup
+  passed: the exact Pod, provider inventory, state, blob, manifest, registry
+  projection, invalidation, quarantine, fallback, and storage-policy checks were
+  all clean without manual repair.
+- The plan was corrected to accept only `completed` or `dead_letter`. The next
+  replay created job `99911bdb-d835-47ca-b424-3702b7d2e4a6` and exact Pod
+  `tuw2a5vj7ysmbn`. Placement and the assigned job used exact manifest
+  `sha256:522768dfd4ba55e7fba029f0ddd950710b4c0ad0c55bf1d708c8bfe573c29f71`.
+  The worker again verified that exact manifest and emitted quarantine for new
+  82-byte digest
+  `sha256:5ebabe4f3455e5decb2e8d7747634394b7b3ee5f506586fed9b81c9a5a398e4d`.
+- The second PR #22 replay failed only its observation-hook time limit. Normal
+  prepared-asset reads placed quarantine 135.756 seconds after
+  `cache_mount_ready`, but the hook allowed 105 seconds. The job reached the now
+  accepted `dead_letter` status, cleanup succeeded, no orphan or audit error was
+  reported, and every direct synthetic-state check was zero. The failed
+  scorecard took 326.718 seconds with a conservative $0.135225 compute upper
+  bound. A 240-second corruption observation window inside a 270-second hook
+  process limit now passes 534 tests on the next PR branch.
 
 The accepted cold/hot scorecard and four accepted failure canaries prove a
 larger part of M0, but M0 is not complete until the corruption canary passes and
@@ -822,6 +859,8 @@ a compact redacted evidence projection is committed.
 | Corruption, first-write attempt | **Failed safely** | Exact manifest selection and loading passed, but writing valid bytes before corrupt bytes let the mount retain the valid first value. The run stopped after the synthetic verified hit and cleanup was complete. |
 | Corruption, deterministic-campaign attempt | **Failed safely** | Corrupt-first publication worked, but each campaign reused the same digest and object key. A mounted volume view retained earlier valid bytes. The run stopped after the synthetic verified hit and cleanup was complete. |
 | Corruption, unique campaign attempt | **Failed; cleaned manually** | Unique digest and exact placement passed, but the mounted view missed the new manifest and used coordinator fallback. Automated cleanup missed its derived registry projection; exact manual cleanup removed it. |
+| Corruption, authority-fetch attempt | **Behavior passed; scorecard failed** | Exact assigned-manifest fetch, quarantine, fallback, and automated cleanup passed. The job reached documented safe `dead_letter`, but the plan expected only `completed`. |
+| Corruption, observation-window attempt | **Behavior passed; harness timed out** | Exact fetch and quarantine passed again, but six normal prepared reads delayed quarantine to 135.756 seconds after mount, beyond the 105-second hook window. Cleanup was complete. |
 | Compact redacted projection | **Required** | Accepted raw scorecards remain local under `.runlogs/`; a safe comparable projection still must be committed. |
 
 ## Current execution state and immediate next work
@@ -867,9 +906,13 @@ Status snapshot as of 2026-07-29:
   mounted object identity across campaigns. PR #21 corrected campaign identity.
   Its replay proved that a fresh mounted view can still miss a newly published
   exact manifest and that fallback publication expands the cleanup target set.
-  An authenticated exact-manifest fetch and complete derived-manifest cleanup
-  now pass 533 tests on the next PR branch. Corruption remains unaccepted until
-  that change merges, a worker image is pinned, and a bounded replay passes.
+  PR #22 added authenticated exact-manifest fetch and complete derived-manifest
+  cleanup. Its pinned worker passed those behaviors twice in production. The
+  first scorecard rejected a documented safe terminal status, and the second
+  let a 105-second hook expire 30.756 seconds before quarantine. A bounded
+  observation-window correction now passes 534 tests on its PR branch.
+  Corruption remains unaccepted until that change merges and one bounded replay
+  produces a passing scorecard and complete cleanup audit.
 - The first unmet M0 work is therefore: compute the corruption manifest from the
   actual injected requirement profile; publish and resolve it through an
   immutable manifest-by-ID path when a mounted mutable index is stale; trigger
@@ -910,7 +953,10 @@ The direct-manifest corruption fix is bounded to these contracts:
    invalidation, quarantine object, blob, and fallback that references the
    unique digest, including manifests created by valid fallback population.
 9. Corruption observation defaults to the durable `cache_mount_ready` event so
-   a finite observation window is not consumed by unrelated image startup.
+   a finite observation window is not consumed by unrelated image startup. The
+   240-second event window and 270-second process limit cover the measured
+   prepared-asset verification path while remaining below scenario and campaign
+   limits.
 10. Existing manifest/index behavior remains the normal path. The coordinator
     fetch is a narrow exact-ID recovery path, not a second source of unsigned
     truth or a general manifest query surface.

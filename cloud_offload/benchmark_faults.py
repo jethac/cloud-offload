@@ -46,6 +46,7 @@ from cloud_offload.storage import create_storage, partition_artifact_key
 
 
 FAULT_KINDS = {"storage", "corruption", "restart"}
+CORRUPTION_OBSERVE_TIMEOUT_SECONDS = 240
 
 
 def _benchmark_context(expected_kind: str) -> tuple[str, str, str]:
@@ -829,7 +830,7 @@ def observe_corruption(
         client,
         job_id,
         {"cache_artifact_quarantined"},
-        timeout_seconds=105,
+        timeout_seconds=CORRUPTION_OBSERVE_TIMEOUT_SECONDS,
     )
     store.client.put_object(
         Bucket=store.volume_id,

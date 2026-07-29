@@ -6,6 +6,7 @@ import pytest
 
 import cloud_offload.benchmark_faults as benchmark_faults
 from cloud_offload.benchmark_faults import (
+    CORRUPTION_OBSERVE_TIMEOUT_SECONDS,
     _benchmark_context,
     _corruption_profile_fingerprint,
     _process_exists,
@@ -376,6 +377,7 @@ def test_storage_fault_is_observed_without_mutating_provider_storage():
 
 
 def test_corruption_fault_uses_fresh_object_and_restores_inventory():
+    assert CORRUPTION_OBSERVE_TIMEOUT_SECONDS == 240
     client = FakeFaultClient()
     client.prepared["policy"] = "smart"
     s3 = FakeS3Client()
