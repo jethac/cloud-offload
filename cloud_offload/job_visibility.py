@@ -507,6 +507,9 @@ def _cache_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     hits: set[str] = set()
     misses: set[str] = set()
     hit_bytes: dict[str, int] = {}
+    verification_bytes: dict[str, int] = {}
+    trusted_hits: set[str] = set()
+    full_verified_hits: set[str] = set()
     populated: set[str] = set()
     for envelope in events:
         event_type = _event_type(envelope)
@@ -515,6 +518,17 @@ def _cache_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         if event_type in {"cache_artifact_hit", "partition_cache_hit"}:
             hits.add(key)
             hit_bytes[key] = max(hit_bytes.get(key, 0), int(_finite_number(event.get("bytes")) or 0))
+            verification_bytes[key] = max(
+                verification_bytes.get(key, 0),
+                int(_finite_number(event.get("verification_bytes")) or 0),
+            )
+            modes = event.get("verification_modes") or [
+                event.get("verification_mode")
+            ]
+            if "trusted_metadata_sample" in modes:
+                trusted_hits.add(key)
+            if "full_digest" in modes:
+                full_verified_hits.add(key)
         elif event_type in {"cache_artifact_miss", "cache_artifact_refused"}:
             misses.add(key)
         elif event_type == "cache_population_completed":
@@ -523,6 +537,9 @@ def _cache_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "hits": len(hits),
         "misses": len(misses),
         "hit_bytes": sum(hit_bytes.values()),
+        "verification_bytes": sum(verification_bytes.values()),
+        "trusted_hits": len(trusted_hits),
+        "full_verified_hits": len(full_verified_hits),
         "items_saved": len(populated),
         "prepared": bool(hits or populated),
     }
@@ -556,6 +573,12 @@ def _safe_event_summaries(events: list[dict[str, Any]], limit: int = 16) -> list
         elapsed = _finite_number(event.get("elapsed_seconds"))
         if elapsed is not None:
             item["elapsed_seconds"] = round(max(0.0, elapsed), 1)
+        verification_mode = str(event.get("verification_mode") or "")
+        if verification_mode in {"full_digest", "trusted_metadata_sample"}:
+            item["verification_mode"] = verification_mode
+        verification_bytes = _finite_number(event.get("verification_bytes"))
+        if verification_bytes is not None:
+            item["verification_bytes"] = int(max(0, verification_bytes))
         summaries.append(item)
     return summaries[-max(1, int(limit)) :]
 

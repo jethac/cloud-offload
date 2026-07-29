@@ -649,6 +649,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#33](https://github.com/jethac/cloud-offload/pull/33) | Adds a reloadable safe job projection with lifecycle phase, monotonic progress, transfer telemetry, ETA confidence, resource identity, estimated spend, cache results, cancellation state, billing state, and bounded event summaries. It also records the compact M2 evidence. | 579 full tests passed. A live same-origin read returned 20 jobs in 350.7 ms, and privacy tests reject raw requests, workflows, prompts, paths, URLs, and provider payloads. M2 is complete. |
 | [#34](https://github.com/jethac/cloud-offload/pull/34) | Adds durable pre-mutation provider-resource leases, worker renewal and identity binding, exact cancellation revocation, restart and uncertain-launch reconciliation, independent idempotent termination, provider closure receipts, hard runtime and dollar limits, and cancelled-cache publication guards. | 593 tests passed. The automated M3 matrix covers five cancellation phases, delayed closure, a stopped but present resource, provider loss, restart recovery, both circuit breakers, late state, and cache safety. |
 | [#35](https://github.com/jethac/cloud-offload/pull/35) | Records the accepted bounded paid RunPod worker-boot cancellation and coordinator-restart campaign, exact lease closure receipts, empty final provider inventory, and the compact redacted M3 evidence. | 594 tests passed. Both exact Pods became provider-absent, both leases received provider termination confirmation, the conservative cost upper bound was USD 0.033868, and no manual cleanup was required. M3 is complete. |
+| [#36](https://github.com/jethac/cloud-offload/pull/36) | Adds coordinator-signed prepared-cache trust receipts, exact manifest/artifact/provider-volume/runtime/generation binding, a rotating sampled hot path, full-verification fallbacks, sensitive-asset policy, and safe verification telemetry. | 599 tests passed. A 6 MiB eligible hot artifact reads one 1 MiB signed sample instead of a complete digest; tampering, metadata change, expiry, audit due state, and private policy return to full verification. Background scrub enforcement and paid M4 performance proof remain. |
 
 ### ComfyUI extension repository
 
@@ -1338,6 +1339,14 @@ Exit:
 - Skip full hot-path reads only for recently attested immutable objects.
 - Add sampled background scrubbing and scheduled complete audits.
 - Quarantine mismatches and preserve safe cold fallback.
+
+Implementation status: the signed trust-receipt and metadata/sample fast path is
+implemented. It binds the exact manifest signature, artifact, volume,
+compatibility contract, object generation, expiry, and audit policy. Private and
+sensitive artifacts stay on full verification. Invalid, changed, expired, or
+audit-due receipts also return to a complete digest read. Background sampling,
+volume degradation, and the paid 25% cold/hot performance proof remain before M4
+can close.
 
 Exit:
 

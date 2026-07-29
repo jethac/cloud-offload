@@ -7,6 +7,7 @@ import tarfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cloud_offload import config as config_module
+from cloud_offload import prepared_state as prepared_state_module
 from cloud_offload import server
 from cloud_offload.cache_registry import CacheRegistry
 from cloud_offload.cache_scheduler import (
@@ -26,11 +28,13 @@ from cloud_offload.config import CloudConfig, estimate_runpod_storage_monthly
 from cloud_offload.prepared_state import (
     CacheCorruptionError,
     CacheMountError,
+    TRUST_RECEIPT_SCHEMA,
     ManifestError,
     ManifestSigner,
     PreparedStateCAS,
     RunPodS3PreparedStore,
     artifact_compatibility,
+    artifact_runtime_compatibility_key,
     blob_key,
     bundle_key,
     build_manifest,
@@ -38,7 +42,9 @@ from cloud_offload.prepared_state import (
     custom_node_requirement_key,
     fingerprint,
     manifest_by_id_key,
+    manifest_signature_digest,
     profile_weight_requirement_key,
+    trust_receipt_key,
 )
 from cloud_offload.providers.base import (
     CloudConnector,
@@ -88,7 +94,7 @@ def portable_artifact(data: bytes, **updates):
     }
 
 
-def signed_manifest(signer, artifacts, profile=None):
+def signed_manifest(signer, artifacts, profile=None, claims=None):
     return build_manifest(
         profile_fingerprint=profile or fingerprint({"profile": "test"}),
         producer={
@@ -101,6 +107,7 @@ def signed_manifest(signer, artifacts, profile=None):
         },
         artifacts=artifacts,
         signer=signer,
+        claims=claims,
     )
 
 
@@ -207,6 +214,216 @@ def test_two_fresh_worker_roots_consume_one_verified_object(tmp_path):
         )
         destinations.append(destination)
     assert [item.read_bytes() for item in destinations] == [source.read_bytes()] * 2
+
+
+def test_signed_trust_receipt_uses_only_metadata_and_one_sample_on_hot_restore(
+    tmp_path, monkeypatch
+):
+    signer = ManifestSigner(b"t" * 32)
+    volume = PreparedStateCAS(tmp_path / "volume", signer)
+    source = tmp_path / "large.safetensors"
+    source.write_bytes(os.urandom(6 * 1024 * 1024))
+    artifact = portable_artifact(source.read_bytes())
+    volume.publish_blob(source, artifact["digest"])
+    manifest = signed_manifest(
+        signer,
+        [artifact],
+        claims={
+            "cache_volume_id": "vol-trusted",
+            "cache_provider_volume_id": "provider-vol-trusted",
+        },
+    )
+    volume.publish_manifest(manifest)
+
+    receipt_path = volume.root / trust_receipt_key(artifact["digest"])
+    receipt = signer.verify_trust_receipt(
+        json.loads(receipt_path.read_text(encoding="utf-8"))
+    )
+    assert receipt["volume_id"] == "vol-trusted"
+
+    monkeypatch.setattr(
+        prepared_state_module,
+        "sha256_file",
+        lambda _path: (_ for _ in ()).throw(AssertionError("full read used")),
+    )
+    decisions = []
+    destination = tmp_path / "worker-b" / source.name
+    volume.restore_artifact(
+        artifact,
+        destination,
+        runtime={},
+        tenant="default",
+        manifest=manifest,
+        volume_id="vol-trusted",
+        provider_volume_id="provider-vol-trusted",
+        verification_callback=decisions.append,
+    )
+
+    assert destination.is_symlink()
+    assert decisions[0]["mode"] == "trusted_metadata_sample"
+    assert 0 < decisions[0]["bytes_read"] < artifact["size"]
+
+
+def test_trust_receipt_tampering_falls_back_to_full_digest(tmp_path, monkeypatch):
+    signer = ManifestSigner(b"r" * 32)
+    volume = PreparedStateCAS(tmp_path / "volume", signer)
+    source = tmp_path / "object"
+    source.write_bytes(os.urandom(2 * 1024 * 1024))
+    artifact = portable_artifact(source.read_bytes())
+    volume.publish_blob(source, artifact["digest"])
+    manifest = signed_manifest(
+        signer,
+        [artifact],
+        claims={
+            "cache_volume_id": "vol-1",
+            "cache_provider_volume_id": "provider-vol-1",
+        },
+    )
+    volume.publish_manifest(manifest)
+    receipt_path = volume.root / trust_receipt_key(artifact["digest"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["volume_id"] = "vol-attacker"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    original = prepared_state_module.sha256_file
+    full_reads = []
+
+    def observe(path):
+        full_reads.append(Path(path))
+        return original(path)
+
+    monkeypatch.setattr(prepared_state_module, "sha256_file", observe)
+    decisions = []
+    volume.restore_artifact(
+        artifact,
+        tmp_path / "restored",
+        runtime={},
+        tenant="default",
+        manifest=manifest,
+        volume_id="vol-1",
+        provider_volume_id="provider-vol-1",
+        verification_callback=decisions.append,
+    )
+
+    assert decisions == [
+        {
+            "mode": "full_digest",
+            "bytes_read": artifact["size"],
+            "receipt_issued": True,
+        }
+    ]
+    assert full_reads
+
+
+def test_signed_sample_detects_same_generation_corruption_and_quarantine_removes_receipt(
+    tmp_path,
+):
+    signer = ManifestSigner(b"c" * 32)
+    volume = PreparedStateCAS(tmp_path / "volume", signer)
+    source = tmp_path / "object"
+    source.write_bytes(os.urandom(2 * 1024 * 1024))
+    artifact = portable_artifact(source.read_bytes())
+    published = volume.publish_blob(source, artifact["digest"])
+    manifest = signed_manifest(
+        signer,
+        [artifact],
+        claims={
+            "cache_volume_id": "vol-1",
+            "cache_provider_volume_id": "provider-vol-1",
+        },
+    )
+    volume.publish_manifest(manifest)
+    original = published.stat()
+    published.write_bytes(b"x" * artifact["size"])
+    os.utime(
+        published,
+        ns=(original.st_atime_ns, original.st_mtime_ns),
+    )
+
+    with pytest.raises(CacheCorruptionError, match="signed trust sample"):
+        volume.restore_artifact(
+            artifact,
+            tmp_path / "restored",
+            runtime={},
+            tenant="default",
+            manifest=manifest,
+            volume_id="vol-1",
+            provider_volume_id="provider-vol-1",
+        )
+    volume.quarantine(
+        artifact["digest"],
+        "sample mismatch",
+        storage_key=artifact["storage_key"],
+    )
+    assert not (volume.root / trust_receipt_key(artifact["digest"])).exists()
+
+
+def test_private_artifact_and_due_full_audit_never_use_fast_trust(tmp_path):
+    signer = ManifestSigner(b"p" * 32)
+    volume = PreparedStateCAS(tmp_path / "volume", signer)
+    source = tmp_path / "private"
+    source.write_bytes(os.urandom(2 * 1024 * 1024))
+    artifact = portable_artifact(
+        source.read_bytes(),
+        policy={
+            "tenant": "default",
+            "cacheable": True,
+            "private": True,
+        },
+    )
+    volume.publish_blob(source, artifact["digest"])
+    manifest = signed_manifest(
+        signer,
+        [artifact],
+        claims={
+            "cache_volume_id": "vol-1",
+            "cache_provider_volume_id": "provider-vol-1",
+        },
+    )
+    volume.publish_manifest(manifest)
+    assert not (volume.root / trust_receipt_key(artifact["digest"])).exists()
+    decisions = []
+    volume.restore_artifact(
+        artifact,
+        tmp_path / "private-restored",
+        runtime={},
+        tenant="default",
+        allow_private=True,
+        manifest=manifest,
+        volume_id="vol-1",
+        provider_volume_id="provider-vol-1",
+        verification_callback=decisions.append,
+    )
+    assert decisions[0]["mode"] == "full_digest"
+    assert decisions[0]["receipt_issued"] is False
+
+    public = portable_artifact(b"public" * 1024 * 1024)
+    public_source = tmp_path / "public"
+    public_source.write_bytes(b"public" * 1024 * 1024)
+    volume.publish_blob(public_source, public["digest"])
+    public_manifest = signed_manifest(
+        signer,
+        [public],
+        claims={
+            "cache_volume_id": "vol-1",
+            "cache_provider_volume_id": "provider-vol-1",
+        },
+    )
+    volume.publish_manifest(public_manifest)
+    future = datetime.now(timezone.utc) + timedelta(days=2)
+    due_decisions = []
+    volume.restore_artifact(
+        public,
+        tmp_path / "public-restored",
+        runtime={},
+        tenant="default",
+        manifest=public_manifest,
+        volume_id="vol-1",
+        provider_volume_id="provider-vol-1",
+        verification_callback=due_decisions.append,
+        now=future,
+    )
+    assert due_decisions[0]["mode"] == "full_digest"
 
 
 def test_exact_manifest_id_falls_back_to_immutable_direct_object(tmp_path):
@@ -1672,6 +1889,132 @@ def test_worker_manifest_announcement_drives_next_exact_cache_placement(
         provider.launch_environments[-1]["CLOUD_OFFLOAD_CACHE_MANIFEST"]
         == manifest["manifest_id"]
     )
+
+
+def test_worker_trust_receipt_is_bound_to_active_worker_manifest_and_volume(
+    monkeypatch, tmp_path
+):
+    content = b"signed-sample"
+    config = dispatcher_config(tmp_path, policy())
+    queue = JobQueue(config.queue_db_path)
+    queue.set_worker_token("worker-secret")
+    queue.create(
+        "comfyui-workflow",
+        "inline://request",
+        params={
+            "runtime_profile": "comfy",
+            "cache_volume_id": "cache-vol",
+            "cache_provider_volume_id": "provider-cache-vol",
+        },
+        request={"workflow": {}},
+        provider="runpod",
+        status=JobStatus.QUEUED,
+    )
+    claimed = queue.claim_jobs(
+        "worker-one",
+        token="worker-secret",
+        limit=1,
+        provider="runpod",
+        models=["comfyui-workflow"],
+        runtime_profile="comfy",
+    )[0]
+    artifact = portable_artifact(content)
+    signer = server._prepared_manifest_signer(config)
+    manifest = signed_manifest(
+        signer,
+        [artifact],
+        claims={
+            "cache_volume_id": "cache-vol",
+            "cache_provider_volume_id": "provider-cache-vol",
+        },
+    )
+    proposal = {
+        "schema": TRUST_RECEIPT_SCHEMA,
+        "manifest_id": manifest["manifest_id"],
+        "manifest_signature_digest": manifest_signature_digest(manifest),
+        "artifact_digest": artifact["digest"],
+        "artifact_size": artifact["size"],
+        "storage_key": artifact["storage_key"],
+        "volume_id": "cache-vol",
+        "provider_volume_id": "provider-cache-vol",
+        "runtime_compatibility": artifact_runtime_compatibility_key(artifact),
+        "object_generation": {
+            "storage_key": artifact["storage_key"],
+            "size": artifact["size"],
+            "modified_ns": 123,
+        },
+        "verified_at": "2000-01-01T00:00:00Z",
+        "expires_at": "2100-01-01T00:00:00Z",
+        "scrub": {
+            "full_audit_due_at": "2100-01-01T00:00:00Z",
+            "samples": [
+                {
+                    "offset": 0,
+                    "size": len(content),
+                    "sha256": portable_artifact(content)["digest"],
+                }
+            ],
+        },
+    }
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda *args, **kwargs: config)
+    client = TestClient(server.app)
+    body = {
+        "job_id": claimed.id,
+        "worker_id": "worker-one",
+        "volume_id": "cache-vol",
+        "receipt": proposal,
+        "manifest": manifest,
+    }
+
+    signed = client.post(
+        "/api/workers/cache/trust-receipts/sign",
+        headers={"Authorization": "Bearer worker-secret"},
+        json=body,
+    )
+    assert signed.status_code == 200, signed.text
+    receipt = signed.json()
+    assert receipt["verified_at"] != proposal["verified_at"]
+    assert receipt["volume_id"] == "cache-vol"
+    assert receipt["provider_volume_id"] == "provider-cache-vol"
+
+    verified = client.post(
+        "/api/workers/cache/trust-receipts/verify",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={
+            "job_id": claimed.id,
+            "worker_id": "worker-one",
+            "volume_id": "cache-vol",
+            "receipt": receipt,
+        },
+    )
+    assert verified.status_code == 200, verified.text
+    assert verified.json()["receipt_id"] == receipt["receipt_id"]
+
+    wrong_volume = client.post(
+        "/api/workers/cache/trust-receipts/verify",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={
+            "job_id": claimed.id,
+            "worker_id": "worker-one",
+            "volume_id": "another-volume",
+            "receipt": receipt,
+        },
+    )
+    assert wrong_volume.status_code == 403
+    tampered = json.loads(json.dumps(receipt))
+    tampered["artifact_size"] += 1
+    refused = client.post(
+        "/api/workers/cache/trust-receipts/verify",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={
+            "job_id": claimed.id,
+            "worker_id": "worker-one",
+            "volume_id": "cache-vol",
+            "receipt": tampered,
+        },
+    )
+    assert refused.status_code == 400
 
 
 def test_result_available_phase_precedes_job_completion(tmp_path):

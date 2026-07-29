@@ -703,12 +703,10 @@ class Worker:
             )
             if not artifact:
                 return False
-            cache.restore_artifact(
+            verification = self._restore_prepared_artifact(
                 artifact,
                 target,
-                runtime=self.cache_runtime,
-                tenant=str(self.cache_policy.get("tenant") or "default"),
-                allow_private=bool(self.cache_policy.get("cache_private_assets")),
+                manifest=manifest,
             )
             if job:
                 self._cache_event(
@@ -718,6 +716,8 @@ class Worker:
                     kind="custom-node-bundle",
                     bytes=artifact["size"],
                     result="hit",
+                    verification_mode=verification.get("mode"),
+                    verification_bytes=verification.get("bytes_read"),
                 )
             if self.cache_receipt:
                 self.cache_receipt.record(
@@ -725,7 +725,9 @@ class Worker:
                     kind="custom-node-bundle",
                     result="hit",
                     bytes=artifact["size"],
-                    reason="verified",
+                    reason=str(verification.get("mode") or "full_digest"),
+                    verification_mode=verification.get("mode"),
+                    verification_bytes=verification.get("bytes_read"),
                     total_ms=round((time.monotonic() - started) * 1000, 3),
                 )
             return True
@@ -1195,12 +1197,10 @@ class Worker:
 
         started = time.monotonic()
         try:
-            cache.restore_artifact(
+            verification = self._restore_prepared_artifact(
                 artifact,
                 target,
-                runtime=self.cache_runtime,
-                tenant=str(self.cache_policy.get("tenant") or "default"),
-                allow_private=bool(self.cache_policy.get("cache_private_assets")),
+                manifest=manifest,
             )
             self._cache_event(
                 job,
@@ -1210,6 +1210,8 @@ class Worker:
                 bytes=artifact["size"],
                 total_ms=round((time.monotonic() - started) * 1000, 3),
                 result="hit",
+                verification_mode=verification.get("mode"),
+                verification_bytes=verification.get("bytes_read"),
             )
             if self.cache_receipt:
                 self.cache_receipt.record(
@@ -1217,7 +1219,9 @@ class Worker:
                     kind="profile-weight",
                     result="hit",
                     bytes=artifact["size"],
-                    reason="verified",
+                    reason=str(verification.get("mode") or "full_digest"),
+                    verification_mode=verification.get("mode"),
+                    verification_bytes=verification.get("bytes_read"),
                     total_ms=round((time.monotonic() - started) * 1000, 3),
                 )
             return True
@@ -1387,6 +1391,7 @@ class Worker:
 
         started = time.monotonic()
         artifact = None
+        verifications: list[dict] = []
         try:
             for artifact in sorted(
                 artifacts,
@@ -1405,20 +1410,21 @@ class Worker:
                     raise RuntimeError(
                         "Prepared snapshot destination escapes the model directory"
                     ) from exc
-                cache.restore_artifact(
+                verification = self._restore_prepared_artifact(
                     artifact,
                     target,
-                    runtime=self.cache_runtime,
-                    tenant=str(self.cache_policy.get("tenant") or "default"),
-                    allow_private=bool(self.cache_policy.get("cache_private_assets")),
+                    manifest=manifest,
                 )
+                verifications.append(verification)
                 if self.cache_receipt:
                     self.cache_receipt.record(
                         digest=artifact["digest"],
                         kind="profile-weight",
                         result="hit",
                         bytes=artifact["size"],
-                        reason="verified_snapshot",
+                        reason=str(verification.get("mode") or "full_digest"),
+                        verification_mode=verification.get("mode"),
+                        verification_bytes=verification.get("bytes_read"),
                     )
             if job:
                 self._cache_event(
@@ -1430,6 +1436,15 @@ class Worker:
                     bytes=sum(int(item["size"]) for item in artifacts),
                     total_ms=round((time.monotonic() - started) * 1000, 3),
                     result="hit",
+                    verification_modes=sorted(
+                        {
+                            str(item.get("mode") or "full_digest")
+                            for item in verifications
+                        }
+                    ),
+                    verification_bytes=sum(
+                        int(item.get("bytes_read") or 0) for item in verifications
+                    ),
                 )
             return True
         except CacheCorruptionError as exc:
@@ -1685,6 +1700,7 @@ class Worker:
         expected = os.environ.get(
             "CLOUD_OFFLOAD_CACHE_EXPECTED_PROVIDER_VOLUME_ID", ""
         ).strip()
+        self.cache_provider_volume_id = expected
         mounted = os.environ.get("RUNPOD_VOLUME_ID", "").strip()
         if expected and mounted != expected:
             from cloud_offload.prepared_state import CacheMountError
@@ -1770,6 +1786,34 @@ class Worker:
                     "Prepared manifest is not authorized for the mounted cache volume"
                 )
         return manifest
+
+    def _restore_prepared_artifact(
+        self,
+        artifact: dict,
+        destination: Path,
+        *,
+        manifest: dict,
+    ) -> dict:
+        """Restore one artifact and return its safe verification decision."""
+        verification: dict = {}
+        self.prepared_cache.restore_artifact(
+            artifact,
+            destination,
+            runtime=self.cache_runtime,
+            tenant=str(self.cache_policy.get("tenant") or "default"),
+            allow_private=bool(self.cache_policy.get("cache_private_assets")),
+            manifest=manifest,
+            volume_id=(
+                str(getattr(self, "cache_volume_id", "") or "")
+                or str(manifest.get("cache_volume_id") or "")
+            ),
+            provider_volume_id=(
+                str(getattr(self, "cache_provider_volume_id", "") or "")
+                or str(manifest.get("cache_provider_volume_id") or "")
+            ),
+            verification_callback=verification.update,
+        )
+        return verification
 
     def _cache_event(self, job: Job, event_type: str, **fields) -> None:
         writer = getattr(self.queue, "append_event", None)
@@ -1879,6 +1923,7 @@ class Worker:
         try:
             manifest = self._selected_prepared_manifest()
             source_manifest_id = manifest["manifest_id"] if manifest else None
+            artifact_manifest = manifest
             artifact = (
                 next(
                     (
@@ -1896,6 +1941,9 @@ class Worker:
                 shared_match = cache.find_portable_artifact(digest)
                 if shared_match:
                     artifact, source_manifest_id = shared_match
+                    artifact_manifest = cache.find_manifest(
+                        manifest_id=source_manifest_id
+                    )
                     shared = True
             if not artifact:
                 self._record_cache_result(
@@ -1914,19 +1962,24 @@ class Worker:
                 profile_fingerprint=profile,
                 cross_profile=shared,
             ) if getattr(self, "_active_cache_job", None) else None
-            cache.restore_artifact(
+            if not artifact_manifest:
+                raise ManifestError("Prepared artifact manifest is unavailable")
+            verification = self._restore_prepared_artifact(
                 artifact,
                 target,
-                runtime=self.cache_runtime,
-                tenant=str(self.cache_policy.get("tenant") or "default"),
-                allow_private=bool(self.cache_policy.get("cache_private_assets")),
+                manifest=artifact_manifest,
             )
             self._verified_prepared_digests = set(
                 getattr(self, "_verified_prepared_digests", set())
             )
             self._verified_prepared_digests.add(digest)
             self._record_cache_result(
-                asset, "hit", "verified", started, target.stat().st_size
+                asset,
+                "hit",
+                str(verification.get("mode") or "full_digest"),
+                started,
+                target.stat().st_size,
+                verification=verification,
             )
             if shared:
                 # Publish a profile-B reference only after policy and digest
@@ -1956,6 +2009,7 @@ class Worker:
         reason: str,
         started: float,
         size: int = 0,
+        verification: dict | None = None,
     ) -> None:
         elapsed = round((time.monotonic() - started) * 1000, 3)
         entry = {
@@ -1968,6 +2022,16 @@ class Worker:
             "reason": reason,
             "bytes": int(size),
             "total_ms": elapsed,
+            **(
+                {
+                    "verification_mode": verification.get("mode"),
+                    "verification_bytes": verification.get("bytes_read"),
+                    "trust_receipt_id": verification.get("receipt_id"),
+                    "full_audit_due_at": verification.get("full_audit_due_at"),
+                }
+                if verification
+                else {}
+            ),
         }
         if self.cache_receipt:
             self.cache_receipt.record(**entry)

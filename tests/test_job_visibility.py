@@ -92,7 +92,13 @@ def test_projection_combines_identity_progress_transfer_eta_and_spend_without_ra
     )
     queue.append_event(
         job.id,
-        {"type": "cache_artifact_hit", "digest": "private-digest", "bytes": 100},
+        {
+            "type": "cache_artifact_hit",
+            "digest": "private-digest",
+            "bytes": 100,
+            "verification_mode": "trusted_metadata_sample",
+            "verification_bytes": 16,
+        },
         occurred_at=_stamp(start, 20),
     )
     queue.append_event(
@@ -156,6 +162,9 @@ def test_projection_combines_identity_progress_transfer_eta_and_spend_without_ra
         "hits": 1,
         "misses": 0,
         "hit_bytes": 100,
+        "verification_bytes": 16,
+        "trusted_hits": 1,
+        "full_verified_hits": 0,
         "items_saved": 0,
         "prepared": True,
     }
