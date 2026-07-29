@@ -9,7 +9,11 @@ from cloud_offload.providers import (
     create_connector,
     register_connector,
 )
-from cloud_offload.providers.base import CloudConnector
+from cloud_offload.providers.base import (
+    CloudConnector,
+    PlacementConstraints,
+    PlacementError,
+)
 from cloud_offload.providers.runpod import RunPodConnector
 
 
@@ -162,6 +166,80 @@ def test_runpod_community_gpu_discovery_requests_community_price():
 
     assert connector.list_available() == []
     assert http.requests[0][2]["json"]["variables"] == {"secureCloud": False}
+
+
+def test_runpod_storage_placement_only_returns_stock_in_requested_datacenter():
+    gpu_types = {
+        "data": {
+            "gpuTypes": [
+                {
+                    "id": "NVIDIA RTX 2000 Ada Generation",
+                    "displayName": "RTX 2000 Ada",
+                    "memoryInGb": 16,
+                    "secureCloud": True,
+                    "communityCloud": False,
+                    "lowestPrice": {"uninterruptablePrice": 0.24},
+                },
+                {
+                    "id": "NVIDIA A100-SXM4-80GB",
+                    "displayName": "A100 SXM",
+                    "memoryInGb": 80,
+                    "secureCloud": True,
+                    "communityCloud": False,
+                    "lowestPrice": {"uninterruptablePrice": 1.49},
+                },
+            ]
+        }
+    }
+    data_centers = {
+        "data": {
+            "dataCenters": [
+                {
+                    "id": "US-MD-1",
+                    "gpuAvailability": [
+                        {
+                            "gpuTypeId": "NVIDIA RTX 2000 Ada Generation",
+                            "stockStatus": None,
+                        },
+                        {
+                            "gpuTypeId": "NVIDIA A100-SXM4-80GB",
+                            "stockStatus": "Low",
+                        },
+                    ],
+                },
+                {
+                    "id": "US-GA-2",
+                    "gpuAvailability": [
+                        {
+                            "gpuTypeId": "NVIDIA RTX 2000 Ada Generation",
+                            "stockStatus": "High",
+                        }
+                    ],
+                },
+            ]
+        }
+    }
+    http = FakeHttp(FakeResponse(data_centers), FakeResponse(gpu_types))
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    offers = connector.list_available(
+        placement=PlacementConstraints(datacenter_ids=("US-MD-1",))
+    )
+
+    assert [offer["id"] for offer in offers] == ["NVIDIA A100-SXM4-80GB"]
+    assert offers[0]["datacenter_stock"] == [
+        {"datacenter_id": "US-MD-1", "stock_status": "Low"}
+    ]
+
+
+def test_runpod_storage_placement_rejects_unknown_datacenter_stock():
+    http = FakeHttp(FakeResponse({"data": {"dataCenters": []}}))
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    with pytest.raises(PlacementError, match="did not report current GPU stock"):
+        connector.list_available(
+            placement=PlacementConstraints(datacenter_ids=("US-OLD-1",))
+        )
 
 
 def test_runpod_launch_passes_worker_environment_and_startup_script():

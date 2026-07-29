@@ -39,6 +39,19 @@ query CloudOffloadGpuTypes($secureCloud: Boolean) {
 """
 
 
+DATA_CENTERS_QUERY = """
+query CloudOffloadDataCenterStock {
+  dataCenters {
+    id
+    gpuAvailability {
+      gpuTypeId
+      stockStatus
+    }
+  }
+}
+"""
+
+
 CREATE_POD_MUTATION = """
 mutation CloudOffloadCreatePod($input: PodFindAndDeployOnDemandInput!) {
   podFindAndDeployOnDemand(input: $input) {
@@ -174,6 +187,39 @@ class RunPodConnector(CloudConnector):
     ) -> list[dict]:
         """List normalized GPU types with current on-demand prices."""
         self._validate_cloud_placement(placement)
+        placement_stock: dict[str, list[dict[str, str]]] | None = None
+        if placement is not None and placement.datacenter_ids:
+            requested_datacenters = set(placement.datacenter_ids)
+            data_centers = self._graphql(DATA_CENTERS_QUERY).get("dataCenters", [])
+            reported_datacenters = {
+                str(item.get("id"))
+                for item in data_centers
+                if str(item.get("id")) in requested_datacenters
+            }
+            if reported_datacenters != requested_datacenters:
+                missing = sorted(requested_datacenters - reported_datacenters)
+                raise PlacementError(
+                    "RunPod did not report current GPU stock for datacenter(s) "
+                    f"{missing}"
+                )
+            placement_stock = {}
+            for data_center in data_centers:
+                datacenter_id = str(data_center.get("id") or "")
+                if datacenter_id not in requested_datacenters:
+                    continue
+                for availability in data_center.get("gpuAvailability") or []:
+                    stock_status = str(availability.get("stockStatus") or "").strip()
+                    if not self._stock_available(stock_status):
+                        continue
+                    gpu_id = str(availability.get("gpuTypeId") or "")
+                    if not gpu_id:
+                        continue
+                    placement_stock.setdefault(gpu_id, []).append(
+                        {
+                            "datacenter_id": datacenter_id,
+                            "stock_status": stock_status,
+                        }
+                    )
         # RunPod reports different on-demand prices for Secure and Community
         # Cloud.  Without this filter ``lowestPrice`` can quote the cheaper
         # tier even though launch() explicitly requests the other one.
@@ -183,6 +229,9 @@ class RunPodConnector(CloudConnector):
         ).get("gpuTypes", [])
         offers: list[dict] = []
         for gpu in gpu_types:
+            stock = placement_stock.get(str(gpu.get("id") or "")) if placement_stock is not None else None
+            if placement_stock is not None and not stock:
+                continue
             if gpu_type and not self._matches_gpu(gpu_type, gpu):
                 continue
             memory_gb = int(gpu.get("memoryInGb") or 0)
@@ -214,8 +263,20 @@ class RunPodConnector(CloudConnector):
             if placement is not None:
                 offer["datacenter_ids"] = list(placement.datacenter_ids)
                 offer["storage_compatible"] = bool(placement.storage_attachments)
+                if stock:
+                    offer["datacenter_stock"] = stock
             offers.append(offer)
         return offers
+
+    @staticmethod
+    def _stock_available(status: str) -> bool:
+        normalized = " ".join(status.lower().split())
+        return bool(normalized) and normalized not in {
+            "none",
+            "unavailable",
+            "out of stock",
+            "no stock",
+        }
 
     @staticmethod
     def _matches_gpu(requested: str, gpu: dict) -> bool:
