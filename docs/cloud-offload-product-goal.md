@@ -171,9 +171,9 @@ validate the product journey.
 | ID | Requirement | Primary milestone | Current state |
 | --- | --- | --- | --- |
 | `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; confirmed launch now binds to the selected offer and prepared volume. |
-| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | `PreflightReportV1`, paid-submit binding, launch-time revalidation, and the ComfyUI handoff exist; merged-stack production evidence remains. |
+| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | Accepted merged-stack production evidence proves free preflight, exact paid binding, and launch-time revalidation. |
 | `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Initial explainable ranking exists; measured history and complete cost components remain. |
-| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Implemented across backend PRs #25–#27 and extension PR #5; merged-stack production evidence remains. |
+| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Implemented across backend PRs #25–#27 and extension PR #5; accepted production replay proves the default confirmation. |
 | `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Implemented in extension PR #5 with persistent coordinator policy from backend PR #27; merged-stack production evidence remains. |
 | `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
 | `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Initial canvas feedback merged; durable drawer pending. |
@@ -642,6 +642,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#27](https://github.com/jethac/cloud-offload/pull/27) | Adds durable rental-confirmation, countdown, recommendation, hard cost, region, and material-change settings; enforces Start now or server-timed countdown completion; and makes material changes restart mandatory confirmation even under `never`. | 558 tests passed. Early or missing confirmation and disjoint region policy create no job or provider resource. |
 | [#28](https://github.com/jethac/cloud-offload/pull/28) | Records the merged ComfyUI confirmation delivery and updates the active M1 handoff. | Merged as `5d71637`; extension PR #5 is part of the canonical delivery record. |
 | [#29](https://github.com/jethac/cloud-offload/pull/29) | Makes free preflight accept the stable worker credential that the dispatcher stores beside the shared queue database. | Merged as `2ab4db4`; 76 focused tests and 559 full tests passed. The failed preflight created no job or provider resource. |
+| [#30](https://github.com/jethac/cloud-offload/pull/30) | Starts worker idle time after each job, gives dispatcher cleanup a 60-second margin, and prevents a provider-restarted container from resetting the paid resource idle clock. It also records the first controlled M1 run. | Merged as `8193bfa`; 63 focused tests and 563 full tests passed. The bounded replay below proves automatic exact-Pod cleanup. |
 
 ### ComfyUI extension repository
 
@@ -685,8 +686,23 @@ not blanket production-readiness claims:
   termination. Provider lookup then proved the Pod absent. Backend PR #30 fixes
   the race by starting worker idle time after job completion, giving dispatcher
   cleanup a safety margin, and preventing a restarted runner from resetting the
-  paid resource idle clock. Automatic cleanup needs one bounded replay before
-  this production journey is accepted.
+  paid resource idle clock. That first run remains failed evidence; the next
+  bounded replay supplies the accepted automatic-cleanup evidence.
+- Controlled replay job `25e58a78-4ddb-49d3-b7d1-46f564a63319` is the accepted
+  M1 merged-stack journey. The default ten-second confirmation again selected a
+  RunPod A100 SXM in `US-MD-1` at $1.49/hour with a $0.11-$0.36 estimate, 100%
+  prepared coverage, and zero missing bytes. Pod `shx3qb2m66iyeg` used worker
+  image `ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:30107fcfdda1ce4b03fe6a1c7d6cc42983177309d9f54591164e69326de516e4`
+  from merge `8193bfa`. Worker `worker-ebdd770f` verified the exact manifest,
+  recorded six prepared cache hits, completed with two output nodes and two
+  output-artifact groups, and returned visible image
+  `ComfyUI_temp_ppkpc_00001_.png`. ComfyUI showed zero active jobs and a
+  297.24-second run time.
+- Automatic closure passed. The dispatcher reached the configured 300-second
+  idle limit at 00:26:10 local time, accepted exact Pod termination at 00:26:12,
+  and a fresh RunPod lookup proved `shx3qb2m66iyeg` absent at 00:26:18. No
+  manual cleanup occurred. The coordinator then reported zero queued, running,
+  or pending jobs. Worker identity did not change during the idle window.
 - Replay, snapshot, support-bundle, journal-authority, concurrency, rollback,
   benchmark validation, force-execution, and credential-resolution tests pass in
   the merged backend history shown above.
@@ -961,9 +977,9 @@ Status snapshot as of 2026-07-29:
   binding, exact launch revalidation, persistent backend policy, and the merged
   ten-second ComfyUI confirmation surface. One merged-stack paid run proved the
   recommendation, confirmation, exact launch, prepared restore, execution, and
-  result return. It exposed a paid cleanup race, so automatic provider closure
-  must pass a bounded replay. Measured history and complete cost components then
-  remain before M1 can close.
+  result return. The bounded PR #30 replay also proved automatic exact-Pod
+  closure. Measured history and complete cost components remain before M1 can
+  close.
 
 ### Completed M0 corruption contract
 
@@ -1089,12 +1105,11 @@ Both defects failed before job creation. With both fixes merged, controlled job
 exact offer launch, exact prepared-volume restore, graph execution, and result
 return. It also exposed the cleanup race recorded above.
 
-The active slice is automatic provider closure for that same merged-stack path.
-Merge backend PR #30, build and pin its worker, restart the dispatcher from the
-merged revision, and run one bounded paid replay. Accept the journey only when
-RunPod proves the exact Pod absent without manual action. Measured history and
-the missing transfer and storage cost components must then improve the initial
-low-confidence recommendation before M1 closes.
+The merged-stack journey is now accepted. The active slice is recommendation
+accuracy. Persist measured execution history by workload and candidate class,
+use it in ranking and time ranges, and include the missing transfer and prepared
+storage cost components. The initial low-confidence recommendation must improve
+without hiding uncertainty before M1 closes.
 
 ### Operational safety rules
 
@@ -1119,7 +1134,7 @@ low-confidence recommendation before M1 closes.
 | Milestone | Status on 2026-07-29 | Gate |
 | --- | --- | --- |
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
-| M1 — preflight, recommendation, confirmation | **In progress** | Backend and ComfyUI confirmation paths are merged; merged-stack end-to-end evidence, measured history, and complete cost components remain. |
+| M1 — preflight, recommendation, confirmation | **In progress** | Backend and ComfyUI paths and one merged-stack paid journey are accepted; measured history and complete cost components remain. |
 | M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
