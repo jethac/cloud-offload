@@ -433,11 +433,24 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
             ]
         )
     )
-    driver = FakeDriver({"corruption": successful_script("pod-corruption")})
+    script = successful_script("pod-corruption")
+    script.steps[0]["events"].append(
+        event(
+            3,
+            "cache_mount_ready",
+            "model_prepare",
+            2,
+            instance_id="pod-corruption",
+            hourly_rate=0.36,
+        )
+    )
+    script.steps[1]["events"][0]["sequence"] = 4
+    driver = FakeDriver({"corruption": script})
 
     assets = plan.scenarios[0].request["partition"]["assets"]
     assert len(assets) == 1
     assert assets[0]["filename"].startswith("cloud_offload_benchmark_canary_")
+    assert plan.scenarios[0].failure.trigger_event == "cache_mount_ready"
 
     scorecard = BenchmarkRunner(driver).run(plan)
     result = scorecard["results"][0]
@@ -451,6 +464,9 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
         "cleanup",
     ]
     assert driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == ""
+    assert (
+        driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_PROFILE"] == "comfyui-partition-v1"
+    )
     assert (
         assets[0]["sha256"]
         in driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS"]

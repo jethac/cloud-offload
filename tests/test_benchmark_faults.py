@@ -15,6 +15,7 @@ from cloud_offload.benchmark_faults import (
     observe_corruption,
     prepare_corruption,
     restart_coordinator,
+    run_fault,
 )
 from cloud_offload.prepared_state import ManifestSigner, blob_key
 
@@ -435,4 +436,49 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
             coordinator_storage_factory=lambda: coordinator_storage,
         )["changed"]
         is False
+    )
+
+
+def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
+    declared = {"a" * 64, "b" * 64}
+    calls = {}
+    client = FakeFaultClient()
+    monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_FAILURE_KIND", "corruption")
+    monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_SCENARIO", "profile-canary")
+    monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE", "prepare")
+    monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS", ",".join(declared))
+    monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_PROFILE", "profile-v2")
+    monkeypatch.setattr(benchmark_faults, "CoordinatorFaultClient", lambda: client)
+
+    def fingerprint(profile_name, digests):
+        calls["fingerprint"] = (profile_name, digests)
+        return "sha256:" + "c" * 64
+
+    def prepare(
+        received_client,
+        scenario,
+        digests,
+        *,
+        profile_fingerprint=None,
+    ):
+        calls["prepare"] = (
+            received_client,
+            scenario,
+            digests,
+            profile_fingerprint,
+        )
+        return {"stage": "prepare"}
+
+    monkeypatch.setattr(
+        benchmark_faults, "_corruption_profile_fingerprint", fingerprint
+    )
+    monkeypatch.setattr(benchmark_faults, "prepare_corruption", prepare)
+
+    assert run_fault("corruption") == {"stage": "prepare"}
+    assert calls["fingerprint"] == ("profile-v2", declared)
+    assert calls["prepare"] == (
+        client,
+        "profile-canary",
+        declared,
+        "sha256:" + "c" * 64,
     )

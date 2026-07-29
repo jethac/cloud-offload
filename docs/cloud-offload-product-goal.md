@@ -181,7 +181,7 @@ validate the product journey.
 | `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
 | `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Durable population/restore baseline merged; fast trust and capsules pending. |
 | `REPLICA-1` | Replicate prepared state only for measured benefit, within budget and TTL. | M6 | Planned; shadow mode first. |
-| `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Cold/hot accepted; cancellation, provider, and storage canaries accepted; corruption and restart evidence remain. |
+| `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Cold/hot plus cancellation, provider, storage, and restart canaries are accepted; corruption and the committed redacted projection remain. |
 | `RELEASE-1` | Pass the continuous production matrix and budget gates. | M7 | Pending. |
 
 ## Product principles
@@ -627,7 +627,8 @@ This ledger records merged implementation evidence across both repositories.
 | [#13](https://github.com/jethac/cloud-offload/pull/13) | Added reversible storage, corruption, and coordinator-restart production canaries plus health PID identity. | Merged as `429d405`; 520 tests passed. |
 | [#14](https://github.com/jethac/cloud-offload/pull/14) | Added two-phase pre-submit failure hooks so reviewed corruption setup settles before job submission and Pod creation, with unconditional idempotent cleanup. | Merged as `4900aa6`; 522 tests passed. |
 | [#15](https://github.com/jethac/cloud-offload/pull/15) | Consolidated the complete program record and replaced the unsafe Windows signal-zero PID probe with native process-state inspection. | Merged as `79faa25`; 525 tests and real live/absent PID probes passed. |
-| [#16](https://github.com/jethac/cloud-offload/pull/16) | Made restart canaries prove journal replay and persist cancellation through the replacement coordinator instead of depending on unrelated image startup. | 526 tests passed; the production restart canary passed before merge. |
+| [#16](https://github.com/jethac/cloud-offload/pull/16) | Made restart canaries prove journal replay and persist cancellation through the replacement coordinator instead of depending on unrelated image startup. | Merged as `7fdc37c`; 526 tests passed and the production restart canary passed. |
+| [#17](https://github.com/jethac/cloud-offload/pull/17) | Made corruption canaries inject an isolated tiny artifact, publish a temporary signed manifest, provide a valid coordinator fallback, and remove all synthetic state during idempotent cleanup. | Merged as `0ea1754`; 527 tests passed. The first production run proved fresh-object isolation and cleanup but exposed stale manifest discovery, so corruption is not yet accepted. |
 
 ### ComfyUI extension repository
 
@@ -694,10 +695,42 @@ not blanket production-readiness claims:
   provider-absent after one termination request. The case passed in 29.234
   seconds with a conservative $0.012100 compute upper bound, restored policy,
   empty final inventory, and no orphan or audit error.
+- The PR #17 fresh-object corruption campaign used safe request digest
+  `8c44c8ee4ddca337b148212dca24e2d9c6e8c068ea5300091f3b33c172310106`
+  for job `d37b5054-d80f-4d59-87f4-dbd18e6d310c` and exact Pod
+  `arlvyvhu8lm1we`. The pre-submit hook published a unique 31-byte corrupt blob,
+  temporary signed generation, registry projection, and valid coordinator
+  fallback. The run completed in 420.500 seconds with a conservative $0.174040
+  compute upper bound, and cleanup removed the Pod, generation, blob, manifest,
+  registry/invalidation/quarantine state, and coordinator fallback. Provider
+  inventory was empty and prepared-storage policy was restored to `smart`.
+- That fresh-object run is safe failed evidence, not an accepted corruption
+  canary. Placement selected no prepared manifest and the worker emitted
+  `cache_artifact_miss` with reason `manifest_not_found`; no
+  `cache_artifact_quarantined` event occurred. The injected asset changed the
+  actual requirement profile to
+  `sha256:77ea27b92fac7d4b45f8e941c1a545d5368d985252453b0bf9d8419912f386f2`,
+  while the canary manifest retained the prior profile. Cross-profile lookup
+  then depended on the mounted mutable `indexes/latest`, which did not contain
+  the newly published manifest. This proves the fresh blob removed cache aliasing
+  and isolates the remaining defect to exact manifest selection and visibility.
 
 The accepted cold/hot scorecard and four accepted failure canaries prove a
 larger part of M0, but M0 is not complete until the corruption canary passes and
 a compact redacted evidence projection is committed.
+
+### M0 evidence matrix
+
+| Evidence | Result | Durable conclusion |
+| --- | --- | --- |
+| Fresh-Pod cold/hot pair | **Accepted** | Prepared state produces real hits, but the measured 8.8% end-to-end improvement is only a baseline and does not meet the M4 acceleration target. |
+| Cancellation | **Accepted** | The attributable Pod was removed in 34.500 seconds and cleanup completed. |
+| Provider interruption | **Accepted** | A terminated Pod was replaced and the job completed. |
+| Strict storage failure | **Accepted** | Invalid storage failed before provider launch; restored configuration then completed. |
+| Coordinator restart | **Accepted** | Replacement health, journal replay, replacement-owned cancellation, and exact provider cleanup passed. |
+| Corruption, cached-object attempts | **Failed safely** | Mounted valid bytes defeated mutation; exact resources and configuration were cleaned up. |
+| Corruption, fresh-object attempt | **Failed safely** | Unique-object isolation worked; stale mutable-index discovery prevented exact manifest restore and quarantine. Cleanup was complete. |
+| Compact redacted projection | **Required** | Accepted raw scorecards remain local under `.runlogs/`; a safe comparable projection still must be committed. |
 
 ## Current execution state and immediate next work
 
@@ -730,11 +763,46 @@ Status snapshot as of 2026-07-29:
 - The Windows restart probe and canary contract were corrected in PRs #15 and
   #16. A focused production rerun now directly proves replacement health,
   journal replay, replacement-owned cancellation, and exact provider cleanup.
-- The first unmet M0 work is therefore: redesign the corruption canary so it
-  cannot alias a previously cached object; rerun it to direct accepted evidence;
-  generate one compact
-  redacted evidence projection for the accepted campaigns; merge that record;
-  and audit every M0 exit before starting M1.
+- PR #17 removed cached-object aliasing from the corruption canary. Its first
+  production run narrowed the remaining failure to an exact-profile mismatch and
+  stale mutable-index discovery. The direct-manifest correction remains
+  intentionally unaccepted production evidence until review, tests, merge, and
+  a bounded production replay complete.
+- The first unmet M0 work is therefore: compute the corruption manifest from the
+  actual injected requirement profile; publish and resolve it through an
+  immutable manifest-by-ID path when a mounted mutable index is stale; trigger
+  observation from durable `cache_mount_ready`; prove the worker quarantines the
+  synthetic artifact while the valid fallback lets the job continue; verify
+  complete cleanup; commit a compact redacted evidence projection; and audit
+  every M0 exit before starting M1.
+
+### Active engineering handoff
+
+The direct-manifest corruption fix is bounded to these contracts:
+
+1. The benchmark hook receives only the safe worker profile name and declared
+   asset digests, never the workflow body or credentials.
+2. The canary recomputes the same prepared-requirement fingerprint the scheduler
+   will use after synthetic-asset injection.
+3. The signed canary manifest is published under an immutable deterministic
+   `manifests/by-id/sha256/...` key, and its registry entry references that key.
+4. `PreparedStateCAS.find_manifest(manifest_id=...)` may load and verify that
+   exact immutable object if the mounted `indexes/latest` view is stale. A
+   mismatched ID or bad signature remains a hard failure.
+5. Corruption observation defaults to the durable `cache_mount_ready` event so
+   a finite observation window is not consumed by unrelated image startup.
+6. Existing manifest/index behavior remains the normal path; the direct object
+   is a narrow exact-ID fallback, not a second source of unsigned truth.
+
+Before this change can become accepted evidence it must pass focused and full
+tests, merge through a reviewed PR, and pass one spend-capped production replay.
+That replay must show a nonempty exact `manifest_ids` placement, a
+`cache_artifact_quarantined` event for the synthetic digest, successful valid
+fallback or explicit safe terminal behavior, hook cleanup success, exact Pod
+absence, empty provider inventory, restored storage policy, and absence of every
+synthetic manifest, blob, registry projection, invalidation, quarantine object,
+and coordinator fallback. A completed job without quarantine is still a failed
+canary.
 
 ### M0 evidence still required
 
@@ -800,8 +868,12 @@ Exit:
 - one job has an explainable critical path;
 - reload reconstructs authoritative state;
 - duplicate and reordered events do not regress it;
-- failure results are comparable JSON; and
-- no validation run leaves an orphaned Pod.
+- cancellation, provider, storage, corruption, and restart canaries all have
+  direct accepted production evidence within explicit spend/runtime ceilings;
+- a compact redacted projection makes cold, hot, and failure results comparable
+  without committing prompts, workflows, private paths, hook details, or
+  secrets; and
+- no validation run leaves an orphaned Pod or synthetic storage state.
 
 ### Milestone 1 — Preflight, GPU recommendation, and rental confirmation
 

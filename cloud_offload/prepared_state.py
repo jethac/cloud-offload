@@ -169,6 +169,11 @@ def bundle_key(digest: str) -> str:
     return f"bundles/sha256/{normalized[:2]}/{normalized}.tar.zst"
 
 
+def manifest_by_id_key(manifest_id: str) -> str:
+    normalized = normalize_digest(manifest_id)
+    return f"manifests/by-id/sha256/{normalized[:2]}/{normalized}.json"
+
+
 def environment_key(runtime: dict[str, Any]) -> str:
     required = ("image_digest", "platform", "python_abi", "dependency_lock")
     return fingerprint({key: runtime.get(key) for key in required})
@@ -841,10 +846,28 @@ class PreparedStateCAS:
         candidates = [
             entry
             for entry in entries
-            if (not profile_fingerprint or entry["profile_fingerprint"] == profile_fingerprint)
+            if (
+                not profile_fingerprint
+                or entry["profile_fingerprint"] == profile_fingerprint
+            )
             and (not manifest_id or entry["manifest_id"] == manifest_id)
         ]
         if not candidates:
+            if manifest_id:
+                direct = self._resolve(manifest_by_id_key(manifest_id))
+                if direct.is_file():
+                    document = json.loads(direct.read_text(encoding="utf-8"))
+                    verified = self.signer.verify(document)
+                    if verified["manifest_id"] != digest_id(manifest_id):
+                        raise ManifestError(
+                            "Direct manifest path contains a different manifest"
+                        )
+                    if (
+                        profile_fingerprint
+                        and verified["profile_fingerprint"] != profile_fingerprint
+                    ):
+                        return None
+                    return verified
             return None
         newest = max(
             candidates,
