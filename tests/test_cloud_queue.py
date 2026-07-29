@@ -870,9 +870,11 @@ def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_
 
 def test_worker_token_required_when_queue_is_configured(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
+    assert queue.worker_auth_configured() is False
     job = queue.create("comfyui-workflow", "input.json")
     queue.update_status(job.id, JobStatus.QUEUED)
     queue.set_worker_token("secret")
+    assert queue.worker_auth_configured() is True
 
     with pytest.raises(PermissionError):
         queue.claim_jobs("worker-a", limit=1)

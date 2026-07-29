@@ -387,6 +387,31 @@ def test_preflight_identity_is_revalidated_and_bound_to_job(
     assert connector.mutations == []
 
 
+def test_preflight_accepts_dispatcher_managed_worker_auth(monkeypatch, tmp_path):
+    config = config_for_preflight(tmp_path)
+    config.worker_token = ""
+    queue = JobQueue(config.queue_db_path)
+    queue.set_worker_token("dispatcher-managed-token")
+    connector = ReadOnlyConnector()
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(
+        preflight,
+        "create_connector",
+        lambda provider, config: connector,
+    )
+
+    report = TestClient(server.app).post(
+        "/api/preflight",
+        json={"partition": partition(), "provider": "runpod"},
+    ).json()
+
+    assert report["status"] == "ready"
+    assert "worker_token_missing" not in {
+        item["code"] for item in report["blockers"]
+    }
+
+
 def test_request_cannot_loosen_configured_cost_or_region_limits(tmp_path):
     config = config_for_preflight(tmp_path)
     config.max_hourly_rate = 0.8
