@@ -13,6 +13,7 @@ from cloud_offload.benchmark import (
     write_scorecard,
 )
 from cloud_offload.config import CloudConfig
+from cloud_offload.benchmark_faults import CORRUPTION_NONCE_FIELD
 
 
 def event(
@@ -450,6 +451,7 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
     assets = plan.scenarios[0].request["partition"]["assets"]
     assert len(assets) == 1
     assert assets[0]["filename"].startswith("cloud_offload_benchmark_canary_")
+    assert len(assets[0][CORRUPTION_NONCE_FIELD]) == 32
     assert plan.scenarios[0].failure.trigger_event == "cache_mount_ready"
 
     scorecard = BenchmarkRunner(driver).run(plan)
@@ -471,10 +473,37 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
         assets[0]["sha256"]
         in driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS"]
     )
+    assert (
+        driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_CANARY_NONCE"]
+        == assets[0][CORRUPTION_NONCE_FIELD]
+    )
     assert driver.hooks[1][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == "job-1"
     assert result["failure_injection"]["preparation_hook"]["exit_code"] == 0
     assert result["failure_injection"]["hook"]["exit_code"] == 0
     assert result["failure_injection"]["cleanup_hook"]["exit_code"] == 0
+
+
+def test_corruption_plan_load_creates_a_new_canary_for_each_campaign():
+    raw = plan_dict(
+        [
+            scenario(
+                "corruption",
+                "failure",
+                failure={
+                    "kind": "corruption",
+                    "before_submit": True,
+                    "hook_argv": ["corruption-canary"],
+                },
+            )
+        ]
+    )
+
+    first = BenchmarkPlan.from_dict(raw).scenarios[0].request["partition"]["assets"]
+    second = BenchmarkPlan.from_dict(raw).scenarios[0].request["partition"]["assets"]
+
+    assert len(first) == len(second) == 1
+    assert first[0][CORRUPTION_NONCE_FIELD] != second[0][CORRUPTION_NONCE_FIELD]
+    assert first[0]["sha256"] != second[0]["sha256"]
 
 
 def test_two_phase_hook_cleans_up_when_submission_never_creates_a_job():

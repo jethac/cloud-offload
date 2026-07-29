@@ -370,7 +370,8 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
     registry = FakeRegistry()
     coordinator_storage = FakeCoordinatorStorage()
     scenario = "corruption-scenario"
-    canary = corruption_canary_asset(scenario)
+    canary_nonce = "campaign-123"
+    canary = corruption_canary_asset(scenario, nonce=canary_nonce)
 
     declared = {"a" * 64, "b" * 64, canary["sha256"]}
     prepared = prepare_corruption(
@@ -381,6 +382,7 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
         signer_factory=lambda: ManifestSigner(b"x" * 32),
         registry_factory=lambda: registry,
         coordinator_storage_factory=lambda: coordinator_storage,
+        canary_nonce=canary_nonce,
         settle_seconds=0,
     )
 
@@ -409,6 +411,7 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
         scenario,
         declared,
         store_factory=lambda volume: store,
+        canary_nonce=canary_nonce,
     )
 
     assert observed == {
@@ -427,6 +430,7 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
         store_factory=lambda volume: store,
         registry_factory=lambda: registry,
         coordinator_storage_factory=lambda: coordinator_storage,
+        canary_nonce=canary_nonce,
     )
     assert cleaned["changed"] is True
     assert cleaned["original_generation_restored"] is True
@@ -444,6 +448,7 @@ def test_corruption_fault_uses_fresh_object_and_restores_inventory():
             store_factory=lambda volume: store,
             registry_factory=lambda: registry,
             coordinator_storage_factory=lambda: coordinator_storage,
+            canary_nonce=canary_nonce,
         )["changed"]
         is False
     )
@@ -458,6 +463,7 @@ def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
     monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE", "prepare")
     monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS", ",".join(declared))
     monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_PROFILE", "profile-v2")
+    monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_CANARY_NONCE", "run-123")
     monkeypatch.setattr(benchmark_faults, "CoordinatorFaultClient", lambda: client)
 
     def fingerprint(profile_name, digests):
@@ -470,12 +476,14 @@ def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
         digests,
         *,
         profile_fingerprint=None,
+        canary_nonce=None,
     ):
         calls["prepare"] = (
             received_client,
             scenario,
             digests,
             profile_fingerprint,
+            canary_nonce,
         )
         return {"stage": "prepare"}
 
@@ -491,6 +499,7 @@ def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
         "profile-canary",
         declared,
         "sha256:" + "c" * 64,
+        "run-123",
     )
 
 

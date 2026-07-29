@@ -631,7 +631,8 @@ This ledger records merged implementation evidence across both repositories.
 | [#17](https://github.com/jethac/cloud-offload/pull/17) | Made corruption canaries inject an isolated tiny artifact, publish a temporary signed manifest, provide a valid coordinator fallback, and remove all synthetic state during idempotent cleanup. | Merged as `0ea1754`; 527 tests passed. The first production run proved fresh-object isolation and cleanup but exposed stale manifest discovery, so corruption is not yet accepted. |
 | [#18](https://github.com/jethac/cloud-offload/pull/18) | Recomputes the injected requirement profile, publishes signed manifests by immutable exact ID, falls back to that verified object when a mounted index is stale, and starts corruption observation at `cache_mount_ready`; also brings this goal record through the fresh-object campaign. | Merged as `f4d9cf9`; 529 tests passed. A bounded replay proved that the hook must fingerprint the configured launch profile name, not its requested capability name. |
 | [#19](https://github.com/jethac/cloud-offload/pull/19) | Resolves the requested worker capability to the normalized configured launch profile before computing the corruption canary fingerprint and records the bounded failed exact-ID replay. | Merged as `3e43ff5`; 530 tests passed. The next replay proved exact selection and direct loading, then exposed first-write object caching. |
-| [#20](https://github.com/jethac/cloud-offload/pull/20) | Writes corrupt bytes as the first and only value of the synthetic S3 key, keeps valid bytes only in coordinator fallback storage, and records the exact-selection replay. | 530 tests pass; a post-merge bounded replay remains the evidence gate. |
+| [#20](https://github.com/jethac/cloud-offload/pull/20) | Writes corrupt bytes as the first and only value of the synthetic S3 key, keeps valid bytes only in coordinator fallback storage, and records the exact-selection replay. | Merged as `b1e6509`; 530 tests passed. Its bounded replay proved that a deterministic canary still reused the same digest and mounted object identity across campaigns. |
+| [#21](https://github.com/jethac/cloud-offload/pull/21) | Gives every corruption campaign a safe random nonce and uses it to create a new payload, digest, object key, file name, and state path across all hook stages. It also records the deterministic-identity replay. | 531 tests pass; merge and a bounded production replay remain the evidence gate. |
 
 ### ComfyUI extension repository
 
@@ -755,6 +756,24 @@ not blanket production-readiness claims:
   empty, storage policy returned `smart`, and all synthetic state was absent.
   The interrupted command produced no accepted cost figure; the configured
   scenario and campaign ceiling was $0.50.
+- The merged PR #20 replay created job
+  `c9dbd0d7-8628-4273-b87a-dfd87d1b0a33` and exact Pod `fqh9x6qm5xtn7c`.
+  Placement selected exact manifest
+  `sha256:e1af79787de255c0dbb7e288abfc540829451b1e3c5b83682a5d821f1dd9d477`,
+  and the worker loaded it through the immutable direct path. The worker again
+  reported synthetic digest
+  `sha256:cec70f0e391431bde36301228ab7b83025c929f2ca61a549300fd55b30860311`
+  as a valid hit instead of quarantining it.
+- The third replay proved a second object-identity error. The canary derived its
+  payload, digest, and object key only from the scenario name. All three recent
+  campaigns therefore used the same synthetic digest. Deleting the control-plane
+  object did not prove that a later mounted volume view had discarded valid
+  bytes from an earlier campaign. The operator stopped the replay immediately.
+  The job closed as failed, the exact Pod became provider-absent, provider
+  inventory returned empty, storage policy returned `smart`, and the synthetic
+  state, blob, and coordinator fallback were absent. The interrupted command has
+  no accepted cost figure; its configured scenario and campaign ceiling was
+  $0.50.
 
 The accepted cold/hot scorecard and four accepted failure canaries prove a
 larger part of M0, but M0 is not complete until the corruption canary passes and
@@ -773,6 +792,7 @@ a compact redacted evidence projection is committed.
 | Corruption, fresh-object attempt | **Failed safely** | Unique-object isolation worked; stale mutable-index discovery prevented exact manifest restore and quarantine. Cleanup was complete. |
 | Corruption, first exact-ID attempt | **Failed safely** | The immutable worker path was present, but capability-name fingerprinting did not match the dispatcher's configured launch-profile fingerprint. The run stopped at placement and cleanup was complete. |
 | Corruption, first-write attempt | **Failed safely** | Exact manifest selection and loading passed, but writing valid bytes before corrupt bytes let the mount retain the valid first value. The run stopped after the synthetic verified hit and cleanup was complete. |
+| Corruption, deterministic-campaign attempt | **Failed safely** | Corrupt-first publication worked, but each campaign reused the same digest and object key. A mounted volume view retained earlier valid bytes. The run stopped after the synthetic verified hit and cleanup was complete. |
 | Compact redacted projection | **Required** | Accepted raw scorecards remain local under `.runlogs/`; a safe comparable projection still must be committed. |
 
 ## Current execution state and immediate next work
@@ -813,9 +833,11 @@ Status snapshot as of 2026-07-29:
   different names for the same profile. The launch-profile-name correction now
   passes 530 tests in merged PR #19. Its replay proved exact manifest selection
   and loading, then showed that a valid first write can remain cached after an
-  object update. The corrupt-first correction now passes 530 tests in PR #20 but
-  remains unaccepted production evidence until merge and a bounded replay
-  complete.
+  object update. PR #20 made corrupt bytes the first and only S3 write. Its
+  replay then proved that the deterministic scenario digest still reused one
+  mounted object identity across campaigns. The campaign-nonce correction now
+  passes 531 tests on its PR branch. Corruption remains unaccepted until that
+  change merges and a bounded replay passes.
 - The first unmet M0 work is therefore: compute the corruption manifest from the
   actual injected requirement profile; publish and resolve it through an
   immutable manifest-by-ID path when a mounted mutable index is stale; trigger
@@ -839,12 +861,16 @@ The direct-manifest corruption fix is bounded to these contracts:
 4. The synthetic S3 key receives corrupt bytes as its first and only value. The
    valid artifact exists only in coordinator fallback storage. The canary never
    depends on a mounted volume observing an update to an existing key.
-5. `PreparedStateCAS.find_manifest(manifest_id=...)` may load and verify that
+5. Each campaign injects one safe random nonce. That nonce creates a new payload,
+   digest, object key, file name, and state path. The same nonce is passed to the
+   prepare, observe, and cleanup hooks. A campaign cannot reuse a synthetic
+   mounted object identity from an earlier run.
+6. `PreparedStateCAS.find_manifest(manifest_id=...)` may load and verify that
    exact immutable object if the mounted `indexes/latest` view is stale. A
    mismatched ID or bad signature remains a hard failure.
-6. Corruption observation defaults to the durable `cache_mount_ready` event so
+7. Corruption observation defaults to the durable `cache_mount_ready` event so
    a finite observation window is not consumed by unrelated image startup.
-7. Existing manifest/index behavior remains the normal path; the direct object
+8. Existing manifest/index behavior remains the normal path; the direct object
    is a narrow exact-ID fallback, not a second source of unsigned truth.
 
 Before this change can become accepted evidence it must pass focused and full
