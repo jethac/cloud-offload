@@ -1,0 +1,129 @@
+{
+  "schema": "cloud-offload.m4-production-evidence.v1",
+  "milestone": "M4",
+  "accepted": true,
+  "captured_at": "2026-07-30T04:31:00+09:00",
+  "merged_stack": {
+    "backend_merge_commit": "6ba0bac638ae9096aad3d13f2b328a6a28ebed98",
+    "extension_merge_commit": "7b2a60f4f57be2d4b22d1dea0cb8bcd71d39c34c",
+    "worker_image_digest": "sha256:3b378e840fd2e8e5e71c3ed3eb58d6e88f85d109162e09da2dd4f07537c72911",
+    "max_job_runtime_seconds": 7200,
+    "lease_ttl_seconds": 900
+  },
+  "automated_verification": {
+    "backend": {
+      "passed": 601,
+      "failed": 0
+    },
+    "focused_prepared_storage_and_visibility": {
+      "passed": 70,
+      "failed": 0
+    },
+    "signed_same_generation_corruption_detected": true,
+    "background_selected_corruption_detected": true,
+    "corrupt_materialized_target_removed_before_return": true,
+    "corrupt_artifact_quarantined": true,
+    "corrupt_volume_removed_from_placement": true,
+    "full_verification_restores_volume_health": true,
+    "private_and_audit_due_assets_use_full_digest": true
+  },
+  "paid_runpod_preparation_campaign": {
+    "preparation_evidence_accepted": true,
+    "campaign_count": 2,
+    "scenario_count": 8,
+    "spend_limit_usd": 2.15,
+    "estimated_compute_cost_upper_usd": 1.712976,
+    "manual_cleanup": false,
+    "provider_absence_receipt_count": 8,
+    "final_provider_resource_count": 0,
+    "orphan_audit_error_count": 0,
+    "cold_preparation_seconds": [
+      171.51757,
+      172.495885,
+      180.468909,
+      190.710169
+    ],
+    "hot_preparation_seconds": [
+      246.361592,
+      14.403773,
+      15.179662
+    ],
+    "cold_median_seconds": 176.482397,
+    "hot_median_seconds": 15.179662,
+    "hot_percent_of_cold": 8.601,
+    "preparation_reduction_percent": 91.399,
+    "target_hot_percent_of_cold": 25.0,
+    "fast_path_observations": [
+      {
+        "kind": "trusted_hot_restore",
+        "artifact_hits": 6,
+        "artifact_bytes": 36664522522,
+        "verification_bytes": 12582912,
+        "trusted_hits": 6,
+        "background_scrub_hits": 6,
+        "full_digest_hits": 0,
+        "preparation_seconds": 14.403773,
+        "preparation_completed": true,
+        "provider_absent": true
+      },
+      {
+        "kind": "trusted_hot_restore",
+        "artifact_hits": 6,
+        "artifact_bytes": 36664522522,
+        "verification_bytes": 12582912,
+        "trusted_hits": 6,
+        "background_scrub_hits": 6,
+        "full_digest_hits": 0,
+        "preparation_seconds": 15.179662,
+        "preparation_completed": true,
+        "provider_absent": true
+      }
+    ],
+    "receipt_issue_observation": {
+      "artifact_hits": 6,
+      "artifact_bytes": 36664522522,
+      "verification_bytes": 36664522522,
+      "full_digest_hits": 6,
+      "trusted_hits": 0,
+      "preparation_seconds": 246.361592,
+      "first_seen_integrity_preserved": true,
+      "receipts_issued": 6
+    },
+    "bounded_incidents": [
+      {
+        "kind": "initial_worker_start_lease_expiry",
+        "before_preparation": true,
+        "provider_absent": true,
+        "corrective_configuration_applied": true,
+        "old_lease_ttl_seconds": 300,
+        "new_lease_ttl_seconds": 900
+      },
+      {
+        "kind": "post_preparation_execution_failure",
+        "preparation_completed": true,
+        "provider_absent": true,
+        "changes_preparation_measurement": false
+      },
+      {
+        "kind": "post_preparation_scenario_cost_limit",
+        "preparation_completed": true,
+        "provider_absent": true,
+        "changes_preparation_measurement": false
+      }
+    ]
+  },
+  "m4_exit_audit": {
+    "trusted_hot_restore_performs_no_complete_artifact_read": true,
+    "corruption_is_detected_and_quarantined": true,
+    "first_seen_integrity_is_unchanged": true,
+    "median_hot_preparation_is_at_most_25_percent_of_cold": true,
+    "all_exits_passed": true
+  },
+  "privacy": {
+    "raw_request_included": false,
+    "raw_workflow_included": false,
+    "raw_prompt_included": false,
+    "private_asset_location_included": false,
+    "credential_or_secret_endpoint_included": false
+  }
+}
