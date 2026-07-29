@@ -217,6 +217,25 @@ def test_matched_history_changes_fastest_recommendation(tmp_path):
     }
 
 
+def test_unknown_provider_costs_are_not_reported_as_zero():
+    estimate = preflight._estimate(
+        provider="plugin-provider",
+        offer={"hourly_rate": 0.5},
+        required_bytes=1024**3,
+        cached_bytes=0,
+        container_disk_gb=40,
+        idle_shutdown_seconds=300,
+        keep_warm=False,
+        keep_warm_warning_seconds=3600,
+    )
+
+    assert estimate["compute_cost_usd"][0] > 0
+    assert estimate["incremental_transfer_cost_usd"] is None
+    assert estimate["incremental_storage_cost_usd"] is None
+    assert estimate["total_job_cost_usd"] is None
+    assert estimate["cost_complete"] is False
+
+
 def test_deterministic_blocker_stops_before_provider_read(tmp_path):
     config = config_for_preflight(tmp_path)
     connector = ReadOnlyConnector()
