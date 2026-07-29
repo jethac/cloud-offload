@@ -718,6 +718,7 @@ class Worker:
                     result="hit",
                     verification_mode=verification.get("mode"),
                     verification_bytes=verification.get("bytes_read"),
+                    background_sampled=verification.get("background_sampled"),
                 )
             if self.cache_receipt:
                 self.cache_receipt.record(
@@ -728,6 +729,7 @@ class Worker:
                     reason=str(verification.get("mode") or "full_digest"),
                     verification_mode=verification.get("mode"),
                     verification_bytes=verification.get("bytes_read"),
+                    background_sampled=verification.get("background_sampled"),
                     total_ms=round((time.monotonic() - started) * 1000, 3),
                 )
             return True
@@ -1212,6 +1214,7 @@ class Worker:
                 result="hit",
                 verification_mode=verification.get("mode"),
                 verification_bytes=verification.get("bytes_read"),
+                background_sampled=verification.get("background_sampled"),
             )
             if self.cache_receipt:
                 self.cache_receipt.record(
@@ -1222,6 +1225,7 @@ class Worker:
                     reason=str(verification.get("mode") or "full_digest"),
                     verification_mode=verification.get("mode"),
                     verification_bytes=verification.get("bytes_read"),
+                    background_sampled=verification.get("background_sampled"),
                     total_ms=round((time.monotonic() - started) * 1000, 3),
                 )
             return True
@@ -1425,6 +1429,7 @@ class Worker:
                         reason=str(verification.get("mode") or "full_digest"),
                         verification_mode=verification.get("mode"),
                         verification_bytes=verification.get("bytes_read"),
+                        background_sampled=verification.get("background_sampled"),
                     )
             if job:
                 self._cache_event(
@@ -1888,6 +1893,13 @@ class Worker:
                             if item.get("kind") != "custom-node-bundle"
                             else "extract",
                             "result": item.get("result") or "unknown",
+                            "verification_mode": item.get("verification_mode"),
+                            "verification_bytes": int(
+                                item.get("verification_bytes") or 0
+                            ),
+                            "background_sampled": bool(
+                                item.get("background_sampled")
+                            ),
                             "bytes": int(item.get("bytes") or 0),
                             "file_count": 1,
                             "lookup_ms": 0,
@@ -2026,6 +2038,7 @@ class Worker:
                 {
                     "verification_mode": verification.get("mode"),
                     "verification_bytes": verification.get("bytes_read"),
+                    "background_sampled": verification.get("background_sampled"),
                     "trust_receipt_id": verification.get("receipt_id"),
                     "full_audit_due_at": verification.get("full_audit_due_at"),
                 }

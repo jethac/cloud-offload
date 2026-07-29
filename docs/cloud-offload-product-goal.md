@@ -1344,9 +1344,10 @@ Implementation status: the signed trust-receipt and metadata/sample fast path is
 implemented. It binds the exact manifest signature, artifact, volume,
 compatibility contract, object generation, expiry, and audit policy. Private and
 sensitive artifacts stay on full verification. Invalid, changed, expired, or
-audit-due receipts also return to a complete digest read. Background sampling,
-volume degradation, and the paid 25% cold/hot performance proof remain before M4
-can close.
+audit-due receipts also return to a complete digest read. A second signed sample
+runs while materialization proceeds; failure removes the target before return,
+quarantines the object through the worker fallback path, and degrades the volume.
+The paid 25% cold/hot performance proof remains before M4 can close.
 
 Exit:
 

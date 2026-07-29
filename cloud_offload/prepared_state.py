@@ -937,7 +937,8 @@ class PreparedStateCAS:
         selector = sha256_bytes(
             f"{verified['receipt_id']}:{bucket}".encode("utf-8")
         )
-        sample = samples[int(selector[:8], 16) % len(samples)]
+        sample_index = int(selector[:8], 16) % len(samples)
+        sample = samples[sample_index]
         offset = int(sample["offset"])
         size = int(sample["size"])
         with source.open("rb") as handle:
@@ -947,7 +948,7 @@ class PreparedStateCAS:
             raise CacheCorruptionError(
                 f"Prepared object {digest} failed a signed trust sample"
             )
-        return {
+        result: dict[str, Any] = {
             "mode": "trusted_metadata_sample",
             "bytes_read": size,
             "receipt_id": verified["receipt_id"],
@@ -955,6 +956,68 @@ class PreparedStateCAS:
                 "full_audit_due_at"
             ),
         }
+        if len(samples) > 1:
+            background_sample = samples[(sample_index + 1) % len(samples)]
+            outcome: dict[str, Any] = {}
+
+            def scrub() -> None:
+                try:
+                    background_offset = int(background_sample["offset"])
+                    background_size = int(background_sample["size"])
+                    with source.open("rb") as handle:
+                        handle.seek(background_offset)
+                        background_value = handle.read(background_size)
+                    if (
+                        len(background_value) != background_size
+                        or digest_id(sha256_bytes(background_value))
+                        != background_sample["sha256"]
+                    ):
+                        raise CacheCorruptionError(
+                            f"Prepared object {digest} failed a background trust sample"
+                        )
+                    outcome["bytes_read"] = background_size
+                except BaseException as exc:
+                    outcome["error"] = exc
+
+            thread = threading.Thread(
+                target=scrub,
+                name=f"cache-scrub-{normalize_digest(digest)[:12]}",
+                daemon=True,
+            )
+            thread.start()
+            result["_background_thread"] = thread
+            result["_background_outcome"] = outcome
+        return result
+
+    @staticmethod
+    def _finish_background_scrub(verification: dict[str, Any]) -> None:
+        thread = verification.pop("_background_thread", None)
+        outcome = verification.pop("_background_outcome", None)
+        if thread is None or not isinstance(outcome, dict):
+            if verification.get("mode") == "trusted_metadata_sample":
+                verification["background_sampled"] = False
+            return
+        thread.join()
+        error = outcome.get("error")
+        if error is not None:
+            if isinstance(error, CacheCorruptionError):
+                raise error
+            raise CacheCorruptionError(
+                "Prepared object background trust sample could not complete"
+            ) from error
+        sampled = int(outcome.get("bytes_read") or 0)
+        verification["bytes_read"] = int(verification.get("bytes_read") or 0) + sampled
+        verification["background_sampled"] = sampled > 0
+
+    @staticmethod
+    def _remove_materialized_destination(destination: Path) -> None:
+        try:
+            if destination.is_symlink() or destination.is_file():
+                destination.unlink(missing_ok=True)
+            elif destination.is_dir():
+                shutil.rmtree(destination)
+        except OSError:
+            pass
 
     def _remember_full_verification(self, digest: str, path: Path) -> None:
         try:
@@ -1479,8 +1542,6 @@ class PreparedStateCAS:
                     verification["receipt_issued"] = issued is not None
                 except (ManifestError, RuntimeError, ValueError, OSError):
                     pass
-        if verification_callback:
-            verification_callback(dict(verification))
         destination = Path(destination).resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
         if (
@@ -1500,6 +1561,13 @@ class PreparedStateCAS:
             )
             shutil.copyfile(source, temporary)
             os.replace(temporary, destination)
+        try:
+            self._finish_background_scrub(verification)
+        except CacheCorruptionError:
+            self._remove_materialized_destination(destination)
+            raise
+        if verification_callback:
+            verification_callback(dict(verification))
         return destination
 
     @staticmethod

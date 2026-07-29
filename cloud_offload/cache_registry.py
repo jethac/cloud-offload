@@ -358,7 +358,18 @@ class CacheRegistry:
                 UPDATE cache_volumes SET inventory_generation=?, last_verified_at=?,
                     status=? WHERE id=?
                 """,
-                (generation, _now(), "degraded" if drifted else "ready", volume_id),
+                (
+                    generation,
+                    _now(),
+                    "degraded"
+                    if drifted
+                    or connection.execute(
+                        "SELECT 1 FROM cache_invalidations WHERE volume_id=? LIMIT 1",
+                        (volume_id,),
+                    ).fetchone()
+                    else "ready",
+                    volume_id,
+                ),
             )
         return {"artifacts": inserted, "drifted": len(drifted)}
 
@@ -713,6 +724,46 @@ class CacheRegistry:
                 "UPDATE cache_artifacts SET eligibility='invalidated' WHERE volume_id=? AND digest=?",
                 (volume_id, digest),
             )
+            connection.execute(
+                "UPDATE cache_volumes SET status='degraded' WHERE id=?",
+                (volume_id,),
+            )
+
+    @staticmethod
+    def _refresh_volume_health(connection, volume_id: str) -> None:
+        unhealthy = connection.execute(
+            """
+            SELECT 1 FROM cache_invalidations WHERE volume_id=? LIMIT 1
+            """,
+            (volume_id,),
+        ).fetchone() or connection.execute(
+            """
+            SELECT 1 FROM cache_artifacts
+            WHERE volume_id=? AND eligibility!='eligible' LIMIT 1
+            """,
+            (volume_id,),
+        ).fetchone()
+        connection.execute(
+            "UPDATE cache_volumes SET status=?, last_verified_at=? WHERE id=?",
+            ("degraded" if unhealthy else "ready", _now(), volume_id),
+        )
+
+    def mark_verified(self, volume_id: str, digest: str) -> None:
+        """Clear one invalidation only after a new complete digest verification."""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM cache_invalidations WHERE volume_id=? AND digest=?",
+                (volume_id, digest),
+            )
+            connection.execute(
+                """
+                UPDATE cache_artifacts
+                SET eligibility='eligible', last_verified_at=?
+                WHERE volume_id=? AND digest=?
+                """,
+                (_now(), volume_id, digest),
+            )
+            self._refresh_volume_health(connection, volume_id)
 
     def record_observation(self, observation: dict[str, Any]) -> str:
         if observation.get("schema") != OBSERVATION_SCHEMA:
@@ -805,6 +856,29 @@ class CacheRegistry:
                         WHERE volume_id=? AND digest=?
                         """,
                         (observation["volume_id"], observation["digest"]),
+                    )
+                    connection.execute(
+                        "UPDATE cache_volumes SET status='degraded' WHERE id=?",
+                        (observation["volume_id"],),
+                    )
+                elif (
+                    observation.get("result") == "hit"
+                    and observation.get("verification_mode") == "full_digest"
+                ):
+                    connection.execute(
+                        "DELETE FROM cache_invalidations WHERE volume_id=? AND digest=?",
+                        (observation["volume_id"], observation["digest"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE cache_artifacts
+                        SET eligibility='eligible', last_verified_at=?
+                        WHERE volume_id=? AND digest=?
+                        """,
+                        (_now(), observation["volume_id"], observation["digest"]),
+                    )
+                    self._refresh_volume_health(
+                        connection, observation["volume_id"]
                     )
         return observation_id
 

@@ -358,6 +358,57 @@ def test_signed_sample_detects_same_generation_corruption_and_quarantine_removes
     assert not (volume.root / trust_receipt_key(artifact["digest"])).exists()
 
 
+def test_background_sample_blocks_materialized_target_before_restore_returns(tmp_path):
+    signer = ManifestSigner(b"b" * 32)
+    volume = PreparedStateCAS(tmp_path / "volume", signer)
+    source = tmp_path / "object"
+    source.write_bytes(os.urandom(12 * 1024 * 1024))
+    artifact = portable_artifact(source.read_bytes())
+    published = volume.publish_blob(source, artifact["digest"])
+    manifest = signed_manifest(
+        signer,
+        [artifact],
+        claims={
+            "cache_volume_id": "vol-1",
+            "cache_provider_volume_id": "provider-vol-1",
+        },
+    )
+    volume.publish_manifest(manifest)
+    receipt = json.loads(
+        (volume.root / trust_receipt_key(artifact["digest"])).read_text(
+            encoding="utf-8"
+        )
+    )
+    samples = receipt["scrub"]["samples"]
+    scrub_now = datetime.now(timezone.utc)
+    bucket = int(scrub_now.timestamp() // 3600)
+    selector = prepared_state_module.sha256_bytes(
+        f"{receipt['receipt_id']}:{bucket}".encode("utf-8")
+    )
+    selected = int(selector[:8], 16) % len(samples)
+    background = samples[(selected + 1) % len(samples)]
+    original = published.stat()
+    with published.open("r+b") as handle:
+        handle.seek(background["offset"])
+        handle.write(b"x" * background["size"])
+    os.utime(published, ns=(original.st_atime_ns, original.st_mtime_ns))
+    destination = tmp_path / "restored"
+
+    with pytest.raises(CacheCorruptionError, match="background trust sample"):
+        volume.restore_artifact(
+            artifact,
+            destination,
+            runtime={},
+            tenant="default",
+            manifest=manifest,
+            volume_id="vol-1",
+            provider_volume_id="provider-vol-1",
+            now=scrub_now,
+        )
+
+    assert not destination.exists()
+
+
 def test_private_artifact_and_due_full_audit_never_use_fast_trust(tmp_path):
     signer = ManifestSigner(b"p" * 32)
     volume = PreparedStateCAS(tmp_path / "volume", signer)
@@ -1322,9 +1373,38 @@ def test_corruption_observation_invalidates_future_scheduler_coverage(tmp_path):
         runtime={},
         tenant="default",
         profile_fingerprint=manifest["profile_fingerprint"],
-    )[0]
-    assert after["cached_bytes"] == 0
-    assert not after["complete"]
+    )
+    assert after == []
+    assert registry.get_volume(volume.id).status == "degraded"
+    registry.record_observation(
+        {
+            "schema": "cloud-offload.restore-observation.v1",
+            "volume_id": volume.id,
+            "manifest_id": manifest["manifest_id"],
+            "digest": artifact["digest"],
+            "datacenter_id": "A",
+            "worker_class": "GPU",
+            "strategy": "symlink",
+            "result": "hit",
+            "verification_mode": "full_digest",
+            "bytes": artifact["size"],
+            "file_count": 1,
+            "lookup_ms": 0,
+            "transfer_ms": 0,
+            "verification_ms": 1,
+            "extraction_ms": 0,
+            "import_ms": 0,
+            "total_ms": 1,
+        }
+    )
+    recovered = registry.volume_coverage(
+        required,
+        runtime={},
+        tenant="default",
+        profile_fingerprint=manifest["profile_fingerprint"],
+    )
+    assert recovered[0]["complete"]
+    assert registry.get_volume(volume.id).status == "ready"
 
 
 class MissingObject(Exception):

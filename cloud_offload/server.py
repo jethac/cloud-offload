@@ -3061,9 +3061,13 @@ async def worker_sign_cache_trust_receipt(
             volume_id=volume_id,
         )
         signer = _prepared_manifest_signer(config)
-        return signer.verify_trust_receipt(
+        signed = signer.verify_trust_receipt(
             signer.sign_trust_receipt(validated, manifest=manifest)
         )
+        _cache_registry(config).mark_verified(
+            volume_id, str(signed["artifact_digest"])
+        )
+        return signed
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
