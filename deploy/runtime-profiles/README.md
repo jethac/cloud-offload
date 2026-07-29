@@ -25,6 +25,12 @@ docker build -f deploy/runtime-profiles/comfyui/Dockerfile \
   -t ghcr.io/jethac/cloud-offload-runner-comfyui:0.1.0 .
 ```
 
+The Dockerfile copies PyTorch and the large CUDA libraries into separate image
+layers. A container runtime can download these registry blobs in parallel. This
+removes the former single 3.28 GB compressed download from the paid worker start
+path. The Dockerfile uses `COPY --exclude`, so it selects Dockerfile syntax 1.19
+at the top of the file.
+
 Push the image, resolve its registry digest, and configure a worker profile with
 the digest:
 

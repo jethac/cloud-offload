@@ -489,6 +489,38 @@ def test_the_entrypoint_stages_node_packs_before_it_starts_comfyui():
     assert "CLOUD_OFFLOAD_WORKER_ID" in script
 
 
+def test_the_runner_image_keeps_large_cuda_payloads_in_parallel_pull_layers():
+    dockerfile = (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "runtime-profiles"
+        / "comfyui"
+        / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    assert dockerfile.startswith("# syntax=docker/dockerfile:1.19")
+    assert " AS pytorch-runtime" in dockerfile
+    assert "FROM ubuntu:22.04@sha256:" in dockerfile
+    assert "--exclude=lib/python3.11/site-packages/torch" in dockerfile
+    assert "--exclude=lib/python3.11/site-packages/nvidia" in dockerfile
+
+    # These are the large payloads in the pinned PyTorch runtime. Each COPY is
+    # a separate registry blob, so a worker can download them in parallel.
+    payloads = (
+        "torch",
+        "nvidia/cublas",
+        "nvidia/cudnn",
+        "nvidia/cufft",
+        "nvidia/curand",
+        "nvidia/cusolver",
+        "nvidia/cusparse",
+        "nvidia/nccl",
+    )
+    for payload in payloads:
+        source = f"/opt/conda/lib/python3.11/site-packages/{payload}/"
+        assert f"COPY --from=pytorch-runtime {source} {source}" in dockerfile
+
+
 def test_both_boot_phases_answer_to_the_same_worker_id(monkeypatch):
     monkeypatch.setenv("CLOUD_OFFLOAD_WORKER_ID", "worker-abc123")
 
