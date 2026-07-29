@@ -219,12 +219,22 @@ def test_workflow_endpoint_queues_dedicated_profile(monkeypatch, tmp_path):
     config = profile_config(tmp_path)
     queue = JobQueue(config.queue_db_path)
     monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    accept_test_preflight(monkeypatch, server, config)
 
     response = TestClient(server.app).post(
         "/api/workflows",
         json={
-            "workflow": {"1": {"class_type": "LoadImage", "inputs": {}}},
+            "capsule": {
+                "schema": "comfy.workflow.capsule.v1",
+                "workflow": {"1": {"class_type": "LoadImage", "inputs": {}}},
+                "dynamic_behavior": {"declared": True, "requirements": []},
+            },
             "provider": "runpod",
+            "preflight_id": "test-preflight",
+            "manifest_digest": "sha256:" + "d" * 64,
+            "candidate_id": "sha256:" + "c" * 64,
+            "confirmation_action": "start_now",
         },
     )
 
@@ -232,7 +242,7 @@ def test_workflow_endpoint_queues_dedicated_profile(monkeypatch, tmp_path):
     job = queue.get(response.json()["job_id"])
     assert job.model == "comfyui-workflow"
     assert job.params["runtime_profile"] == "comfyui"
-    assert job.request["workflow"]["1"]["class_type"] == "LoadImage"
+    assert job.request["capsule"]["workflow"]["1"]["class_type"] == "LoadImage"
     assert response.json()["status_url"] == f"/api/jobs/{job.id}"
 
 

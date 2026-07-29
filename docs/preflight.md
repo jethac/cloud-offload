@@ -1,7 +1,7 @@
-# Partition preflight
+# Workload preflight
 
-`POST /api/preflight` checks one compiled partition before Cloud Offload queues
-it or creates a paid provider resource. The response schema is
+`POST /api/preflight` checks one compiled partition or whole-workflow capsule
+before Cloud Offload queues it or creates a paid provider resource. The response schema is
 `cloud-offload.preflight.v1`.
 
 ## Mutation boundary
@@ -23,8 +23,9 @@ The request contains:
 
 | Field | Meaning |
 | --- | --- |
-| `partition` | A `comfy.partition.job.v1` compiled partition. |
-| `input_artifacts` | Boundary key to immutable artifact digest. |
+| `partition` | A `comfy.partition.job.v1` compiled partition. Use this field or `capsule`, not both. |
+| `capsule` | A `comfy.workflow.capsule.v1` whole-workflow closure. Use this field or `partition`, not both. |
+| `input_artifacts` | Boundary key or safe workflow input name to immutable artifact digest. |
 | `provider` | `auto` or one allowed provider. |
 | `recommendation_policy` | Optional request override for `balanced`, `cheapest`, `fastest`, or `manual`. The configured policy is the default. |
 | `max_hourly_rate` | Optional stricter hourly price limit. It cannot loosen the configured hard limit. |
@@ -127,6 +128,32 @@ The response includes a random `preflight_id` and a `manifest_digest`. The diges
 binds the partition, boundary artifact identities, profile, image, GPU limits,
 storage plan, residency, provider policy, price limits, region limits, asset
 digests, and node pack digests. The report does not return the workflow body.
+
+## Whole-workflow capsule
+
+`comfy.workflow.capsule.v1` is the canonical execution closure for a complete
+API-format ComfyUI graph. It contains:
+
+- `workflow`;
+- `runner` with profile, GPU type, and minimum VRAM;
+- `residency`;
+- immutable `assets` and `node_packs`;
+- declared `inputs` and expected `outputs`;
+- optional `object_info_digest` and `dependency_lock_digest` under
+  `environment`; and
+- `dynamic_behavior`, including requirements that static proof cannot resolve.
+
+Equivalent normalized closures have the same `capsule_digest`. Asset and node
+pack order does not change this digest. A missing required input blocks before
+rental. An environment digest must match the selected pinned worker profile.
+An omitted dynamic declaration remains in `unknowns` as
+`workflow_dynamic_behavior_undeclared`.
+
+Paid `POST /api/workflows` uses the same `preflight_id`, `manifest_digest`,
+`candidate_id`, and `confirmation_action` binding as partition submission.
+The worker passes cooperative cancellation into ComfyUI. The result schema is
+`comfy.workflow.result.v1`. Images, meshes, and other files are returned as
+content-addressed `artifacts`; they are not stored as base64 job result data.
 
 ## Submission binding and revalidation
 

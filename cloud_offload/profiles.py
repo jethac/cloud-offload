@@ -61,8 +61,29 @@ def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
             "image_size_gb": normalized_profile_disk_gb(
                 str(name), "image_size_gb", value.get("image_size_gb")
             ),
+            "object_info_digest": normalized_profile_digest(
+                str(name), "object_info_digest", value.get("object_info_digest")
+            ),
+            "dependency_lock_digest": normalized_profile_digest(
+                str(name),
+                "dependency_lock_digest",
+                value.get("dependency_lock_digest"),
+            ),
         }
     return result
+
+
+def normalized_profile_digest(name: str, field: str, value: Any) -> str:
+    """Normalize one optional sha256 readiness identity on a worker profile."""
+
+    digest = str(value or "").strip().lower()
+    if not digest:
+        return ""
+    if digest.startswith("sha256:"):
+        digest = digest[7:]
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"Worker profile {name!r}: {field} must be a sha256 digest")
+    return "sha256:" + digest
 
 
 def normalized_profile_disk_gb(name: str, field: str, value: Any) -> float:
