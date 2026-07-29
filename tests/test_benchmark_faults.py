@@ -7,6 +7,7 @@ import pytest
 import cloud_offload.benchmark_faults as benchmark_faults
 from cloud_offload.benchmark_faults import (
     _benchmark_context,
+    _corruption_profile_fingerprint,
     _process_exists,
     _windows_process_exists,
     cleanup_corruption,
@@ -482,3 +483,48 @@ def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
         declared,
         "sha256:" + "c" * 64,
     )
+
+
+def test_corruption_profile_uses_dispatcher_launch_profile_name(monkeypatch):
+    from types import SimpleNamespace
+
+    from cloud_offload.cache_scheduler import resolve_prepared_requirements
+    from cloud_offload.profiles import configured_worker_profiles, profile_providing
+
+    config = SimpleNamespace(
+        worker_profiles={
+            "operator-comfy": {
+                "image": "ghcr.io/example/worker@sha256:" + "d" * 64,
+                "models": ["comfyui-partition-v1"],
+                "providers": ["runpod"],
+            }
+        }
+    )
+    monkeypatch.setattr(
+        benchmark_faults.CloudConfig,
+        "load",
+        lambda resolve_secrets=False: config,
+    )
+    declared = {"a" * 64, "b" * 64}
+    profiles = configured_worker_profiles(config)
+    profile = profile_providing(profiles, "comfyui-partition-v1")
+    jobs = [
+        SimpleNamespace(
+            request={
+                "assets": [
+                    {"sha256": digest, "size": 123} for digest in sorted(declared)
+                ]
+            }
+        )
+    ]
+    expected = resolve_prepared_requirements("operator-comfy", profile, jobs)[
+        "profile_fingerprint"
+    ]
+    capability_named = resolve_prepared_requirements(
+        "comfyui-partition-v1", profile, jobs
+    )["profile_fingerprint"]
+
+    actual = _corruption_profile_fingerprint("comfyui-partition-v1", declared)
+
+    assert actual == expected
+    assert actual != capability_named
