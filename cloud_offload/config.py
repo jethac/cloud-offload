@@ -32,9 +32,9 @@ def estimate_runpod_storage_monthly(size_gb: int | float) -> float:
 # keys in the OS keychain. These names are re-exported so callers keep one
 # import site.
 from cloud_offload.credentials import (  # noqa: E402
-    KeychainUnavailable,
+    KeychainUnavailable,  # noqa: F401 - public compatibility re-export
     normalize_provider_name,
-    provider_env_var,
+    provider_env_var,  # noqa: F401 - public compatibility re-export
 )
 
 
