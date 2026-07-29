@@ -1404,9 +1404,11 @@ Exit:
 Implementation status: active. The canonical `comfy.workflow.capsule.v1`
 closure, stable capsule digest, full-workflow preflight, confirmed submission,
 artifact input and result transport, environment readiness identities, and
-cooperative whole-workflow cancellation are implemented. Reproducible
-custom-node and environment bundle production and paid fresh-Pod proof remain
-before this milestone can close.
+cooperative whole-workflow cancellation are implemented. First-rent workers now
+build reproducible custom-node and Python environment bundles. The coordinator
+binds them to exact profile and runtime identities before it signs the prepared
+manifest. Later Pods restore both before ComfyUI starts. Paid fresh-Pod proof
+remains before this milestone can close.
 
 Exit:
 

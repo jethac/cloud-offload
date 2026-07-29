@@ -54,3 +54,9 @@ custom-node repositories your workflows import (pin each by revision) before the
 name (still starting with `comfyui`, e.g. `comfyui-omni`). Nothing else in the
 coordinator changes — the runner still only claims the two workflow
 capabilities.
+
+Profile custom-node requirements install into
+`/opt/cloud-offload/environment`. When prepared storage is attached, the first
+authorized job publishes reproducible code and environment bundles. Later Pods
+restore them before ComfyUI starts. See
+[`docs/prepared-runtime-bundles.md`](../../docs/prepared-runtime-bundles.md).

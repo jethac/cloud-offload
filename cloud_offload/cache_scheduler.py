@@ -9,6 +9,8 @@ from cloud_offload.cache_registry import CacheVolume
 from cloud_offload.providers.base import PlacementConstraints, StorageAttachment
 from cloud_offload.prepared_state import (
     custom_node_requirement_key,
+    environment_requirement_key,
+    fingerprint,
     profile_key,
     profile_weight_requirement_key,
 )
@@ -148,6 +150,16 @@ def resolve_prepared_requirements(
         logical_required.extend(
             custom_node_requirement_key(profile_pack_identifier(item))
             for item in profile["custom_nodes"]
+        )
+        logical_required.append(
+            environment_requirement_key(
+                fingerprint(
+                    {
+                        "custom_nodes": profile.get("custom_nodes") or [],
+                        "wheelhouse_sha256": profile.get("wheelhouse_sha256") or None,
+                    }
+                )
+            )
         )
     keys = sorted([*artifacts, "runtime:" + json_fingerprint(runtime_identity)])
     return {

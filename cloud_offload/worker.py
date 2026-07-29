@@ -28,6 +28,7 @@ from cloud_offload.profiles import WORKFLOW_CAPABILITIES, load_worker_manifest
 logger = logging.getLogger(__name__)
 
 DEFAULT_PARTITION_ROOT = "/opt/cloud-offload/partitions"
+DEFAULT_ENVIRONMENT_ROOT = "/opt/cloud-offload/environment"
 # Where a model file whose bytes contradict the job's manifest is set aside.
 # Quarantine rather than overwrite: it preserves the evidence, and it makes
 # "same filename, different weights" a loud event instead of a silent one.
@@ -603,7 +604,10 @@ class Worker:
         decision nobody can see is the reason a second attempt on an already
         staged runner looked exactly like a runner that never staged anything.
         """
+        environment_ready = self._restore_environment_bundle(job)
         if self._custom_nodes_staged:
+            if job is not None:
+                self._populate_staged_runtime_bundles(job)
             self._publish_node_pack_skip(job, "already_staged")
             return
         if not self.custom_nodes:
@@ -661,10 +665,14 @@ class Worker:
                     pack_id,
                     target,
                 )
-                if restored and entry.get("install_requirements", True):
+                if (
+                    restored
+                    and not environment_ready
+                    and entry.get("install_requirements", True)
+                ):
                     self._install_pack_requirements(job, pack_id, target)
                 if job is not None:
-                    self._populate_custom_node_bundle(pack_id, target, job)
+                    self._populate_custom_node_bundle(pack_id, entry, target, job)
                 downloaded += 1
                 continue
             if source == "registry":
@@ -673,12 +681,142 @@ class Worker:
                 self._install_git_pack(entry, target)
             if entry.get("install_requirements", True):
                 self._install_pack_requirements(job, pack_id, target)
-            self._populate_custom_node_bundle(pack_id, target, job)
+            if job is not None:
+                self._populate_custom_node_bundle(pack_id, entry, target, job)
             downloaded += 1
 
         publish(None, None)
+        self._mark_environment_ready()
+        if job is not None:
+            self._populate_environment_bundle(job)
         self._custom_nodes_staged = True
         logger.info("Staged %d custom node pack(s) into %s", total_packs, root)
+
+    def _environment_root(self) -> Path:
+        return Path(
+            os.environ.get("CLOUD_OFFLOAD_ENV_ROOT", DEFAULT_ENVIRONMENT_ROOT)
+        ).resolve()
+
+    def _environment_marker(self) -> Path:
+        return self._environment_root() / ".cloud-offload-environment.json"
+
+    def _dependency_lock(self) -> str:
+        return str((getattr(self, "cache_runtime", None) or {}).get("dependency_lock") or "")
+
+    def _environment_is_ready(self) -> bool:
+        import json
+
+        try:
+            marker = json.loads(self._environment_marker().read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return bool(self._dependency_lock()) and marker.get(
+            "dependency_lock"
+        ) == self._dependency_lock()
+
+    def _mark_environment_ready(self) -> None:
+        import json
+
+        dependency_lock = self._dependency_lock()
+        if not dependency_lock or not self.custom_nodes:
+            return
+        root = self._environment_root()
+        root.mkdir(parents=True, exist_ok=True)
+        self._environment_marker().write_text(
+            json.dumps(
+                {
+                    "schema": "cloud-offload.environment-ready.v1",
+                    "dependency_lock": dependency_lock,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
+    def _restore_environment_bundle(self, job: Job | None) -> bool:
+        if not self.custom_nodes or self._environment_is_ready():
+            return bool(self.custom_nodes)
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            self._environment_root().mkdir(parents=True, exist_ok=True)
+            return False
+        manifest = self._selected_prepared_manifest()
+        dependency_lock = self._dependency_lock()
+        artifact = next(
+            (
+                item
+                for item in (manifest or {}).get("artifacts") or []
+                if item.get("kind") == "environment-bundle"
+                and (item.get("destination") or {}).get("dependency_lock")
+                == dependency_lock
+            ),
+            None,
+        )
+        if not artifact:
+            self._environment_root().mkdir(parents=True, exist_ok=True)
+            return False
+        from cloud_offload.prepared_state import CacheCorruptionError
+
+        try:
+            verification = self._restore_prepared_artifact(
+                artifact,
+                self._environment_root(),
+                manifest=manifest,
+            )
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_hit",
+                    digest=artifact["digest"],
+                    kind="environment-bundle",
+                    bytes=artifact["size"],
+                    result="hit",
+                    verification_mode=verification.get("mode"),
+                    verification_bytes=verification.get("bytes_read"),
+                )
+            return self._environment_is_ready()
+        except CacheCorruptionError as exc:
+            cache.quarantine(
+                artifact["digest"], str(exc), storage_key=artifact["storage_key"]
+            )
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_quarantined",
+                    kind="environment-bundle",
+                    digest=artifact["digest"],
+                    reason=str(exc),
+                )
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            self._environment_root().mkdir(parents=True, exist_ok=True)
+            return False
+        except Exception as exc:
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_refused",
+                    kind="environment-bundle",
+                    reason=str(exc),
+                )
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            self._environment_root().mkdir(parents=True, exist_ok=True)
+            return False
+
+    def _populate_staged_runtime_bundles(self, job: Job) -> None:
+        from cloud_offload.comfyui import comfyui_custom_nodes_dir
+        from cloud_offload.profiles import profile_pack_identifier
+
+        root = comfyui_custom_nodes_dir().resolve()
+        for entry in self.custom_nodes:
+            pack_id = profile_pack_identifier(entry)
+            target = (root / pack_id).resolve()
+            if target.is_dir():
+                self._populate_custom_node_bundle(pack_id, entry, target, job)
+        self._mark_environment_ready()
+        self._populate_environment_bundle(job)
 
     def _restore_custom_node_bundle(
         self, pack_id: str, target: Path, job: Job | None
@@ -772,18 +910,96 @@ class Worker:
             return False
 
     def _populate_custom_node_bundle(
-        self, pack_id: str, target: Path, job: Job | None
+        self,
+        pack_id: str,
+        entry: dict,
+        target: Path,
+        job: Job | None,
     ) -> None:
         cache = getattr(self, "prepared_cache", None)
         if cache is None or job is None:
             return
-        self._cache_event(
-            job,
-            "cache_artifact_refused",
-            kind="custom-node-bundle",
-            reason="custom_node_bundle_requires_coordinator_preparation",
+        from cloud_offload.prepared_state import bundle_key
+        from cloud_offload.runtime_bundles import build_reproducible_bundle
+
+        with tempfile.TemporaryDirectory(prefix="cloud-offload-node-bundle-") as root:
+            archive = Path(root) / "custom-node.tar"
+            built = build_reproducible_bundle(target, archive)
+            digest = str(built["sha256"])
+            cache.publish_blob(
+                archive,
+                digest,
+                writer_id=self.worker_id,
+                bundle=True,
+                source_verified=True,
+            )
+        self._verified_prepared_digests.add("sha256:" + digest)
+        self._pending_prepared_artifacts.append(
+            {
+                "digest": "sha256:" + digest,
+                "kind": "custom-node-bundle",
+                "size": int(built["size"]),
+                "storage_key": bundle_key(digest),
+                "portability": "portable",
+                "requirements": {},
+                "materialization": "extract",
+                "policy": {
+                    "tenant": str(self.cache_policy.get("tenant") or "default"),
+                    "cacheable": True,
+                    "private": False,
+                },
+                "source": {"pack_id": pack_id, **entry},
+                "destination": {"pack_id": pack_id},
+            }
         )
-        return
+
+    def _populate_environment_bundle(self, job: Job) -> None:
+        cache = getattr(self, "prepared_cache", None)
+        dependency_lock = self._dependency_lock()
+        root = self._environment_root()
+        if cache is None or not dependency_lock or not root.is_dir():
+            return
+        from cloud_offload.prepared_state import bundle_key
+        from cloud_offload.runtime_bundles import build_reproducible_bundle
+
+        with tempfile.TemporaryDirectory(prefix="cloud-offload-env-bundle-") as temporary:
+            archive = Path(temporary) / "environment.tar"
+            built = build_reproducible_bundle(root, archive)
+            digest = str(built["sha256"])
+            cache.publish_blob(
+                archive,
+                digest,
+                writer_id=self.worker_id,
+                bundle=True,
+                source_verified=True,
+            )
+        self._verified_prepared_digests.add("sha256:" + digest)
+        self._pending_prepared_artifacts.append(
+            {
+                "digest": "sha256:" + digest,
+                "kind": "environment-bundle",
+                "size": int(built["size"]),
+                "storage_key": bundle_key(digest),
+                "portability": "runtime-bound",
+                "requirements": {
+                    key: self.cache_runtime.get(key, "")
+                    for key in (
+                        "image_digest",
+                        "platform",
+                        "python_abi",
+                        "dependency_lock",
+                    )
+                },
+                "materialization": "extract",
+                "policy": {
+                    "tenant": str(self.cache_policy.get("tenant") or "default"),
+                    "cacheable": True,
+                    "private": False,
+                },
+                "source": {"dependency_lock": dependency_lock},
+                "destination": {"dependency_lock": dependency_lock},
+            }
+        )
 
     def _publish_node_pack_skip(self, job: Job | None, reason: str) -> None:
         """Say out loud that node pack staging did nothing, and why."""
@@ -997,8 +1213,19 @@ class Worker:
         requirements = target / "requirements.txt"
         if not requirements.is_file():
             return
+        environment_root = self._environment_root()
+        environment_root.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--target",
+                str(environment_root),
+                "-r",
+                str(requirements),
+            ],
             capture_output=True,
             text=True,
             timeout=PIP_TIMEOUT_SECONDS,
