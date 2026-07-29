@@ -6,6 +6,7 @@ publishes results/artifacts back to the coordinator. The worker never loads a
 3D model: generation rides inside the submitted subgraph.
 """
 
+import base64
 import hashlib
 import logging
 import os
@@ -14,6 +15,7 @@ import signal
 import subprocess
 import threading
 import time
+import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -2325,34 +2327,156 @@ class Worker:
     def _run_comfyui_workflow(self, job: Job) -> dict:
         """Execute an arbitrary API-format workflow in the colocated ComfyUI."""
         from cloud_offload.comfyui import ComfyUIWorkflowExecutor
+        from cloud_offload.workflow_capsule import workflow_capsule_digest
 
         request = job.request
         if request.get("kind") == "comfyui-partition":
             return self._run_comfyui_partition(job, ComfyUIWorkflowExecutor())
-        workflow = request.get("workflow") or {}
+        capsule = (
+            request.get("capsule")
+            if request.get("kind") == "comfyui-workflow-capsule"
+            else None
+        )
+        workflow = (capsule or {}).get("workflow") or request.get("workflow") or {}
         first_sampler = False
+        total_nodes = max(1, len(workflow))
+        finished_nodes: set[str] = set()
+        last_progress_sent = 0.0
+        last_cancel_check = 0.0
+        cancel_requested = False
+
+        def should_cancel() -> bool:
+            nonlocal last_cancel_check, cancel_requested
+            if cancel_requested:
+                return True
+            now = time.monotonic()
+            if now - last_cancel_check < 1.0:
+                return False
+            last_cancel_check = now
+            current = self.queue.get(job.id)
+            cancel_requested = bool(
+                current
+                and current.status in {JobStatus.FAILED, JobStatus.DEAD_LETTER}
+                and str(current.error or "").lower().startswith("cancel")
+            )
+            return cancel_requested
 
         def relay(event: dict) -> None:
-            nonlocal first_sampler
+            nonlocal first_sampler, last_progress_sent
             writer = getattr(self.queue, "append_event", None)
             if callable(writer):
                 writer(job.id, event)
+            event_type = str(event.get("type") or "")
             node_id = str(event.get("node_id") or "")
             node = workflow.get(node_id) or {}
             if (
                 not first_sampler
-                and event.get("type") == "executing"
+                and event_type == "executing"
                 and "sampler" in str(node.get("class_type") or "").lower()
             ):
                 first_sampler = True
                 self._phase_event(job, "first_sampler", node_id=node_id)
+            if event_type == "executed" and node_id:
+                finished_nodes.add(node_id)
+            elif event_type == "execution_cached":
+                for cached in (event.get("data") or {}).get("nodes") or []:
+                    finished_nodes.add(str(cached))
+            now = time.monotonic()
+            fraction = 0.0
+            if event_type == "progress":
+                data = event.get("data") or {}
+                maximum = max(1, int(data.get("max") or 1))
+                fraction = max(
+                    0.0, min(1.0, float(data.get("value") or 0) / maximum)
+                )
+                if now - last_progress_sent < 0.25 and fraction < 1.0:
+                    return
+                last_progress_sent = now
+            overall = (len(finished_nodes) + fraction) / total_nodes
+            setter = getattr(self.queue, "set_progress", None)
+            if callable(setter):
+                setter(job.id, max(10, min(95, 10 + round(overall * 85))))
 
-        return ComfyUIWorkflowExecutor().execute(
-            workflow,
-            inputs=request.get("inputs") or {},
-            timeout_seconds=int(request.get("timeout_seconds", 3600)),
-            event_callback=relay,
-        )
+        inputs = request.get("inputs") or {}
+        with tempfile.TemporaryDirectory(prefix="cloud-offload-workflow-") as root_name:
+            root = Path(root_name).resolve()
+            if capsule is not None:
+                inputs = {}
+                for filename, artifact_id in (
+                    request.get("input_artifacts") or {}
+                ).items():
+                    target = (root / filename).resolve()
+                    target.relative_to(root)
+                    self._download_partition_artifact(str(artifact_id), target)
+                    inputs[filename] = base64.b64encode(target.read_bytes()).decode(
+                        "ascii"
+                    )
+            result = ComfyUIWorkflowExecutor().execute(
+                workflow,
+                inputs=inputs,
+                timeout_seconds=int(request.get("timeout_seconds", 3600)),
+                event_callback=relay,
+                cancel_check=should_cancel,
+            )
+            if capsule is None:
+                return result
+
+            artifacts: list[dict] = []
+            for output_kind, entries in (
+                ("image", result.pop("images", [])),
+                ("file", result.pop("files", [])),
+            ):
+                for index, entry in enumerate(entries):
+                    self._raise_if_cancelled(job)
+                    encoded = entry.pop("data", "")
+                    try:
+                        content = base64.b64decode(encoded, validate=True)
+                    except ValueError as exc:
+                        raise RuntimeError("ComfyUI returned an invalid output") from exc
+                    target = root / f"output-{len(artifacts):04d}.artifact"
+                    target.write_bytes(content)
+                    stored = self._upload_partition_artifact(target)
+                    artifacts.append(
+                        {
+                            **stored,
+                            "node_id": str(entry.get("node_id") or ""),
+                            "filename": str(entry.get("filename") or f"output-{index}"),
+                            "subfolder": str(entry.get("subfolder") or ""),
+                            "mime_type": str(
+                                entry.get("mime_type") or "application/octet-stream"
+                            ),
+                            "output_kind": str(
+                                entry.get("output_kind") or output_kind
+                            ),
+                        }
+                    )
+
+            for expected in capsule.get("outputs") or []:
+                if not expected.get("required", True):
+                    continue
+                kind = str(expected.get("kind") or "any")
+                found = any(
+                    item["node_id"] == str(expected["node_id"])
+                    and (
+                        kind == "any"
+                        or item["output_kind"] == kind
+                        or (kind == "file" and item["output_kind"] != "image")
+                    )
+                    for item in artifacts
+                )
+                if not found:
+                    raise RuntimeError(
+                        "ComfyUI produced no required workflow output for node "
+                        + str(expected["node_id"])
+                    )
+            return {
+                "schema": "comfy.workflow.result.v1",
+                "capsule_digest": workflow_capsule_digest(capsule),
+                "prompt_id": result.get("prompt_id"),
+                "uploaded_inputs": result.get("uploaded_inputs") or {},
+                "outputs": result.get("outputs") or {},
+                "artifacts": artifacts,
+            }
 
     @staticmethod
     def _partition_artifact_key(artifact_id: str) -> str:

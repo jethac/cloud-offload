@@ -484,6 +484,7 @@ def build_partition_preflight(
     history_lookup: Callable[[str, dict[str, Any]], dict[str, Any] | None]
     | None = None,
     now: Callable[[], datetime] = _utc_now,
+    required_capability: str = "comfyui-partition-v1",
 ) -> dict[str, Any]:
     """Build a versioned report without creating or changing paid resources."""
 
@@ -646,12 +647,12 @@ def build_partition_preflight(
             )
         )
         profile = {}
-    elif "comfyui-partition-v1" not in (profile.get("models") or []):
+    elif required_capability not in (profile.get("models") or []):
         blockers.append(
             _issue(
                 "partition_capability_not_supported",
-                f"Worker profile {profile.get('name') or profile_name} does not provide comfyui-partition-v1.",
-                action="Use a worker profile that provides the partition capability.",
+                f"Worker profile {profile.get('name') or profile_name} does not provide {required_capability}.",
+                action=f"Use a worker profile that provides {required_capability}.",
             )
         )
 
@@ -1307,6 +1308,153 @@ def build_partition_preflight(
             ],
         },
     }
+
+
+def build_workflow_preflight(
+    *,
+    config: Any,
+    capsule: dict[str, Any],
+    input_artifacts: dict[str, str],
+    provider: str = "auto",
+    recommendation_policy: str | None = None,
+    max_hourly_rate: float | None = None,
+    max_total_job_cost: float | None = None,
+    allowed_regions: list[str] | None = None,
+    storage: Any,
+    cache_registry: CacheRegistry,
+    worker_auth_configured: bool | None = None,
+    connector_factory: Callable[[str, Any], Any] | None = None,
+    history_lookup: Callable[[str, dict[str, Any]], dict[str, Any] | None]
+    | None = None,
+    now: Callable[[], datetime] = _utc_now,
+) -> dict[str, Any]:
+    """Build a free readiness report for a canonical whole-workflow capsule."""
+
+    from cloud_offload.workflow_capsule import (
+        capsule_partition,
+        normalize_workflow_capsule,
+        workflow_capsule_digest,
+    )
+
+    normalized = normalize_workflow_capsule(capsule)
+    declared_inputs = {item["name"]: item for item in normalized["inputs"]}
+    provided_inputs = {str(name): str(digest) for name, digest in input_artifacts.items()}
+    synthetic_inputs = {
+        f"input_{index:04d}": provided_inputs[name]
+        for index, name in enumerate(sorted(provided_inputs))
+    }
+    report = build_partition_preflight(
+        config=config,
+        partition=capsule_partition(normalized),
+        input_artifacts=synthetic_inputs,
+        provider=provider,
+        recommendation_policy=recommendation_policy,
+        max_hourly_rate=max_hourly_rate,
+        max_total_job_cost=max_total_job_cost,
+        allowed_regions=allowed_regions,
+        storage=storage,
+        cache_registry=cache_registry,
+        worker_auth_configured=worker_auth_configured,
+        connector_factory=connector_factory,
+        history_lookup=history_lookup,
+        now=now,
+        required_capability="comfyui-workflow",
+    )
+
+    missing = sorted(
+        name
+        for name, declaration in declared_inputs.items()
+        if declaration["required"] and name not in provided_inputs
+    )
+    unexpected = sorted(set(provided_inputs) - set(declared_inputs))
+    if missing:
+        report["blockers"].append(
+            _issue(
+                "workflow_input_missing",
+                "One or more required workflow inputs are missing.",
+                action="Upload every required input before preflight.",
+                field="input_artifacts",
+                details={"names": missing},
+            )
+        )
+    if unexpected:
+        report["blockers"].append(
+            _issue(
+                "workflow_input_undeclared",
+                "One or more uploaded workflow inputs are not in the capsule.",
+                action="Declare each input in the workflow capsule.",
+                field="input_artifacts",
+                details={"names": unexpected},
+            )
+        )
+    dynamic = normalized["dynamic_behavior"]
+    if not dynamic["declared"]:
+        report["unknowns"].append(
+            _issue(
+                "workflow_dynamic_behavior_undeclared",
+                "The workflow does not declare whether it has dynamic requirements.",
+                action="Declare dynamic behavior before release use.",
+                field="capsule.dynamic_behavior",
+            )
+        )
+    for requirement in dynamic["requirements"]:
+        report["unknowns"].append(
+            _issue(
+                "workflow_dynamic_requirement",
+                requirement["description"],
+                action="Confirm that the selected runner can satisfy this dynamic requirement.",
+                field=(
+                    f"capsule.workflow.{requirement['node_id']}"
+                    if requirement.get("node_id")
+                    else "capsule.dynamic_behavior"
+                ),
+            )
+        )
+
+    profile = resolve_worker_profile(config, normalized["runner"]["profile"]) or {}
+    for field in ("object_info_digest", "dependency_lock_digest"):
+        required = normalized["environment"].get(field)
+        if not required:
+            continue
+        provided = str(profile.get(field) or "").strip().lower()
+        if provided and not provided.startswith("sha256:"):
+            provided = "sha256:" + provided
+        if provided != required:
+            report["blockers"].append(
+                _issue(
+                    "workflow_environment_not_ready",
+                    f"The worker profile does not provide the required {field}.",
+                    action="Build or select a worker profile with the exact environment digest.",
+                    field=f"capsule.environment.{field}",
+                )
+            )
+
+    capsule_digest = workflow_capsule_digest(normalized)
+    report["workload_type"] = "workflow_capsule"
+    report["capsule_digest"] = capsule_digest
+    report["workload_digest"] = _digest(
+        {
+            "capsule_digest": capsule_digest,
+            "profile": normalized["runner"]["profile"],
+            "minimum_vram_gb": normalized["runner"]["min_gpu_ram_gb"],
+        }
+    )
+    report["manifest_digest"] = _digest(
+        {
+            "capsule": normalized,
+            "input_artifacts": provided_inputs,
+            "readiness_manifest": report["manifest_digest"],
+        }
+    )
+    report["input_artifacts"] = {
+        "declared": sorted(declared_inputs),
+        "provided": sorted(provided_inputs),
+    }
+    if report["blockers"]:
+        report["status"] = "blocked"
+        report["confirmation"]["required"] = False
+        report["confirmation"]["not_before"] = None
+    return report
 
 
 def finite_report(report: dict[str, Any]) -> bool:

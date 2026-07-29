@@ -8,10 +8,13 @@ def accept_test_preflight(monkeypatch, server, config):
     """Patch binding only when a test is about another submit-route contract."""
 
     def accepted(*, request, config=config, storage=None):
-        runner = request.partition.get("runner") or {}
+        workload = getattr(request, "partition", None) or getattr(
+            request, "capsule", None
+        )
+        runner = workload.get("runner") or {}
         profile_name = str(runner.get("profile") or "comfyui")
         profile = resolve_worker_profile(config, profile_name) or {}
-        residency = request.partition.get("residency", "cloud")
+        residency = workload.get("residency", "cloud")
         providers = [
             name
             for name in profile.get("providers") or config.provider_order
@@ -46,6 +49,7 @@ def accept_test_preflight(monkeypatch, server, config):
         report = {
             "preflight_id": "test-preflight",
             "manifest_digest": "sha256:" + "d" * 64,
+            "capsule_digest": "sha256:" + "e" * 64,
             "expires_at": "2099-01-01T00:00:00Z",
             "request_policy": {
                 "provider": requested,
@@ -55,6 +59,16 @@ def accept_test_preflight(monkeypatch, server, config):
                 "allowed_regions": [],
             },
         }
-        return {"accepted": True, "report": report, "candidate": candidate}
+        return {
+            "accepted": True,
+            "report": report,
+            "candidate": candidate,
+            "confirmation": {
+                "accepted": True,
+                "action": "start_now",
+                "policy": "test",
+                "mandatory": False,
+            },
+        }
 
     monkeypatch.setattr(server, "_revalidate_partition_preflight", accepted)

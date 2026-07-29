@@ -96,10 +96,17 @@ class ErrorResponse(BaseModel):
 
 
 class WorkflowSubmitRequest(BaseModel):
-    workflow: dict[str, Any]
-    inputs: dict[str, str] = Field(default_factory=dict)
+    capsule: dict[str, Any]
+    input_artifacts: dict[str, str] = Field(default_factory=dict)
     provider: str = "auto"
     timeout_seconds: int = Field(default=3600, ge=1, le=86400)
+    preflight_id: str | None = None
+    manifest_digest: str | None = None
+    candidate_id: str | None = None
+    confirmation_action: (
+        Literal["start_now", "countdown_elapsed", "policy_skip"] | None
+    ) = None
+    force_execution: bool = False
 
 
 class PartitionSubmitRequest(BaseModel):
@@ -119,7 +126,8 @@ class PartitionSubmitRequest(BaseModel):
 
 
 class PreflightRequest(BaseModel):
-    partition: dict[str, Any]
+    partition: dict[str, Any] | None = None
+    capsule: dict[str, Any] | None = None
     input_artifacts: dict[str, str] = Field(default_factory=dict)
     provider: str = "auto"
     recommendation_policy: str | None = None
@@ -2215,27 +2223,49 @@ async def job_events(job_id: str, after: int = 0, limit: int = 250):
 @app.post("/api/preflight")
 async def preflight_partition(request: PreflightRequest):
     """Prove readiness and recommend a current offer without paid mutation."""
-    from cloud_offload.preflight import build_partition_preflight, finite_report
+    from cloud_offload.preflight import (
+        build_partition_preflight,
+        build_workflow_preflight,
+        finite_report,
+    )
     from cloud_offload.recommendation_history import RecommendationHistory
     from cloud_offload.storage import create_storage
 
     config = _config()
     history = RecommendationHistory(config.queue_db_path)
-    report = await asyncio.to_thread(
-        build_partition_preflight,
-        config=config,
-        partition=request.partition,
-        input_artifacts=request.input_artifacts,
-        provider=request.provider,
-        recommendation_policy=request.recommendation_policy,
-        max_hourly_rate=request.max_hourly_rate,
-        max_total_job_cost=request.max_total_job_cost,
-        allowed_regions=request.allowed_regions,
-        storage=create_storage(config),
-        cache_registry=_cache_registry(config),
-        worker_auth_configured=_worker_auth_configured(config),
-        history_lookup=history.lookup,
+    if (request.partition is None) == (request.capsule is None):
+        raise HTTPException(
+            status_code=400,
+            detail="Preflight requires exactly one partition or workflow capsule",
+        )
+    builder = (
+        build_workflow_preflight
+        if request.capsule is not None
+        else build_partition_preflight
     )
+    workload = (
+        {"capsule": request.capsule}
+        if request.capsule is not None
+        else {"partition": request.partition}
+    )
+    try:
+        report = await asyncio.to_thread(
+            builder,
+            config=config,
+            **workload,
+            input_artifacts=request.input_artifacts,
+            provider=request.provider,
+            recommendation_policy=request.recommendation_policy,
+            max_hourly_rate=request.max_hourly_rate,
+            max_total_job_cost=request.max_total_job_cost,
+            allowed_regions=request.allowed_regions,
+            storage=create_storage(config),
+            cache_registry=_cache_registry(config),
+            worker_auth_configured=_worker_auth_configured(config),
+            history_lookup=history.lookup,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not finite_report(report):
         raise HTTPException(
             status_code=500,
@@ -2401,12 +2431,16 @@ def _iso_confirmation_not_before(report: dict[str, Any]) -> str:
 
 def _revalidate_partition_preflight(
     *,
-    request: PartitionSubmitRequest,
+    request: PartitionSubmitRequest | WorkflowSubmitRequest,
     config: Any,
     storage: Any,
 ) -> dict[str, Any]:
     """Rebuild volatile facts and accept only the exact confirmed candidate."""
-    from cloud_offload.preflight import build_partition_preflight, finite_report
+    from cloud_offload.preflight import (
+        build_partition_preflight,
+        build_workflow_preflight,
+        finite_report,
+    )
     from cloud_offload.recommendation_history import RecommendationHistory
 
     if (
@@ -2451,6 +2485,18 @@ def _revalidate_partition_preflight(
             "message": "The preflight report is not ready for paid launch.",
             "details": {"action": "Resolve its blockers or unknown provider state."},
         }
+    expected_workload_type = (
+        "workflow_capsule"
+        if isinstance(request, WorkflowSubmitRequest)
+        else None
+    )
+    if previous.get("workload_type") != expected_workload_type:
+        return {
+            "accepted": False,
+            "code": "cloud_offload.preflight_workload_mismatch",
+            "message": "The preflight report is for a different workload type.",
+            "details": {"action": "Run preflight again for this workload."},
+        }
 
     confirmation = _confirmation_gate(previous, request.confirmation_action)
     if not confirmation["accepted"]:
@@ -2458,19 +2504,25 @@ def _revalidate_partition_preflight(
 
     policy = previous.get("request_policy") or {}
     history = RecommendationHistory(config.queue_db_path)
-    current = build_partition_preflight(
-        config=config,
-        partition=request.partition,
-        input_artifacts=request.input_artifacts,
-        provider=str(policy.get("provider") or request.provider),
-        recommendation_policy=str(policy.get("recommendation_policy") or "balanced"),
-        max_hourly_rate=policy.get("max_hourly_rate"),
-        max_total_job_cost=policy.get("max_total_job_cost"),
-        allowed_regions=list(policy.get("allowed_regions") or []),
-        storage=storage,
-        cache_registry=_cache_registry(config),
-        worker_auth_configured=_worker_auth_configured(config),
-        history_lookup=history.lookup,
+    common = {
+        "config": config,
+        "input_artifacts": request.input_artifacts,
+        "provider": str(policy.get("provider") or request.provider),
+        "recommendation_policy": str(
+            policy.get("recommendation_policy") or "balanced"
+        ),
+        "max_hourly_rate": policy.get("max_hourly_rate"),
+        "max_total_job_cost": policy.get("max_total_job_cost"),
+        "allowed_regions": list(policy.get("allowed_regions") or []),
+        "storage": storage,
+        "cache_registry": _cache_registry(config),
+        "worker_auth_configured": _worker_auth_configured(config),
+        "history_lookup": history.lookup,
+    }
+    current = (
+        build_workflow_preflight(capsule=request.capsule, **common)
+        if isinstance(request, WorkflowSubmitRequest)
+        else build_partition_preflight(partition=request.partition, **common)
     )
     if not finite_report(current):
         return {
@@ -2535,32 +2587,162 @@ def _revalidate_partition_preflight(
 
 @app.post("/api/workflows", status_code=202)
 async def submit_workflow(request: WorkflowSubmitRequest):
-    """Queue an API-format ComfyUI workflow on the dedicated cloud profile."""
+    """Queue one confirmed, preflighted whole-workflow capsule."""
+    from cloud_offload.assets import (
+        resolve_partition_assets,
+        unresolved_assets_message,
+    )
+    from cloud_offload.node_packs import (
+        missing_node_packs,
+        missing_node_packs_message,
+        node_pack_version_warnings,
+    )
     from cloud_offload.queue import JobStatus
-    from cloud_offload.router import select_profile_provider
+    from cloud_offload.router import resolve_worker_profile
+    from cloud_offload.storage import create_storage
+    from cloud_offload.storage_plan import (
+        GIB,
+        exceeds_ceiling_message,
+        plan_disk_gb,
+        plan_storage,
+        plan_summary,
+    )
+    from cloud_offload.weight_sizes import cached_weight_sizes
+    from cloud_offload.workflow_capsule import normalize_workflow_capsule
 
     config, queue = _queue()
     try:
-        route = await asyncio.to_thread(
-            select_profile_provider, config, "comfyui", request.provider
-        )
+        capsule = normalize_workflow_capsule(request.capsule)
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    runner = capsule["runner"]
+    profile_name = runner["profile"]
+    profile = resolve_worker_profile(config, profile_name)
+    storage = create_storage(config)
+    for filename, artifact_id in request.input_artifacts.items():
+        try:
+            exists = storage.exists(_partition_artifact_key(str(artifact_id)))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not exists:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Workflow input artifact was not found: {filename}",
+            )
+
+    assets, unresolved = resolve_partition_assets(
+        config, capsule["assets"], profile, storage
+    )
+    if unresolved:
+        return error_response(
+            409,
+            "cloud_offload.unresolved_assets",
+            unresolved_assets_message(unresolved),
+            {"unresolved": unresolved},
+        )
+    missing_packs = missing_node_packs(capsule["node_packs"], profile)
+    if missing_packs:
+        return error_response(
+            409,
+            "cloud_offload.missing_node_packs",
+            missing_node_packs_message(missing_packs),
+            {"missing": missing_packs},
+        )
+    pack_warnings = node_pack_version_warnings(capsule["node_packs"], profile)
+    image_bytes = int(float((profile or {}).get("image_size_gb") or 0) * GIB) or None
+    plan = plan_storage(
+        assets,
+        profile,
+        image_bytes=image_bytes,
+        weight_bytes=cached_weight_sizes(config, profile),
+    )
+    disk_gb = plan_disk_gb(plan)
+    storage_summary = plan_summary(plan)
+    if disk_gb > config.max_container_disk_gb:
+        return error_response(
+            409,
+            "cloud_offload.storage_plan_exceeds_ceiling",
+            exceeds_ceiling_message(plan, disk_gb, config.max_container_disk_gb),
+            {"storage": storage_summary},
+        )
+
+    preflight_binding = await asyncio.to_thread(
+        _revalidate_partition_preflight,
+        request=request,
+        config=config,
+        storage=storage,
+    )
+    if not preflight_binding["accepted"]:
+        return error_response(
+            409,
+            preflight_binding["code"],
+            preflight_binding["message"],
+            preflight_binding["details"],
+        )
+    confirmed_report = preflight_binding["report"]
+    confirmed_candidate = preflight_binding["candidate"]
+    confirmation_evidence = preflight_binding["confirmation"]
+    confirmed_offer = {
+        "id": confirmed_candidate["offer_id"],
+        "provider": confirmed_candidate["provider"],
+        "gpu_type": confirmed_candidate["gpu_type"],
+        "gpu_count": confirmed_candidate["gpu_count"],
+        "gpu_ram_gb": confirmed_candidate["gpu_ram_gb"],
+        "hourly_rate": confirmed_candidate["hourly_rate"],
+    }
+    confirmed_launch = {
+        "preflight_id": confirmed_report["preflight_id"],
+        "manifest_digest": confirmed_report["manifest_digest"],
+        "capsule_digest": confirmed_report["capsule_digest"],
+        "workload_digest": confirmed_report.get("workload_digest"),
+        "candidate_id": confirmed_candidate["candidate_id"],
+        "expires_at": confirmed_report["expires_at"],
+        "provider": confirmed_candidate["provider"],
+        "offer_id": confirmed_candidate["offer_id"],
+        "gpu_type": confirmed_candidate["gpu_type"],
+        "gpu_ram_gb": confirmed_candidate["gpu_ram_gb"],
+        "hourly_rate": confirmed_candidate["hourly_rate"],
+        "region": confirmed_candidate.get("region"),
+        "prepared_volume_id": confirmed_candidate.get("prepared_volume_id"),
+        "preparation_class": confirmed_candidate.get("preparation_class"),
+        "estimate": confirmed_candidate["estimate"],
+        "request_policy": confirmed_report["request_policy"],
+        "confirmation": confirmation_evidence,
+    }
     job = queue.create(
         model="comfyui-workflow",
-        input_path="inline://comfyui-workflow",
+        input_path="artifacts://comfyui-workflow-capsule",
         params={
-            **({"offer": route.offer} if route.offer else {}),
-            "runtime_profile": "comfyui",
+            "offer": confirmed_offer,
+            "preflight": confirmed_launch,
+            "runtime_profile": profile_name,
+            "gpu_type": confirmed_candidate["gpu_type"],
+            "min_gpu_ram_gb": runner["min_gpu_ram_gb"],
+            "container_disk_gb": disk_gb,
+            "keep_warm": bool(config.keep_warm),
         },
-        request=request.model_dump(),
-        provider=route.provider,
+        request={
+            "kind": "comfyui-workflow-capsule",
+            "capsule": capsule,
+            "input_artifacts": request.input_artifacts,
+            "timeout_seconds": request.timeout_seconds,
+            **({"assets": assets} if assets else {}),
+        },
+        provider=confirmed_candidate["provider"],
         status=JobStatus.QUEUED,
     )
     return {
         "job_id": job.id,
         "status": job.status.value,
         "status_url": f"/api/jobs/{job.id}",
+        "preflight_id": confirmed_report["preflight_id"],
+        "manifest_digest": confirmed_report["manifest_digest"],
+        "capsule_digest": confirmed_report["capsule_digest"],
+        "candidate_id": confirmed_candidate["candidate_id"],
+        "confirmation_action": confirmation_evidence["action"],
+        "storage": storage_summary,
+        **_asset_warnings(assets),
+        **_node_pack_warnings(pack_warnings),
     }
 
 

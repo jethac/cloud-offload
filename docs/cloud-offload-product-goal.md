@@ -1401,6 +1401,13 @@ Exit:
 - Build reproducible signed custom-node and environment bundles.
 - Promote capsules using measured reuse and cold-start cost.
 
+Implementation status: active. The canonical `comfy.workflow.capsule.v1`
+closure, stable capsule digest, full-workflow preflight, confirmed submission,
+artifact input and result transport, environment readiness identities, and
+cooperative whole-workflow cancellation are implemented. Reproducible
+custom-node and environment bundle production and paid fresh-Pod proof remain
+before this milestone can close.
+
 Exit:
 
 - missing credentials, artifacts, disk, and incompatible nodes fail free;

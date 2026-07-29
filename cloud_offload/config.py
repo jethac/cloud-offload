@@ -393,6 +393,7 @@ class CloudConfig:
         from cloud_offload.assets import normalized_asset_sources
         from cloud_offload.profiles import (
             normalized_profile_custom_nodes,
+            normalized_profile_digest,
             normalized_profile_disk_gb,
             normalized_profile_weights,
         )
@@ -406,6 +407,13 @@ class CloudConfig:
                 for storage_field in ("extra_disk_gb", "image_size_gb"):
                     normalized_profile_disk_gb(
                         str(profile_name), storage_field, profile.get(storage_field)
+                    )
+                for digest_field in (
+                    "object_info_digest",
+                    "dependency_lock_digest",
+                ):
+                    normalized_profile_digest(
+                        str(profile_name), digest_field, profile.get(digest_field)
                     )
         self.asset_sources = normalized_asset_sources(self.asset_sources)
         self.prepared_storage = normalized_prepared_storage(self.prepared_storage)
