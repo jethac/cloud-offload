@@ -2,7 +2,7 @@
 
 > Status: **canonical product goal**
 > Last updated: **2026-07-30**
-> Program status: **in progress — Milestone 1 is complete and Milestone 2 persistent visibility is the current gate**
+> Program status: **in progress — Milestone 2 is complete and Milestone 3 leases and billing closure is the current gate**
 > Scope: the end-to-end Cloud Offload product across the coordinator, dispatcher,
 > workers, provider connectors, prepared storage, and ComfyUI extension.
 >
@@ -31,11 +31,12 @@ requests:
 4. **What happens next?** The current execution state and the first unmet exit
    criterion in milestone order.
 
-The active program gate is **M2 persistent visibility**. M0 and M1 are complete.
-M3 through M7 remain part of this same goal; they are not a backlog that can be
-silently deferred or a new goal that must be rediscovered later. M2 may close
-only after the Cloud Jobs surface reconstructs authoritative state and every M2
-exit has durable evidence.
+The active program gate is **M3 revocable leases and billing closure**. M0, M1,
+and M2 are complete. M4 through M7 remain part of this same goal; they are not a
+backlog that can be silently deferred or a new goal that must be rediscovered
+later. M3 may close only after every paid resource has a persisted lease,
+provider-confirmed termination, bounded reconciliation, and durable evidence for
+every M3 exit.
 
 Raw benchmark plans, workflows, hooks, support bundles, and service logs remain
 local under `.runlogs/`. The durable record committed to the repository contains
@@ -176,7 +177,7 @@ validate the product journey.
 | `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Complete across backend PRs #25–#27 and extension PR #5; the accepted production replay proves the default confirmation. |
 | `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Complete; extension PR #5, backend PR #27, and the accepted merged-stack journey prove the interaction and persistent policy. |
 | `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
-| `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Initial canvas feedback merged; durable drawer pending. |
+| `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Complete; the persistent Cloud Jobs surface reconstructs safe authoritative state after reload and exposes complete M2 telemetry. |
 | `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Logical cancellation baseline exists; leases and provider receipt pending. |
 | `STORAGE-1` | Opt into or adopt RunPod storage before cached rental and attach it to compatible future Pods. | M4 foundation | Initial managed/adopted-volume MVP merged. |
 | `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
@@ -645,6 +646,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#30](https://github.com/jethac/cloud-offload/pull/30) | Starts worker idle time after each job, gives dispatcher cleanup a 60-second margin, and prevents a provider-restarted container from resetting the paid resource idle clock. It also records the first controlled M1 run. | Merged as `8193bfa`; 63 focused tests and 563 full tests passed. The bounded replay below proves automatic exact-Pod cleanup. |
 | [#31](https://github.com/jethac/cloud-offload/pull/31) | Records the accepted merged-stack replay and its automatic exact-Pod cleanup receipt. | Merged as `de49afa`; the accepted replay below closes the paid journey and cleanup evidence. |
 | [#32](https://github.com/jethac/cloud-offload/pull/32) | Adds private-data-free workload identity, read-only matched timing history, candidate-class measurement, full RunPod compute/transfer/container-storage estimates, the paid idle window, and the compact M1 evidence record. | 25 focused tests and 571 full tests passed; two repeated live free preflights were stable and created no job or Pod. M1 is complete. |
+| [#33](https://github.com/jethac/cloud-offload/pull/33) | Adds a reloadable safe job projection with lifecycle phase, monotonic progress, transfer telemetry, ETA confidence, resource identity, estimated spend, cache results, cancellation state, billing state, and bounded event summaries. It also records the compact M2 evidence. | 579 full tests passed. A live same-origin read returned 20 jobs in 350.7 ms, and privacy tests reject raw requests, workflows, prompts, paths, URLs, and provider payloads. M2 is complete. |
 
 ### ComfyUI extension repository
 
@@ -656,6 +658,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#4](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/4) | Action-bar discovery, write-only RunPod S3 credential setup, and monotonic startup/cache feedback in the partition title. | Merged as `40c3cf6`; 74 Python tests passed, 3 skipped, and 5 focused JavaScript tests passed. |
 | [#5](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/5) | Runs free preflight after final boundary upload; presents one-time GPU rental confirmation with cost, timing, prepared coverage, rationale, uncertainty, countdown, alternate GPU choice, cancellation, and persistent settings; submits only the exact confirmed plan. | Merged as `ff872b4`; 81 Python tests passed, 3 skipped, 60 JavaScript tests passed, syntax and compile checks passed, and the settings, confirmation, details, and GPU-choice states passed a 1440×1000 visual check. Cancellation during the countdown cannot retry paid submission. |
 | [#6](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/6) | Binds ComfyUI `api.fetchApi` before the one-time rental decision POST. | Merged as `5c17b31`; 81 Python tests passed, 3 skipped, and 61 JavaScript tests passed. A failed unbound POST created no paid job. |
+| [#7](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/7) | Adds the persistent Cloud Jobs panel, safe same-origin job and cancellation routes, reload reconstruction, stable details, active/idle polling, and complete M2 telemetry. | 82 Python tests passed, 3 skipped, and 67 JavaScript tests passed. Live reload restored the open panel and 20 safe jobs; expanded details stayed open across polling. |
 
 ## Validation record
 
@@ -988,12 +991,14 @@ Status snapshot as of 2026-07-30:
   then extended only the bounded corruption observation window. The accepted
   replay proved exact manifest authority, quarantine, safe terminal behavior,
   and complete automated cleanup in production.
-- M0 and M1 are complete. The accepted merged-stack paid run proves the
+- M0, M1, and M2 are complete. The accepted merged-stack paid run proves the
   recommendation, confirmation, exact launch, prepared restore, execution,
   result return, and automatic exact-Pod closure. Two repeated free preflights
   prove stable identity, two-sample measured timing, medium confidence,
   complete RunPod compute/transfer/container-storage cost, and no provider
-  mutation. M2 persistent visibility is now the active gate.
+  mutation. The persistent Cloud Jobs surface now reconstructs safe lifecycle,
+  transfer, ETA, resource, cost, cache, cancellation, and billing state after a
+  reload. M3 revocable leases and billing closure is now the active gate.
 
 ### Completed M0 corruption contract
 
@@ -1124,9 +1129,7 @@ Equivalent workflow shapes share history without hashing node IDs, prompts,
 seeds, artifact IDs, or private paths. History is matched by provider, GPU,
 region, and prepared/cold class. One observation remains visible but cannot
 change ranking; two through four observations give medium confidence, and five
-or more give high confidence. M2 now starts with the authoritative journal and
-initial canvas feedback already in place. Its first delivery is the persistent
-Cloud Jobs surface and reload reconstruction.
+or more give high confidence.
 
 ### M1 evidence and exit audit
 
@@ -1153,7 +1156,33 @@ identifiers, cleanup state, test counts, and pass conclusions.
    displays one short confirmation, and submits the exact choice. The accepted
    inpainting journey required no provider infrastructure action from the user.
 
-All M1 exits pass. M1 is complete. M2 is the first unmet milestone.
+All M1 exits pass. M1 is complete.
+
+### M2 evidence and exit audit
+
+The safe evidence projection is
+[M2 visibility evidence](evidence/m2-visibility-evidence-2026-07-30.json).
+It contains aggregate latency, test counts, safe field coverage, persistence
+results, privacy conclusions, and explicit M3 deferrals. It contains no raw job
+IDs, request bodies, workflows, prompts, private paths, signed URLs, digests, or
+provider payloads.
+
+1. **Reload:** a live same-origin request returned 20 recent jobs in 350.7 ms.
+   Browser reload restored the open Cloud Jobs panel and its job list.
+2. **Progress:** stage bands and time-based estimates keep active early phases
+   moving without regressing. Successful terminal state is 100%. Automated tests
+   cover monotonic merge and projection behavior.
+3. **Transfers:** declared artifact, URL, and authenticated Hugging Face transfers
+   report observed bytes when file size or a local path makes measurement
+   possible. The projection calculates smoothed throughput and transfer ETA.
+4. **Persistent truth:** the coordinator projection and Cloud Jobs panel work
+   without canvas state. Explicit job details stay open across idle polling.
+5. **Safe uncertainty:** missing values remain unknown. Billing closure remains
+   unconfirmed until M3 adds authoritative provider termination receipts.
+
+The backend passed 579 tests. The extension passed 82 Python tests with 3 skips
+and 67 JavaScript tests. Syntax checks also passed. All M2 exits pass. M2 is
+complete. M3 is the first unmet milestone.
 
 ### Operational safety rules
 
@@ -1179,8 +1208,8 @@ All M1 exits pass. M1 is complete. M2 is the first unmet milestone.
 | --- | --- | --- |
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
 | M1 — preflight, recommendation, confirmation | **Complete** | All exits passed; the merged-stack paid journey, automatic cleanup, stable free preflight, measured recommendation history, and complete RunPod cost are durable. |
-| M2 — persistent visibility | **In progress** | Journal and initial canvas feedback exist; Cloud Jobs drawer, reload reconstruction, and complete telemetry are the current gate. |
-| M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
+| M2 — persistent visibility | **Complete** | All exits passed; the persistent Cloud Jobs surface, reload reconstruction, complete safe telemetry, and compact evidence are durable. |
+| M3 — leases and billing closure | **In progress** | Logical cancellation exists; persisted leases, independent termination, provider receipts, reconciliation, and circuit breakers are the current gate. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
 | M5 — workflow capsules | **Not started** | Schema and custom-node readiness contracts remain. |
 | M6 — regional replication | **Not started** | Shadow recommendations precede automation. |
