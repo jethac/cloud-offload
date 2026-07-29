@@ -117,7 +117,10 @@ def test_comfyui_manifest_and_worker_capability(tmp_path):
         "comfyui-workflow",
         "comfyui-partition-v1",
     ]
-    assert load_worker_manifest(manifest)["partition_protocol"] == "comfy.partition.bundle.v1"
+    assert (
+        load_worker_manifest(manifest)["partition_protocol"]
+        == "comfy.partition.bundle.v1"
+    )
 
 
 def test_executor_uploads_inputs_runs_prompt_and_returns_images():
@@ -290,7 +293,7 @@ def test_partition_artifact_and_job_endpoints(monkeypatch, tmp_path):
                 "phase": "execution",
                 "node_id": "1",
                 "data": {"value": 2, "max": 10},
-            }
+            },
         },
     )
     assert event.status_code == 200
@@ -325,7 +328,8 @@ def test_partition_artifact_and_job_endpoints(monkeypatch, tmp_path):
     )
     assert spoofed.status_code == 403
     page = client.get(f"/api/jobs/{event_job.id}/events").json()
-    assert page["events"][0]["event"]["node_id"] == "1"
+    progress_event = next(item for item in page["events"] if item["type"] == "progress")
+    assert progress_event["event"]["node_id"] == "1"
     resumed = client.get(
         f"/api/jobs/{event_job.id}/events?after={page['next_after']}"
     ).json()
@@ -354,7 +358,13 @@ def test_partition_artifact_and_job_endpoints(monkeypatch, tmp_path):
         "ignored": True,
         "status": "completed",
     }
-    assert len(queue.list_events(event_job.id)) == 1
+    event_types = [item["type"] for item in queue.list_events(event_job.id)]
+    assert event_types == [
+        "job_created",
+        "job_status_changed",
+        "progress",
+        "job_status_changed",
+    ]
 
 
 def test_worker_partition_stages_bridges_and_publishes_outputs(tmp_path):
@@ -382,11 +392,20 @@ def test_worker_partition_stages_bridges_and_publishes_outputs(tmp_path):
                 "workflow": {
                     "in": {
                         "class_type": "CloudPartitionInput",
-                        "inputs": {"boundary_key": "input_0000", "artifact_path": "", "type_name": "IMAGE"},
+                        "inputs": {
+                            "boundary_key": "input_0000",
+                            "artifact_path": "",
+                            "type_name": "IMAGE",
+                        },
                     },
                     "out": {
                         "class_type": "CloudPartitionOutput",
-                        "inputs": {"value": ["in", 0], "boundary_key": "output_0000", "output_path": "", "type_name": "IMAGE"},
+                        "inputs": {
+                            "value": ["in", 0],
+                            "boundary_key": "output_0000",
+                            "output_path": "",
+                            "type_name": "IMAGE",
+                        },
                     },
                 },
                 "inputs": [{"key": "input_0000"}],
@@ -449,7 +468,11 @@ def test_worker_partition_stages_bridges_and_publishes_outputs(tmp_path):
     assert result["schema"] == "comfy.partition.result.v1"
     assert output_id == hashlib.sha256(b"output-bundle").hexdigest()
     assert worker.storage.exists(worker._partition_artifact_key(output_id))
-    events = queue.list_events(job.id)
+    events = [
+        item
+        for item in queue.list_events(job.id)
+        if not item["type"].startswith("job_")
+    ]
     assert [item["event"]["type"] for item in events] == [
         "partition_staging",
         "executing",
@@ -461,6 +484,7 @@ def test_worker_partition_stages_bridges_and_publishes_outputs(tmp_path):
 
 
 # === Auth: tunneled loopback must be able to require a bearer token ===
+
 
 def test_loopback_requires_auth_by_default(monkeypatch):
     """Binding to loopback keeps other hosts out, not other local processes."""
@@ -501,13 +525,19 @@ def test_bearer_middleware_rejects_and_admits_and_exempts_worker(monkeypatch):
     # No credential -> rejected on a normal route.
     assert client.get("/api/status").status_code == 401
     # Correct bearer -> admitted (health needs no queue).
-    assert client.get("/api/health", headers={"Authorization": "Bearer sekret"}).status_code == 200
+    assert (
+        client.get(
+            "/api/health", headers={"Authorization": "Bearer sekret"}
+        ).status_code
+        == 200
+    )
     # Worker channel carries its own token and is exempt from the global bearer.
     worker = client.get(f"{server.WORKER_PATH_PREFIX}/policy")
     assert worker.status_code != 401
 
 
 # === Output collection: 3D/mesh outputs must not be dropped ===
+
 
 def test_executor_returns_mesh_outputs_under_files():
     http = HTTP(
@@ -552,6 +582,7 @@ def test_executor_returns_mesh_outputs_under_files():
 
 
 # === Pluggable provider discovery and credentials ===
+
 
 def test_providers_endpoint_lists_registered_connectors(monkeypatch, tmp_path):
     from cloud_offload.providers import register_connector
@@ -646,11 +677,15 @@ def test_credentials_route_stores_secret_in_the_keychain(monkeypatch, tmp_path):
             delete_password=lambda service, user: vault.pop(user, None),
         ),
     )
-    monkeypatch.setattr(config_module, "CREDENTIALS_FILE", tmp_path / "credentials.json")
+    monkeypatch.setattr(
+        config_module, "CREDENTIALS_FILE", tmp_path / "credentials.json"
+    )
     monkeypatch.delenv("CLOUD_OFFLOAD_RUNPOD_API_KEY", raising=False)
     client = TestClient(server.app)
 
-    response = client.post("/api/providers/runpod/credentials", json={"api_key": "secret-key"})
+    response = client.post(
+        "/api/providers/runpod/credentials", json={"api_key": "secret-key"}
+    )
     assert response.status_code == 200
     assert response.json() == {"provider": "runpod", "configured": True}
     # Stored in the OS keychain, never echoed back and never written to disk.
@@ -659,10 +694,17 @@ def test_credentials_route_stores_secret_in_the_keychain(monkeypatch, tmp_path):
     assert not (tmp_path / "credentials.json").exists()
 
     # Unknown connectors are rejected rather than silently stored.
-    assert client.post("/api/providers/nope/credentials", json={"api_key": "x"}).status_code == 404
+    assert (
+        client.post(
+            "/api/providers/nope/credentials", json={"api_key": "x"}
+        ).status_code
+        == 404
+    )
 
 
-def test_credentials_route_accepts_the_huggingface_token(monkeypatch, isolate_credentials):
+def test_credentials_route_accepts_the_huggingface_token(
+    monkeypatch, isolate_credentials
+):
     """The Hub token is not a connector but stores through the same route."""
     client = TestClient(server.app)
 
@@ -676,13 +718,17 @@ def test_credentials_route_accepts_the_huggingface_token(monkeypatch, isolate_cr
 
     # While HF_TOKEN is set, a keychain write would be shadowed; refuse it.
     monkeypatch.setenv("HF_TOKEN", "ambient")
-    conflict = client.post("/api/providers/huggingface/credentials", json={"api_key": "x"})
+    conflict = client.post(
+        "/api/providers/huggingface/credentials", json={"api_key": "x"}
+    )
     assert conflict.status_code == 409
     assert "HF_TOKEN" in conflict.json()["error"]["message"]
 
     # Clearing works like any connector credential.
     monkeypatch.delenv("HF_TOKEN")
-    cleared = client.post("/api/providers/huggingface/credentials", json={"api_key": ""})
+    cleared = client.post(
+        "/api/providers/huggingface/credentials", json={"api_key": ""}
+    )
     assert cleared.json() == {"provider": "huggingface", "configured": False}
     assert "huggingface" not in isolate_credentials.store
 
@@ -711,14 +757,18 @@ def test_provider_settings_route_persists_and_rejects_secrets(monkeypatch, tmp_p
     monkeypatch.setattr(config_module, "CONFIG_DIR", tmp_path)
     client = TestClient(server.app)
 
-    ok = client.post("/api/providers/runpod/settings", json={"settings": {"cloud_type": "COMMUNITY"}})
+    ok = client.post(
+        "/api/providers/runpod/settings", json={"settings": {"cloud_type": "COMMUNITY"}}
+    )
     assert ok.status_code == 200
     assert ok.json()["settings"]["cloud_type"] == "COMMUNITY"
     saved = json.loads((tmp_path / "config.json").read_text())
     assert saved["cloud"]["connector_options"]["runpod"]["cloud_type"] == "COMMUNITY"
 
     # Secrets must go through the credentials route, not the settings blob.
-    leak = client.post("/api/providers/runpod/settings", json={"settings": {"runpod_api_key": "x"}})
+    leak = client.post(
+        "/api/providers/runpod/settings", json={"settings": {"runpod_api_key": "x"}}
+    )
     assert leak.status_code == 400
 
 
@@ -731,10 +781,15 @@ def test_provider_test_route_reports_failure_without_credentials(monkeypatch, tm
 
     payload = TestClient(server.app).post("/api/providers/runpod/test").json()
 
-    assert payload == {"provider": "runpod", "ok": False, "error": "No credentials configured"}
+    assert payload == {
+        "provider": "runpod",
+        "ok": False,
+        "error": "No credentials configured",
+    }
 
 
 # === TLS ===
+
 
 def test_tls_requires_both_cert_and_key(monkeypatch, tmp_path):
     from cloud_offload.service_config import ServiceConfigError

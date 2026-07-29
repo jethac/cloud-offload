@@ -20,6 +20,9 @@ ordering while allowing dispatchers and workers to retry delivery safely.
   },
   "type": "weight_download_progress",
   "phase": "dependency_preparation",
+  "phase_owner": "worker",
+  "partition_id": "partition-uuid",
+  "status": "running",
   "metrics": {
     "bytes": 1048576,
     "total_bytes": 4294967296,
@@ -34,6 +37,9 @@ ordering while allowing dispatchers and workers to retry delivery safely.
   "event": {
     "type": "weight_download_progress",
     "phase": "dependency_preparation",
+    "phase_owner": "worker",
+    "partition_id": "partition-uuid",
+    "status": "running",
     "bytes": 1048576,
     "total_bytes": 4294967296,
     "overall_progress": 24,
@@ -74,10 +80,16 @@ client can restore by loading a snapshot, applying events after its cursor, and
 continuing from the returned `next_after` value. Progress is projected
 monotonically and completed jobs project 100 percent.
 
-The current snapshot combines the durable job row with the event journal. The
-product goal's stronger requirement—deriving the entire lifecycle from journaled
-state transitions—is tracked in Milestone 0 and is not implied by this first
-transport slice.
+Creation, claim, status changes, retries, progress changes, and terminal state are
+journaled in the same SQLite transaction as the compatibility job row. Existing
+databases receive one `job_state_seeded` event per job during migration. Snapshot
+status and progress are projected from journal evidence; the included `job` row
+remains a compatibility/detail payload and is not the lifecycle authority.
+
+Known critical-path phases are ranked semantically. A delayed worker event from
+an earlier phase can remain visible as the last observed event without moving the
+projected phase or progress backward. Lifecycle terminality comes from
+coordinator-owned state events, so producer delivery order cannot reopen a job.
 
 ## Support bundle boundary
 

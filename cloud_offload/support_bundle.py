@@ -90,7 +90,9 @@ def _redact(value: Any, *, key: str = "") -> Any:
     return value
 
 
-def _node_type_counts(value: Any, counts: Counter[str], *, remaining: list[int]) -> None:
+def _node_type_counts(
+    value: Any, counts: Counter[str], *, remaining: list[int]
+) -> None:
     if remaining[0] <= 0:
         return
     if isinstance(value, dict):
@@ -144,6 +146,9 @@ def _redacted_event(item: dict[str, Any]) -> dict[str, Any]:
         "producer": _redact(item.get("producer") or {}),
         "type": item.get("type"),
         "phase": item.get("phase"),
+        "phase_owner": item.get("phase_owner"),
+        "partition_id": item.get("partition_id"),
+        "status": item.get("status"),
         "metrics": _redact(item.get("metrics") or {}),
         "resources": _redact(item.get("resources") or {}),
         "evidence": _redact(item.get("evidence") or {}),
@@ -151,7 +156,9 @@ def _redacted_event(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _all_events(queue: JobQueue, job_id: str, *, maximum: int = 10_000) -> tuple[list, bool]:
+def _all_events(
+    queue: JobQueue, job_id: str, *, maximum: int = 10_000
+) -> tuple[list, bool]:
     events: list[dict[str, Any]] = []
     cursor = 0
     while len(events) < maximum:
@@ -179,6 +186,7 @@ def build_support_bundle(queue: JobQueue, job: Job) -> dict[str, Any]:
         for key in (
             "schema",
             "status",
+            "state_source",
             "lifecycle_phase",
             "progress",
             "event_cursor",

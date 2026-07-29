@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -101,7 +102,9 @@ def test_config_resolves_provider_credentials_from_the_keychain(monkeypatch, tmp
             delete_password=lambda service, user: vault.pop(user, None),
         ),
     )
-    monkeypatch.setattr(creds, "legacy_credentials_file", lambda: tmp_path / "none.json")
+    monkeypatch.setattr(
+        creds, "legacy_credentials_file", lambda: tmp_path / "none.json"
+    )
     vault["runpod"] = "runpod-secret"
 
     config = CloudConfig.load(config_path)
@@ -127,7 +130,9 @@ def test_env_var_overrides_the_keychain_for_headless_workers(monkeypatch, tmp_pa
             delete_password=lambda *a: None,
         ),
     )
-    monkeypatch.setattr(creds, "legacy_credentials_file", lambda: tmp_path / "none.json")
+    monkeypatch.setattr(
+        creds, "legacy_credentials_file", lambda: tmp_path / "none.json"
+    )
 
     assert CloudConfig().api_key_for("runpod") == "from-env"
 
@@ -278,14 +283,18 @@ def test_queue_migrates_legacy_schema(tmp_path):
         "event_type",
         "phase",
     } <= event_columns
-    assert version == "6"
-    legacy_event = queue.list_events("legacy-job")[0]
+    assert version == "7"
+    migrated_events = queue.list_events("legacy-job")
+    legacy_event = migrated_events[0]
     assert legacy_event["schema"] == "cloud-offload.job-event.v2"
     assert legacy_event["producer"] == {"id": "legacy", "sequence": None}
     assert legacy_event["occurred_at"] == "2026-07-29T00:00:00"
     assert legacy_event["observed_at"] == "2026-07-29T00:00:00"
     assert legacy_event["type"] == "progress"
     assert legacy_event["phase"] == "execution"
+    assert migrated_events[1]["type"] == "job_state_seeded"
+    assert migrated_events[1]["status"] == "queued"
+    assert queue.event_snapshot("legacy-job")["state_source"] == "journal"
 
 
 def test_job_events_are_ordered_and_resumable(tmp_path):
@@ -297,6 +306,7 @@ def test_job_events_are_ordered_and_resumable(tmp_path):
 
     assert first["sequence"] < second["sequence"]
     assert [item["event"]["type"] for item in queue.list_events(job.id)] == [
+        "job_created",
         "executing",
         "progress",
     ]
@@ -332,9 +342,11 @@ def test_job_event_v2_is_idempotent_per_producer_sequence(tmp_path):
     assert duplicate == first
     assert first["schema"] == "cloud-offload.job-event.v2"
     assert first["producer"] == {"id": "worker:one:process-a", "sequence": 7}
+    assert first["phase_owner"] == "worker"
+    assert first["event"]["phase_owner"] == "worker"
     assert first["metrics"] == {"bytes": 1024, "total_bytes": 4096}
     assert first["resources"] == {"provider": "runpod"}
-    assert len(queue.list_events(job.id)) == 1
+    assert len(queue.list_events(job.id)) == 2
 
     with pytest.raises(ValueError, match="reused with different data"):
         queue.append_event(
@@ -365,13 +377,139 @@ def test_job_event_snapshot_projects_cursor_phase_and_monotonic_progress(tmp_pat
 
     assert snapshot["schema"] == "cloud-offload.job-snapshot.v1"
     assert snapshot["event_cursor"] == last["sequence"]
-    assert snapshot["event_count"] == 2
+    assert snapshot["event_count"] == 3
     assert snapshot["lifecycle_phase"] == "dependency_preparation"
     assert snapshot["progress"] == 24
     assert snapshot["last_event"] == last
 
     queue.update_status(job.id, JobStatus.COMPLETED)
     assert queue.event_snapshot(job.id)["progress"] == 100
+
+
+def test_lifecycle_journal_is_authoritative_across_reload_and_row_drift(tmp_path):
+    db_path = tmp_path / "queue.db"
+    queue = JobQueue(db_path)
+    job = queue.create(
+        "comfyui-partition-v1",
+        "partition://input",
+        provider="runpod",
+        request={"partition": {"partition_id": "part-7"}},
+        status=JobStatus.QUEUED,
+    )
+    claimed = queue.claim_jobs(
+        "worker-7", provider="runpod", models=["comfyui-partition-v1"]
+    )[0]
+    queue.update_status(claimed.id, JobStatus.RUNNING, progress=10)
+    queue.complete_job(claimed.id, {"partition_id": "part-7"})
+
+    lifecycle = [
+        item for item in queue.list_events(job.id) if item["type"].startswith("job_")
+    ]
+    assert [item["status"] for item in lifecycle] == [
+        "queued",
+        "dispatched",
+        "running",
+        "completed",
+    ]
+    assert all(item["partition_id"] == "part-7" for item in lifecycle)
+    assert lifecycle[1]["resources"] == {
+        "provider": "runpod",
+        "worker_id": "worker-7",
+    }
+
+    # Simulate a stale/corrupted projection row. Reload still derives lifecycle
+    # state from the immutable journal instead of trusting that row.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, progress = ? WHERE id = ?",
+            ("pending", 0, job.id),
+        )
+    snapshot = JobQueue(db_path).event_snapshot(job.id)
+
+    assert snapshot["state_source"] == "journal"
+    assert snapshot["status"] == "completed"
+    assert snapshot["progress"] == 100
+    assert snapshot["lifecycle_phase"] == "result_transfer"
+
+
+def test_concurrent_event_retries_collapse_to_one_journal_entry(tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = queue.create("comfyui-workflow", "partition://input")
+
+    def publish():
+        return queue.append_event(
+            job.id,
+            {"type": "runner_ready", "phase": "worker_boot"},
+            producer_id="worker:one:process-a",
+            producer_sequence=9,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: publish(), range(2)))
+
+    assert results[0] == results[1]
+    assert [item["type"] for item in queue.list_events(job.id)] == [
+        "job_created",
+        "runner_ready",
+    ]
+
+
+def test_progress_snapshot_is_reconstructed_from_journal_not_projection_row(tmp_path):
+    db_path = tmp_path / "queue.db"
+    queue = JobQueue(db_path)
+    job = queue.create("comfyui-workflow", "partition://input")
+
+    queue.set_progress(job.id, 37)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE jobs SET progress = 0 WHERE id = ?", (job.id,))
+
+    events = queue.list_events(job.id)
+    assert events[-1]["type"] == "job_progress_changed"
+    assert events[-1]["metrics"] == {"overall_progress": 37, "progress": 37}
+    assert events[-1]["phase_owner"] == "coordinator"
+    assert JobQueue(db_path).event_snapshot(job.id)["progress"] == 37
+
+
+def test_reordered_worker_events_cannot_regress_snapshot_phase_or_progress(tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = queue.create("comfyui-workflow", "partition://input")
+    queue.append_event(
+        job.id,
+        {"type": "executing", "phase": "execution", "overall_progress": 61},
+        producer_id="worker:one:process-a",
+        producer_sequence=2,
+    )
+    delayed = queue.append_event(
+        job.id,
+        {"type": "runner_starting", "phase": "worker_boot", "overall_progress": 5},
+        producer_id="worker:one:process-a",
+        producer_sequence=1,
+    )
+
+    snapshot = queue.event_snapshot(job.id)
+
+    assert snapshot["event_cursor"] == delayed["sequence"]
+    assert snapshot["last_event"] == delayed
+    assert snapshot["lifecycle_phase"] == "execution"
+    assert snapshot["progress"] == 61
+
+
+def test_status_row_rolls_back_when_lifecycle_event_cannot_be_persisted(
+    monkeypatch, tmp_path
+):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = queue.create("comfyui-workflow", "partition://input")
+
+    def refuse_event(*args, **kwargs):
+        raise sqlite3.OperationalError("journal unavailable")
+
+    monkeypatch.setattr(queue, "_append_event_in_transaction", refuse_event)
+
+    with pytest.raises(sqlite3.OperationalError, match="journal unavailable"):
+        queue.update_status(job.id, JobStatus.QUEUED)
+
+    assert queue.get(job.id).status == JobStatus.PENDING
+    assert [item["type"] for item in queue.list_events(job.id)] == ["job_created"]
 
 
 def test_coordinator_queue_publishes_process_scoped_monotonic_event_ids(monkeypatch):
@@ -414,10 +552,16 @@ def test_claim_increments_attempts_and_assigns_worker(tmp_path):
 def test_claim_is_scoped_to_worker_provider(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
     vast = queue.create(
-        "comfyui-workflow", "inline://request", provider="vast.ai", status=JobStatus.QUEUED
+        "comfyui-workflow",
+        "inline://request",
+        provider="vast.ai",
+        status=JobStatus.QUEUED,
     )
     runpod = queue.create(
-        "comfyui-workflow", "inline://request", provider="runpod", status=JobStatus.QUEUED
+        "comfyui-workflow",
+        "inline://request",
+        provider="runpod",
+        status=JobStatus.QUEUED,
     )
 
     claimed = queue.claim_jobs("worker-r", provider="runpod")
@@ -429,7 +573,10 @@ def test_claim_is_scoped_to_worker_provider(tmp_path):
 def test_claim_is_scoped_to_worker_model_capabilities(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
     supported = queue.create(
-        "comfyui-partition-v1", "inline://request", provider="runpod", status=JobStatus.QUEUED
+        "comfyui-partition-v1",
+        "inline://request",
+        provider="runpod",
+        status=JobStatus.QUEUED,
     )
     unsupported = queue.create(
         "comfyui-workflow",
@@ -592,7 +739,9 @@ def test_dispatcher_does_not_launch_over_registered_warm_worker(monkeypatch, tmp
     assert provider.launches == 0
 
 
-def test_dispatcher_launches_legacy_workers_with_effectively_indefinite_timeout(tmp_path):
+def test_dispatcher_launches_legacy_workers_with_effectively_indefinite_timeout(
+    tmp_path,
+):
     class LaunchProvider(DummyProvider):
         def __init__(self):
             self.env_vars = None
@@ -633,7 +782,9 @@ def test_dispatcher_launches_legacy_workers_with_effectively_indefinite_timeout(
     dispatcher._launch_worker("vast.ai", "comfyui")
 
     assert provider.env_vars["CLOUD_OFFLOAD_KEEP_WARM"] == "true"
-    assert int(provider.env_vars["CLOUD_OFFLOAD_IDLE_SHUTDOWN"]) == 10 * 365 * 24 * 60 * 60
+    assert (
+        int(provider.env_vars["CLOUD_OFFLOAD_IDLE_SHUTDOWN"]) == 10 * 365 * 24 * 60 * 60
+    )
 
 
 def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_path):
@@ -681,7 +832,8 @@ def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_
     dispatcher._tick()
     dispatcher._tick()
 
-    envelopes = queue.list_events(job.id)
+    all_envelopes = queue.list_events(job.id)
+    envelopes = [item for item in all_envelopes if item["type"] != "job_created"]
     events = [item["event"] for item in envelopes]
     assert provider.launch_count == 1
     assert [item["type"] for item in events] == [
@@ -692,9 +844,8 @@ def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_
     ]
     assert events[-1]["retry_seconds"] == 10
     assert events[-1]["error"] == "private image cannot be pulled"
-    assert all(
-        item["producer"]["id"].startswith("dispatcher:") for item in envelopes
-    )
+    assert all(item["producer"]["id"].startswith("dispatcher:") for item in envelopes)
+    assert all(item["phase_owner"] == "dispatcher" for item in envelopes)
     assert [item["producer"]["sequence"] for item in envelopes] == [1, 2, 3, 4]
 
 
@@ -788,16 +939,14 @@ def test_fail_job_requeues_then_dead_letters(tmp_path):
 
 def test_cancelled_job_is_not_resurrected_by_late_worker_callbacks(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
-    job = queue.create(
+    queue.create(
         "comfyui-partition-v1",
         "input.part",
         params={"partition_cache_key": "cancelled-result"},
         status=JobStatus.QUEUED,
     )
     claimed = queue.claim_jobs("worker-a", limit=1)[0]
-    cancelled = queue.update_status(
-        claimed.id, JobStatus.FAILED, error="Cancelled"
-    )
+    cancelled = queue.update_status(claimed.id, JobStatus.FAILED, error="Cancelled")
 
     assert cancelled.status == JobStatus.FAILED
     assert queue.update_status(claimed.id, JobStatus.RUNNING).status == JobStatus.FAILED
@@ -862,6 +1011,7 @@ def test_profile_startup_assumes_dependencies_are_baked_into_image(tmp_path):
 
 
 # === Offer cooldown after failed launches ===
+
 
 class TwoOfferProvider(DummyProvider):
     """Cheapest offer's host refuses to launch; the pricier one works."""
@@ -947,6 +1097,7 @@ def test_find_cheapest_exclude_filters_offers(tmp_path):
 
 
 # === Profile resolution: capability or name ===
+
 
 def _profile_config(tmp_path, profile_names=("comfyui",)):
     profiles = {
@@ -1173,7 +1324,10 @@ def test_dispatcher_reloads_worker_profile_before_launch(tmp_path, monkeypatch):
 
     Dispatcher(config, queue=queue, provider=provider)._tick()
 
-    assert provider.launch_kwargs[0]["docker_image"] == persisted.worker_profiles["comfyui"]["image"]
+    assert (
+        provider.launch_kwargs[0]["docker_image"]
+        == persisted.worker_profiles["comfyui"]["image"]
+    )
 
 
 def long_idle_dispatcher(config, queue):

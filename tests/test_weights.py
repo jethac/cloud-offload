@@ -8,7 +8,10 @@ import pytest
 
 from cloud_offload.config import CloudConfig
 from cloud_offload.dispatcher import Dispatcher
-from cloud_offload.profiles import configured_worker_profiles, normalized_profile_weights
+from cloud_offload.profiles import (
+    configured_worker_profiles,
+    normalized_profile_weights,
+)
 from cloud_offload.providers.base import CloudProvider
 from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.worker import Worker
@@ -44,6 +47,7 @@ def weights_config(tmp_path, weights=SDXL_WEIGHTS):
 
 
 # === Schema validation ===
+
 
 def test_weights_are_normalized_into_the_profile(tmp_path):
     config = weights_config(tmp_path)
@@ -136,6 +140,7 @@ def test_invalid_weights_fail_at_config_load(tmp_path):
 
 # === Dispatcher: worker environment ===
 
+
 class LaunchProvider(CloudProvider):
     """Captures the env_vars a launch would hand to the cloud instance."""
 
@@ -175,7 +180,9 @@ class LaunchProvider(CloudProvider):
 def test_dispatcher_passes_the_token_for_gated_weights(isolate_credentials, tmp_path):
     isolate_credentials.store["huggingface"] = "hf-secret"
     provider = LaunchProvider()
-    dispatcher = Dispatcher(weights_config(tmp_path, weights=SDXL_GATED), provider=provider)
+    dispatcher = Dispatcher(
+        weights_config(tmp_path, weights=SDXL_GATED), provider=provider
+    )
 
     dispatcher._launch_worker("runpod", "comfyui")
 
@@ -200,7 +207,9 @@ def test_dispatcher_passes_the_token_for_public_weight_launches(
 
 def test_dispatcher_omits_the_token_when_none_resolves(tmp_path):
     provider = LaunchProvider()
-    dispatcher = Dispatcher(weights_config(tmp_path, weights=SDXL_GATED), provider=provider)
+    dispatcher = Dispatcher(
+        weights_config(tmp_path, weights=SDXL_GATED), provider=provider
+    )
 
     dispatcher._launch_worker("runpod", "comfyui")
 
@@ -221,6 +230,7 @@ def test_dispatcher_sets_neither_var_without_weights(isolate_credentials, tmp_pa
 
 
 # === Worker: staging at the first claimed job ===
+
 
 class FakeHub:
     """Stands in for huggingface_hub; records calls, writes the target file."""
@@ -280,7 +290,9 @@ def test_staging_downloads_listed_files_into_the_models_dir(tmp_path, monkeypatc
 
 def test_staging_uses_snapshot_download_when_files_is_null(tmp_path, monkeypatch):
     hub = FakeHub()
-    weights = [{"repo_id": "org/vae", "revision": "def456", "files": None, "dest": "vae"}]
+    weights = [
+        {"repo_id": "org/vae", "revision": "def456", "files": None, "dest": "vae"}
+    ]
     worker = staging_worker(tmp_path, monkeypatch, weights, hub)
     job = worker.queue.create("comfyui-workflow", "inline://request")
 
@@ -305,7 +317,9 @@ def test_staging_passes_the_hub_token_from_the_environment(tmp_path, monkeypatch
 def test_staging_skips_files_that_already_exist(tmp_path, monkeypatch):
     hub = FakeHub()
     worker = staging_worker(tmp_path, monkeypatch, SDXL_WEIGHTS, hub)
-    staged = tmp_path / "ComfyUI" / "models" / "checkpoints" / "sd_xl_base_1.0.safetensors"
+    staged = (
+        tmp_path / "ComfyUI" / "models" / "checkpoints" / "sd_xl_base_1.0.safetensors"
+    )
     staged.parent.mkdir(parents=True)
     staged.write_bytes(b"already here")
     job = worker.queue.create("comfyui-workflow", "inline://request")
@@ -332,7 +346,11 @@ def test_staging_emits_ordered_weights_staging_events(tmp_path, monkeypatch):
 
     worker._stage_profile_weights(job)
 
-    events = [item["event"] for item in worker.queue.list_events(job.id)]
+    events = [
+        item["event"]
+        for item in worker.queue.list_events(job.id)
+        if not item["type"].startswith("job_")
+    ]
     assert [event["type"] for event in events] == ["weights_staging"] * 4
     assert [(event["repo_id"], event["file"]) for event in events] == [
         ("org/checkpoints", "base.safetensors"),
@@ -371,7 +389,9 @@ def test_first_job_stages_before_executing_and_later_jobs_skip(tmp_path, monkeyp
         return original(self, **kwargs)
 
     monkeypatch.setattr(FakeHub, "hf_hub_download", tracking_download)
-    worker._run_comfyui_workflow = lambda job: order.append("execute") or {"outputs": {}}
+    worker._run_comfyui_workflow = lambda job: order.append("execute") or {
+        "outputs": {}
+    }
 
     first = worker.queue.create("comfyui-workflow", "inline://request")
     second = worker.queue.create("comfyui-workflow", "inline://request")

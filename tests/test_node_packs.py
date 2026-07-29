@@ -55,7 +55,10 @@ QWEN_PACK = {
 }
 
 REGISTRY_ENTRY = {"registry_id": "eric-qwen-layer", "version": "0.1.0"}
-GIT_ENTRY = {"git": "https://github.com/EricRollei/eric-qwen-layer.git", "commit": COMMIT}
+GIT_ENTRY = {
+    "git": "https://github.com/EricRollei/eric-qwen-layer.git",
+    "commit": COMMIT,
+}
 
 
 def packs_config(tmp_path, *, custom_nodes=None):
@@ -122,7 +125,11 @@ def test_both_source_kinds_normalize_with_install_requirements_defaulted():
     normalized = normalized_profile_custom_nodes("comfyui", [REGISTRY_ENTRY, GIT_ENTRY])
 
     assert normalized == [
-        {"registry_id": "eric-qwen-layer", "version": "0.1.0", "install_requirements": True},
+        {
+            "registry_id": "eric-qwen-layer",
+            "version": "0.1.0",
+            "install_requirements": True,
+        },
         {"git": GIT_ENTRY["git"], "commit": COMMIT, "install_requirements": True},
     ]
 
@@ -173,7 +180,11 @@ def test_invalid_custom_nodes_fail_at_config_load(tmp_path):
             {
                 "cloud": {
                     "worker_profiles": {
-                        "comfyui": {"custom_nodes": [{"git": GIT_ENTRY["git"], "commit": "main"}]}
+                        "comfyui": {
+                            "custom_nodes": [
+                                {"git": GIT_ENTRY["git"], "commit": "main"}
+                            ]
+                        }
                     }
                 }
             }
@@ -256,7 +267,9 @@ def test_a_git_declaration_covers_the_pack_it_clones(monkeypatch, tmp_path):
 
 
 def test_matching_ignores_case(monkeypatch, tmp_path):
-    config = packs_config(tmp_path, custom_nodes=[{**REGISTRY_ENTRY, "registry_id": "Eric-Qwen-Layer"}])
+    config = packs_config(
+        tmp_path, custom_nodes=[{**REGISTRY_ENTRY, "registry_id": "Eric-Qwen-Layer"}]
+    )
     client, _ = packs_client(monkeypatch, config)
 
     response = client.post("/api/partitions", json=partition_request([QWEN_PACK]))
@@ -264,7 +277,9 @@ def test_matching_ignores_case(monkeypatch, tmp_path):
     assert response.status_code == 202
 
 
-def test_an_undeclared_pack_is_refused_before_routing(monkeypatch, tmp_path, watch_routing):
+def test_an_undeclared_pack_is_refused_before_routing(
+    monkeypatch, tmp_path, watch_routing
+):
     config = packs_config(tmp_path, custom_nodes=[])
     client, queue = packs_client(monkeypatch, config)
 
@@ -293,7 +308,9 @@ def test_the_refusal_names_every_undeclared_pack(monkeypatch, tmp_path):
         {**QWEN_PACK, "id": "ComfyUI-See-through", "directory": "ComfyUI-See-through"},
     ]
 
-    response = client.post("/api/partitions", json=partition_request([QWEN_PACK, *missing]))
+    response = client.post(
+        "/api/partitions", json=partition_request([QWEN_PACK, *missing])
+    )
 
     assert response.status_code == 409
     message = response.json()["error"]["message"]
@@ -313,7 +330,9 @@ def test_the_refusal_names_every_undeclared_pack(monkeypatch, tmp_path):
         "not-a-list",
     ],
 )
-def test_malformed_node_packs_are_rejected_with_400(monkeypatch, tmp_path, packs, watch_routing):
+def test_malformed_node_packs_are_rejected_with_400(
+    monkeypatch, tmp_path, packs, watch_routing
+):
     config = packs_config(tmp_path, custom_nodes=[REGISTRY_ENTRY])
     client, queue = packs_client(monkeypatch, config)
 
@@ -325,7 +344,9 @@ def test_malformed_node_packs_are_rejected_with_400(monkeypatch, tmp_path, packs
 
 
 def test_a_version_disagreement_warns_and_still_routes(monkeypatch, tmp_path):
-    config = packs_config(tmp_path, custom_nodes=[{**REGISTRY_ENTRY, "version": "0.2.0"}])
+    config = packs_config(
+        tmp_path, custom_nodes=[{**REGISTRY_ENTRY, "version": "0.2.0"}]
+    )
     client, queue = packs_client(monkeypatch, config)
 
     response = client.post("/api/partitions", json=partition_request([QWEN_PACK]))
@@ -333,7 +354,10 @@ def test_a_version_disagreement_warns_and_still_routes(monkeypatch, tmp_path):
     assert response.status_code == 202
     warning = response.json()["node_pack_warnings"][0]
     assert warning["id"] == "eric-qwen-layer"
-    assert (warning["declared_version"], warning["profile_version"]) == ("0.1.0", "0.2.0")
+    assert (warning["declared_version"], warning["profile_version"]) == (
+        "0.1.0",
+        "0.2.0",
+    )
     assert "would not have proven a code match" in warning["warning"]
     assert queue.get(response.json()["job_id"]).status == JobStatus.QUEUED
 
@@ -348,7 +372,9 @@ def test_a_git_pin_never_warns_about_versions(monkeypatch, tmp_path):
     assert "node_pack_warnings" not in response.json()
 
 
-def test_a_partition_without_node_packs_behaves_exactly_as_before(monkeypatch, tmp_path):
+def test_a_partition_without_node_packs_behaves_exactly_as_before(
+    monkeypatch, tmp_path
+):
     """Regression guard for every workflow compiled by an older node pack."""
     client, queue = packs_client(monkeypatch, packs_config(tmp_path))
 
@@ -361,7 +387,9 @@ def test_a_partition_without_node_packs_behaves_exactly_as_before(monkeypatch, t
     assert job.provider == "runpod"
 
 
-def test_an_empty_node_pack_list_routes_without_a_profile_declaration(monkeypatch, tmp_path):
+def test_an_empty_node_pack_list_routes_without_a_profile_declaration(
+    monkeypatch, tmp_path
+):
     client, _ = packs_client(monkeypatch, packs_config(tmp_path))
 
     response = client.post("/api/partitions", json=partition_request([]))
@@ -414,7 +442,11 @@ def test_the_dispatcher_passes_declared_packs_to_the_runner(tmp_path):
     Dispatcher(config, provider=provider)._launch_worker("runpod", "comfyui")
 
     assert json.loads(provider.env_vars["CLOUD_OFFLOAD_CUSTOM_NODES"]) == [
-        {"registry_id": "eric-qwen-layer", "version": "0.1.0", "install_requirements": True}
+        {
+            "registry_id": "eric-qwen-layer",
+            "version": "0.1.0",
+            "install_requirements": True,
+        }
     ]
 
 
@@ -423,7 +455,9 @@ def test_the_dispatcher_sets_no_variable_without_declared_packs(tmp_path):
 
     provider = LaunchProvider()
 
-    Dispatcher(packs_config(tmp_path), provider=provider)._launch_worker("runpod", "comfyui")
+    Dispatcher(packs_config(tmp_path), provider=provider)._launch_worker(
+        "runpod", "comfyui"
+    )
 
     assert "CLOUD_OFFLOAD_CUSTOM_NODES" not in provider.env_vars
 
@@ -441,7 +475,7 @@ def pack_zip(members: dict[str, bytes], symlinks: tuple[str, ...] = ()) -> bytes
         for name in symlinks:
             info = zipfile.ZipInfo(name)
             # 0o120000 is the symlink file type in the high half of external_attr.
-            info.external_attr = (0o120777 << 16)
+            info.external_attr = 0o120777 << 16
             bundle.writestr(info, "../../../etc/passwd")
     return buffer.getvalue()
 
@@ -450,12 +484,18 @@ class FakeRequests:
     """Stands in for ``requests``; serves a versions list and one archive."""
 
     def __init__(self, versions=None, archive=None):
-        self.versions = versions if versions is not None else [
-            {"version": "0.0.9", "downloadUrl": "https://cdn.invalid/old.zip"},
-            {"version": "0.1.0", "downloadUrl": "https://cdn.invalid/node.zip"},
-        ]
-        self.archive = archive if archive is not None else pack_zip(
-            {"eric-qwen-layer/__init__.py": PACK_SOURCE}
+        self.versions = (
+            versions
+            if versions is not None
+            else [
+                {"version": "0.0.9", "downloadUrl": "https://cdn.invalid/old.zip"},
+                {"version": "0.1.0", "downloadUrl": "https://cdn.invalid/node.zip"},
+            ]
+        )
+        self.archive = (
+            archive
+            if archive is not None
+            else pack_zip({"eric-qwen-layer/__init__.py": PACK_SOURCE})
         )
         self.urls = []
 
@@ -528,7 +568,9 @@ def test_a_registry_pack_is_resolved_by_version_and_extracted(tmp_path, monkeypa
 
 
 def test_a_version_the_registry_does_not_publish_fails_clearly(tmp_path, monkeypatch):
-    fake = FakeRequests(versions=[{"version": "0.9.0", "downloadUrl": "https://cdn.invalid/x.zip"}])
+    fake = FakeRequests(
+        versions=[{"version": "0.9.0", "downloadUrl": "https://cdn.invalid/x.zip"}]
+    )
     worker = staging_worker(tmp_path, monkeypatch, [dict(REGISTRY_ENTRY)], fake)
 
     with pytest.raises(RuntimeError, match="no registry version 0.1.0"):
@@ -538,11 +580,23 @@ def test_a_version_the_registry_does_not_publish_fails_clearly(tmp_path, monkeyp
 @pytest.mark.parametrize(
     "members, symlinks, match",
     [
-        ({"../../evil.py": b"x"}, (), "traverses upward and was refused: ../../evil.py"),
+        (
+            {"../../evil.py": b"x"},
+            (),
+            "traverses upward and was refused: ../../evil.py",
+        ),
         ({"pack/../../evil.py": b"x"}, (), "traverses upward and was refused"),
-        ({"/etc/cron.d/evil": b"x"}, (), "absolute path and was refused: /etc/cron.d/evil"),
+        (
+            {"/etc/cron.d/evil": b"x"},
+            (),
+            "absolute path and was refused: /etc/cron.d/evil",
+        ),
         ({"C:/Windows/evil.py": b"x"}, (), "absolute path and was refused"),
-        ({"pack/__init__.py": PACK_SOURCE}, ("pack/link.py",), "symlink and was refused: pack/link.py"),
+        (
+            {"pack/__init__.py": PACK_SOURCE},
+            ("pack/link.py",),
+            "symlink and was refused: pack/link.py",
+        ),
     ],
 )
 def test_a_traversal_bearing_archive_is_refused_by_member(
@@ -565,7 +619,9 @@ def test_a_git_pack_is_cloned_and_pinned(tmp_path, monkeypatch):
     def fake_run(arguments, **kwargs):
         calls.append(arguments)
         if arguments[-1] == "HEAD":
-            return subprocess.CompletedProcess(arguments, 0, stdout=f"{COMMIT}\n", stderr="")
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=f"{COMMIT}\n", stderr=""
+            )
         if arguments[1] == "clone":
             Path(arguments[-1]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
@@ -580,7 +636,14 @@ def test_a_git_pack_is_cloned_and_pinned(tmp_path, monkeypatch):
     assert staging.parent == target.parent
     assert staging.name.startswith(".eric-qwen-layer-staging-")
     assert calls == [
-        ["git", "clone", "--filter=blob:none", "--no-checkout", GIT_ENTRY["git"], str(staging)],
+        [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            GIT_ENTRY["git"],
+            str(staging),
+        ],
         ["git", "-C", str(staging), "checkout", "--detach", COMMIT],
         ["git", "-C", str(staging), "rev-parse", "HEAD"],
     ]
@@ -593,7 +656,9 @@ def test_a_checkout_that_lands_off_the_pin_fails_loudly(tmp_path, monkeypatch):
 
     def fake_run(arguments, **kwargs):
         if arguments[-1] == "HEAD":
-            return subprocess.CompletedProcess(arguments, 0, stdout=f"{other}\n", stderr="")
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=f"{other}\n", stderr=""
+            )
         if arguments[1] == "clone":
             Path(arguments[-1]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
@@ -601,13 +666,17 @@ def test_a_checkout_that_lands_off_the_pin_fails_loudly(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
     worker = staging_worker(tmp_path, monkeypatch, [dict(GIT_ENTRY)])
 
-    with pytest.raises(RuntimeError, match=f"checked out {other} but the worker profile pins"):
+    with pytest.raises(
+        RuntimeError, match=f"checked out {other} but the worker profile pins"
+    ):
         worker._stage_custom_nodes(staging_job(worker))
 
 
 def test_a_failing_git_command_reports_its_stderr(tmp_path, monkeypatch):
     def fake_run(arguments, **kwargs):
-        return subprocess.CompletedProcess(arguments, 128, stdout="", stderr="fatal: not found\n")
+        return subprocess.CompletedProcess(
+            arguments, 128, stdout="", stderr="fatal: not found\n"
+        )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     worker = staging_worker(tmp_path, monkeypatch, [dict(GIT_ENTRY)])
@@ -654,7 +723,11 @@ def test_staging_emits_events_in_the_weight_staging_band(tmp_path, monkeypatch):
 
     worker._stage_custom_nodes(job)
 
-    events = [item["event"] for item in worker.queue.list_events(job.id)]
+    events = [
+        item["event"]
+        for item in worker.queue.list_events(job.id)
+        if not item["type"].startswith("job_")
+    ]
     assert [event["type"] for event in events] == ["node_pack_staging"] * 3
     assert [event["pack_id"] for event in events] == [
         "eric-qwen-layer",
@@ -768,7 +841,9 @@ def test_the_worker_rejects_a_malformed_custom_nodes_env(monkeypatch):
         ('["eric-qwen-layer"]', r"\[0\] must be a JSON object"),
     ],
 )
-def test_an_unusable_packs_variable_names_the_value_it_refused(monkeypatch, value, match):
+def test_an_unusable_packs_variable_names_the_value_it_refused(
+    monkeypatch, value, match
+):
     """A variable that cannot be read is a launch that thinks it configured a
     runner and did not. Yielding an empty list there is indistinguishable from a
     profile that declared no packs at all, which is precisely the silence that
@@ -810,7 +885,9 @@ def test_what_the_dispatcher_serializes_is_what_the_worker_reads(tmp_path, monke
     )
 
     assert Worker._load_custom_nodes_env() == declared
-    assert [profile_pack_identifier(entry) for entry in Worker._load_custom_nodes_env()] == [
+    assert [
+        profile_pack_identifier(entry) for entry in Worker._load_custom_nodes_env()
+    ] == [
         "eric-qwen-layer",
         "layerscope",
     ]
@@ -828,7 +905,11 @@ def test_a_skipped_staging_says_so_and_says_why(tmp_path, monkeypatch):
     second = staging_job(worker)
     worker._stage_custom_nodes(second)
 
-    events = [item["event"] for item in worker.queue.list_events(second.id)]
+    events = [
+        item["event"]
+        for item in worker.queue.list_events(second.id)
+        if not item["type"].startswith("job_")
+    ]
     assert [event["type"] for event in events] == ["node_pack_staging"]
     assert events[0]["skipped"] == "already_staged"
     assert events[0]["total_packs"] == 1
@@ -840,7 +921,11 @@ def test_declaring_no_packs_is_stated_rather_than_assumed(tmp_path, monkeypatch)
 
     worker._stage_custom_nodes(job)
 
-    events = [item["event"] for item in worker.queue.list_events(job.id)]
+    events = [
+        item["event"]
+        for item in worker.queue.list_events(job.id)
+        if not item["type"].startswith("job_")
+    ]
     assert [event["skipped"] for event in events] == ["none_declared"]
     assert events[0]["total_packs"] == 0
 
@@ -855,7 +940,11 @@ def test_a_pack_already_on_disk_is_reported_as_present(tmp_path, monkeypatch):
 
     worker._stage_custom_nodes(job)
 
-    events = [item["event"] for item in worker.queue.list_events(job.id)]
+    events = [
+        item["event"]
+        for item in worker.queue.list_events(job.id)
+        if not item["type"].startswith("job_")
+    ]
     assert events[0]["pack_id"] == "eric-qwen-layer"
     assert events[0]["present"] is True
     assert fake.urls == []
@@ -869,13 +958,18 @@ def test_staging_before_comfyui_exists_needs_no_job(tmp_path, monkeypatch):
 
     worker.stage_node_packs()
 
-    assert pack_path(
-        tmp_path, "eric-qwen-layer", "eric-qwen-layer", "__init__.py"
-    ).read_bytes() == PACK_SOURCE
+    assert (
+        pack_path(
+            tmp_path, "eric-qwen-layer", "eric-qwen-layer", "__init__.py"
+        ).read_bytes()
+        == PACK_SOURCE
+    )
     assert worker._custom_nodes_staged is True
     # Nothing to attach progress to, so the worker record carries the only
     # signal there is: this pod is alive and still coming up.
-    assert [item["status"] for item in worker.queue.list_active_workers()] == ["starting"]
+    assert [item["status"] for item in worker.queue.list_active_workers()] == [
+        "starting"
+    ]
 
 
 def test_the_missing_message_reads_the_same_way_the_asset_one_does():
@@ -885,6 +979,7 @@ def test_the_missing_message_reads_the_same_way_the_asset_one_does():
 
 
 # === A pack's name, its repository and its directory may all differ ===
+
 
 def test_an_entry_may_state_which_pack_it_provides():
     # eric-qwen-layer ships from a repository called
@@ -919,7 +1014,12 @@ def test_an_explicit_id_satisfies_the_preflight_check():
         )
     }
     required = [
-        {"id": "eric-qwen-layer", "directory": "eric-qwen-layer", "version": "0.1.0", "digest": "d" * 64}
+        {
+            "id": "eric-qwen-layer",
+            "directory": "eric-qwen-layer",
+            "version": "0.1.0",
+            "digest": "d" * 64,
+        }
     ]
 
     assert missing_node_packs(required, profile) == []
@@ -952,7 +1052,11 @@ def test_preflight_resolves_the_profile_by_capability(tmp_path, monkeypatch):
                 "models": ["comfyui-partition-v1"],
                 "providers": ["runpod"],
                 "custom_nodes": [
-                    {"id": "layerscope", "git": "https://example.invalid/x.git", "commit": "c" * 40}
+                    {
+                        "id": "layerscope",
+                        "git": "https://example.invalid/x.git",
+                        "commit": "c" * 40,
+                    }
                 ],
             }
         },
@@ -962,6 +1066,11 @@ def test_preflight_resolves_the_profile_by_capability(tmp_path, monkeypatch):
 
     assert profile is not None and profile["name"] == "comfyui"
     required = [
-        {"id": "layerscope", "directory": "layerscope", "version": "0.1.0", "digest": "d" * 64}
+        {
+            "id": "layerscope",
+            "directory": "layerscope",
+            "version": "0.1.0",
+            "digest": "d" * 64,
+        }
     ]
     assert missing_node_packs(required, profile) == []
