@@ -536,11 +536,24 @@ def restart_coordinator(client: CoordinatorFaultClient, job_id: str) -> dict[str
         if current and int(current.get("pid") or 0) == process.pid:
             replacement = CoordinatorFaultClient(current)
             if int(replacement.get("/api/health").get("pid") or 0) == process.pid:
+                replayed = replacement.job(job_id)
+                replayed_status = str(replayed.get("status") or "")
+                if replayed_status not in {"queued", "dispatched", "running"}:
+                    raise RuntimeError(
+                        "Replacement coordinator did not replay the live job"
+                    )
+                cancelled = replacement.post(f"/api/jobs/{job_id}/cancel", {})
+                if str(cancelled.get("status") or "") != "failed":
+                    raise RuntimeError(
+                        "Replacement coordinator did not persist canary cancellation"
+                    )
                 return {
                     "kind": "restart",
                     "old_process_stopped": True,
                     "replacement_healthy": True,
-                    "job_replay_available": bool(replacement.job(job_id)),
+                    "job_replay_available": True,
+                    "replayed_status": replayed_status,
+                    "cancellation_recorded": True,
                 }
         if process.poll() is not None:
             raise RuntimeError("Replacement coordinator exited during restart canary")
