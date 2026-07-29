@@ -121,6 +121,7 @@ class CoordinatorQueue:
         runtime_profile: str | None = None,
         gpu_vram_gb: float | None = None,
         gpu_name: str | None = None,
+        cache_volume_id: str | None = None,
     ) -> list[Job]:
         data = self._post(
             "/api/workers/claim",
@@ -132,6 +133,7 @@ class CoordinatorQueue:
                 "runtime_profile": runtime_profile,
                 "gpu_vram_gb": gpu_vram_gb,
                 "gpu_name": gpu_name,
+                "cache_volume_id": cache_volume_id or "",
             },
         )
         return [Job.from_dict(item) for item in data]

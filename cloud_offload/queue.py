@@ -894,6 +894,7 @@ class JobQueue:
         runtime_profile: str | None = None,
         gpu_vram_gb: float | None = None,
         gpu_name: str | None = None,
+        cache_volume_id: str | None = None,
     ) -> list[Job]:
         """
         Atomically claim queued jobs for a worker.
@@ -906,6 +907,7 @@ class JobQueue:
             provider_clause = " AND provider = ?" if provider else ""
             models_clause = ""
             gpu_clause = ""
+            cache_clause = ""
             values: list[Any] = [JobStatus.QUEUED.value]
             if provider:
                 values.append(provider)
@@ -940,6 +942,16 @@ class JobQueue:
                     )
                 """
                 values.append(str(gpu_name))
+            if cache_volume_id is not None:
+                cache_clause = """
+                    AND (
+                        json_extract(params, '$.preflight.prepared_volume_id') IS NULL
+                        OR COALESCE(
+                            json_extract(params, '$.preflight.prepared_volume_id'), ''
+                        ) = ?
+                    )
+                """
+                values.append(str(cache_volume_id))
             values.append(limit)
             rows = conn.execute(
                 f"""
@@ -948,6 +960,7 @@ class JobQueue:
                 {provider_clause}
                 {models_clause}
                 {gpu_clause}
+                {cache_clause}
                 ORDER BY created_at
                 LIMIT ?
                 """,

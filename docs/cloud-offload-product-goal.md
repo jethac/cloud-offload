@@ -31,10 +31,11 @@ requests:
 4. **What happens next?** The current execution state and the first unmet exit
    criterion in milestone order.
 
-The active program gate is **M0 production evidence**. M1 through M7 remain part
-of this same goal; they are not a backlog that can be silently deferred or a new
-goal that must be rediscovered later. The next implementation milestone may
-start only after M0 evidence is durable, redacted, comparable, and orphan-free.
+The active program gate is **M1 preflight, recommendation, and confirmation**.
+M0 is complete. M2 through M7 remain part of this same goal; they are not a
+backlog that can be silently deferred or a new goal that must be rediscovered
+later. M1 may close only after preflight is bound to paid launch, the user can
+confirm the recommendation, and every M1 exit has durable evidence.
 
 Raw benchmark plans, workflows, hooks, support bundles, and service logs remain
 local under `.runlogs/`. The durable record committed to the repository contains
@@ -169,8 +170,8 @@ validate the product journey.
 
 | ID | Requirement | Primary milestone | Current state |
 | --- | --- | --- | --- |
-| `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; recommendation and preflight remain. |
-| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | Read-only `PreflightReportV1` exists; submission binding and launch revalidation remain. |
+| `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; confirmed launch now binds to the selected offer and prepared volume. |
+| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | `PreflightReportV1`, paid-submit binding, and launch-time revalidation exist; UI confirmation evidence remains. |
 | `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Initial explainable ranking exists; measured history and complete cost components remain. |
 | `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | In progress; M0 is closed. |
 | `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | In progress; M0 is closed. |
@@ -637,6 +638,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#23](https://github.com/jethac/cloud-offload/pull/23) | Gives only corruption observation a 240-second event window inside a 270-second hook process limit and records both PR #22 production replays. | Merged as `c0114c5`; 534 tests passed. The bounded replay then produced accepted corruption evidence. |
 | [#24](https://github.com/jethac/cloud-offload/pull/24) | Commits the compact redacted seven-scenario production projection, checks its completeness and redaction contract, records the accepted corruption replay, and audits every M0 exit. | 535 tests passed; M0 is complete and M1 is active. |
 | [#25](https://github.com/jethac/cloud-offload/pull/25) | Adds the read-only `cloud-offload.preflight.v1` report and endpoint, deterministic blockers, safe volatile offer reads, storage-local candidate ranking, cost/time ranges, quote expiry, and explicit unknowns. | 541 tests passed. Provider-mutation guard tests pass; submission binding is the next M1 slice. |
+| [#26](https://github.com/jethac/cloud-offload/pull/26) | Persists the safe preflight report, binds each paid cache miss to one confirmed candidate, revalidates provider facts before queue creation and launch, prevents silent offer or storage substitution, constrains prepared workers to the exact volume, and makes benchmarks use preflight. | 552 tests passed. Failed revalidation creates no job or provider resource; confirmation policy and UI remain. |
 
 ### ComfyUI extension repository
 
@@ -932,8 +934,9 @@ Status snapshot as of 2026-07-29:
   then extended only the bounded corruption observation window. The accepted
   replay proved exact manifest authority, quarantine, safe terminal behavior,
   and complete automated cleanup in production.
-- M0 is complete. The first unmet work is M1: implement the versioned preflight
-  report and endpoint, then connect recommendation and confirmation to it.
+- M0 is complete. M1 now has the versioned report, recommendation, paid-submit
+  binding, and exact launch revalidation. The first unmet work is the persistent
+  confirmation policy, followed by the ten-second ComfyUI confirmation surface.
 
 ### Completed M0 corruption contract
 
@@ -1023,18 +1026,23 @@ canary. The accepted replay satisfied all of these conditions.
 
 ### Active engineering handoff
 
-PR #25 starts M1 with the backend contract. `PreflightReportV1` and
-`POST /api/preflight` separate deterministic proof from volatile observations,
-hash the canonical execution plan as `manifest_digest`, identify the report
-with `preflight_id`, and make no provider mutation. The report ranks safe GPU
-choices, includes prepared state locality, returns time and compute-cost ranges,
-and identifies missing history and cost components as unknowns.
+PR #25 started M1 with the read-only backend contract. PR #26 binds that
+contract to paid execution. The coordinator now persists only the safe report,
+requires a current `preflight_id`, matching `manifest_digest`, and selected
+`candidate_id`, and re-reads volatile facts before it creates a job. The
+dispatcher then requires the exact confirmed offer, price, GPU, region, and
+prepared volume before provider launch. A changed plan fails safely and asks
+for a new confirmation. It does not silently select another offer or use cold
+storage. A prepared worker can claim the job only when it mounted the exact
+confirmed volume. Confirmed work starts at queue depth one so that normal batch
+delay does not consume the 60-second quote lifetime.
 
-The active slice is submission binding and revalidation. Persist a safe
-preflight record, require a current `preflight_id` and matching
-`manifest_digest` for paid partition launch, re-read availability, price,
-region, and volume immediately before provider mutation, and return a revised
-report instead of silently substituting a materially changed recommendation.
+The active slice is confirmation policy and user interaction. Add the durable
+setting that controls normal confirmation, keep hard spend and policy checks
+active in all modes, and then add the default ten-second ComfyUI countdown with
+Start now, Cancel, Choose another GPU, and Don't show again. Measured history
+and the missing transfer and storage cost components must also improve the
+initial low-confidence recommendation before M1 closes.
 
 ### Operational safety rules
 
@@ -1059,7 +1067,7 @@ report instead of silently substituting a materially changed recommendation.
 | Milestone | Status on 2026-07-29 | Gate |
 | --- | --- | --- |
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
-| M1 — preflight, recommendation, confirmation | **In progress** | Read-only report and initial ranking exist; bind submission and revalidate next. |
+| M1 — preflight, recommendation, confirmation | **In progress** | Report, initial ranking, paid-submit binding, and exact launch revalidation exist; confirmation policy and UI are next. |
 | M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |

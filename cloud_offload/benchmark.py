@@ -1313,10 +1313,46 @@ class CoordinatorBenchmarkDriver:
     def submit(self, scenario: BenchmarkScenario) -> str:
         # Submission is not transport-idempotent yet, so it is deliberately not
         # retried after an ambiguous connection failure.
+        request_payload = dict(scenario.request)
+        if scenario.endpoint == "/api/partitions":
+            preflight_response = self._request(
+                "POST",
+                "/api/preflight",
+                json={
+                    "partition": request_payload.get("partition") or {},
+                    "input_artifacts": request_payload.get("input_artifacts") or {},
+                    "provider": request_payload.get("provider") or "auto",
+                    "recommendation_policy": "balanced",
+                },
+                timeout=120,
+            )
+            preflight_response.raise_for_status()
+            preflight = preflight_response.json()
+            if preflight.get("status") not in {"ready", "ready_with_preparation"}:
+                codes = [
+                    str(item.get("code") or "unknown")
+                    for item in preflight.get("blockers") or preflight.get("unknowns") or []
+                ]
+                raise RuntimeError(
+                    "Benchmark preflight is not ready"
+                    + (f" ({', '.join(codes)})" if codes else "")
+                )
+            candidate_id = (preflight.get("recommendation") or {}).get(
+                "candidate_id"
+            )
+            if not candidate_id:
+                raise RuntimeError("Benchmark preflight returned no recommendation")
+            request_payload.update(
+                {
+                    "preflight_id": preflight["preflight_id"],
+                    "manifest_digest": preflight["manifest_digest"],
+                    "candidate_id": candidate_id,
+                }
+            )
         response = self._request(
             "POST",
             scenario.endpoint,
-            json=scenario.request,
+            json=request_payload,
             timeout=120,
         )
         response.raise_for_status()

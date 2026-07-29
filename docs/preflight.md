@@ -15,8 +15,7 @@ Preflight can read:
 - current provider offers.
 
 Preflight does not queue a job, create or stop a Pod, or create, change, or
-delete provider storage. The current `/api/partitions` route does not yet require
-a preflight report. Binding and revalidation are the next M1 delivery slice.
+delete provider storage.
 
 ## Request
 
@@ -104,3 +103,33 @@ The response includes a random `preflight_id` and a `manifest_digest`. The diges
 binds the partition, boundary artifact identities, profile, image, GPU limits,
 storage plan, residency, provider policy, price limits, region limits, asset
 digests, and node pack digests. The report does not return the workflow body.
+
+## Submission binding and revalidation
+
+The coordinator stores the safe report projection in its SQLite database. It
+does not store the workflow body in the preflight record.
+
+A partition that needs paid execution must submit:
+
+- `preflight_id`;
+- `manifest_digest`; and
+- one `candidate_id` from that report.
+
+A valid completed partition-cache hit stays free and does not require these
+fields. Every cache miss requires them before the coordinator queues the job.
+
+The submit route reads current facts again. It returns HTTP 409 without queuing
+the job when the report is absent, blocked, expired, or does not match the
+partition, or when the chosen offer, GPU, price, region, volume, preparation, or
+estimate changed. A changed response includes a new safe preflight report for a
+new user decision.
+
+The queued job contains only the safe confirmed launch projection. Immediately
+before provider launch, the dispatcher reads the exact offer and prepared volume
+again. It refuses launch when the quote expired or the provider, offer, GPU,
+price, region, or volume changed. It does not select a replacement silently. A
+confirmed prepared launch also cannot use the normal automatic cold fallback.
+
+The worker sends its mounted prepared-volume identity when it claims work. A
+job confirmed for one prepared volume cannot be claimed by a cold worker or a
+worker on a different volume.

@@ -738,6 +738,40 @@ def test_coordinator_driver_refuses_to_overwrite_a_concurrent_config_change():
     assert state["prepared_storage"]["tenant"] == "changed-concurrently"
 
 
+def test_coordinator_driver_preflights_partition_before_submission():
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append((method, path, kwargs.get("json")))
+        if path == "/api/preflight":
+            return FakeResponse(
+                {
+                    "schema": "cloud-offload.preflight.v1",
+                    "preflight_id": "preflight-1",
+                    "manifest_digest": "sha256:" + "a" * 64,
+                    "status": "ready",
+                    "recommendation": {"candidate_id": "sha256:" + "b" * 64},
+                }
+            )
+        return FakeResponse({"job_id": "job-1"})
+
+    driver._request = request
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    assert driver.submit(selected) == "job-1"
+    assert [item[1] for item in calls] == ["/api/preflight", "/api/partitions"]
+    submitted = calls[1][2]
+    assert submitted["preflight_id"] == "preflight-1"
+    assert submitted["manifest_digest"] == "sha256:" + "a" * 64
+    assert submitted["candidate_id"] == "sha256:" + "b" * 64
+    assert submitted["private_prompt"] == "private-cold"
+
+
 def test_cli_validation_redacts_request_and_run_requires_spend_confirmation(
     monkeypatch, capsys, tmp_path
 ):
