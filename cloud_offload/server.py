@@ -98,6 +98,16 @@ class PartitionSubmitRequest(BaseModel):
     force_execution: bool = False
 
 
+class PreflightRequest(BaseModel):
+    partition: dict[str, Any]
+    input_artifacts: dict[str, str] = Field(default_factory=dict)
+    provider: str = "auto"
+    recommendation_policy: str = "balanced"
+    max_hourly_rate: float | None = Field(default=None, gt=0)
+    max_total_job_cost: float | None = Field(default=None, gt=0)
+    allowed_regions: list[str] = Field(default_factory=list)
+
+
 # === App Setup ===
 
 app = FastAPI(
@@ -1987,6 +1997,34 @@ async def job_events(job_id: str, after: int = 0, limit: int = 250):
         "events": events,
         "next_after": events[-1]["sequence"] if events else max(0, int(after)),
     }
+
+
+@app.post("/api/preflight")
+async def preflight_partition(request: PreflightRequest):
+    """Prove readiness and recommend a current offer without paid mutation."""
+    from cloud_offload.preflight import build_partition_preflight, finite_report
+    from cloud_offload.storage import create_storage
+
+    config = _config()
+    report = await asyncio.to_thread(
+        build_partition_preflight,
+        config=config,
+        partition=request.partition,
+        input_artifacts=request.input_artifacts,
+        provider=request.provider,
+        recommendation_policy=request.recommendation_policy,
+        max_hourly_rate=request.max_hourly_rate,
+        max_total_job_cost=request.max_total_job_cost,
+        allowed_regions=request.allowed_regions,
+        storage=create_storage(config),
+        cache_registry=_cache_registry(config),
+    )
+    if not finite_report(report):
+        raise HTTPException(
+            status_code=500,
+            detail="Preflight produced a non-finite numeric value",
+        )
+    return report
 
 
 @app.post("/api/workflows", status_code=202)
