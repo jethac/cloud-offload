@@ -77,6 +77,27 @@ def test_comfyui_profile_accepts_workflow_capability(tmp_path):
     assert route.profile["name"] == "comfyui"
 
 
+def test_worker_profile_declares_pinned_image_runtime_identity(tmp_path):
+    config = profile_config(tmp_path)
+    config.worker_profiles["comfyui"].update(
+        {"platform": "linux-x86_64", "python_abi": "cp311"}
+    )
+
+    profile = configured_worker_profiles(config)["comfyui"]
+
+    assert profile["platform"] == "linux-x86_64"
+    assert profile["python_abi"] == "cp311"
+
+
+@pytest.mark.parametrize("field", ("platform", "python_abi"))
+def test_worker_profile_rejects_invalid_runtime_identity(tmp_path, field):
+    config = profile_config(tmp_path)
+    config.worker_profiles["comfyui"][field] = "../not-an-identity"
+
+    with pytest.raises(ValueError, match="simple runtime identity"):
+        configured_worker_profiles(config)
+
+
 def test_active_worker_endpoint_supports_fresh_pod_benchmark_waits(
     monkeypatch, tmp_path
 ):
@@ -118,7 +139,8 @@ def test_omni_profile_accepts_partition_capability(tmp_path):
 def test_comfyui_manifest_and_worker_capability(tmp_path):
     manifest = tmp_path / "runtime-profile.json"
     manifest.write_text(
-        '{"profile":"comfyui","models":["comfyui-workflow"]}',
+        '{"profile":"comfyui","models":["comfyui-workflow"],'
+        '"platform":"linux-x86_64","python_abi":"cp311"}',
         encoding="utf-8",
     )
     worker = Worker.__new__(Worker)
@@ -126,6 +148,8 @@ def test_comfyui_manifest_and_worker_capability(tmp_path):
     worker.declared_capabilities = ["comfyui-workflow"]
 
     assert load_worker_manifest(manifest)["models"] == ["comfyui-workflow"]
+    assert load_worker_manifest(manifest)["platform"] == "linux-x86_64"
+    assert load_worker_manifest(manifest)["python_abi"] == "cp311"
     assert worker._validated_capabilities() == ["comfyui-workflow"]
 
     manifest.write_text(
@@ -178,6 +202,24 @@ def test_configured_profile_alias_rejects_the_wrong_image_family(tmp_path):
     )
 
     with pytest.raises(RuntimeError, match="expected image profile comfyui"):
+        worker._apply_image_manifest()
+
+
+def test_worker_rejects_incorrect_baked_runtime_identity(tmp_path):
+    manifest = tmp_path / "runtime-profile.json"
+    manifest.write_text(
+        '{"profile":"comfyui","models":["comfyui-workflow"],'
+        '"platform":"wrong-platform"}',
+        encoding="utf-8",
+    )
+    worker = Worker.__new__(Worker)
+    worker.runtime_profile = "comfyui"
+    worker.declared_capabilities = ["comfyui-workflow"]
+    worker.config = SimpleNamespace(
+        worker_manifest_path=str(manifest), worker_image_profile="comfyui"
+    )
+
+    with pytest.raises(RuntimeError, match="but runtime is"):
         worker._apply_image_manifest()
 
 

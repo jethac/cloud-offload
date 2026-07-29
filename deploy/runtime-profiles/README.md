@@ -44,6 +44,8 @@ the digest:
   "worker_profiles": {
     "comfyui": {
       "image": "ghcr.io/jethac/cloud-offload-runner-comfyui@sha256:<digest>",
+      "platform": "linux-x86_64",
+      "python_abi": "cp311",
       "models": ["comfyui-workflow", "comfyui-partition-v1"],
       "providers": ["runpod", "vast.ai"],
       "gpu_type": "any",
@@ -52,6 +54,11 @@ the digest:
   }
 }
 ```
+
+The platform and Python ABI must match the immutable runner image. The
+coordinator uses these declarations to prove that a runtime-bound environment
+bundle is compatible before it recommends a prepared volume. The worker still
+checks the actual runtime during restore.
 
 `POST /api/workflows` targets this `comfyui` profile; `POST /api/partitions`
 targets whichever `comfyui*` profile the compiled job requests via

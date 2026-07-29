@@ -41,6 +41,11 @@ extraction permits only regular files and directories. A corrupt environment
 bundle is quarantined. The configured cold-fallback policy then decides whether
 the worker can rebuild it or must stop.
 
+The configured worker profile declares the platform and Python ABI that its
+pinned image digest provides. Preflight uses these values with the image digest
+and dependency lock. An omitted value stays unknown and makes the
+runtime-bound bundle a cache miss.
+
 ## Boundaries
 
 The bundle contains only declared profile code and packages. A custom node that
