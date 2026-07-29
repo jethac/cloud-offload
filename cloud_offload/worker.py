@@ -14,7 +14,7 @@ import subprocess
 import time
 import uuid
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from cloud_offload.config import CloudConfig
 from cloud_offload.queue import Job, JobQueue, JobStatus
@@ -123,6 +123,7 @@ class Worker:
         self._weights_staged = False
         self.custom_nodes = self._load_custom_nodes_env()
         self._custom_nodes_staged = False
+        self._initialize_prepared_cache()
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -405,15 +406,37 @@ class Worker:
         # download; later jobs skip both. Packs come first: they are what makes
         # the graph's node types exist at all, and they are far the smaller
         # download, so a profile that is wrong about them fails fast.
-        self._stage_custom_nodes(job)
-        self._stage_profile_weights(job)
+        self._phase_event(job, "staging_started")
+        self._begin_cache_restore(job)
+        try:
+            self._stage_custom_nodes(job)
+            self._stage_profile_weights(job)
+        finally:
+            self._complete_cache_restore(job)
 
         # Mark as running
         self.queue.update_status(job.id, JobStatus.RUNNING)
+        self._phase_event(job, "comfyui_ready")
+        self._phase_event(job, "execution_started")
 
         result = self._run_comfyui_workflow(job)
+        self._phase_event(job, "result_available")
         self.queue.update_status(job.id, JobStatus.COMPLETED, result=result)
         logger.info(f"Job {job.id} completed")
+
+    def _phase_event(self, job: Job, phase: str, **fields) -> None:
+        writer = getattr(self.queue, "append_event", None)
+        if callable(writer):
+            writer(
+                job.id,
+                {
+                    "schema": "cloud-offload.phase-event.v1",
+                    "type": "phase_timing",
+                    "phase": phase,
+                    "monotonic_ms": round(time.monotonic() * 1000, 3),
+                    **fields,
+                },
+            )
 
     def _stage_custom_nodes(self, job: Job | None) -> None:
         """Install the profile's declared node packs, once per runner.
@@ -484,12 +507,19 @@ class Worker:
                 raise RuntimeError(
                     f"Custom node pack escapes the custom_nodes directory: {pack_id!r}"
                 )
+            restored = False
+            if not target.exists():
+                restored = self._restore_custom_node_bundle(pack_id, target, job)
             present = target.exists()
             publish(pack_id, source, present=present)
             if present:
                 logger.info(
                     "Custom node pack already present, skipping %s (%s)", pack_id, target
                 )
+                if restored and entry.get("install_requirements", True):
+                    self._install_pack_requirements(job, pack_id, target)
+                if job is not None:
+                    self._populate_custom_node_bundle(pack_id, target, job)
                 downloaded += 1
                 continue
             if source == "registry":
@@ -498,11 +528,113 @@ class Worker:
                 self._install_git_pack(entry, target)
             if entry.get("install_requirements", True):
                 self._install_pack_requirements(job, pack_id, target)
+            self._populate_custom_node_bundle(pack_id, target, job)
             downloaded += 1
 
         publish(None, None)
         self._custom_nodes_staged = True
         logger.info("Staged %d custom node pack(s) into %s", total_packs, root)
+
+    def _restore_custom_node_bundle(
+        self, pack_id: str, target: Path, job: Job | None
+    ) -> bool:
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            return False
+        from cloud_offload.prepared_state import CacheCorruptionError
+
+        artifact = None
+        started = time.monotonic()
+        try:
+            manifest = self._selected_prepared_manifest()
+            if not manifest:
+                return False
+            artifact = next(
+                (
+                    item
+                    for item in manifest["artifacts"]
+                    if item.get("kind") == "custom-node-bundle"
+                    and (item.get("destination") or {}).get("pack_id") == pack_id
+                ),
+                None,
+            )
+            if not artifact:
+                return False
+            cache.restore_artifact(
+                artifact,
+                target,
+                runtime=self.cache_runtime,
+                tenant=str(self.cache_policy.get("tenant") or "default"),
+                allow_private=bool(self.cache_policy.get("cache_private_assets")),
+            )
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_hit",
+                    digest=artifact["digest"],
+                    kind="custom-node-bundle",
+                    bytes=artifact["size"],
+                    result="hit",
+                )
+            if self.cache_receipt:
+                self.cache_receipt.record(
+                    digest=artifact["digest"],
+                    kind="custom-node-bundle",
+                    result="hit",
+                    bytes=artifact["size"],
+                    reason="verified",
+                    total_ms=round((time.monotonic() - started) * 1000, 3),
+                )
+            return True
+        except CacheCorruptionError as exc:
+            if artifact:
+                cache.quarantine(
+                    artifact["digest"], str(exc), storage_key=artifact["storage_key"]
+                )
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_quarantined",
+                    kind="custom-node-bundle",
+                    digest=artifact.get("digest") if artifact else None,
+                    reason=str(exc),
+                )
+            if self.cache_receipt and artifact:
+                self.cache_receipt.record(
+                    digest=artifact["digest"],
+                    kind="custom-node-bundle",
+                    result="corruption",
+                    bytes=0,
+                    reason=str(exc),
+                )
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            return False
+        except Exception as exc:
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_refused",
+                    kind="custom-node-bundle",
+                    reason=str(exc),
+                )
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            return False
+
+    def _populate_custom_node_bundle(
+        self, pack_id: str, target: Path, job: Job | None
+    ) -> None:
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None or job is None:
+            return
+        self._cache_event(
+            job,
+            "cache_artifact_refused",
+            kind="custom-node-bundle",
+            reason="custom_node_bundle_requires_coordinator_preparation",
+        )
+        return
 
     def _publish_node_pack_skip(self, job: Job | None, reason: str) -> None:
         """Say out loud that node pack staging did nothing, and why."""
@@ -813,6 +945,9 @@ class Worker:
                         )
                         downloaded += 1
                         continue
+                    if self._restore_profile_weight(entry, filename, target, job):
+                        downloaded += 1
+                        continue
                     publish(repo_id, filename)
                     try:
                         huggingface_hub.hf_hub_download(
@@ -826,8 +961,12 @@ class Worker:
                         raise RuntimeError(
                             f"Weights staging failed for {repo_id} ({filename}@{revision}): {exc}"
                         ) from exc
+                    self._populate_profile_weight(entry, filename, target, job)
                     downloaded += 1
             else:
+                if self._restore_profile_snapshot(entry, target_dir, job):
+                    downloaded += 1
+                    continue
                 publish(repo_id, None)
                 try:
                     huggingface_hub.snapshot_download(
@@ -840,6 +979,7 @@ class Worker:
                     raise RuntimeError(
                         f"Weights staging failed for {repo_id}@{revision}: {exc}"
                     ) from exc
+                self._populate_profile_snapshot(entry, target_dir, job)
                 downloaded += 1
 
         for asset in assets:
@@ -854,6 +994,410 @@ class Worker:
         publish(None, None)
         self._weights_staged = True
         logger.info("Staged %d weight file(s) into %s", total_files, models_dir)
+
+    def _restore_profile_weight(
+        self, entry: dict, filename: str, target: Path, job: Job
+    ) -> bool:
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            return False
+        manifest = self._selected_prepared_manifest()
+        if not manifest:
+            return False
+        artifact = next(
+            (
+                item
+                for item in manifest["artifacts"]
+                if item.get("kind") == "profile-weight"
+                and (item.get("source") or {}).get("repo_id") == entry.get("repo_id")
+                and (item.get("source") or {}).get("revision") == entry.get("revision")
+                and (item.get("source") or {}).get("filename") == filename
+            ),
+            None,
+        )
+        if not artifact:
+            self._cache_event(
+                job,
+                "cache_artifact_miss",
+                kind="profile-weight",
+                repo_id=entry.get("repo_id"),
+                file=filename,
+                reason="profile_weight_not_in_manifest",
+            )
+            return False
+        from cloud_offload.prepared_state import CacheCorruptionError
+
+        started = time.monotonic()
+        try:
+            cache.restore_artifact(
+                artifact,
+                target,
+                runtime=self.cache_runtime,
+                tenant=str(self.cache_policy.get("tenant") or "default"),
+                allow_private=bool(self.cache_policy.get("cache_private_assets")),
+            )
+            self._cache_event(
+                job,
+                "cache_artifact_hit",
+                kind="profile-weight",
+                digest=artifact["digest"],
+                bytes=artifact["size"],
+                total_ms=round((time.monotonic() - started) * 1000, 3),
+                result="hit",
+            )
+            if self.cache_receipt:
+                self.cache_receipt.record(
+                    digest=artifact["digest"], kind="profile-weight", result="hit",
+                    bytes=artifact["size"], reason="verified",
+                    total_ms=round((time.monotonic() - started) * 1000, 3),
+                )
+            return True
+        except CacheCorruptionError as exc:
+            cache.quarantine(
+                artifact["digest"], str(exc), storage_key=artifact["storage_key"]
+            )
+            self._cache_event(
+                job,
+                "cache_artifact_quarantined",
+                kind="profile-weight",
+                digest=artifact["digest"],
+                reason=str(exc),
+            )
+            if self.cache_receipt:
+                self.cache_receipt.record(
+                    digest=artifact["digest"],
+                    kind="profile-weight",
+                    result="corruption",
+                    bytes=0,
+                    reason=str(exc),
+                )
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            return False
+        except Exception as exc:
+            self._cache_event(
+                job, "cache_artifact_refused", kind="profile-weight", reason=str(exc)
+            )
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            return False
+
+    def _populate_profile_weight(
+        self, entry: dict, filename: str, target: Path, job: Job
+    ) -> None:
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            return
+        gated = bool(entry.get("gated"))
+        if gated and not self.cache_policy.get("cache_private_assets"):
+            self._cache_event(
+                job,
+                "cache_artifact_refused",
+                kind="profile-weight",
+                file=filename,
+                reason="private_cache_refused",
+            )
+            return
+        from cloud_offload.prepared_state import blob_key, build_manifest
+        from cloud_offload.service_config import VERSION
+
+        digest = sha256_file(target)
+        self._cache_event(
+            job, "cache_population_started", kind="profile-weight", digest="sha256:" + digest
+        )
+        cache.publish_blob(target, digest, writer_id=self.worker_id)
+        existing = self._selected_prepared_manifest()
+        artifacts = list(existing.get("artifacts") or []) if existing else []
+        source = {
+            "repo_id": str(entry.get("repo_id") or ""),
+            "revision": str(entry.get("revision") or ""),
+            "filename": filename,
+        }
+        artifacts = [
+            item
+            for item in artifacts
+            if not (item.get("kind") == "profile-weight" and item.get("source") == source)
+        ]
+        artifacts.append(
+            {
+                "digest": "sha256:" + digest,
+                "kind": "profile-weight",
+                "size": target.stat().st_size,
+                "storage_key": blob_key(digest),
+                "portability": "portable",
+                "requirements": {},
+                "policy": {
+                    "tenant": str(self.cache_policy.get("tenant") or "default"),
+                    "cacheable": True,
+                    "private": gated,
+                },
+                "source": source,
+                "destination": {"dest": entry.get("dest"), "filename": filename},
+            }
+        )
+        profile = str(self.cache_requirements.get("profile_fingerprint") or "")
+        try:
+            manifest = build_manifest(
+                profile_fingerprint=profile,
+                producer={
+                    "image_digest": self.cache_runtime.get("image_digest", ""),
+                    "cloud_offload_version": VERSION,
+                    "python_abi": self.cache_runtime.get("python_abi", ""),
+                    "platform": self.cache_runtime.get("platform", ""),
+                    "torch": self.cache_runtime.get("torch", ""),
+                    "cuda": self.cache_runtime.get("cuda", ""),
+                },
+                artifacts=artifacts,
+                signer=cache.signer,
+            )
+            cache.publish_manifest(manifest)
+        except Exception as exc:
+            logger.warning("Profile-weight cache publication refused: %s", exc)
+            self._cache_event(
+                job,
+                "cache_artifact_refused",
+                kind="profile-weight",
+                reason=str(exc),
+            )
+            return
+        self._latest_prepared_manifest = manifest
+        self._cache_event(
+            job,
+            "cache_population_completed",
+            kind="profile-weight",
+            digest="sha256:" + digest,
+            manifest_id=manifest["manifest_id"],
+            bytes=target.stat().st_size,
+        )
+
+    def _restore_profile_snapshot(
+        self, entry: dict, target_dir: Path, job: Job | None
+    ) -> bool:
+        """Restore every file from a previously completed HF snapshot manifest."""
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            return False
+        manifest = self._selected_prepared_manifest()
+        if not manifest:
+            return False
+        artifacts = [
+            item
+            for item in manifest.get("artifacts") or []
+            if item.get("kind") == "profile-weight"
+            and (item.get("source") or {}).get("repo_id") == entry.get("repo_id")
+            and (item.get("source") or {}).get("revision") == entry.get("revision")
+            and (item.get("source") or {}).get("snapshot") is True
+        ]
+        if not artifacts:
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_miss",
+                    kind="profile-weight-snapshot",
+                    repo_id=entry.get("repo_id"),
+                    reason="profile_snapshot_not_in_manifest",
+                )
+            return False
+        from cloud_offload.prepared_state import CacheCorruptionError
+
+        started = time.monotonic()
+        artifact = None
+        try:
+            for artifact in sorted(
+                artifacts, key=lambda item: str((item.get("source") or {}).get("filename"))
+            ):
+                filename = str((artifact.get("source") or {}).get("filename") or "")
+                relative = PurePosixPath(filename)
+                if not filename or relative.is_absolute() or ".." in relative.parts:
+                    raise RuntimeError("Prepared snapshot contains an unsafe destination")
+                target = (target_dir / relative).resolve()
+                try:
+                    target.relative_to(target_dir.resolve())
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "Prepared snapshot destination escapes the model directory"
+                    ) from exc
+                cache.restore_artifact(
+                    artifact,
+                    target,
+                    runtime=self.cache_runtime,
+                    tenant=str(self.cache_policy.get("tenant") or "default"),
+                    allow_private=bool(self.cache_policy.get("cache_private_assets")),
+                )
+                if self.cache_receipt:
+                    self.cache_receipt.record(
+                        digest=artifact["digest"],
+                        kind="profile-weight",
+                        result="hit",
+                        bytes=artifact["size"],
+                        reason="verified_snapshot",
+                    )
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_hit",
+                    kind="profile-weight-snapshot",
+                    repo_id=entry.get("repo_id"),
+                    files=len(artifacts),
+                    bytes=sum(int(item["size"]) for item in artifacts),
+                    total_ms=round((time.monotonic() - started) * 1000, 3),
+                    result="hit",
+                )
+            return True
+        except CacheCorruptionError as exc:
+            if artifact:
+                cache.quarantine(
+                    artifact["digest"], str(exc), storage_key=artifact["storage_key"]
+                )
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_quarantined",
+                    kind="profile-weight-snapshot",
+                    digest=artifact.get("digest") if artifact else None,
+                    reason=str(exc),
+                )
+            if self.cache_receipt and artifact:
+                self.cache_receipt.record(
+                    digest=artifact["digest"],
+                    kind="profile-weight",
+                    result="corruption",
+                    bytes=0,
+                    reason=str(exc),
+                )
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            return False
+        except Exception as exc:
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_refused",
+                    kind="profile-weight-snapshot",
+                    repo_id=entry.get("repo_id"),
+                    reason=str(exc),
+                )
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            return False
+
+    def _populate_profile_snapshot(
+        self, entry: dict, target_dir: Path, job: Job | None
+    ) -> None:
+        """Publish a completed HF snapshot as portable, independently verified files."""
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            return
+        gated = bool(entry.get("gated"))
+        if gated and not self.cache_policy.get("cache_private_assets"):
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_refused",
+                    kind="profile-weight-snapshot",
+                    reason="private_cache_refused",
+                )
+            return
+        from cloud_offload.prepared_state import blob_key, build_manifest
+        from cloud_offload.service_config import VERSION
+
+        root = target_dir.resolve()
+        files = [
+            path
+            for path in sorted(root.rglob("*"))
+            if path.is_file() and ".cache" not in path.relative_to(root).parts
+        ]
+        if not files:
+            return
+        if job:
+            self._cache_event(
+                job,
+                "cache_population_started",
+                kind="profile-weight-snapshot",
+                repo_id=entry.get("repo_id"),
+                files=len(files),
+            )
+        additions = []
+        total_bytes = 0
+        for path in files:
+            filename = path.relative_to(root).as_posix()
+            digest = sha256_file(path)
+            cache.publish_blob(path, digest, writer_id=self.worker_id)
+            total_bytes += path.stat().st_size
+            additions.append(
+                {
+                    "digest": "sha256:" + digest,
+                    "kind": "profile-weight",
+                    "size": path.stat().st_size,
+                    "storage_key": blob_key(digest),
+                    "portability": "portable",
+                    "requirements": {},
+                    "policy": {
+                        "tenant": str(self.cache_policy.get("tenant") or "default"),
+                        "cacheable": True,
+                        "private": gated,
+                    },
+                    "source": {
+                        "repo_id": str(entry.get("repo_id") or ""),
+                        "revision": str(entry.get("revision") or ""),
+                        "filename": filename,
+                        "snapshot": True,
+                    },
+                    "destination": {
+                        "dest": entry.get("dest"),
+                        "filename": filename,
+                    },
+                }
+            )
+        existing = self._selected_prepared_manifest()
+        artifacts = [
+            item
+            for item in (existing.get("artifacts") or [] if existing else [])
+            if not (
+                item.get("kind") == "profile-weight"
+                and (item.get("source") or {}).get("repo_id") == entry.get("repo_id")
+                and (item.get("source") or {}).get("revision") == entry.get("revision")
+                and (item.get("source") or {}).get("snapshot") is True
+            )
+        ]
+        artifacts.extend(additions)
+        profile = str(self.cache_requirements.get("profile_fingerprint") or "")
+        try:
+            manifest = build_manifest(
+                profile_fingerprint=profile,
+                producer={
+                    "image_digest": self.cache_runtime.get("image_digest", ""),
+                    "cloud_offload_version": VERSION,
+                    "python_abi": self.cache_runtime.get("python_abi", ""),
+                    "platform": self.cache_runtime.get("platform", ""),
+                    "torch": self.cache_runtime.get("torch", ""),
+                    "cuda": self.cache_runtime.get("cuda", ""),
+                },
+                artifacts=artifacts,
+                signer=cache.signer,
+            )
+            cache.publish_manifest(manifest)
+        except Exception as exc:
+            logger.warning("Profile snapshot cache publication refused: %s", exc)
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_refused",
+                    kind="profile-weight-snapshot",
+                    reason=str(exc),
+                )
+            return
+        self._latest_prepared_manifest = manifest
+        if job:
+            self._cache_event(
+                job,
+                "cache_population_completed",
+                kind="profile-weight-snapshot",
+                repo_id=entry.get("repo_id"),
+                manifest_id=manifest["manifest_id"],
+                files=len(additions),
+                bytes=total_bytes,
+            )
 
     def _stage_declared_asset(
         self, asset: dict, models_dir: Path, token: str | None
@@ -877,6 +1421,9 @@ class Worker:
             raise RuntimeError(
                 f"Declared asset escapes the models directory: {category}/{filename}"
             )
+
+        if not target.exists() and self._restore_declared_asset(asset, target):
+            return
 
         if target.is_file():
             present = sha256_file(target)
@@ -903,6 +1450,377 @@ class Worker:
             raise RuntimeError(
                 f"Declared asset {category}/{filename} hashed {written} after "
                 f"staging but the job declared {expected}"
+            )
+        self._populate_declared_asset(asset, target)
+
+    def _initialize_prepared_cache(self) -> None:
+        """Consume an existing provider mount; never create or mount storage."""
+        import json
+        import os
+
+        self.prepared_cache = None
+        self.cache_policy: dict = {}
+        self.cache_requirements: dict = {}
+        self.cache_runtime: dict = {}
+        self.cache_receipt = None
+        self.cache_manifest_instruction = ""
+        self._latest_prepared_manifest = None
+        root_value = os.environ.get("CLOUD_OFFLOAD_CACHE_ROOT", "").strip()
+        if not root_value:
+            return
+        root = Path(root_value).resolve()
+        expected = os.environ.get(
+            "CLOUD_OFFLOAD_CACHE_EXPECTED_PROVIDER_VOLUME_ID", ""
+        ).strip()
+        mounted = os.environ.get("RUNPOD_VOLUME_ID", "").strip()
+        if expected and mounted != expected:
+            from cloud_offload.prepared_state import CacheMountError
+
+            raise CacheMountError(
+                f"Expected cache volume {expected}, provider reported {mounted or 'none'}"
+            )
+        if not root.is_dir():
+            if not expected or not root.parent.is_dir():
+                from cloud_offload.prepared_state import CacheMountError
+
+                raise CacheMountError(f"Expected prepared cache mount is absent: {root}")
+            # The provider mounted /workspace and proved its identity. Creating
+            # our namespaced child on an empty first-use volume is safe.
+            root.mkdir(parents=False)
+        try:
+            self.cache_policy = json.loads(
+                os.environ.get("CLOUD_OFFLOAD_CACHE_POLICY", "{}")
+            )
+            self.cache_requirements = json.loads(
+                os.environ.get("CLOUD_OFFLOAD_CACHE_REQUIREMENTS", "{}")
+            )
+            self.cache_manifest_instruction = os.environ.get(
+                "CLOUD_OFFLOAD_CACHE_MANIFEST", ""
+            ).strip()
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Prepared cache instructions are malformed JSON") from exc
+        from cloud_offload.prepared_state import (
+            CoordinatorManifestAuthority,
+            PreparedStateCAS,
+            fingerprint,
+            runtime_fingerprint,
+        )
+
+        authority = CoordinatorManifestAuthority(self.queue)
+        self.cache_authority = authority
+        cache = PreparedStateCAS(root, authority)
+        cache.verify_mount(expected or None)
+        identity = self.cache_requirements.get("runtime_identity") or {}
+        image = str(identity.get("image") or "")
+        image_digest = ""
+        if "@sha256:" in image:
+            image_digest = "sha256:" + image.rsplit("@sha256:", 1)[1]
+        dependency_lock = fingerprint(
+            {
+                "custom_nodes": identity.get("custom_nodes") or [],
+                "wheelhouse_sha256": identity.get("wheelhouse_sha256"),
+            }
+        )
+        self.cache_runtime = runtime_fingerprint(
+            {"image_digest": image_digest, "dependency_lock": dependency_lock}
+        )
+        self.prepared_cache = cache
+
+    def _selected_prepared_manifest(self):
+        import os
+
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            return None
+        profile = str(self.cache_requirements.get("profile_fingerprint") or "")
+        latest = getattr(self, "_latest_prepared_manifest", None)
+        if latest and latest.get("profile_fingerprint") == profile:
+            manifest = latest
+        else:
+            selected = str(getattr(self, "cache_manifest_instruction", "") or "")
+            if selected and selected != profile:
+                # A selected manifest is a placement promise. Do not silently pick
+                # a different generation when that exact promise is absent.
+                manifest = cache.find_manifest(manifest_id=selected)
+            else:
+                manifest = cache.find_manifest(profile_fingerprint=profile)
+        expected_volume = os.environ.get("CLOUD_OFFLOAD_CACHE_VOLUME_ID", "").strip()
+        if manifest and expected_volume:
+            if str(manifest.get("cache_volume_id") or "") != expected_volume:
+                from cloud_offload.prepared_state import ManifestError
+
+                raise ManifestError(
+                    "Prepared manifest is not authorized for the mounted cache volume"
+                )
+        return manifest
+
+    def _cache_event(self, job: Job, event_type: str, **fields) -> None:
+        writer = getattr(self.queue, "append_event", None)
+        if callable(writer):
+            writer(
+                job.id,
+                {
+                    "schema": "cloud-offload.phase-event.v1",
+                    "type": event_type,
+                    "phase": event_type.removeprefix("cache_"),
+                    "monotonic_ms": round(time.monotonic() * 1000, 3),
+                    **fields,
+                },
+            )
+
+    def _begin_cache_restore(self, job: Job) -> None:
+        self._active_cache_job = job
+        if getattr(self, "prepared_cache", None) is None:
+            return
+        import os
+
+        from cloud_offload.prepared_state import RestoreReceipt
+
+        self.cache_receipt = RestoreReceipt(
+            manifest_id=None,
+            volume_id=os.environ.get("CLOUD_OFFLOAD_CACHE_VOLUME_ID", ""),
+            datacenter_id=os.environ.get("RUNPOD_DC_ID", ""),
+            worker_class=self.gpu_name or "unknown",
+        )
+        self.cache_authority.set_context(
+            job_id=job.id, volume_id=self.cache_receipt.volume_id
+        )
+        healed, pending = self.prepared_cache.retry_pending_announcements()
+        if healed or pending:
+            self._cache_event(
+                job,
+                "cache_inventory_projection",
+                healed=healed,
+                pending=pending,
+            )
+        self._cache_event(
+            job,
+            "cache_mount_ready",
+            volume_id=self.cache_receipt.volume_id,
+            datacenter_id=self.cache_receipt.datacenter_id,
+        )
+        self._cache_event(job, "cache_restore_started")
+
+    def _complete_cache_restore(self, job: Job) -> None:
+        if not getattr(self, "cache_receipt", None):
+            self._active_cache_job = None
+            return
+        receipt = self.cache_receipt.to_dict()
+        self._cache_event(job, "cache_restore_completed", receipt=receipt)
+        recorder = getattr(self.queue, "record_cache_observation", None)
+        if callable(recorder):
+            for item in receipt["artifacts"]:
+                try:
+                    recorder(
+                        job.id,
+                        {
+                            "schema": "cloud-offload.restore-observation.v1",
+                            "volume_id": receipt["volume_id"],
+                            "manifest_id": receipt["manifest_id"],
+                            "digest": item.get("digest"),
+                            "datacenter_id": receipt["datacenter_id"],
+                            "worker_class": receipt["worker_class"],
+                            "image_digest": self.cache_runtime.get("image_digest"),
+                            "strategy": "symlink" if item.get("kind") != "custom-node-bundle" else "extract",
+                            "result": item.get("result") or "unknown",
+                            "bytes": int(item.get("bytes") or 0),
+                            "file_count": 1,
+                            "lookup_ms": 0,
+                            "transfer_ms": 0,
+                            "verification_ms": float(item.get("total_ms") or 0),
+                            "extraction_ms": 0,
+                            "import_ms": 0,
+                            "total_ms": float(item.get("total_ms") or 0),
+                            "fallback_ms": item.get("fallback_ms"),
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning("Could not record cache observation: %s", exc)
+        self.cache_receipt = None
+        self.cache_authority.set_context(job_id=None, volume_id=None)
+        self._active_cache_job = None
+
+    def _restore_declared_asset(self, asset: dict, target: Path) -> bool:
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            return False
+        from cloud_offload.prepared_state import (
+            CacheCorruptionError,
+            CachePolicyError,
+            ManifestError,
+            normalize_digest,
+        )
+
+        digest = "sha256:" + normalize_digest(str(asset.get("sha256") or ""))
+        profile = str(self.cache_requirements.get("profile_fingerprint") or "")
+        started = time.monotonic()
+        artifact = None
+        try:
+            manifest = self._selected_prepared_manifest()
+            source_manifest_id = manifest["manifest_id"] if manifest else None
+            artifact = (
+                next(
+                    (item for item in manifest["artifacts"] if item["digest"] == digest),
+                    None,
+                )
+                if manifest
+                else None
+            )
+            shared = False
+            if not artifact:
+                shared_match = cache.find_portable_artifact(digest)
+                if shared_match:
+                    artifact, source_manifest_id = shared_match
+                    shared = True
+            if not artifact:
+                self._record_cache_result(
+                    asset,
+                    "miss",
+                    "artifact_not_in_manifest" if manifest else "manifest_not_found",
+                    started,
+                )
+                return False
+            if self.cache_receipt:
+                self.cache_receipt.manifest_id = source_manifest_id
+            self._cache_event(
+                self._active_cache_job,
+                "cache_manifest_verified",
+                manifest_id=source_manifest_id,
+                profile_fingerprint=profile,
+                cross_profile=shared,
+            ) if getattr(self, "_active_cache_job", None) else None
+            cache.restore_artifact(
+                artifact,
+                target,
+                runtime=self.cache_runtime,
+                tenant=str(self.cache_policy.get("tenant") or "default"),
+                allow_private=bool(self.cache_policy.get("cache_private_assets")),
+            )
+            self._record_cache_result(asset, "hit", "verified", started, target.stat().st_size)
+            if shared:
+                # Publish a profile-B reference only after policy and digest
+                # verification. The immutable blob is reused; no origin call.
+                self._populate_declared_asset(asset, target)
+            return True
+        except CacheCorruptionError as exc:
+            cache.quarantine(
+                digest,
+                str(exc),
+                storage_key=(artifact or {}).get("storage_key"),
+            )
+            self._record_cache_result(asset, "corruption", str(exc), started)
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            return False
+        except (ManifestError, CachePolicyError) as exc:
+            self._record_cache_result(asset, "refused", str(exc), started)
+            if self.cache_policy.get("cold_fallback") == "deny":
+                raise
+            return False
+
+    def _record_cache_result(
+        self,
+        asset: dict,
+        result: str,
+        reason: str,
+        started: float,
+        size: int = 0,
+    ) -> None:
+        elapsed = round((time.monotonic() - started) * 1000, 3)
+        entry = {
+            "digest": "sha256:" + str(asset.get("sha256") or "").removeprefix("sha256:"),
+            "kind": "model-weight",
+            "result": result,
+            "reason": reason,
+            "bytes": int(size),
+            "total_ms": elapsed,
+        }
+        if self.cache_receipt:
+            self.cache_receipt.record(**entry)
+        job = getattr(self, "_active_cache_job", None)
+        if job:
+            event_type = {
+                "hit": "cache_artifact_hit",
+                "miss": "cache_artifact_miss",
+                "refused": "cache_artifact_refused",
+                "corruption": "cache_artifact_quarantined",
+            }.get(result, "cache_artifact_miss")
+            self._cache_event(job, event_type, **entry)
+
+    def _populate_declared_asset(self, asset: dict, target: Path) -> None:
+        cache = getattr(self, "prepared_cache", None)
+        if cache is None:
+            return
+        policy = {
+            "tenant": str(asset.get("tenant") or self.cache_policy.get("tenant") or "default"),
+            "cacheable": bool(asset.get("cacheable", True)),
+            "private": bool(asset.get("private") or asset.get("gated")),
+        }
+        if not policy["cacheable"] or (
+            policy["private"] and not self.cache_policy.get("cache_private_assets")
+        ):
+            job = getattr(self, "_active_cache_job", None)
+            if job:
+                self._cache_event(
+                    job,
+                    "cache_artifact_refused",
+                    digest="sha256:" + str(asset.get("sha256") or "").removeprefix("sha256:"),
+                    reason="asset_policy_refuses_population",
+                )
+            return
+        from cloud_offload.prepared_state import (
+            blob_key,
+            build_manifest,
+            normalize_digest,
+        )
+        from cloud_offload.service_config import VERSION
+
+        digest = normalize_digest(str(asset.get("sha256") or ""))
+        job = getattr(self, "_active_cache_job", None)
+        if job:
+            self._cache_event(job, "cache_population_started", digest="sha256:" + digest)
+        cache.publish_blob(target, digest, writer_id=self.worker_id)
+        profile = str(self.cache_requirements.get("profile_fingerprint") or "")
+        existing = self._selected_prepared_manifest()
+        artifacts = list(existing.get("artifacts") or []) if existing else []
+        artifacts = [item for item in artifacts if item.get("digest") != "sha256:" + digest]
+        artifacts.append(
+            {
+                "digest": "sha256:" + digest,
+                "kind": "model-weight",
+                "size": target.stat().st_size,
+                "storage_key": blob_key(digest),
+                "portability": "portable",
+                "requirements": {},
+                "policy": policy,
+                "destination": {
+                    "category": str(asset.get("category") or ""),
+                    "filename": str(asset.get("filename") or target.name),
+                },
+            }
+        )
+        manifest = build_manifest(
+            profile_fingerprint=profile,
+            producer={
+                "image_digest": self.cache_runtime.get("image_digest", ""),
+                "cloud_offload_version": VERSION,
+                "python_abi": self.cache_runtime.get("python_abi", ""),
+                "platform": self.cache_runtime.get("platform", ""),
+                "torch": self.cache_runtime.get("torch", ""),
+                "cuda": self.cache_runtime.get("cuda", ""),
+            },
+            artifacts=artifacts,
+            signer=cache.signer,
+        )
+        cache.publish_manifest(manifest)
+        self._latest_prepared_manifest = manifest
+        if job:
+            self._cache_event(
+                job,
+                "cache_population_completed",
+                digest="sha256:" + digest,
+                manifest_id=manifest["manifest_id"],
+                bytes=target.stat().st_size,
             )
 
     def _fetch_declared_asset(self, asset: dict, target: Path, token: str | None) -> None:
@@ -957,10 +1875,29 @@ class Worker:
         request = job.request
         if request.get("kind") == "comfyui-partition":
             return self._run_comfyui_partition(job, ComfyUIWorkflowExecutor())
+        workflow = request.get("workflow") or {}
+        first_sampler = False
+
+        def relay(event: dict) -> None:
+            nonlocal first_sampler
+            writer = getattr(self.queue, "append_event", None)
+            if callable(writer):
+                writer(job.id, event)
+            node_id = str(event.get("node_id") or "")
+            node = workflow.get(node_id) or {}
+            if (
+                not first_sampler
+                and event.get("type") == "executing"
+                and "sampler" in str(node.get("class_type") or "").lower()
+            ):
+                first_sampler = True
+                self._phase_event(job, "first_sampler", node_id=node_id)
+
         return ComfyUIWorkflowExecutor().execute(
-            request.get("workflow") or {},
+            workflow,
             inputs=request.get("inputs") or {},
             timeout_seconds=int(request.get("timeout_seconds", 3600)),
+            event_callback=relay,
         )
 
     @staticmethod
@@ -1053,6 +1990,7 @@ class Worker:
         last_progress_sent = 0.0
         last_cancel_check = 0.0
         cancel_requested = False
+        first_sampler = False
 
         def should_cancel() -> bool:
             nonlocal last_cancel_check, cancel_requested
@@ -1071,9 +2009,17 @@ class Worker:
             return cancel_requested
 
         def relay(event: dict) -> None:
-            nonlocal last_progress_sent
+            nonlocal last_progress_sent, first_sampler
             event_type = str(event.get("type") or "")
             node_id = event.get("node_id")
+            node = workflow.get(str(node_id)) or {}
+            if (
+                not first_sampler
+                and event_type == "executing"
+                and "sampler" in str(node.get("class_type") or "").lower()
+            ):
+                first_sampler = True
+                self._phase_event(job, "first_sampler", node_id=str(node_id))
             if event_type == "executed" and node_id is not None:
                 finished_nodes.add(str(node_id))
             elif event_type == "execution_cached":

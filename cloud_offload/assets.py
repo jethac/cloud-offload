@@ -74,7 +74,11 @@ def normalized_asset_sources(entries: Any) -> dict[str, dict[str, Any]]:
         if url:
             if not url.startswith(("http://", "https://")):
                 raise ValueError(f"{label}: url must be http or https")
-            normalized[digest] = {"url": url}
+            normalized[digest] = {
+                "url": url,
+                **({"private": bool(entry["private"])} if "private" in entry else {}),
+                **({"cacheable": bool(entry["cacheable"])} if "cacheable" in entry else {}),
+            }
             continue
         if not repo_id:
             raise ValueError(f"{label}: repo_id is required (or a url)")
@@ -89,6 +93,8 @@ def normalized_asset_sources(entries: Any) -> dict[str, dict[str, Any]]:
             "repo_id": repo_id,
             "revision": revision,
             "filename": filename,
+            **({"private": bool(entry["private"])} if "private" in entry else {}),
+            **({"cacheable": bool(entry["cacheable"])} if "cacheable" in entry else {}),
         }
     return normalized
 

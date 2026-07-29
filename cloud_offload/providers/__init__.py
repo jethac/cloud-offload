@@ -8,7 +8,16 @@ as the default provider; Vast.ai is the worked "add a provider" example.
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from cloud_offload.providers.base import CloudConnector, CloudProvider, Instance
+from cloud_offload.providers.base import (
+    CloudConnector,
+    CloudProvider,
+    Instance,
+    PlacementConstraints,
+    PlacementError,
+    ProviderStorage,
+    StorageAttachment,
+    StorageUnsupportedError,
+)
 
 if TYPE_CHECKING:
     from cloud_offload.config import CloudConfig
@@ -169,6 +178,11 @@ __all__ = [
     "CloudProvider",
     "ConnectorFactory",
     "Instance",
+    "PlacementConstraints",
+    "PlacementError",
+    "ProviderStorage",
+    "StorageAttachment",
+    "StorageUnsupportedError",
     "RESIDENCY_CLASSES",
     "connector_metadata",
     "connector_names",

@@ -532,6 +532,8 @@ def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_
     assert provider.launch_count == 1
     assert [item["type"] for item in events] == [
         "provisioning_started",
+        "provider_request_started",
+        "provider_request_failed",
         "provisioning_failed",
     ]
     assert events[-1]["retry_seconds"] == 10

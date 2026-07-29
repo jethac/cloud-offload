@@ -1,6 +1,11 @@
 # Storage-aware Cloud Offload — persistent prepared state
 
-> Status: **product requirements; designed, not yet implemented.**
+> Status: **initial RunPod storage-aware MVP implemented** — opt-in volume
+> lifecycle, signed prepared-state manifests/CAS, storage-aware placement,
+> worker restore/population, status telemetry, and the ComfyUI settings flow are
+> delivered. Adaptive admission/retention, full environment and compiler-cache
+> layers, automated multi-region replication, and live performance validation
+> remain follow-up work.
 >
 > Initial provider: **RunPod Secure Cloud**. The control-plane model is
 > provider-neutral, but the first delivery uses RunPod network volumes and their
@@ -130,10 +135,20 @@ Proposed persisted configuration:
     "cold_fallback": "allow",
     "managed_size_gb": 250,
     "existing_volume_id": null,
-    "max_monthly_storage_cost": null
+    "max_monthly_storage_cost": null,
+    "confirmed": true,
+    "tenant": "default",
+    "cache_private_assets": false,
+    "shadow_admission": true
   }
 }
 ```
+
+`confirmed` is persisted only after the first-run disclosure is accepted; an
+enabled hand-written configuration without it is rejected. RunPod managed
+volume size is constrained to 1–4000 GB. Cost shown by the MVP is a published
+estimate ($0.07/GB-month through 1000 GB, then $0.05/GB-month), not a live
+provider quote.
 
 Provider credentials and S3-compatible credentials remain in the environment or
 OS keychain and must never be serialized into this object or returned by an API.

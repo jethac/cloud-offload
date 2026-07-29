@@ -10,9 +10,11 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
+import threading
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -59,6 +61,9 @@ MAX_PARTITION_ARTIFACT_BYTES = int(
 auth_required = False
 auth_token: str | None = None
 last_error: str | None = None
+_config_write_lock = threading.RLock()
+_ANY_VOLUME_BINDING = object()
+_HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
 
 
 # === Request/Response Models ===
@@ -219,6 +224,34 @@ def _queue():
     return config, JobQueue(config.queue_db_path)
 
 
+def _cache_registry(config=None):
+    from cloud_offload.cache_registry import CacheRegistry
+
+    config = config or _config(resolve_secrets=False)
+    return CacheRegistry(config.queue_db_path)
+
+
+def _cache_connector(config, provider: str):
+    from cloud_offload.providers import create_connector
+
+    return create_connector(provider, config)
+
+
+def _runpod_s3_store(volume, connector):
+    from cloud_offload.prepared_state import RunPodS3PreparedStore
+
+    endpoint = connector.s3_endpoint(volume.datacenter_id)
+    if not endpoint:
+        raise RuntimeError(
+            f"RunPod datacenter {volume.datacenter_id} has no published S3 endpoint"
+        )
+    return RunPodS3PreparedStore.from_environment(
+        volume_id=volume.provider_volume_id,
+        datacenter_id=volume.datacenter_id,
+        endpoint_url=endpoint,
+    )
+
+
 def _worker_token(request: Request) -> str | None:
     authorization = request.headers.get("Authorization", "")
     return authorization[7:] if authorization.startswith("Bearer ") else None
@@ -229,6 +262,210 @@ def _partition_artifact_key(digest: str) -> str:
     if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
         raise HTTPException(status_code=400, detail="Invalid partition artifact digest")
     return f"partition-artifacts/{normalized[:2]}/{normalized}.part"
+
+
+def _prepared_manifest_signer(config):
+    from cloud_offload.prepared_state import load_or_create_manifest_signer
+
+    return load_or_create_manifest_signer(
+        Path(config.queue_db_path).with_name("prepared-manifest-key")
+    )
+
+
+def _validate_manifest_proposal(
+    config,
+    proposal: dict[str, Any],
+    *,
+    job,
+    volume_id: str,
+) -> None:
+    """Apply coordinator policy before an untrusted worker proposal is signed."""
+    if proposal.get("schema") != "cloud-offload.prepared-state.v1":
+        raise ValueError("Unsupported prepared manifest schema")
+    if not isinstance(proposal.get("artifacts"), list):
+        raise ValueError("Prepared manifest artifacts must be a list")
+    allowed_top_level = {
+        "schema", "profile_fingerprint", "created_at", "producer", "artifacts"
+    }
+    unknown_claims = set(proposal) - allowed_top_level
+    if unknown_claims:
+        raise ValueError(
+            "Prepared manifest has unknown authority claims: "
+            + ", ".join(sorted(unknown_claims))
+        )
+    policy = config.prepared_storage
+    tenant = str(policy.get("tenant") or "default")
+    forbidden = ("secret", "token", "api_key", "access_key", "password")
+
+    def walk(value: Any, path: str = "manifest") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if any(fragment in str(key).lower() for fragment in forbidden):
+                    raise ValueError(
+                        f"Prepared manifest contains credential field {path}.{key}"
+                    )
+                walk(child, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                walk(child, f"{path}[{index}]")
+
+    walk(proposal)
+    requirement = job.params.get("prepared_requirement") or {}
+    if proposal.get("profile_fingerprint") != requirement.get("profile_fingerprint"):
+        raise ValueError("Prepared manifest profile is outside the job launch plan")
+    if str(job.params.get("cache_volume_id") or "") != str(volume_id):
+        raise ValueError("Prepared manifest volume is outside the job launch plan")
+
+    from cloud_offload.profiles import configured_worker_profiles
+    from cloud_offload.service_config import VERSION
+
+    profile_name = str(job.params.get("runtime_profile") or "")
+    profiles = configured_worker_profiles(config)
+    profile = profiles.get(profile_name)
+    if profile is None:
+        from cloud_offload.profiles import profile_providing
+
+        profile = profile_providing(profiles, profile_name)
+    if profile is None:
+        raise ValueError("Prepared manifest job profile is no longer configured")
+    declared_digests = {
+        str(item.get("digest") or "")
+        for item in (requirement.get("artifacts") or [])
+        if isinstance(item, dict) and item.get("digest")
+    }
+    declared_policies = {
+        str(item.get("digest") or ""): dict(item.get("policy") or {})
+        for item in (requirement.get("artifacts") or [])
+        if isinstance(item, dict) and item.get("digest")
+    }
+    weight_entries = list(profile.get("weights") or [])
+    for artifact in proposal["artifacts"]:
+        portability = artifact.get("portability")
+        if portability in {"process-bound", "gpu-resident"}:
+            raise ValueError(f"Coordinator refuses durable {portability} state")
+        artifact_policy = artifact.get("policy") or {}
+        if artifact_policy.get("cacheable") is not True:
+            raise ValueError("Coordinator refuses a non-cacheable artifact")
+        if str(artifact_policy.get("tenant") or "") != tenant:
+            raise ValueError("Prepared artifact tenant is outside coordinator policy")
+        if artifact_policy.get("private") and not policy.get("cache_private_assets"):
+            raise ValueError("Coordinator policy refuses private prepared artifacts")
+        kind = str(artifact.get("kind") or "")
+        if kind == "model-weight":
+            if str(artifact.get("digest") or "") not in declared_digests:
+                raise ValueError("Prepared model is not declared by the authorized job")
+            artifact_policy["private"] = bool(
+                declared_policies.get(str(artifact.get("digest") or ""), {}).get("private")
+            )
+        elif kind == "profile-weight":
+            source = artifact.get("source") or {}
+            identity = (
+                str(source.get("repo_id") or ""),
+                str(source.get("revision") or ""),
+                str(source.get("filename") or ""),
+            )
+            relative = PurePosixPath(identity[2])
+            matching_weights = [
+                item
+                for item in weight_entries
+                if str(item.get("repo_id") or "") == identity[0]
+                and str(item.get("revision") or "") == identity[1]
+                and (
+                    (
+                        item.get("files")
+                        and identity[2] in (item.get("files") or [])
+                        and source.get("snapshot") is not True
+                    )
+                    or (
+                        not item.get("files")
+                        and source.get("snapshot") is True
+                        and bool(identity[2])
+                        and not relative.is_absolute()
+                        and ".." not in relative.parts
+                    )
+                )
+            ]
+            if not matching_weights:
+                raise ValueError("Prepared weight is not pinned by the authorized profile")
+            if len(identity[1]) != 40 or any(
+                character not in "0123456789abcdefABCDEF" for character in identity[1]
+            ):
+                raise ValueError(
+                    "Prepared weight revision must be an immutable 40-character commit"
+                )
+            trusted_digest = _trusted_huggingface_digest(*identity)
+            if str(artifact.get("digest") or "") != trusted_digest:
+                raise ValueError(
+                    "Prepared weight digest does not match its coordinator-verified source"
+                )
+            artifact_policy["private"] = any(
+                bool(item.get("gated")) for item in matching_weights
+            )
+        elif kind == "custom-node-bundle":
+            raise ValueError(
+                "Worker-produced custom-node bundles have no coordinator-verifiable "
+                "source-to-digest binding"
+            )
+        else:
+            raise ValueError(f"Prepared artifact kind is not authorized: {kind}")
+        if artifact_policy.get("private") and not policy.get("cache_private_assets"):
+            raise ValueError("Coordinator policy refuses private prepared artifacts")
+        artifact["policy"] = {
+            **artifact_policy,
+            "tenant": tenant,
+            "cacheable": True,
+        }
+    image = str(profile.get("image") or "")
+    image_digest = (
+        "sha256:" + image.rsplit("@sha256:", 1)[1]
+        if "@sha256:" in image else ""
+    )
+    from cloud_offload.prepared_state import utc_now
+
+    proposal["created_at"] = utc_now()
+    proposal["producer"] = {
+        "image_digest": image_digest,
+        "cloud_offload_version": VERSION,
+    }
+    proposal["cache_volume_id"] = str(volume_id)
+
+
+def _trusted_huggingface_digest(
+    repo_id: str, revision: str, filename: str
+) -> str:
+    """Resolve pinned HF source bytes to a coordinator-trusted sha256 digest."""
+    identity = (str(repo_id), str(revision), str(filename))
+    cached = _HF_SOURCE_DIGESTS.get(identity)
+    if cached:
+        return cached
+    import huggingface_hub
+
+    from cloud_offload.credentials import huggingface_token
+    from cloud_offload.prepared_state import sha256_file
+
+    token = huggingface_token() or None
+    url = huggingface_hub.hf_hub_url(
+        repo_id=identity[0], filename=identity[2], revision=identity[1]
+    )
+    metadata = huggingface_hub.get_hf_file_metadata(url, token=token)
+    etag = str(getattr(metadata, "etag", "") or "").strip('"').lower()
+    is_lfs_sha256 = (
+        getattr(metadata, "xet_file_data", None) is None
+        and len(etag) == 64
+        and all(character in "0123456789abcdef" for character in etag)
+    )
+    if is_lfs_sha256:
+        digest = "sha256:" + etag
+    else:
+        downloaded = huggingface_hub.hf_hub_download(
+            repo_id=identity[0],
+            filename=identity[2],
+            revision=identity[1],
+            token=token,
+        )
+        digest = "sha256:" + sha256_file(downloaded)
+    _HF_SOURCE_DIGESTS[identity] = digest
+    return digest
 
 
 async def _store_partition_artifact(
@@ -375,6 +612,17 @@ def _authorize_worker_job(request: Request, job_id: str):
     return queue, job
 
 
+def _is_active_worker_job(job, worker_id: str) -> bool:
+    from cloud_offload.queue import JobStatus
+
+    return bool(
+        job
+        and worker_id
+        and job.worker_id == worker_id
+        and job.status in {JobStatus.DISPATCHED, JobStatus.RUNNING}
+    )
+
+
 # === Public routes ===
 
 @app.get("/")
@@ -421,11 +669,84 @@ async def get_config():
     return _config().to_dict()
 
 
+def _read_persisted_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError("Persisted config must be a JSON object")
+    return value
+
+
+def _atomic_write_persisted_config(path: Path, data: dict[str, Any]) -> None:
+    """Replace config.json atomically so dispatcher reloads never see a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False, suffix=".tmp"
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        with temporary:
+            json.dump(data, temporary, indent=2)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _persist_config_updates(payload: dict[str, Any]) -> None:
+    from cloud_offload.config import CONFIG_DIR
+
+    config_path = CONFIG_DIR / "config.json"
+    with _config_write_lock:
+        data = _read_persisted_config(config_path)
+        if "cloud" in data and isinstance(data["cloud"], dict):
+            data["cloud"].update(payload)
+        else:
+            data.update(payload)
+        _atomic_write_persisted_config(config_path, data)
+
+
+def _persist_prepared_volume_binding(
+    config,
+    provider_volume_id: str | None,
+    *,
+    expected_provider_volume_id: object = _ANY_VOLUME_BINDING,
+) -> bool:
+    """Atomically bind or clear the one configured prepared-state volume.
+
+    A conditional clear prevents a delayed detach request for volume A from
+    erasing a newer user choice of volume B.
+    """
+    from cloud_offload.config import CONFIG_DIR, normalized_prepared_storage
+
+    config_path = CONFIG_DIR / "config.json"
+    with _config_write_lock:
+        data = _read_persisted_config(config_path)
+        target = (
+            data["cloud"]
+            if "cloud" in data and isinstance(data["cloud"], dict)
+            else data
+        )
+        prepared = normalized_prepared_storage(
+            target.get("prepared_storage", config.prepared_storage)
+        )
+        if (
+            expected_provider_volume_id is not _ANY_VOLUME_BINDING
+            and prepared.get("existing_volume_id") != expected_provider_volume_id
+        ):
+            return False
+        prepared["existing_volume_id"] = provider_volume_id
+        target["prepared_storage"] = normalized_prepared_storage(prepared)
+        _atomic_write_persisted_config(config_path, data)
+        return True
+
+
 @app.post("/api/config")
 async def update_config(updates: dict[str, Any] = Body(...)):
     """Persist non-secret configuration. Secrets come from the environment only."""
-    from cloud_offload.config import CONFIG_DIR
-
     secret_fields = {
         "vast_api_key",
         "runpod_api_key",
@@ -444,21 +765,17 @@ async def update_config(updates: dict[str, Any] = Body(...)):
             status_code=400,
             detail=f"Secrets must be supplied through environment variables: {', '.join(rejected)}",
         )
+    if "prepared_storage" in payload:
+        from cloud_offload.config import normalized_prepared_storage
 
-    config_path = CONFIG_DIR / "config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            data = json.load(f)
-    else:
-        data = {}
-    if "cloud" in data and isinstance(data["cloud"], dict):
-        data["cloud"].update(payload)
-    else:
-        data.update(payload)
+        try:
+            payload["prepared_storage"] = normalized_prepared_storage(
+                payload["prepared_storage"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, "w") as f:
-        json.dump(data, f, indent=2)
+    _persist_config_updates(payload)
 
     return {"status": "updated", "config": _config().to_dict()}
 
@@ -473,6 +790,528 @@ async def get_providers():
         "default_provider": config.provider,
         "providers": await asyncio.to_thread(_provider_statuses, config),
     }
+
+
+@app.get("/api/cache/status")
+async def cache_status():
+    """Prepared-storage policy, regional volumes, health and measured benefit."""
+    config = _config(resolve_secrets=False)
+    return _cache_registry(config).status(config.prepared_storage)
+
+
+@app.post("/api/cache/volumes")
+async def create_or_adopt_cache_volume(body: dict[str, Any] = Body(...)):
+    """Perform a confirmed managed create or untrusted-volume adoption."""
+    config = _config()
+    policy = config.prepared_storage
+    if not policy.get("enabled") or not policy.get("confirmed"):
+        from cloud_offload.config import estimate_runpod_storage_monthly
+
+        raise HTTPException(
+            status_code=409,
+            detail="Prepared storage must be enabled after first-run disclosure confirmation",
+        )
+    if body.get("confirmed") is not True:
+        size_gb = int(
+            body["size_gb"]
+            if "size_gb" in body
+            else policy.get("managed_size_gb") or 250
+        )
+        region = str(body.get("datacenter_id") or policy.get("region") or "auto")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Confirm prepared storage creation or adoption",
+                "provider": "runpod",
+                "datacenter_id": region,
+                "size_gb": size_gb,
+                "published_estimated_monthly_usd": estimate_runpod_storage_monthly(size_gb),
+                "placement_constrained": True,
+                "cold_fallback": policy.get("cold_fallback"),
+                "cache_private_assets": policy.get("cache_private_assets"),
+                "provider_deletion_is_separate": True,
+            },
+        )
+    operation = str(body.get("operation") or "adopt")
+    connector = _cache_connector(config, "runpod")
+    registry = _cache_registry(config)
+    if operation == "adopt":
+        provider_id = str(body.get("provider_volume_id") or "")
+        if not provider_id:
+            raise HTTPException(status_code=400, detail="provider_volume_id is required")
+        volume = await asyncio.to_thread(connector.get_storage, provider_id)
+        if volume is None:
+            raise HTTPException(status_code=404, detail="RunPod network volume not found")
+        expected_region = str(body.get("datacenter_id") or "")
+        if expected_region and expected_region != volume.datacenter_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Volume is in {volume.datacenter_id}, not {expected_region}",
+            )
+        ownership = "adopted"
+    elif operation == "create":
+        region = str(body.get("datacenter_id") or policy.get("region") or "auto")
+        if region == "auto":
+            raise HTTPException(
+                status_code=409,
+                detail="Select a concrete RunPod datacenter before managed volume creation",
+            )
+        size_gb = int(
+            body["size_gb"]
+            if "size_gb" in body
+            else policy.get("managed_size_gb") or 250
+        )
+        from cloud_offload.config import (
+            RUNPOD_NETWORK_VOLUME_MAX_GB,
+            estimate_runpod_storage_monthly,
+        )
+
+        if size_gb < 1 or size_gb > RUNPOD_NETWORK_VOLUME_MAX_GB:
+            raise HTTPException(
+                status_code=409,
+                detail=f"RunPod network volume size must be 1-{RUNPOD_NETWORK_VOLUME_MAX_GB} GB",
+            )
+        budget = policy.get("max_monthly_storage_cost")
+        if budget is not None and estimate_runpod_storage_monthly(size_gb) > float(budget):
+            raise HTTPException(status_code=409, detail="Managed volume exceeds storage budget")
+        volume = await asyncio.to_thread(
+            connector.create_storage,
+            name=str(body.get("name") or f"cloud-offload-{region.lower()}"),
+            size_gb=size_gb,
+            datacenter_id=region,
+        )
+        ownership = "managed"
+    else:
+        raise HTTPException(status_code=400, detail="operation must be create or adopt")
+    registered = registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id=volume.id,
+        datacenter_id=volume.datacenter_id,
+        ownership=ownership,
+        capacity_bytes=volume.size_gb * 1024**3,
+        policy={**policy, "existing_volume_id": volume.id},
+        status="ready",
+        s3_compatible=volume.s3_compatible,
+    )
+    _persist_prepared_volume_binding(config, volume.id)
+    return registered.__dict__
+
+
+@app.delete("/api/cache/volumes/{volume_id}")
+async def delete_cache_volume(
+    volume_id: str,
+    delete_provider: bool = False,
+    confirm_provider_volume_id: str | None = None,
+):
+    """Delete metadata; provider deletion is a separate, explicit action."""
+    config = _config()
+    registry = _cache_registry(config)
+    volume = registry.get_volume(volume_id)
+    if not volume:
+        raise HTTPException(status_code=404, detail="Cache volume not found")
+    if delete_provider:
+        if volume.ownership != "managed":
+            raise HTTPException(
+                status_code=409,
+                detail="Adopted volumes can only be detached; delete them in the provider console",
+            )
+        if confirm_provider_volume_id != volume.provider_volume_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Provider volume ID confirmation does not match",
+            )
+    provider_deleted = False
+    binding_cleared = _persist_prepared_volume_binding(
+        config,
+        None,
+        expected_provider_volume_id=volume.provider_volume_id,
+    )
+    if delete_provider:
+        registry.mark_volume(volume.id, "deleting")
+        connector = _cache_connector(config, volume.provider)
+        provider_deleted = await asyncio.to_thread(
+            connector.delete_storage, volume.provider_volume_id
+        )
+        if not provider_deleted:
+            registry.mark_volume(volume.id, "failed")
+            if binding_cleared:
+                _persist_prepared_volume_binding(
+                    config,
+                    volume.provider_volume_id,
+                    expected_provider_volume_id=None,
+                )
+            raise HTTPException(status_code=502, detail="Provider volume deletion failed")
+    try:
+        metadata_deleted = registry.delete_metadata(volume.id)
+    except Exception:
+        if binding_cleared and not provider_deleted:
+            _persist_prepared_volume_binding(
+                config,
+                volume.provider_volume_id,
+                expected_provider_volume_id=None,
+            )
+        raise
+    if not metadata_deleted:
+        if binding_cleared and not provider_deleted:
+            _persist_prepared_volume_binding(
+                config,
+                volume.provider_volume_id,
+                expected_provider_volume_id=None,
+            )
+        raise HTTPException(status_code=409, detail="Cache volume metadata changed concurrently")
+    return {
+        "deleted_metadata": True,
+        "deleted_provider_volume": provider_deleted,
+        "ownership": volume.ownership,
+        "cleared_existing_volume_id": binding_cleared,
+    }
+
+
+@app.post("/api/cache/volumes/{volume_id}/verify")
+async def verify_cache_volume(volume_id: str):
+    """Reconcile provider truth and a compact signed inventory generation."""
+    config = _config()
+    registry = _cache_registry(config)
+    volume = registry.get_volume(volume_id)
+    if not volume:
+        raise HTTPException(status_code=404, detail="Cache volume not found")
+    connector = _cache_connector(config, volume.provider)
+    actual = await asyncio.to_thread(connector.get_storage, volume.provider_volume_id)
+    if not actual or actual.datacenter_id != volume.datacenter_id:
+        registry.mark_volume(volume.id, "degraded")
+        raise HTTPException(
+            status_code=409,
+            detail="Provider volume is missing or no longer in the recorded datacenter",
+        )
+    if not actual.s3_compatible:
+        registry.mark_volume(volume.id, "ready")
+        return {"volume_id": volume.id, "provider_verified": True, "inventory": None}
+    try:
+        store = _runpod_s3_store(volume, connector)
+        await asyncio.to_thread(store.probe)
+        index = await asyncio.to_thread(store.load_index)
+        if index.get("generation") is None:
+            registry.mark_volume(volume.id, "ready")
+            return {"volume_id": volume.id, "provider_verified": True, "inventory": None}
+        signer = _prepared_manifest_signer(config)
+        documents = {}
+        for entry in index.get("manifests") or []:
+            document = await asyncio.to_thread(store.read_json, entry["storage_key"])
+            documents[entry["manifest_id"]] = signer.verify(document)
+        result = registry.reconcile_index(
+            volume.id, index, manifest_documents=documents
+        )
+        return {
+            "volume_id": volume.id,
+            "provider_verified": True,
+            "generation": index["generation"],
+            **result,
+        }
+    except Exception as exc:
+        registry.mark_volume(volume.id, "degraded")
+        raise HTTPException(status_code=409, detail=f"Cache verification failed: {exc}")
+
+
+@app.get("/api/cache/manifests")
+async def get_cache_manifests(
+    profile_fingerprint: str | None = None,
+    datacenter_id: str | None = None,
+):
+    return {
+        "manifests": _cache_registry().query_manifests(
+            profile_fingerprint=profile_fingerprint,
+            datacenter_id=datacenter_id,
+        )
+    }
+
+
+@app.post("/api/cache/prepopulate")
+async def prepopulate_cache(body: dict[str, Any] = Body(...)):
+    """Resolve pinned sources and copy verified bytes through RunPod S3."""
+    from types import SimpleNamespace
+
+    from cloud_offload.cache_scheduler import resolve_prepared_requirements
+    from cloud_offload.credentials import huggingface_token
+    from cloud_offload.prepared_state import (
+        blob_key,
+        build_manifest,
+        normalize_digest,
+        sha256_file as prepared_sha256_file,
+    )
+    from cloud_offload.profiles import configured_worker_profiles
+    from cloud_offload.storage import create_storage, partition_artifact_key
+
+    config = _config()
+    registry = _cache_registry(config)
+    volume = registry.get_volume(str(body.get("volume_id") or ""))
+    if not volume:
+        raise HTTPException(status_code=404, detail="Cache volume not found")
+    if not volume.s3_compatible:
+        raise HTTPException(
+            status_code=409,
+            detail="This RunPod datacenter has no coordinator-side S3 prepopulation",
+        )
+    profile_name = str(body.get("profile") or "")
+    profile = configured_worker_profiles(config).get(profile_name)
+    if not profile:
+        raise HTTPException(status_code=400, detail="A configured profile is required")
+    artifacts = body.get("artifacts") or []
+    if not isinstance(artifacts, list) or not artifacts:
+        raise HTTPException(
+            status_code=400,
+            detail="A non-empty artifacts list is required",
+        )
+    connector = _cache_connector(config, volume.provider)
+    store = _runpod_s3_store(volume, connector)
+    canonical = create_storage(config)
+    manifest_artifacts = []
+    requirement_assets = []
+    token = huggingface_token() or None
+    with tempfile.TemporaryDirectory(prefix="cloud-offload-prepopulate-") as directory:
+        for item in artifacts:
+            try:
+                digest = normalize_digest(str(item.get("sha256") or ""))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            source = Path(directory) / digest
+            source_key = partition_artifact_key(digest)
+            registered_source = config.asset_sources.get(digest)
+            profile_source = None
+            requested_source = item.get("source") or {}
+            if requested_source:
+                identity = (
+                    str(requested_source.get("repo_id") or ""),
+                    str(requested_source.get("revision") or ""),
+                    str(requested_source.get("filename") or ""),
+                )
+                for candidate in profile.get("weights") or []:
+                    if (
+                        str(candidate.get("repo_id") or "") == identity[0]
+                        and str(candidate.get("revision") or "") == identity[1]
+                        and identity[2] in (candidate.get("files") or [])
+                    ):
+                        profile_source = {**requested_source, "gated": candidate.get("gated")}
+                        break
+                if profile_source is None:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Requested source is not pinned by the configured profile",
+                    )
+                if len(identity[1]) != 40 or any(
+                    character not in "0123456789abcdefABCDEF" for character in identity[1]
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Prepared weight revision must be an immutable 40-character commit",
+                    )
+            if canonical.exists(source_key):
+                canonical.download(source_key, source)
+            elif registered_source or profile_source:
+                resolved = registered_source or profile_source
+                if resolved.get("repo_id"):
+                    try:
+                        import huggingface_hub
+                    except ImportError as exc:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="huggingface_hub is required for HF prepopulation",
+                        ) from exc
+                    downloaded = await asyncio.to_thread(
+                        huggingface_hub.hf_hub_download,
+                        repo_id=str(resolved["repo_id"]),
+                        filename=str(resolved["filename"]),
+                        revision=str(resolved["revision"]),
+                        local_dir=directory,
+                        token=token,
+                    )
+                    shutil.copyfile(downloaded, source)
+                elif resolved.get("url"):
+                    import requests
+
+                    with requests.get(str(resolved["url"]), stream=True, timeout=60) as response:
+                        response.raise_for_status()
+                        with source.open("wb") as handle:
+                            for chunk in response.iter_content(1024 * 1024):
+                                if chunk:
+                                    handle.write(chunk)
+                else:
+                    raise HTTPException(status_code=400, detail="Pinned source is malformed")
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No canonical or immutable configured source for sha256:{digest}",
+                )
+            if prepared_sha256_file(source) != digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Prepopulation source failed sha256 verification: {digest}",
+                )
+            private = bool(
+                (registered_source or {}).get("private")
+                or (profile_source or {}).get("gated")
+            )
+            cacheable = bool((registered_source or {}).get("cacheable", True))
+            if not cacheable:
+                raise HTTPException(status_code=403, detail="Artifact policy forbids caching")
+            if private and not config.prepared_storage.get("cache_private_assets"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Prepared storage policy refuses private/gated weights",
+                )
+            await asyncio.to_thread(store.upload_verified, source, digest)
+            kind = "profile-weight" if profile_source else "model-weight"
+            category = str(item.get("category") or "")
+            filename = str(item.get("filename") or source.name)
+            requirement_assets.append(
+                {
+                    "sha256": digest,
+                    "size": source.stat().st_size,
+                    "category": category,
+                    "filename": filename,
+                    "private": private,
+                    "cacheable": cacheable,
+                }
+            )
+            manifest_artifacts.append(
+                {
+                    "digest": "sha256:" + digest,
+                    "kind": kind,
+                    "size": source.stat().st_size,
+                    "storage_key": blob_key(digest),
+                    "portability": "portable",
+                    "requirements": {},
+                    "policy": {
+                        "tenant": str(config.prepared_storage.get("tenant") or "default"),
+                        "cacheable": cacheable,
+                        "private": private,
+                    },
+                    **({"source": {
+                        "repo_id": profile_source["repo_id"],
+                        "revision": profile_source["revision"],
+                        "filename": profile_source["filename"],
+                    }} if profile_source else {}),
+                    "destination": {"category": category, "filename": filename},
+                }
+            )
+    requirement = resolve_prepared_requirements(
+        profile_name,
+        profile,
+        [SimpleNamespace(request={"assets": requirement_assets})],
+    )
+    profile_fingerprint = requirement["profile_fingerprint"]
+    signer = _prepared_manifest_signer(config)
+    manifest = build_manifest(
+        profile_fingerprint=profile_fingerprint,
+        producer={
+            "image_digest": "sha256:" + profile["image"].rsplit("@sha256:", 1)[1],
+            "cloud_offload_version": VERSION,
+            "python_abi": "coordinator-prepopulation",
+            "platform": "portable",
+            "torch": "",
+            "cuda": "",
+        },
+        artifacts=manifest_artifacts,
+        signer=signer,
+        claims={"cache_volume_id": volume.id},
+    )
+    await asyncio.to_thread(store.publish_manifest, manifest, signer)
+    index = await asyncio.to_thread(store.load_index)
+    registry.reconcile_index(
+        volume.id, index, manifest_documents={manifest["manifest_id"]: manifest}
+    )
+    return {
+        "volume_id": volume.id,
+        "manifest_id": manifest["manifest_id"],
+        "generation": index["generation"],
+        "artifacts": len(manifest_artifacts),
+    }
+
+
+@app.post("/api/cache/replicate")
+async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
+    """Manually copy one verified immutable manifest to an approved replica."""
+    if body.get("confirmed") is not True:
+        raise HTTPException(status_code=409, detail="Replication requires confirmation")
+    config = _config()
+    registry = _cache_registry(config)
+    source = registry.get_volume(str(body.get("source_volume_id") or ""))
+    target = registry.get_volume(str(body.get("target_volume_id") or ""))
+    if not source or not target:
+        raise HTTPException(status_code=404, detail="Replication volume not found")
+    if not source.s3_compatible or not target.s3_compatible:
+        raise HTTPException(status_code=409, detail="Both replica volumes need RunPod S3")
+    source_connector = _cache_connector(config, source.provider)
+    target_connector = _cache_connector(config, target.provider)
+    source_store = _runpod_s3_store(source, source_connector)
+    target_store = _runpod_s3_store(target, target_connector)
+    source_index = await asyncio.to_thread(source_store.load_index)
+    manifest_id = str(body.get("manifest_id") or "")
+    entry = next(
+        (
+            item for item in source_index.get("manifests") or []
+            if item.get("manifest_id") == manifest_id
+        ),
+        None,
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Source manifest not found")
+    signer = _prepared_manifest_signer(config)
+    document = signer.verify(
+        await asyncio.to_thread(source_store.read_json, entry["storage_key"])
+    )
+    sizes = {
+        item["digest"]: int(item["size"]) for item in document["artifacts"]
+    }
+    plan = registry.create_replication(
+        source.id, target.id, list(sizes), sizes
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="cloud-offload-replica-") as directory:
+            for artifact in document["artifacts"]:
+                path = Path(directory) / normalize_cache_filename(artifact["digest"])
+                await asyncio.to_thread(
+                    source_store.download_verified,
+                    artifact["storage_key"], artifact["digest"], path,
+                )
+                await asyncio.to_thread(
+                    target_store.upload_verified,
+                    path,
+                    artifact["digest"],
+                    storage_key=artifact["storage_key"],
+                )
+        proposal = {
+            key: value
+            for key, value in document.items()
+            if key not in {"manifest_id", "signature", "cache_volume_id"}
+        }
+        proposal["cache_volume_id"] = target.id
+        replica_manifest = signer.sign(proposal)
+        signer.verify(replica_manifest)
+        await asyncio.to_thread(
+            target_store.publish_manifest, replica_manifest, signer
+        )
+        target_index = await asyncio.to_thread(target_store.load_index)
+        registry.reconcile_index(
+            target.id,
+            target_index,
+            manifest_documents={replica_manifest["manifest_id"]: replica_manifest},
+        )
+        registry.complete_replication(plan["id"])
+        return {
+            **plan,
+            "status": "completed",
+            "target_manifest_id": replica_manifest["manifest_id"],
+            "target_generation": target_index["generation"],
+        }
+    except Exception as exc:
+        registry.complete_replication(plan["id"], failed_reason=str(exc))
+        raise HTTPException(status_code=409, detail=f"Replication failed: {exc}")
+
+
+def normalize_cache_filename(digest: str) -> str:
+    from cloud_offload.prepared_state import normalize_digest
+
+    return normalize_digest(digest)
 
 
 @app.post("/api/providers/{provider}/credentials")
@@ -1260,6 +2099,135 @@ async def worker_download_artifact(artifact_id: str, request: Request):
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
     return _partition_artifact_response(artifact_id)
+
+
+@app.post("/api/workers/cache/manifests/sign")
+async def worker_sign_prepared_manifest(
+    request: Request, payload: dict[str, Any] = Body(...)
+):
+    """Validate and sign a worker proposal without disclosing authority key."""
+    config, queue = _queue()
+    try:
+        queue.authorize_worker(_worker_token(request))
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    proposal = payload.get("manifest")
+    if not isinstance(proposal, dict):
+        raise HTTPException(status_code=400, detail="manifest must be an object")
+    job_id = str(payload.get("job_id") or "")
+    volume_id = str(payload.get("volume_id") or "")
+    worker_id = str(payload.get("worker_id") or "")
+    job = queue.get(job_id)
+    if not _is_active_worker_job(job, worker_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Prepared manifest proposal is not bound to this worker's active job",
+        )
+    try:
+        await asyncio.to_thread(
+            _validate_manifest_proposal,
+            config,
+            proposal,
+            job=job,
+            volume_id=volume_id,
+        )
+        signer = _prepared_manifest_signer(config)
+        signed = signer.sign(proposal)
+        # Full canonical key, size, tier and signature validation before return.
+        return signer.verify(signed)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workers/cache/manifests/verify")
+async def worker_verify_prepared_manifest(
+    request: Request, payload: dict[str, Any] = Body(...)
+):
+    """Verify a manifest against coordinator authority for an authenticated worker."""
+    config, queue = _queue()
+    try:
+        queue.authorize_worker(_worker_token(request))
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    manifest = payload.get("manifest")
+    if not isinstance(manifest, dict):
+        raise HTTPException(status_code=400, detail="manifest must be an object")
+    try:
+        return _prepared_manifest_signer(config).verify(manifest)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workers/cache/manifests/announce")
+async def worker_announce_prepared_manifest(
+    request: Request, payload: dict[str, Any] = Body(...)
+):
+    """Project a manifest only after an active worker atomically published it."""
+    config, queue = _queue()
+    try:
+        queue.authorize_worker(_worker_token(request))
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    job = queue.get(str(payload.get("job_id") or ""))
+    worker_id = str(payload.get("worker_id") or "")
+    volume_id = str(payload.get("volume_id") or "")
+    generation = str(payload.get("generation") or "")
+    manifest = payload.get("manifest")
+    if not _is_active_worker_job(job, worker_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Prepared manifest announcement is not bound to this worker's active job",
+        )
+    if str(job.params.get("cache_volume_id") or "") != volume_id:
+        raise HTTPException(status_code=403, detail="Announcement volume is outside launch plan")
+    if not generation or "/" in generation or "\\" in generation:
+        raise HTTPException(status_code=400, detail="Announcement generation is invalid")
+    if not isinstance(manifest, dict):
+        raise HTTPException(status_code=400, detail="manifest must be an object")
+    try:
+        verified = _prepared_manifest_signer(config).verify(manifest)
+        if str(verified.get("cache_volume_id") or "") != volume_id:
+            raise ValueError("Signed manifest volume claim does not match announcement")
+        volume = _cache_registry(config).get_volume(volume_id)
+        if not volume:
+            raise ValueError("Announcement cache volume is not registered")
+        result = _cache_registry(config).announce_manifest(
+            volume_id, generation, verified
+        )
+    except (ValueError, RuntimeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "volume_id": volume_id,
+        "manifest_id": verified["manifest_id"],
+        "generation": generation,
+        **result,
+    }
+
+
+@app.post("/api/workers/cache/observations")
+async def worker_record_cache_observation(
+    request: Request, payload: dict[str, Any] = Body(...)
+):
+    config, queue = _queue()
+    try:
+        queue.authorize_worker(_worker_token(request))
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    job = queue.get(str(payload.get("job_id") or ""))
+    worker_id = str(payload.get("worker_id") or "")
+    if not _is_active_worker_job(job, worker_id):
+        raise HTTPException(status_code=403, detail="Observation is not bound to this worker job")
+    observation = payload.get("observation")
+    if not isinstance(observation, dict):
+        raise HTTPException(status_code=400, detail="observation must be an object")
+    allowed_volume = str(job.params.get("cache_volume_id") or "")
+    if str(observation.get("volume_id") or "") != allowed_volume:
+        raise HTTPException(status_code=403, detail="Observation volume is outside launch plan")
+    try:
+        observation_id = _cache_registry(config).record_observation(observation)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"id": observation_id}
 
 
 @app.post("/api/workers/artifacts")
