@@ -75,6 +75,26 @@ def test_comfyui_profile_accepts_workflow_capability(tmp_path):
     assert route.profile["name"] == "comfyui"
 
 
+def test_active_worker_endpoint_supports_fresh_pod_benchmark_waits(
+    monkeypatch, tmp_path
+):
+    config = profile_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    queue.record_worker(
+        "worker-1",
+        "runpod",
+        runtime_profile="comfyui",
+        capabilities=["comfyui-workflow"],
+    )
+    monkeypatch.setattr(server, "_queue", lambda: (config, queue))
+
+    response = TestClient(server.app).get("/api/active-workers")
+
+    assert response.status_code == 200
+    assert response.json()["active_workers"] == 1
+    assert response.json()["workers"][0]["worker_id"] == "worker-1"
+
+
 def test_omni_profile_accepts_partition_capability(tmp_path):
     config = profile_config(tmp_path)
     config.worker_profiles["comfyui-omni"] = {

@@ -14,7 +14,6 @@ import logging
 import os
 import sys
 from datetime import datetime
-from pathlib import Path
 
 from cloud_offload.config import CONFIG_DIR
 
@@ -61,7 +60,9 @@ def load_plugins(logger: logging.Logger | None = None) -> dict:
     return summary
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> tuple[
+    argparse.ArgumentParser, argparse.ArgumentParser, argparse.ArgumentParser
+]:
     parser = argparse.ArgumentParser(
         prog="cloud-offload", description="Provider-neutral cloud offload coordinator"
     )
@@ -73,7 +74,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--port", type=int, help="Port to bind. Omit or pass 0 to auto-select."
     )
     serve_parser.add_argument(
-        "--allow-lan", action="store_true", help="Allow binding to a non-localhost address"
+        "--allow-lan",
+        action="store_true",
+        help="Allow binding to a non-localhost address",
     )
     serve_parser.add_argument(
         "--require-auth",
@@ -90,7 +93,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     worker_parser = subparsers.add_parser("worker", help="Run as a cloud worker")
     worker_parser.add_argument("--config", help="Path to config file")
-    worker_parser.add_argument("--poll", type=int, default=10, help="Poll interval in seconds")
+    worker_parser.add_argument(
+        "--poll", type=int, default=10, help="Poll interval in seconds"
+    )
     worker_parser.add_argument("--max-jobs", type=int, help="Max jobs before exit")
 
     boot_parser = subparsers.add_parser(
@@ -119,7 +124,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     dispatch_parser = subparsers.add_parser("dispatch", help="Run the job dispatcher")
     dispatch_parser.add_argument("--config", help="Path to config file")
-    dispatch_parser.add_argument("--once", action="store_true", help="Run once and exit")
+    dispatch_parser.add_argument(
+        "--once", action="store_true", help="Run once and exit"
+    )
 
     storage_parser = subparsers.add_parser(
         "storage-plan", help="Size the container disk a worker profile needs"
@@ -131,6 +138,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Resolve unknown weight sizes from Hugging Face and cache them",
     )
 
+    benchmark_parser = subparsers.add_parser(
+        "benchmark", help="Run or validate a spend-capped production benchmark"
+    )
+    benchmark_sub = benchmark_parser.add_subparsers(dest="benchmark_command")
+    benchmark_validate = benchmark_sub.add_parser(
+        "validate", help="Validate a plan without submitting work"
+    )
+    benchmark_validate.add_argument("--plan", required=True, help="Benchmark plan JSON")
+    benchmark_run = benchmark_sub.add_parser(
+        "run", help="Execute a benchmark campaign and write its scorecard"
+    )
+    benchmark_run.add_argument("--plan", required=True, help="Benchmark plan JSON")
+    benchmark_run.add_argument("--output", required=True, help="Scorecard JSON path")
+    benchmark_run.add_argument("--config", help="Path to Cloud Offload config")
+    benchmark_run.add_argument(
+        "--confirm-spend",
+        action="store_true",
+        help="Acknowledge the plan's provider spend and runtime ceilings",
+    )
+    benchmark_run.add_argument(
+        "--allow-hooks",
+        action="store_true",
+        help="Allow explicit storage/corruption/restart hook commands from the plan",
+    )
+
     queue_parser = subparsers.add_parser("queue", help="Manage the local job queue")
     queue_sub = queue_parser.add_subparsers(dest="queue_command")
     queue_sub.add_parser("status", help="Show queue status")
@@ -138,12 +170,14 @@ def _build_parser() -> argparse.ArgumentParser:
     queue_cancel = queue_sub.add_parser("cancel", help="Cancel a job")
     queue_cancel.add_argument("job_id", help="Job ID to cancel")
     queue_clean = queue_sub.add_parser("clean", help="Clean old terminal jobs")
-    queue_clean.add_argument("--days", type=int, default=7, help="Delete jobs older than N days")
-    return parser, queue_parser
+    queue_clean.add_argument(
+        "--days", type=int, default=7, help="Delete jobs older than N days"
+    )
+    return parser, queue_parser, benchmark_parser
 
 
 def main():
-    parser, queue_parser = _build_parser()
+    parser, queue_parser, benchmark_parser = _build_parser()
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -177,7 +211,9 @@ def main():
         from cloud_offload.config import CloudConfig
         from cloud_offload.worker import Worker
 
-        config = CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
+        config = (
+            CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
+        )
         worker = Worker(config)
         worker.run(poll_interval=args.poll, max_jobs=args.max_jobs)
 
@@ -187,7 +223,9 @@ def main():
         from cloud_offload.config import CloudConfig
         from cloud_offload.runner import DEFAULT_COMFYUI_LOG, run_boot, run_ready
 
-        config = CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
+        config = (
+            CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
+        )
         if args.command == "runner-boot":
             raise SystemExit(run_boot(config))
         raise SystemExit(
@@ -205,7 +243,9 @@ def main():
         from cloud_offload.config import CloudConfig
         from cloud_offload.dispatcher import Dispatcher
 
-        config = CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
+        config = (
+            CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
+        )
         dispatcher = Dispatcher(config)
         try:
             dispatcher.run(once=args.once)
@@ -237,7 +277,9 @@ def main():
         plan = plan_storage(
             [], profile, image_bytes=image_bytes, weight_bytes=weight_bytes
         )
-        print(f"Storage plan for worker profile {args.profile!r}, with no partition assets:")
+        print(
+            f"Storage plan for worker profile {args.profile!r}, with no partition assets:"
+        )
         for component in plan["components"]:
             print(
                 f"  {component['name']:<9} {component['bytes'] / GIB:>9.1f} GiB  "
@@ -249,6 +291,85 @@ def main():
             print("Unknown, charged a conservative default:")
             for item in plan["unknown"]:
                 print(f"  - {item}")
+
+    elif args.command == "benchmark":
+        from cloud_offload.benchmark import (
+            BenchmarkPlan,
+            BenchmarkRunner,
+            CoordinatorBenchmarkDriver,
+            write_scorecard,
+        )
+
+        if not args.benchmark_command:
+            benchmark_parser.print_help()
+            raise SystemExit(2)
+
+        try:
+            plan = BenchmarkPlan.load(args.plan)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"Invalid benchmark plan: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+
+        if args.benchmark_command == "validate":
+            print(json.dumps(plan.safe_summary(), indent=2, sort_keys=True))
+        elif args.benchmark_command == "run":
+            if not args.confirm_spend:
+                print(
+                    "Benchmark run not started. Review the validated plan, then pass "
+                    "--confirm-spend to acknowledge ceilings of "
+                    f"${plan.limits.max_total_cost_usd:.2f} and "
+                    f"{plan.limits.max_campaign_seconds:.0f}s.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            hook_scenarios = [
+                scenario.name
+                for scenario in plan.scenarios
+                if scenario.failure and scenario.failure.hook_argv
+            ]
+            if hook_scenarios and not args.allow_hooks:
+                print(
+                    "Benchmark run not started. These scenarios contain external "
+                    "failure hooks and require --allow-hooks: "
+                    + ", ".join(hook_scenarios),
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            setup_logging("benchmark")
+            load_plugins()
+            from cloud_offload.config import CloudConfig
+            from cloud_offload.service_config import discover_service_info
+
+            config = (
+                CloudConfig.from_file(args.config)
+                if args.config
+                else CloudConfig.load()
+            )
+            try:
+                service = discover_service_info(require_healthy=True)
+                driver = CoordinatorBenchmarkDriver(
+                    service["url"],
+                    service.get("token"),
+                    config,
+                    plan.providers,
+                    allow_hooks=args.allow_hooks,
+                )
+                scorecard = BenchmarkRunner(driver).run(plan)
+                output = write_scorecard(args.output, scorecard)
+            except Exception as exc:  # noqa: BLE001 - CLI must report a safe failure
+                print(
+                    f"Benchmark failed before scorecard completion: {exc}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1) from exc
+            print(
+                f"Benchmark {'passed' if scorecard['passed'] else 'failed'}: {output} "
+                f"(estimated upper compute cost "
+                f"${scorecard['estimated_compute_cost_upper_usd']:.4f})"
+            )
+            raise SystemExit(0 if scorecard["passed"] else 1)
+        else:
+            benchmark_parser.print_help()
 
     elif args.command == "queue":
         load_plugins()
@@ -284,14 +405,18 @@ def main():
                 print("-" * 90)
                 for job in jobs:
                     created = job.created_at[:19] if job.created_at else "N/A"
-                    print(f"{job.id:<36} {job.model:<25} {job.status.value:<12} {created}")
+                    print(
+                        f"{job.id:<36} {job.model:<25} {job.status.value:<12} {created}"
+                    )
 
         elif args.queue_command == "cancel":
             job = queue.get(args.job_id)
             if not job:
                 print(f"Job {args.job_id} not found")
                 sys.exit(1)
-            queue.update_status(args.job_id, JobStatus.FAILED, error="Cancelled by user")
+            queue.update_status(
+                args.job_id, JobStatus.FAILED, error="Cancelled by user"
+            )
             print(f"Cancelled job {args.job_id}")
 
         elif args.queue_command == "clean":
