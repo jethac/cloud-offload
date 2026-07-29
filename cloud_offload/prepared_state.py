@@ -274,6 +274,10 @@ def custom_node_requirement_key(pack_id: str) -> str:
     return f"custom-node:{pack_id}"
 
 
+def environment_requirement_key(dependency_lock: str) -> str:
+    return f"environment:{digest_id(dependency_lock)}"
+
+
 def artifact_requirement_key(artifact: dict[str, Any]) -> str | None:
     kind = str(artifact.get("kind") or "")
     if kind == "profile-weight":
@@ -288,6 +292,10 @@ def artifact_requirement_key(artifact: dict[str, Any]) -> str | None:
     if kind == "custom-node-bundle":
         return custom_node_requirement_key(
             str((artifact.get("destination") or {}).get("pack_id") or "")
+        )
+    if kind == "environment-bundle":
+        return environment_requirement_key(
+            str((artifact.get("destination") or {}).get("dependency_lock") or "")
         )
     return None
 

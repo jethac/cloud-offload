@@ -540,6 +540,9 @@ class FakeRequests:
 def staging_worker(tmp_path, monkeypatch, custom_nodes, requests_module=None):
     monkeypatch.setitem(sys.modules, "requests", requests_module or FakeRequests())
     monkeypatch.setenv("CLOUD_OFFLOAD_COMFYUI_ROOT", str(tmp_path / "ComfyUI"))
+    monkeypatch.setenv(
+        "CLOUD_OFFLOAD_ENV_ROOT", str(tmp_path / "cloud-offload-environment")
+    )
     worker = Worker.__new__(Worker)
     worker.config = CloudConfig(
         provider="runpod",
@@ -775,6 +778,10 @@ def test_requirements_are_installed_and_their_output_captured(tmp_path, monkeypa
     worker._stage_custom_nodes(job)
 
     assert commands[0][1:4] == ["-m", "pip", "install"]
+    assert commands[0][4:6] == [
+        "--target",
+        str(tmp_path / "cloud-offload-environment"),
+    ]
     installed = [item["event"] for item in worker.queue.list_events(job.id)]
     requirements_event = next(
         event for event in installed if event["type"] == "node_pack_requirements"

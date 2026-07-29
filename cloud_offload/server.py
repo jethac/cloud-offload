@@ -392,7 +392,11 @@ def _validate_manifest_proposal(
     if str(job.params.get("cache_volume_id") or "") != str(volume_id):
         raise ValueError("Prepared manifest volume is outside the job launch plan")
 
-    from cloud_offload.profiles import configured_worker_profiles
+    from cloud_offload.prepared_state import fingerprint
+    from cloud_offload.profiles import (
+        configured_worker_profiles,
+        profile_pack_identifier,
+    )
     from cloud_offload.service_config import VERSION
 
     profile_name = str(job.params.get("runtime_profile") or "")
@@ -415,6 +419,17 @@ def _validate_manifest_proposal(
         if isinstance(item, dict) and item.get("digest")
     }
     weight_entries = list(profile.get("weights") or [])
+    pack_entries = {
+        profile_pack_identifier(item): item
+        for item in (profile.get("custom_nodes") or [])
+    }
+    runtime_identity = requirement.get("runtime_identity") or {}
+    dependency_lock = fingerprint(
+        {
+            "custom_nodes": runtime_identity.get("custom_nodes") or [],
+            "wheelhouse_sha256": runtime_identity.get("wheelhouse_sha256"),
+        }
+    )
     for artifact in proposal["artifacts"]:
         portability = artifact.get("portability")
         if portability in {"process-bound", "gpu-resident"}:
@@ -482,10 +497,51 @@ def _validate_manifest_proposal(
                 bool(item.get("gated")) for item in matching_weights
             )
         elif kind == "custom-node-bundle":
-            raise ValueError(
-                "Worker-produced custom-node bundles have no coordinator-verifiable "
-                "source-to-digest binding"
-            )
+            destination = artifact.get("destination") or {}
+            pack_id = str(destination.get("pack_id") or "")
+            declared_pack = pack_entries.get(pack_id)
+            if declared_pack is None:
+                raise ValueError(
+                    "Prepared custom-node bundle is not pinned by the authorized profile"
+                )
+            expected_source = {"pack_id": pack_id, **declared_pack}
+            if artifact.get("source") != expected_source:
+                raise ValueError(
+                    "Prepared custom-node bundle source does not match the profile pin"
+                )
+            if artifact.get("materialization") != "extract":
+                raise ValueError("Prepared custom-node bundle must use safe extraction")
+            if portability != "portable" or artifact.get("requirements") != {}:
+                raise ValueError(
+                    "Prepared custom-node source bundle has an invalid portability contract"
+                )
+            artifact_policy["private"] = False
+        elif kind == "environment-bundle":
+            destination = artifact.get("destination") or {}
+            if destination.get("dependency_lock") != dependency_lock:
+                raise ValueError(
+                    "Prepared environment bundle does not match the profile dependency lock"
+                )
+            if artifact.get("source") != {"dependency_lock": dependency_lock}:
+                raise ValueError(
+                    "Prepared environment bundle source does not match the dependency lock"
+                )
+            if artifact.get("materialization") != "extract":
+                raise ValueError("Prepared environment bundle must use safe extraction")
+            requirements = artifact.get("requirements") or {}
+            if portability != "runtime-bound":
+                raise ValueError("Prepared environment bundle must be runtime-bound")
+            if requirements.get("dependency_lock") != dependency_lock:
+                raise ValueError(
+                    "Prepared environment bundle has the wrong dependency lock"
+                )
+            if not str(requirements.get("platform") or "") or not str(
+                requirements.get("python_abi") or ""
+            ):
+                raise ValueError(
+                    "Prepared environment bundle has incomplete runtime requirements"
+                )
+            artifact_policy["private"] = False
         else:
             raise ValueError(f"Prepared artifact kind is not authorized: {kind}")
         if artifact_policy.get("private") and not policy.get("cache_private_assets"):
@@ -499,6 +555,13 @@ def _validate_manifest_proposal(
     image_digest = (
         "sha256:" + image.rsplit("@sha256:", 1)[1] if "@sha256:" in image else ""
     )
+    for artifact in proposal["artifacts"]:
+        if artifact.get("kind") == "environment-bundle" and (
+            artifact.get("requirements") or {}
+        ).get("image_digest") != image_digest:
+            raise ValueError(
+                "Prepared environment bundle does not match the pinned worker image"
+            )
     from cloud_offload.prepared_state import utc_now
 
     proposal["created_at"] = utc_now()

@@ -11,6 +11,10 @@ export CLOUD_OFFLOAD_WORKER_ID="${CLOUD_OFFLOAD_WORKER_ID:-worker-$(python -c 'i
 # installed after the server is up is a pack the server will never see.
 cloud-offload runner-boot
 
+# Custom-node Python packages are installed or restored into one immutable
+# profile environment before ComfyUI imports its node registry.
+export PYTHONPATH="${CLOUD_OFFLOAD_ENV_ROOT:-/opt/cloud-offload/environment}${PYTHONPATH:+:${PYTHONPATH}}"
+
 python /opt/ComfyUI/main.py \
   --listen 127.0.0.1 \
   --port 8188 \
