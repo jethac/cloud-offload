@@ -509,6 +509,7 @@ def _cache_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     hit_bytes: dict[str, int] = {}
     verification_bytes: dict[str, int] = {}
     trusted_hits: set[str] = set()
+    background_scrub_hits: set[str] = set()
     full_verified_hits: set[str] = set()
     populated: set[str] = set()
     for envelope in events:
@@ -527,6 +528,8 @@ def _cache_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
             ]
             if "trusted_metadata_sample" in modes:
                 trusted_hits.add(key)
+            if event.get("background_sampled") is True:
+                background_scrub_hits.add(key)
             if "full_digest" in modes:
                 full_verified_hits.add(key)
         elif event_type in {"cache_artifact_miss", "cache_artifact_refused"}:
@@ -539,6 +542,7 @@ def _cache_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "hit_bytes": sum(hit_bytes.values()),
         "verification_bytes": sum(verification_bytes.values()),
         "trusted_hits": len(trusted_hits),
+        "background_scrub_hits": len(background_scrub_hits),
         "full_verified_hits": len(full_verified_hits),
         "items_saved": len(populated),
         "prepared": bool(hits or populated),
@@ -579,6 +583,8 @@ def _safe_event_summaries(events: list[dict[str, Any]], limit: int = 16) -> list
         verification_bytes = _finite_number(event.get("verification_bytes"))
         if verification_bytes is not None:
             item["verification_bytes"] = int(max(0, verification_bytes))
+        if event.get("background_sampled") is True:
+            item["background_sampled"] = True
         summaries.append(item)
     return summaries[-max(1, int(limit)) :]
 

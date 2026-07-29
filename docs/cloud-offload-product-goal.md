@@ -650,6 +650,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#34](https://github.com/jethac/cloud-offload/pull/34) | Adds durable pre-mutation provider-resource leases, worker renewal and identity binding, exact cancellation revocation, restart and uncertain-launch reconciliation, independent idempotent termination, provider closure receipts, hard runtime and dollar limits, and cancelled-cache publication guards. | 593 tests passed. The automated M3 matrix covers five cancellation phases, delayed closure, a stopped but present resource, provider loss, restart recovery, both circuit breakers, late state, and cache safety. |
 | [#35](https://github.com/jethac/cloud-offload/pull/35) | Records the accepted bounded paid RunPod worker-boot cancellation and coordinator-restart campaign, exact lease closure receipts, empty final provider inventory, and the compact redacted M3 evidence. | 594 tests passed. Both exact Pods became provider-absent, both leases received provider termination confirmation, the conservative cost upper bound was USD 0.033868, and no manual cleanup was required. M3 is complete. |
 | [#36](https://github.com/jethac/cloud-offload/pull/36) | Adds coordinator-signed prepared-cache trust receipts, exact manifest/artifact/provider-volume/runtime/generation binding, a rotating sampled hot path, full-verification fallbacks, sensitive-asset policy, and safe verification telemetry. | 599 tests passed. A 6 MiB eligible hot artifact reads one 1 MiB signed sample instead of a complete digest; tampering, metadata change, expiry, audit due state, and private policy return to full verification. Background scrub enforcement and paid M4 performance proof remain. |
+| [#37](https://github.com/jethac/cloud-offload/pull/37) | Adds a second signed cache sample during materialization, blocks return of a corrupt target, degrades affected cache volumes, and restores placement eligibility only after a new full digest verification. | 600 tests passed. The focused corruption test places damage only in the background-selected range and proves that the target is removed before return. The registry test proves that corruption removes the volume from placement and that full verification restores it. The paid M4 performance proof remains. |
 
 ### ComfyUI extension repository
 
@@ -1344,9 +1345,10 @@ Implementation status: the signed trust-receipt and metadata/sample fast path is
 implemented. It binds the exact manifest signature, artifact, volume,
 compatibility contract, object generation, expiry, and audit policy. Private and
 sensitive artifacts stay on full verification. Invalid, changed, expired, or
-audit-due receipts also return to a complete digest read. Background sampling,
-volume degradation, and the paid 25% cold/hot performance proof remain before M4
-can close.
+audit-due receipts also return to a complete digest read. A second signed sample
+runs while materialization proceeds; failure removes the target before return,
+quarantines the object through the worker fallback path, and degrades the volume.
+The paid 25% cold/hot performance proof remains before M4 can close.
 
 Exit:
 

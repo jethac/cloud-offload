@@ -25,9 +25,12 @@ day. The coordinator owns these times. A worker cannot extend them.
 ## Restore decision
 
 A hot restore must verify the receipt signature and every binding above. It then
-reads one rotating 1 MiB sample. For an object larger than 1 MiB, this is not a
+reads one rotating 1 MiB sample. A second signed sample runs in a background
+thread while the artifact is materialized. The restore waits for that scrub
+before it returns. For an object larger than 2 MiB, these checks are not a
 complete artifact read. The job event and safe visibility projection distinguish
-`trusted_metadata_sample` from `full_digest` and report verification bytes.
+`trusted_metadata_sample` from `full_digest`, report verification bytes, and show
+whether the background sample completed.
 
 Cloud Offload performs a complete digest read when:
 
@@ -38,8 +41,10 @@ Cloud Offload performs a complete digest read when:
 - the coordinator receipt service is not available.
 
 A successful complete read renews the receipt. A signed sample mismatch is
-corruption. The worker quarantines the object, removes its receipt, and uses the
-configured safe cold fallback. A denied cold fallback fails the job.
+corruption. If the background sample fails, Cloud Offload removes the materialized
+target before the restore can return. The worker then quarantines the object,
+removes its receipt, marks the cache volume degraded, and uses the configured safe
+cold fallback. A denied cold fallback fails the job.
 
 ## Threat model and honest language
 
@@ -52,6 +57,5 @@ sampled ranges, can remain undetected until a later sample or complete audit.
 Private and explicitly sensitive artifacts do not use this risk tradeoff. They
 always receive complete digest verification.
 
-The current slice enforces the scheduled complete audit on the next restore.
-Background sampling, volume degradation state, and the paid cold/hot performance
-gate remain in Milestone 4.
+The scheduled complete audit is enforced on the next restore. The paid cold/hot
+performance gate remains in Milestone 4.
