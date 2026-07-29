@@ -165,6 +165,7 @@ def scenario(name, cache_state, **overrides):
         "request": {
             "partition": {"partition_id": name},
             "private_prompt": f"private-{name}",
+            "force_execution": True,
         },
         "timeout_seconds": 20,
         "expected_statuses": ["completed"],
@@ -233,6 +234,11 @@ def test_plan_requires_alternating_cold_hot_and_explicit_failure_hooks():
     )
     with pytest.raises(ValueError, match="requires hook_argv"):
         BenchmarkPlan.from_dict(plan_dict([restart]))
+
+    unsafe_fresh = scenario("fresh", "cold")
+    unsafe_fresh["request"].pop("force_execution")
+    with pytest.raises(ValueError, match="force_execution=true"):
+        BenchmarkPlan.from_dict(plan_dict([unsafe_fresh]))
 
 
 def test_cold_hot_campaign_records_comparable_json_and_removes_exact_pods(tmp_path):

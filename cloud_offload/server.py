@@ -93,6 +93,9 @@ class PartitionSubmitRequest(BaseModel):
     input_artifacts: dict[str, str] = Field(default_factory=dict)
     provider: str = "auto"
     timeout_seconds: int = Field(default=3600, ge=1, le=86400)
+    # Production benchmarking must exercise a fresh Pod rather than silently
+    # accepting an already-computed partition result.
+    force_execution: bool = False
 
 
 # === App Setup ===
@@ -2156,7 +2159,7 @@ async def submit_partition(request: PartitionSubmitRequest):
             "utf-8"
         )
     ).hexdigest()
-    cached = queue.get_partition_cache(cache_key)
+    cached = None if request.force_execution else queue.get_partition_cache(cache_key)
     if cached:
         output_ids = (cached.get("output_artifacts") or {}).values()
         if all(
@@ -2232,6 +2235,7 @@ async def submit_partition(request: PartitionSubmitRequest):
         "job_id": job.id,
         "status": job.status.value,
         "status_url": f"/api/jobs/{job.id}",
+        **({"cache_bypassed": True} if request.force_execution else {}),
         "storage": storage_summary,
         **_asset_warnings(assets),
         **_node_pack_warnings(pack_warnings),
