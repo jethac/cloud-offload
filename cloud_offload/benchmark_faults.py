@@ -313,8 +313,13 @@ def _corruption_profile_fingerprint(
 
     config = CloudConfig.load(resolve_secrets=False)
     profile = resolve_worker_profile(config, profile_name)
+    if profile is None:
+        raise RuntimeError(
+            f"Corruption canary cannot resolve worker profile {profile_name!r}"
+        )
+    launch_profile_name = str(profile["name"])
     requirement = resolve_prepared_requirements(
-        profile_name,
+        launch_profile_name,
         profile,
         [
             SimpleNamespace(

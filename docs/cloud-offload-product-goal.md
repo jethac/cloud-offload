@@ -629,7 +629,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#15](https://github.com/jethac/cloud-offload/pull/15) | Consolidated the complete program record and replaced the unsafe Windows signal-zero PID probe with native process-state inspection. | Merged as `79faa25`; 525 tests and real live/absent PID probes passed. |
 | [#16](https://github.com/jethac/cloud-offload/pull/16) | Made restart canaries prove journal replay and persist cancellation through the replacement coordinator instead of depending on unrelated image startup. | Merged as `7fdc37c`; 526 tests passed and the production restart canary passed. |
 | [#17](https://github.com/jethac/cloud-offload/pull/17) | Made corruption canaries inject an isolated tiny artifact, publish a temporary signed manifest, provide a valid coordinator fallback, and remove all synthetic state during idempotent cleanup. | Merged as `0ea1754`; 527 tests passed. The first production run proved fresh-object isolation and cleanup but exposed stale manifest discovery, so corruption is not yet accepted. |
-| [#18](https://github.com/jethac/cloud-offload/pull/18) | Recomputes the injected requirement profile, publishes signed manifests by immutable exact ID, falls back to that verified object when a mounted index is stale, and starts corruption observation at `cache_mount_ready`; also brings this goal record through the fresh-object campaign. | 529 tests pass; bounded production replay with a worker image containing the change remains the evidence gate. |
+| [#18](https://github.com/jethac/cloud-offload/pull/18) | Recomputes the injected requirement profile, publishes signed manifests by immutable exact ID, falls back to that verified object when a mounted index is stale, and starts corruption observation at `cache_mount_ready`; also brings this goal record through the fresh-object campaign. | Merged as `f4d9cf9`; 529 tests passed. A bounded replay proved that the hook must fingerprint the configured launch profile name, not its requested capability name. |
 
 ### ComfyUI extension repository
 
@@ -715,6 +715,28 @@ not blanket production-readiness claims:
   then depended on the mounted mutable `indexes/latest`, which did not contain
   the newly published manifest. This proves the fresh blob removed cache aliasing
   and isolates the remaining defect to exact manifest selection and visibility.
+- A worker image built from PR #18 was pushed as
+  `ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:2ecdf8b88ef758257a50aae9e24e90cea914dad731a16157bc5d84683d1db509`.
+  Its in-image smoke test confirmed the exact manifest-by-ID code and source
+  revision `f4d9cf9751a00d31e24f287140ec19993ee129a3`.
+- The first PR #18 production replay created job
+  `d66cf2c0-67d9-4272-b785-2b912f3e7327` and exact Pod `ni6c882lcryxyu`.
+  The benchmark was stopped as soon as placement reported `complete: false` and
+  `manifest_ids: []`; waiting for worker startup could not turn that state into
+  an accepted exact-manifest canary. The exact Pod became provider-absent, the
+  job was closed as failed, provider inventory returned empty, and the synthetic
+  state, blob, coordinator fallback, and policy were clean. Because the operator
+  stopped the command before scorecard completion, this run has no accepted cost
+  figure; its configured scenario and campaign ceiling was $0.50.
+- The replay isolated a second name-identity defect. The hook fingerprinted the
+  requested capability `comfyui-partition-v1` as
+  `sha256:fed17d04a6deb7117c56bd13256da11bed6b12d22088813bce89d5f8a3db5e24`.
+  The dispatcher resolved that capability to configured launch profile
+  `comfyui`, so the job fingerprint was
+  `sha256:86a2004c166c05ec60f84d39c4fd0f3a1b565afd175ab3425689245b54185ed8`.
+  The launch profile name is part of both the runtime identity and profile key.
+  The canary must therefore use the normalized resolved profile's `name`, which
+  is the same value used by `Dispatcher._launch_worker`.
 
 The accepted cold/hot scorecard and four accepted failure canaries prove a
 larger part of M0, but M0 is not complete until the corruption canary passes and
@@ -731,6 +753,7 @@ a compact redacted evidence projection is committed.
 | Coordinator restart | **Accepted** | Replacement health, journal replay, replacement-owned cancellation, and exact provider cleanup passed. |
 | Corruption, cached-object attempts | **Failed safely** | Mounted valid bytes defeated mutation; exact resources and configuration were cleaned up. |
 | Corruption, fresh-object attempt | **Failed safely** | Unique-object isolation worked; stale mutable-index discovery prevented exact manifest restore and quarantine. Cleanup was complete. |
+| Corruption, first exact-ID attempt | **Failed safely** | The immutable worker path was present, but capability-name fingerprinting did not match the dispatcher's configured launch-profile fingerprint. The run stopped at placement and cleanup was complete. |
 | Compact redacted projection | **Required** | Accepted raw scorecards remain local under `.runlogs/`; a safe comparable projection still must be committed. |
 
 ## Current execution state and immediate next work
@@ -765,10 +788,12 @@ Status snapshot as of 2026-07-29:
   #16. A focused production rerun now directly proves replacement health,
   journal replay, replacement-owned cancellation, and exact provider cleanup.
 - PR #17 removed cached-object aliasing from the corruption canary. Its first
-  production run narrowed the remaining failure to an exact-profile mismatch and
-  stale mutable-index discovery. PR #18 implements the direct-manifest
-  correction and passes 529 tests; it remains intentionally unaccepted
-  production evidence until merge and a bounded production replay complete.
+  production run narrowed the failure to exact-profile and mutable-index
+  identity. PR #18 merged the direct manifest path and produced the pinned
+  worker image above. Its first replay showed that the hook and dispatcher used
+  different names for the same profile. The launch-profile-name correction now
+  passes 530 tests but remains unaccepted production evidence until merge and a
+  bounded production replay complete.
 - The first unmet M0 work is therefore: compute the corruption manifest from the
   actual injected requirement profile; publish and resolve it through an
   immutable manifest-by-ID path when a mounted mutable index is stale; trigger
@@ -781,10 +806,12 @@ Status snapshot as of 2026-07-29:
 
 The direct-manifest corruption fix is bounded to these contracts:
 
-1. The benchmark hook receives only the safe worker profile name and declared
-   asset digests, never the workflow body or credentials.
-2. The canary recomputes the same prepared-requirement fingerprint the scheduler
-   will use after synthetic-asset injection.
+1. The benchmark hook receives only the safe requested worker capability and
+   declared asset digests, never the workflow body or credentials.
+2. The canary resolves that capability to the normalized configured launch
+   profile and recomputes the same prepared-requirement fingerprint the
+   dispatcher will use after synthetic-asset injection. The configured profile's
+   `name`, not the requested capability, is the fingerprint identity.
 3. The signed canary manifest is published under an immutable deterministic
    `manifests/by-id/sha256/...` key, and its registry entry references that key.
 4. `PreparedStateCAS.find_manifest(manifest_id=...)` may load and verify that
