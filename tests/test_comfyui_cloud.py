@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from cloud_offload import server
 from cloud_offload.comfyui import ComfyUIWorkflowError, ComfyUIWorkflowExecutor
 from cloud_offload.config import CloudConfig
-from cloud_offload.queue import JobQueue
+from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.router import select_profile_provider
 from cloud_offload.worker import Worker
 from cloud_offload.profiles import configured_worker_profiles, load_worker_manifest
@@ -269,25 +269,92 @@ def test_partition_artifact_and_job_endpoints(monkeypatch, tmp_path):
     assert cached_job.status.value == "completed"
     assert cached_job.result == cached_result
 
+    event_job = queue.create(
+        "comfyui-partition-v1",
+        "inline://event-test",
+        provider="runpod",
+        status=JobStatus.QUEUED,
+    )
+    # Claiming binds producer identity to this exact worker.
+    queue.claim_jobs("worker-1", provider="runpod", models=["comfyui-partition-v1"])
     queue.set_worker_token("worker-secret")
     event = client.post(
-        f"/api/workers/jobs/{job.id}/events",
+        f"/api/workers/jobs/{event_job.id}/events",
         headers={"Authorization": "Bearer worker-secret"},
         json={
+            "producer_id": "worker:worker-1:process-a",
+            "producer_sequence": 1,
+            "occurred_at": "2026-07-29T00:00:00",
             "event": {
                 "type": "progress",
+                "phase": "execution",
                 "node_id": "1",
                 "data": {"value": 2, "max": 10},
             }
         },
     )
     assert event.status_code == 200
-    page = client.get(f"/api/jobs/{job.id}/events").json()
+    assert event.json()["schema"] == "cloud-offload.job-event.v2"
+    assert event.json()["producer"] == {
+        "id": "worker:worker-1:process-a",
+        "sequence": 1,
+    }
+    duplicate = client.post(
+        f"/api/workers/jobs/{event_job.id}/events",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={
+            "producer_id": "worker:worker-1:process-a",
+            "producer_sequence": 1,
+            "event": {
+                "type": "progress",
+                "phase": "execution",
+                "node_id": "1",
+                "data": {"value": 2, "max": 10},
+            },
+        },
+    )
+    assert duplicate.json() == event.json()
+    spoofed = client.post(
+        f"/api/workers/jobs/{event_job.id}/events",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={
+            "producer_id": "worker:different-worker:process-a",
+            "producer_sequence": 2,
+            "event": {"type": "progress"},
+        },
+    )
+    assert spoofed.status_code == 403
+    page = client.get(f"/api/jobs/{event_job.id}/events").json()
     assert page["events"][0]["event"]["node_id"] == "1"
     resumed = client.get(
-        f"/api/jobs/{job.id}/events?after={page['next_after']}"
+        f"/api/jobs/{event_job.id}/events?after={page['next_after']}"
     ).json()
     assert resumed["events"] == []
+    snapshot = client.get(f"/api/jobs/{event_job.id}/snapshot")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["event_cursor"] == page["next_after"]
+    assert snapshot.json()["lifecycle_phase"] == "execution"
+
+    bundle = client.get(f"/api/jobs/{event_job.id}/support-bundle")
+    assert bundle.status_code == 200
+    assert bundle.json()["schema"] == "cloud-offload.support-bundle.v1"
+
+    queue.complete_job(event_job.id, {"partition_id": "part-1"})
+    late = client.post(
+        f"/api/workers/jobs/{event_job.id}/events",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={
+            "producer_id": "worker:worker-1:process-a",
+            "producer_sequence": 2,
+            "event": {"type": "runner_starting", "phase": "worker_boot"},
+        },
+    )
+    assert late.json() == {
+        "job_id": event_job.id,
+        "ignored": True,
+        "status": "completed",
+    }
+    assert len(queue.list_events(event_job.id)) == 1
 
 
 def test_worker_partition_stages_bridges_and_publishes_outputs(tmp_path):

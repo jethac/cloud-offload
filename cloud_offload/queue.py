@@ -19,6 +19,81 @@ from typing import Any
 WORKER_STATUSES = ("starting", "active", "failed")
 LIVE_WORKER_STATUSES = ("starting", "active")
 
+JOB_EVENT_SCHEMA = "cloud-offload.job-event.v2"
+JOB_EVENT_METRIC_FIELDS = (
+    "overall_progress",
+    "progress",
+    "bytes",
+    "total_bytes",
+    "percent",
+    "elapsed_seconds",
+    "downloaded_files",
+    "total_files",
+    "value",
+    "max",
+)
+JOB_EVENT_RESOURCE_FIELDS = (
+    "provider",
+    "datacenter_id",
+    "region",
+    "worker_instance_id",
+    "worker_id",
+    "pod_id",
+    "cache_volume_id",
+    "cache_provider_volume_id",
+    "gpu_type",
+    "hourly_rate",
+)
+
+
+def _job_event_envelope(row: tuple) -> dict[str, Any]:
+    (
+        sequence,
+        job_id,
+        event_json,
+        created_at,
+        producer_id,
+        producer_sequence,
+        occurred_at,
+        observed_at,
+        event_type,
+        phase,
+    ) = row
+    event = json.loads(event_json)
+    metrics = {
+        key: event[key]
+        for key in JOB_EVENT_METRIC_FIELDS
+        if event.get(key) is not None
+    }
+    resources = {
+        key: event[key]
+        for key in JOB_EVENT_RESOURCE_FIELDS
+        if event.get(key) is not None
+    }
+    evidence = event.get("evidence")
+    return {
+        "schema": JOB_EVENT_SCHEMA,
+        "sequence": int(sequence),
+        "job_id": job_id,
+        # ``created_at`` remains as a compatibility alias for older clients.
+        "created_at": created_at,
+        "occurred_at": occurred_at or created_at,
+        "observed_at": observed_at or created_at,
+        "producer": {
+            "id": producer_id or "legacy",
+            "sequence": (
+                int(producer_sequence) if producer_sequence is not None else None
+            ),
+        },
+        "type": event_type or str(event.get("type") or "unknown"),
+        "phase": phase or event.get("phase"),
+        "metrics": metrics,
+        "resources": resources,
+        "evidence": evidence if isinstance(evidence, dict) else {},
+        # Preserve the original event while producers migrate incrementally.
+        "event": event,
+    }
+
 
 class JobStatus(str, Enum):
     """Job lifecycle states."""
@@ -83,7 +158,7 @@ class Job:
 class JobQueue:
     """SQLite-backed job queue."""
 
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -160,12 +235,57 @@ class JobQueue:
                     job_id TEXT NOT NULL,
                     event_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    producer_id TEXT NOT NULL DEFAULT 'legacy',
+                    producer_sequence INTEGER,
+                    occurred_at TEXT,
+                    observed_at TEXT,
+                    event_type TEXT,
+                    phase TEXT,
                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 )
             """)
+            event_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(job_events)").fetchall()
+            }
+            event_migrations = {
+                "producer_id": (
+                    "ALTER TABLE job_events ADD COLUMN producer_id "
+                    "TEXT NOT NULL DEFAULT 'legacy'"
+                ),
+                "producer_sequence": (
+                    "ALTER TABLE job_events ADD COLUMN producer_sequence INTEGER"
+                ),
+                "occurred_at": "ALTER TABLE job_events ADD COLUMN occurred_at TEXT",
+                "observed_at": "ALTER TABLE job_events ADD COLUMN observed_at TEXT",
+                "event_type": "ALTER TABLE job_events ADD COLUMN event_type TEXT",
+                "phase": "ALTER TABLE job_events ADD COLUMN phase TEXT",
+            }
+            for column, statement in event_migrations.items():
+                if column not in event_columns:
+                    conn.execute(statement)
+            conn.execute(
+                """
+                UPDATE job_events
+                SET occurred_at = COALESCE(occurred_at, created_at),
+                    observed_at = COALESCE(observed_at, created_at),
+                    event_type = COALESCE(
+                        event_type, json_extract(event_json, '$.type'), 'unknown'
+                    ),
+                    phase = COALESCE(phase, json_extract(event_json, '$.phase'))
+                WHERE occurred_at IS NULL
+                   OR observed_at IS NULL
+                   OR event_type IS NULL
+                """
+            )
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_job_events_job_sequence
                 ON job_events(job_id, sequence)
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_job_events_producer_sequence
+                ON job_events(job_id, producer_id, producer_sequence)
+                WHERE producer_sequence IS NOT NULL
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS partition_cache (
@@ -536,34 +656,92 @@ class JobQueue:
         self.update(job)
         return job
 
-    def append_event(self, job_id: str, event: dict[str, Any]) -> dict[str, Any]:
-        """Append an immutable, resumable execution event for a cloud job."""
+    def append_event(
+        self,
+        job_id: str,
+        event: dict[str, Any],
+        *,
+        producer_id: str | None = None,
+        producer_sequence: int | None = None,
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Append an immutable, resumable, idempotent execution event."""
         if not self.get(job_id):
             raise KeyError(f"Job not found: {job_id}")
         if not isinstance(event, dict) or not event.get("type"):
             raise ValueError("Job events require a non-empty type")
+        normalized_producer = str(producer_id or "coordinator").strip()
+        if not normalized_producer or len(normalized_producer) > 256:
+            raise ValueError("Job event producer_id must contain 1 to 256 characters")
+        if producer_sequence is not None:
+            try:
+                producer_sequence = int(producer_sequence)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Job event producer_sequence must be an integer") from exc
+            if producer_sequence < 0:
+                raise ValueError("Job event producer_sequence cannot be negative")
         try:
-            encoded = json.dumps(event, allow_nan=False)
+            encoded = json.dumps(event, allow_nan=False, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
             raise ValueError("Job event is not finite JSON") from exc
         if len(encoded.encode("utf-8")) > 4 * 1024 * 1024:
             raise ValueError("Job event exceeds the 4 MiB limit")
-        created_at = datetime.utcnow().isoformat()
+        observed_at = datetime.utcnow().isoformat()
+        normalized_occurred_at = str(
+            occurred_at or event.get("occurred_at") or observed_at
+        )
+        if len(normalized_occurred_at) > 128:
+            raise ValueError("Job event occurred_at is too long")
+        event_type = str(event["type"])
+        phase = str(event["phase"]) if event.get("phase") is not None else None
         with sqlite3.connect(self.db_path) as conn:
+            if producer_sequence is not None:
+                existing = conn.execute(
+                    """
+                    SELECT sequence, job_id, event_json, created_at,
+                           producer_id, producer_sequence, occurred_at,
+                           observed_at, event_type, phase
+                    FROM job_events
+                    WHERE job_id = ? AND producer_id = ? AND producer_sequence = ?
+                    """,
+                    (job_id, normalized_producer, producer_sequence),
+                ).fetchone()
+                if existing:
+                    if existing[2] != encoded:
+                        raise ValueError(
+                            "Job event producer sequence was reused with different data"
+                        )
+                    return _job_event_envelope(existing)
             cursor = conn.execute(
                 """
-                INSERT INTO job_events (job_id, event_json, created_at)
-                VALUES (?, ?, ?)
+                INSERT INTO job_events (
+                    job_id, event_json, created_at, producer_id,
+                    producer_sequence, occurred_at, observed_at, event_type, phase
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, encoded, created_at),
+                (
+                    job_id,
+                    encoded,
+                    observed_at,
+                    normalized_producer,
+                    producer_sequence,
+                    normalized_occurred_at,
+                    observed_at,
+                    event_type,
+                    phase,
+                ),
             )
             sequence = int(cursor.lastrowid)
-        return {
-            "sequence": sequence,
-            "job_id": job_id,
-            "created_at": created_at,
-            "event": event,
-        }
+            row = conn.execute(
+                """
+                SELECT sequence, job_id, event_json, created_at,
+                       producer_id, producer_sequence, occurred_at,
+                       observed_at, event_type, phase
+                FROM job_events WHERE sequence = ?
+                """,
+                (sequence,),
+            ).fetchone()
+        return _job_event_envelope(row)
 
     def list_events(
         self, job_id: str, *, after: int = 0, limit: int = 250
@@ -573,7 +751,9 @@ class JobQueue:
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 """
-                SELECT sequence, event_json, created_at
+                SELECT sequence, job_id, event_json, created_at,
+                       producer_id, producer_sequence, occurred_at,
+                       observed_at, event_type, phase
                 FROM job_events
                 WHERE job_id = ? AND sequence > ?
                 ORDER BY sequence
@@ -581,15 +761,70 @@ class JobQueue:
                 """,
                 (job_id, max(0, int(after)), bounded_limit),
             ).fetchall()
-        return [
-            {
-                "sequence": int(sequence),
-                "job_id": job_id,
-                "created_at": created_at,
-                "event": json.loads(event_json),
-            }
-            for sequence, event_json, created_at in rows
-        ]
+        return [_job_event_envelope(row) for row in rows]
+
+    def event_snapshot(self, job_id: str) -> dict[str, Any] | None:
+        """Project current replay state without making the client scan history."""
+        job = self.get(job_id)
+        if not job:
+            return None
+        with sqlite3.connect(self.db_path) as conn:
+            stats = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(MAX(sequence), 0),
+                       COALESCE(MAX(
+                           CASE
+                               WHEN json_type(event_json, '$.overall_progress')
+                                    IN ('integer', 'real')
+                               THEN CAST(
+                                   json_extract(event_json, '$.overall_progress')
+                                   AS INTEGER
+                               )
+                               ELSE 0
+                           END
+                       ), 0)
+                FROM job_events WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            latest = conn.execute(
+                """
+                SELECT sequence, job_id, event_json, created_at,
+                       producer_id, producer_sequence, occurred_at,
+                       observed_at, event_type, phase
+                FROM job_events
+                WHERE job_id = ?
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            phase_row = conn.execute(
+                """
+                SELECT phase FROM job_events
+                WHERE job_id = ? AND phase IS NOT NULL
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+        event_count, event_cursor, event_progress = stats
+        progress = max(int(job.progress or 0), int(event_progress or 0))
+        if job.status == JobStatus.COMPLETED:
+            progress = 100
+        return {
+            "schema": "cloud-offload.job-snapshot.v1",
+            "job": job.to_dict(),
+            "status": job.status.value,
+            "lifecycle_phase": (
+                phase_row[0]
+                if phase_row
+                else (latest[8] if latest else job.status.value)
+            ),
+            "progress": max(0, min(100, progress)),
+            "event_cursor": int(event_cursor),
+            "event_count": int(event_count),
+            "last_event": _job_event_envelope(latest) if latest else None,
+            "updated_at": job.updated_at,
+        }
 
     def complete_job(self, job_id: str, result: dict) -> Job | None:
         """Store a completed worker result."""
