@@ -269,6 +269,7 @@ def build_partition_preflight(
     allowed_regions: list[str] | None = None,
     storage: Any,
     cache_registry: CacheRegistry,
+    worker_auth_configured: bool | None = None,
     connector_factory: Callable[[str, Any], Any] | None = None,
     now: Callable[[], datetime] = _utc_now,
 ) -> dict[str, Any]:
@@ -588,7 +589,9 @@ def build_partition_preflight(
                 action="Save the RunPod S3 access key and secret key in Cloud Offload settings.",
             )
         )
-    if not config.worker_token:
+    if worker_auth_configured is None:
+        worker_auth_configured = bool(config.worker_token)
+    if not worker_auth_configured:
         blockers.append(
             _issue(
                 "worker_token_missing",

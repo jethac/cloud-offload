@@ -490,6 +490,10 @@ class JobQueue:
             raise ValueError("Worker token must not be empty")
         self._set_meta("worker_token_sha256", self._hash_worker_token(token))
 
+    def worker_auth_configured(self) -> bool:
+        """Return whether the shared queue has a worker credential."""
+        return bool(self._get_meta("worker_token_sha256"))
+
     def _verify_worker_token(self, token: str | None) -> None:
         expected = self._get_meta("worker_token_sha256")
         if not expected:

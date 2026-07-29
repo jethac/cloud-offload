@@ -275,6 +275,15 @@ def _preflight_store(config=None):
     return PreflightStore(config.queue_db_path)
 
 
+def _worker_auth_configured(config) -> bool:
+    """Include the stable token that the dispatcher stores in the shared queue."""
+    from cloud_offload.queue import JobQueue
+
+    return bool(config.worker_token) or JobQueue(
+        config.queue_db_path
+    ).worker_auth_configured()
+
+
 def _cache_connector(config, provider: str):
     from cloud_offload.providers import create_connector
 
@@ -2053,6 +2062,7 @@ async def preflight_partition(request: PreflightRequest):
         allowed_regions=request.allowed_regions,
         storage=create_storage(config),
         cache_registry=_cache_registry(config),
+        worker_auth_configured=_worker_auth_configured(config),
     )
     if not finite_report(report):
         raise HTTPException(
@@ -2283,6 +2293,7 @@ def _revalidate_partition_preflight(
         allowed_regions=list(policy.get("allowed_regions") or []),
         storage=storage,
         cache_registry=_cache_registry(config),
+        worker_auth_configured=_worker_auth_configured(config),
     )
     if not finite_report(current):
         return {
