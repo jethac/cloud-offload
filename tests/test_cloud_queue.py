@@ -887,6 +887,47 @@ def test_dispatcher_gives_worker_idle_fail_safe_a_cleanup_grace(tmp_path):
     assert int(provider.env_vars["CLOUD_OFFLOAD_IDLE_SHUTDOWN"]) == 360
 
 
+def test_dispatcher_passes_configured_and_image_profile_names(tmp_path):
+    class LaunchProvider(DummyProvider):
+        def __init__(self):
+            self.env_vars = None
+
+        def find_cheapest(self, **kwargs):
+            return {"id": "offer-1", "gpu_type": "A100", "hourly_rate": 1.49}
+
+        def launch(self, *args, **kwargs):
+            self.env_vars = kwargs["env_vars"]
+            return SimpleNamespace(
+                id="pod-1",
+                provider="runpod",
+                gpu_type="A100",
+                hourly_rate=1.49,
+                status="running",
+            )
+
+    provider = LaunchProvider()
+    config = CloudConfig(
+        queue_db_path=str(tmp_path / "queue.db"),
+        coordinator_url="https://coordinator.invalid",
+        provider="runpod",
+        worker_profiles={
+            "comfyui-runtime-proof": {
+                "image_profile": "comfyui",
+                "image": "ghcr.io/example/comfyui@sha256:abc",
+                "models": ["comfyui-workflow"],
+                "providers": ["runpod"],
+            }
+        },
+    )
+
+    Dispatcher(config, provider=provider)._launch_worker(
+        "runpod", "comfyui-runtime-proof"
+    )
+
+    assert provider.env_vars["CLOUD_OFFLOAD_WORKER_PROFILE"] == "comfyui-runtime-proof"
+    assert provider.env_vars["CLOUD_OFFLOAD_WORKER_IMAGE_PROFILE"] == "comfyui"
+
+
 def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_path):
     class FailingProvider(DummyProvider):
         def __init__(self):

@@ -72,6 +72,7 @@ def test_comfyui_profile_accepts_workflow_capability(tmp_path):
     route = select_profile_provider(config, "comfyui", "runpod")
 
     assert profile["models"] == ["comfyui-workflow"]
+    assert profile["image_profile"] == "comfyui"
     assert route.provider == "runpod"
     assert route.profile["name"] == "comfyui"
 
@@ -142,6 +143,42 @@ def test_comfyui_manifest_and_worker_capability(tmp_path):
         load_worker_manifest(manifest)["partition_protocol"]
         == "comfy.partition.bundle.v1"
     )
+
+
+def test_configured_profile_alias_keeps_its_name_with_a_compatible_image(tmp_path):
+    manifest = tmp_path / "runtime-profile.json"
+    manifest.write_text(
+        '{"profile":"comfyui","models":["comfyui-workflow"]}',
+        encoding="utf-8",
+    )
+    worker = Worker.__new__(Worker)
+    worker.runtime_profile = "comfyui-runtime-proof"
+    worker.declared_capabilities = ["comfyui-workflow"]
+    worker.config = SimpleNamespace(
+        worker_manifest_path=str(manifest), worker_image_profile="comfyui"
+    )
+
+    worker._apply_image_manifest()
+
+    assert worker.runtime_profile == "comfyui-runtime-proof"
+    assert worker.declared_capabilities == ["comfyui-workflow"]
+
+
+def test_configured_profile_alias_rejects_the_wrong_image_family(tmp_path):
+    manifest = tmp_path / "runtime-profile.json"
+    manifest.write_text(
+        '{"profile":"other","models":["comfyui-workflow"]}',
+        encoding="utf-8",
+    )
+    worker = Worker.__new__(Worker)
+    worker.runtime_profile = "comfyui-runtime-proof"
+    worker.declared_capabilities = ["comfyui-workflow"]
+    worker.config = SimpleNamespace(
+        worker_manifest_path=str(manifest), worker_image_profile="comfyui"
+    )
+
+    with pytest.raises(RuntimeError, match="expected image profile comfyui"):
+        worker._apply_image_manifest()
 
 
 def test_executor_uploads_inputs_runs_prompt_and_returns_images():

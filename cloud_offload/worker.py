@@ -146,18 +146,25 @@ class Worker:
             logger.warning("Worker capability manifest not found: %s", manifest_path)
             return
         manifest = load_worker_manifest(manifest_path)
-        if self.runtime_profile and manifest["profile"] != self.runtime_profile:
+        requested_profile = self.runtime_profile
+        expected_image_profile = str(
+            getattr(self.config, "worker_image_profile", "") or requested_profile or ""
+        ).strip()
+        if expected_image_profile and manifest["profile"] != expected_image_profile:
             raise RuntimeError(
                 f"Worker image profile {manifest['profile']} does not match "
-                f"requested profile {self.runtime_profile}"
+                f"expected image profile {expected_image_profile} for configured "
+                f"profile {requested_profile or '(unset)'}"
             )
-        self.runtime_profile = manifest["profile"]
+        # Keep the configured routing name. Workers and leases must answer to
+        # that name even when several configured profiles use one image family.
+        self.runtime_profile = requested_profile or manifest["profile"]
         manifest_models = set(manifest["models"])
         self.declared_capabilities = [
             model for model in self.declared_capabilities if model in manifest_models
         ]
         if (
-            self.runtime_profile.startswith("comfyui")
+            manifest["profile"].startswith("comfyui")
             and "comfyui-workflow" in self.declared_capabilities
             and "comfyui-partition-v1" in manifest_models
         ):
