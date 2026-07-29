@@ -152,7 +152,8 @@ def test_asset_sources_round_trip_through_the_config_routes(monkeypatch, tmp_pat
     assert client.get("/api/config").json()["asset_sources"] == {}
 
     updated = client.post(
-        "/api/config", json={"asset_sources": {CHECKPOINT_SHA: {"url": "https://cdn.invalid/x"}}}
+        "/api/config",
+        json={"asset_sources": {CHECKPOINT_SHA: {"url": "https://cdn.invalid/x"}}},
     )
 
     assert updated.status_code == 200
@@ -171,7 +172,11 @@ def test_asset_sources_round_trip_through_the_config_routes(monkeypatch, tmp_pat
         ({"repo_id": "org/repo", "filename": "x.safetensors"}, "revision is required"),
         ({"repo_id": "org/repo", "revision": "abc"}, "filename is required"),
         (
-            {"repo_id": "org/repo", "revision": "abc", "filename": "../escape.safetensors"},
+            {
+                "repo_id": "org/repo",
+                "revision": "abc",
+                "filename": "../escape.safetensors",
+            },
             "must not traverse upward",
         ),
         ({"url": "ftp://cdn.invalid/x"}, "url must be http or https"),
@@ -194,7 +199,9 @@ def test_asset_source_keys_must_be_sha256_digests():
 def test_invalid_asset_sources_fail_at_config_load(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
-        json.dumps({"cloud": {"asset_sources": {CHECKPOINT_SHA: {"repo_id": "org/repo"}}}}),
+        json.dumps(
+            {"cloud": {"asset_sources": {CHECKPOINT_SHA: {"repo_id": "org/repo"}}}}
+        ),
         encoding="utf-8",
     )
 
@@ -221,7 +228,10 @@ def test_declared_assets_are_normalized():
         ({**CHECKPOINT_ASSET, "sha256": "abc"}, "sha256 must be"),
         ({**CHECKPOINT_ASSET, "category": ""}, "category is required"),
         ({**CHECKPOINT_ASSET, "filename": ""}, "filename is required"),
-        ({**CHECKPOINT_ASSET, "filename": "../../etc/passwd"}, "must not traverse upward"),
+        (
+            {**CHECKPOINT_ASSET, "filename": "../../etc/passwd"},
+            "must not traverse upward",
+        ),
         ({**CHECKPOINT_ASSET, "category": "/abs"}, "must be a relative path"),
         ({**CHECKPOINT_ASSET, "size": "big"}, "size must be an integer"),
         ({**CHECKPOINT_ASSET, "size": -1}, "cannot be negative"),
@@ -313,7 +323,9 @@ def test_submission_threads_resolutions_into_the_job(monkeypatch, tmp_path):
     config = assets_config(tmp_path, asset_sources={CHECKPOINT_SHA: HF_SOURCE})
     client, queue = assets_client(monkeypatch, config)
 
-    response = client.post("/api/partitions", json=partition_request([CHECKPOINT_ASSET]))
+    response = client.post(
+        "/api/partitions", json=partition_request([CHECKPOINT_ASSET])
+    )
 
     assert response.status_code == 202
     assert "asset_warnings" not in response.json()
@@ -327,13 +339,17 @@ def test_submission_warns_when_an_asset_is_only_name_matched(monkeypatch, tmp_pa
     config = assets_config(tmp_path, weights=[dict(PROFILE_WEIGHTS[0])])
     client, queue = assets_client(monkeypatch, config)
 
-    response = client.post("/api/partitions", json=partition_request([CHECKPOINT_ASSET]))
+    response = client.post(
+        "/api/partitions", json=partition_request([CHECKPOINT_ASSET])
+    )
 
     assert response.status_code == 202
     warning = response.json()["asset_warnings"][0]
     assert warning["filename"] == CHECKPOINT_ASSET["filename"]
     assert "not by digest" in warning["warning"]
-    assert queue.get(response.json()["job_id"]).request["assets"][0]["origin"] == "profile"
+    assert (
+        queue.get(response.json()["job_id"]).request["assets"][0]["origin"] == "profile"
+    )
 
 
 def test_an_unresolvable_asset_is_refused_before_routing(
@@ -366,7 +382,12 @@ def test_the_refusal_names_every_unresolvable_file(monkeypatch, tmp_path):
     client, _ = assets_client(monkeypatch, config)
     missing = [
         {**CHECKPOINT_ASSET, "filename": "hero.safetensors", "sha256": OTHER_SHA},
-        {**CHECKPOINT_ASSET, "filename": "villain.pth", "sha256": "b" * 64, "format": "pickle"},
+        {
+            **CHECKPOINT_ASSET,
+            "filename": "villain.pth",
+            "sha256": "b" * 64,
+            "format": "pickle",
+        },
     ]
 
     response = client.post(
@@ -390,7 +411,9 @@ def test_the_refusal_names_every_unresolvable_file(monkeypatch, tmp_path):
         "not-a-list",
     ],
 )
-def test_malformed_assets_are_rejected_with_400(monkeypatch, tmp_path, assets, watch_routing):
+def test_malformed_assets_are_rejected_with_400(
+    monkeypatch, tmp_path, assets, watch_routing
+):
     client, queue = assets_client(monkeypatch, assets_config(tmp_path))
 
     response = client.post("/api/partitions", json=partition_request(assets))
@@ -511,7 +534,9 @@ def test_a_matching_file_on_disk_is_not_downloaded_again(tmp_path, monkeypatch):
     assert staged.read_bytes() == CHECKPOINT_BYTES
 
 
-def test_a_file_with_the_same_name_but_other_bytes_is_quarantined(tmp_path, monkeypatch):
+def test_a_file_with_the_same_name_but_other_bytes_is_quarantined(
+    tmp_path, monkeypatch
+):
     hub = FakeHub()
     worker = staging_worker(tmp_path, monkeypatch, hub)
     staged = models_path(tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"])
@@ -573,15 +598,18 @@ def test_a_url_source_is_streamed_to_disk(tmp_path, monkeypatch):
     worker = staging_worker(tmp_path, monkeypatch)
     job = asset_job(
         worker,
-        source_asset(origin="source", source={"url": "https://cdn.invalid/base.safetensors"}),
+        source_asset(
+            origin="source", source={"url": "https://cdn.invalid/base.safetensors"}
+        ),
     )
 
     worker._stage_profile_weights(job)
 
     assert requested == [("https://cdn.invalid/base.safetensors", True)]
-    assert models_path(
-        tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"]
-    ).read_bytes() == CHECKPOINT_BYTES
+    assert (
+        models_path(tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"]).read_bytes()
+        == CHECKPOINT_BYTES
+    )
 
 
 def test_a_stored_artifact_comes_down_the_worker_channel(tmp_path, monkeypatch):
@@ -602,9 +630,10 @@ def test_a_stored_artifact_comes_down_the_worker_channel(tmp_path, monkeypatch):
     worker._stage_profile_weights(job)
 
     assert downloads == [CHECKPOINT_SHA]
-    assert models_path(
-        tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"]
-    ).read_bytes() == CHECKPOINT_BYTES
+    assert (
+        models_path(tmp_path, "checkpoints", CHECKPOINT_ASSET["filename"]).read_bytes()
+        == CHECKPOINT_BYTES
+    )
 
 
 def test_an_asset_escaping_the_models_directory_is_refused(tmp_path, monkeypatch):
@@ -636,7 +665,11 @@ def test_staging_emits_one_event_per_asset(tmp_path, monkeypatch):
 
     worker._stage_profile_weights(job)
 
-    events = [item["event"] for item in worker.queue.list_events(job.id)]
+    events = [
+        item["event"]
+        for item in worker.queue.list_events(job.id)
+        if not item["type"].startswith("job_")
+    ]
     assert [event["type"] for event in events] == ["weights_staging"] * 3
     assert [(event["file"], event["category"]) for event in events] == [
         ("base.safetensors", None),
@@ -675,7 +708,11 @@ def test_a_job_without_assets_stages_nothing_new(tmp_path, monkeypatch):
     worker._stage_profile_weights(job)
 
     assert hub.calls == []
-    assert worker.queue.list_events(job.id) == []
+    assert [
+        item
+        for item in worker.queue.list_events(job.id)
+        if not item["type"].startswith("job_")
+    ] == []
     assert worker._weights_staged is True
 
 

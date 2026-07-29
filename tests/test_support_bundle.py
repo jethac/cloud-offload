@@ -71,8 +71,10 @@ def test_support_bundle_keeps_evidence_and_removes_payloads_and_secrets(tmp_path
     assert bundle["job"]["request"]["assets"] == [
         {"filename": "model.safetensors", "sha256": "b" * 64, "size": 1234}
     ]
-    assert bundle["events"][0]["type"] == "weight_download_progress"
-    assert bundle["events"][0]["metrics"] == {"bytes": 512, "total_bytes": 1234}
+    transfer = next(
+        item for item in bundle["events"] if item["type"] == "weight_download_progress"
+    )
+    assert transfer["metrics"] == {"bytes": 512, "total_bytes": 1234}
     for private_value in (
         "hf_private-token",
         "worker-secret",

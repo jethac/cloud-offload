@@ -44,6 +44,90 @@ JOB_EVENT_RESOURCE_FIELDS = (
     "gpu_type",
     "hourly_rate",
 )
+JOB_LIFECYCLE_EVENT_TYPES = (
+    "job_created",
+    "job_state_seeded",
+    "job_status_changed",
+)
+JOB_PHASE_ORDER = {
+    "readiness": 0,
+    "preflight": 0,
+    "provisioning": 10,
+    "provider_request": 10,
+    "worker_boot": 20,
+    "dependency_preparation": 30,
+    "weights_staging": 30,
+    "node_pack_staging": 30,
+    "cache_restore": 30,
+    "execution": 40,
+    "result_transfer": 50,
+    "resource_closure": 60,
+}
+
+
+def _status_phase(status: "JobStatus") -> str:
+    return {
+        JobStatus.PENDING: "readiness",
+        JobStatus.PREVIEW_DONE: "readiness",
+        JobStatus.QUEUED: "readiness",
+        JobStatus.DISPATCHED: "provisioning",
+        JobStatus.RUNNING: "execution",
+        JobStatus.COMPLETED: "result_transfer",
+        JobStatus.FAILED: "failure",
+        JobStatus.DEAD_LETTER: "failure",
+    }[status]
+
+
+def _partition_id(job: "Job") -> str | None:
+    partition = job.request.get("partition") if isinstance(job.request, dict) else None
+    if isinstance(partition, dict) and partition.get("partition_id") is not None:
+        return str(partition["partition_id"])
+    return None
+
+
+def _lifecycle_event(
+    job: "Job",
+    event_type: str,
+    *,
+    previous_status: "JobStatus | None" = None,
+) -> dict[str, Any]:
+    event = {
+        "type": event_type,
+        "phase": _status_phase(job.status),
+        "phase_owner": "coordinator",
+        "status": job.status.value,
+        "previous_status": previous_status.value if previous_status else None,
+        "overall_progress": int(job.progress or 0),
+        "attempts": int(job.attempts or 0),
+    }
+    partition_id = _partition_id(job)
+    if partition_id:
+        event["partition_id"] = partition_id
+    if job.provider:
+        event["provider"] = job.provider
+    if job.worker_id:
+        event["worker_id"] = job.worker_id
+    if job.error:
+        event["error"] = job.error
+    return event
+
+
+def _progress_event(job: "Job", previous_progress: int) -> dict[str, Any]:
+    event = {
+        "type": "job_progress_changed",
+        "phase": _status_phase(job.status),
+        "phase_owner": "coordinator",
+        "status": job.status.value,
+        "progress": int(job.progress or 0),
+        "overall_progress": int(job.progress or 0),
+        "previous_progress": int(previous_progress or 0),
+    }
+    partition_id = _partition_id(job)
+    if partition_id:
+        event["partition_id"] = partition_id
+    if job.worker_id:
+        event["worker_id"] = job.worker_id
+    return event
 
 
 def _job_event_envelope(row: tuple) -> dict[str, Any]:
@@ -61,9 +145,7 @@ def _job_event_envelope(row: tuple) -> dict[str, Any]:
     ) = row
     event = json.loads(event_json)
     metrics = {
-        key: event[key]
-        for key in JOB_EVENT_METRIC_FIELDS
-        if event.get(key) is not None
+        key: event[key] for key in JOB_EVENT_METRIC_FIELDS if event.get(key) is not None
     }
     resources = {
         key: event[key]
@@ -87,6 +169,9 @@ def _job_event_envelope(row: tuple) -> dict[str, Any]:
         },
         "type": event_type or str(event.get("type") or "unknown"),
         "phase": phase or event.get("phase"),
+        "phase_owner": event.get("phase_owner"),
+        "partition_id": event.get("partition_id"),
+        "status": event.get("status"),
         "metrics": metrics,
         "resources": resources,
         "evidence": evidence if isinstance(evidence, dict) else {},
@@ -97,19 +182,21 @@ def _job_event_envelope(row: tuple) -> dict[str, Any]:
 
 class JobStatus(str, Enum):
     """Job lifecycle states."""
-    PENDING = "pending"           # Created, needs local preview
-    PREVIEW_DONE = "preview_done" # Local preview complete, waiting for user
-    QUEUED = "queued"             # User approved, waiting for cloud
-    DISPATCHED = "dispatched"     # Sent to cloud worker
-    RUNNING = "running"           # Worker processing
-    COMPLETED = "completed"       # Done, result available
-    FAILED = "failed"             # Error occurred
-    DEAD_LETTER = "dead_letter"   # Retry limit exceeded
+
+    PENDING = "pending"  # Created, needs local preview
+    PREVIEW_DONE = "preview_done"  # Local preview complete, waiting for user
+    QUEUED = "queued"  # User approved, waiting for cloud
+    DISPATCHED = "dispatched"  # Sent to cloud worker
+    RUNNING = "running"  # Worker processing
+    COMPLETED = "completed"  # Done, result available
+    FAILED = "failed"  # Error occurred
+    DEAD_LETTER = "dead_letter"  # Retry limit exceeded
 
 
 @dataclass
 class Job:
     """A cloud offload job."""
+
     id: str
     model: str
     status: JobStatus
@@ -158,7 +245,7 @@ class Job:
 class JobQueue:
     """SQLite-backed job queue."""
 
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -287,6 +374,64 @@ class JobQueue:
                 ON job_events(job_id, producer_id, producer_sequence)
                 WHERE producer_sequence IS NOT NULL
             """)
+            # Existing databases predate journaled state changes. Seed one
+            # lifecycle event per job so snapshots can immediately treat the
+            # journal as authoritative after migration. New jobs emit
+            # ``job_created`` in the same transaction as their row.
+            conn.execute(
+                """
+                INSERT INTO job_events (
+                    job_id, event_json, created_at, producer_id,
+                    producer_sequence, occurred_at, observed_at, event_type, phase
+                )
+                SELECT
+                    jobs.id,
+                    json_object(
+                        'type', 'job_state_seeded',
+                        'phase', CASE jobs.status
+                            WHEN 'pending' THEN 'readiness'
+                            WHEN 'preview_done' THEN 'readiness'
+                            WHEN 'queued' THEN 'readiness'
+                            WHEN 'dispatched' THEN 'provisioning'
+                            WHEN 'running' THEN 'execution'
+                            WHEN 'completed' THEN 'result_transfer'
+                            ELSE 'failure'
+                        END,
+                        'phase_owner', 'coordinator',
+                        'status', jobs.status,
+                        'overall_progress', CASE
+                            WHEN jobs.status = 'completed' THEN 100
+                            ELSE COALESCE(jobs.progress, 0)
+                        END,
+                        'attempts', COALESCE(jobs.attempts, 0),
+                        'provider', jobs.provider,
+                        'worker_id', jobs.worker_id
+                    ),
+                    COALESCE(jobs.updated_at, jobs.created_at, CURRENT_TIMESTAMP),
+                    'coordinator:migration',
+                    NULL,
+                    COALESCE(jobs.updated_at, jobs.created_at, CURRENT_TIMESTAMP),
+                    COALESCE(jobs.updated_at, jobs.created_at, CURRENT_TIMESTAMP),
+                    'job_state_seeded',
+                    CASE jobs.status
+                        WHEN 'pending' THEN 'readiness'
+                        WHEN 'preview_done' THEN 'readiness'
+                        WHEN 'queued' THEN 'readiness'
+                        WHEN 'dispatched' THEN 'provisioning'
+                        WHEN 'running' THEN 'execution'
+                        WHEN 'completed' THEN 'result_transfer'
+                        ELSE 'failure'
+                    END
+                FROM jobs
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM job_events
+                    WHERE job_events.job_id = jobs.id
+                      AND job_events.event_type IN (
+                          'job_created', 'job_state_seeded', 'job_status_changed'
+                      )
+                )
+                """
+            )
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS partition_cache (
                     cache_key TEXT PRIMARY KEY,
@@ -384,6 +529,144 @@ class JobQueue:
             progress=row[19] if len(row) > 19 and row[19] is not None else 0,
         )
 
+    @staticmethod
+    def _write_job(conn: sqlite3.Connection, job: Job) -> None:
+        conn.execute(
+            """
+            UPDATE jobs SET
+                model = ?, status = ?, input_path = ?, params = ?,
+                preview_path = ?, result_path = ?, updated_at = ?,
+                started_at = ?, completed_at = ?, error = ?, worker_id = ?,
+                attempts = ?, max_attempts = ?, schema_version = ?,
+                request_json = ?, provider = ?, result_json = ?, progress = ?
+            WHERE id = ?
+            """,
+            (
+                job.model,
+                job.status.value,
+                job.input_path,
+                json.dumps(job.params),
+                job.preview_path,
+                job.result_path,
+                job.updated_at,
+                job.started_at,
+                job.completed_at,
+                job.error,
+                job.worker_id,
+                job.attempts,
+                job.max_attempts,
+                job.schema_version,
+                json.dumps(job.request),
+                job.provider,
+                json.dumps(job.result) if job.result is not None else None,
+                job.progress,
+                job.id,
+            ),
+        )
+
+    @staticmethod
+    def _append_event_in_transaction(
+        conn: sqlite3.Connection,
+        job_id: str,
+        event: dict[str, Any],
+        *,
+        producer_id: str | None = None,
+        producer_sequence: int | None = None,
+        occurred_at: str | None = None,
+        observed_at: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(event, dict) or not event.get("type"):
+            raise ValueError("Job events require a non-empty type")
+        normalized_producer = str(producer_id or "coordinator").strip()
+        if not normalized_producer or len(normalized_producer) > 256:
+            raise ValueError("Job event producer_id must contain 1 to 256 characters")
+        normalized_event = dict(event)
+        if "phase_owner" not in normalized_event:
+            if normalized_producer.startswith("worker:"):
+                normalized_event["phase_owner"] = "worker"
+            elif normalized_producer.startswith("dispatcher:"):
+                normalized_event["phase_owner"] = "dispatcher"
+            else:
+                normalized_event["phase_owner"] = "coordinator"
+        if producer_sequence is not None:
+            try:
+                producer_sequence = int(producer_sequence)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Job event producer_sequence must be an integer"
+                ) from exc
+            if producer_sequence < 0:
+                raise ValueError("Job event producer_sequence cannot be negative")
+        try:
+            encoded = json.dumps(
+                normalized_event, allow_nan=False, separators=(",", ":")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Job event is not finite JSON") from exc
+        if len(encoded.encode("utf-8")) > 4 * 1024 * 1024:
+            raise ValueError("Job event exceeds the 4 MiB limit")
+        normalized_observed_at = str(observed_at or datetime.utcnow().isoformat())
+        normalized_occurred_at = str(
+            occurred_at or normalized_event.get("occurred_at") or normalized_observed_at
+        )
+        if len(normalized_occurred_at) > 128:
+            raise ValueError("Job event occurred_at is too long")
+        if len(normalized_observed_at) > 128:
+            raise ValueError("Job event observed_at is too long")
+        event_type = str(normalized_event["type"])
+        phase = (
+            str(normalized_event["phase"])
+            if normalized_event.get("phase") is not None
+            else None
+        )
+        if producer_sequence is not None:
+            existing = conn.execute(
+                """
+                SELECT sequence, job_id, event_json, created_at,
+                       producer_id, producer_sequence, occurred_at,
+                       observed_at, event_type, phase
+                FROM job_events
+                WHERE job_id = ? AND producer_id = ? AND producer_sequence = ?
+                """,
+                (job_id, normalized_producer, producer_sequence),
+            ).fetchone()
+            if existing:
+                if existing[2] != encoded:
+                    raise ValueError(
+                        "Job event producer sequence was reused with different data"
+                    )
+                return _job_event_envelope(existing)
+        cursor = conn.execute(
+            """
+            INSERT INTO job_events (
+                job_id, event_json, created_at, producer_id,
+                producer_sequence, occurred_at, observed_at, event_type, phase
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                encoded,
+                normalized_observed_at,
+                normalized_producer,
+                producer_sequence,
+                normalized_occurred_at,
+                normalized_observed_at,
+                event_type,
+                phase,
+            ),
+        )
+        sequence = int(cursor.lastrowid)
+        row = conn.execute(
+            """
+            SELECT sequence, job_id, event_json, created_at,
+                   producer_id, producer_sequence, occurred_at,
+                   observed_at, event_type, phase
+            FROM job_events WHERE sequence = ?
+            """,
+            (sequence,),
+        ).fetchone()
+        return _job_event_envelope(row)
+
     def create(
         self,
         model: str,
@@ -416,51 +699,78 @@ class JobQueue:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    job.id, job.model, job.status.value, job.input_path,
-                    json.dumps(job.params), job.preview_path, job.result_path,
-                    job.created_at, job.updated_at, job.started_at,
-                    job.completed_at, job.error, job.worker_id,
-                    job.attempts, job.max_attempts, job.schema_version,
-                    json.dumps(job.request), job.provider,
+                    job.id,
+                    job.model,
+                    job.status.value,
+                    job.input_path,
+                    json.dumps(job.params),
+                    job.preview_path,
+                    job.result_path,
+                    job.created_at,
+                    job.updated_at,
+                    job.started_at,
+                    job.completed_at,
+                    job.error,
+                    job.worker_id,
+                    job.attempts,
+                    job.max_attempts,
+                    job.schema_version,
+                    json.dumps(job.request),
+                    job.provider,
                     json.dumps(job.result) if job.result is not None else None,
                     job.progress,
                 ),
+            )
+            self._append_event_in_transaction(
+                conn,
+                job.id,
+                _lifecycle_event(job, "job_created"),
+                producer_id="coordinator:job-queue",
+                occurred_at=job.created_at,
+                observed_at=job.created_at,
             )
         return job
 
     def get(self, job_id: str) -> Job | None:
         """Get job by ID."""
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE id = ?", (job_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row) if row else None
 
     def update(self, job: Job) -> None:
-        """Update job in database."""
+        """Update a job and journal a status change in the same transaction."""
         job.updated_at = datetime.utcnow().isoformat()
 
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """
-                UPDATE jobs SET
-                    model = ?, status = ?, input_path = ?, params = ?,
-                    preview_path = ?, result_path = ?, updated_at = ?,
-                    started_at = ?, completed_at = ?, error = ?, worker_id = ?,
-                    attempts = ?, max_attempts = ?, schema_version = ?,
-                    request_json = ?, provider = ?, result_json = ?, progress = ?
-                WHERE id = ?
-                """,
-                (
-                    job.model, job.status.value, job.input_path,
-                    json.dumps(job.params), job.preview_path, job.result_path,
-                    job.updated_at, job.started_at, job.completed_at,
-                    job.error, job.worker_id, job.attempts, job.max_attempts,
-                    job.schema_version, json.dumps(job.request), job.provider,
-                    json.dumps(job.result) if job.result is not None else None,
-                    job.progress, job.id,
-                ),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, progress FROM jobs WHERE id = ?", (job.id,)
+            ).fetchone()
+            previous_status = JobStatus(row[0]) if row else None
+            previous_progress = int(row[1] or 0) if row else 0
+            self._write_job(conn, job)
+            if previous_status is not None and previous_status != job.status:
+                self._append_event_in_transaction(
+                    conn,
+                    job.id,
+                    _lifecycle_event(
+                        job,
+                        "job_status_changed",
+                        previous_status=previous_status,
+                    ),
+                    producer_id="coordinator:job-queue",
+                    occurred_at=job.updated_at,
+                    observed_at=job.updated_at,
+                )
+            elif previous_status is not None and previous_progress != job.progress:
+                self._append_event_in_transaction(
+                    conn,
+                    job.id,
+                    _progress_event(job, previous_progress),
+                    producer_id="coordinator:job-queue",
+                    occurred_at=job.updated_at,
+                    observed_at=job.updated_at,
+                )
 
     def update_status(
         self,
@@ -470,42 +780,73 @@ class JobQueue:
         **kwargs,
     ) -> Job | None:
         """Update job status and optional fields."""
-        job = self.get(job_id)
-        if not job:
-            return None
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            job = self._row_to_job(row)
 
-        # Terminal states are immutable. In particular, a worker may finish a
-        # blocking download just after the user cancels; its late `running`,
-        # `complete`, or `fail` callback must not resurrect the job or enqueue
-        # another retry behind the user's back.
-        if job.status in {
-            JobStatus.COMPLETED,
-            JobStatus.FAILED,
-            JobStatus.DEAD_LETTER,
-        }:
+            # Terminal states are immutable. In particular, a worker may finish a
+            # blocking download just after the user cancels; its late `running`,
+            # `complete`, or `fail` callback must not resurrect the job or enqueue
+            # another retry behind the user's back.
+            if job.status in {
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.DEAD_LETTER,
+            }:
+                return job
+
+            previous_status = job.status
+            previous_progress = int(job.progress or 0)
+            job.status = status
+            if error is not None:
+                job.error = error
+            elif status in (JobStatus.RUNNING, JobStatus.COMPLETED):
+                job.error = None
+
+            for key, value in kwargs.items():
+                if hasattr(job, key):
+                    setattr(job, key, value)
+
+            now = datetime.utcnow().isoformat()
+            job.updated_at = now
+            if status == JobStatus.RUNNING:
+                job.started_at = now
+            elif status in (
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.DEAD_LETTER,
+            ):
+                job.completed_at = now
+            else:
+                job.completed_at = None
+
+            self._write_job(conn, job)
+            if previous_status != job.status:
+                self._append_event_in_transaction(
+                    conn,
+                    job.id,
+                    _lifecycle_event(
+                        job,
+                        "job_status_changed",
+                        previous_status=previous_status,
+                    ),
+                    producer_id="coordinator:job-queue",
+                    occurred_at=now,
+                    observed_at=now,
+                )
+            elif previous_progress != job.progress:
+                self._append_event_in_transaction(
+                    conn,
+                    job.id,
+                    _progress_event(job, previous_progress),
+                    producer_id="coordinator:job-queue",
+                    occurred_at=now,
+                    observed_at=now,
+                )
             return job
-
-        job.status = status
-        if error is not None:
-            job.error = error
-        elif status in (JobStatus.RUNNING, JobStatus.COMPLETED):
-            # A successful retry must not continue to expose the previous
-            # attempt's failure through the job API.
-            job.error = None
-
-        for key, value in kwargs.items():
-            if hasattr(job, key):
-                setattr(job, key, value)
-
-        if status == JobStatus.RUNNING:
-            job.started_at = datetime.utcnow().isoformat()
-        elif status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.DEAD_LETTER):
-            job.completed_at = datetime.utcnow().isoformat()
-        else:
-            job.completed_at = None
-
-        self.update(job)
-        return job
 
     def list_by_status(
         self, *statuses: JobStatus, provider: str | None = None
@@ -526,9 +867,7 @@ class JobQueue:
             ).fetchall()
             return [self._row_to_job(row) for row in rows]
 
-    def count_by_status(
-        self, *statuses: JobStatus, provider: str | None = None
-    ) -> int:
+    def count_by_status(self, *statuses: JobStatus, provider: str | None = None) -> int:
         """Count jobs with given status(es)."""
         placeholders = ",".join("?" * len(statuses))
         status_values = [s.value for s in statuses]
@@ -562,6 +901,7 @@ class JobQueue:
         """
         self._verify_worker_token(token)
         with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             # Get job IDs to claim
             provider_clause = " AND provider = ?" if provider else ""
             models_clause = ""
@@ -632,8 +972,29 @@ class JobQueue:
                 """,
                 [JobStatus.DISPATCHED.value, worker_id, now] + job_ids,
             )
+            claimed = []
+            for job_id in job_ids:
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                if not row:
+                    continue
+                job = self._row_to_job(row)
+                self._append_event_in_transaction(
+                    conn,
+                    job.id,
+                    _lifecycle_event(
+                        job,
+                        "job_status_changed",
+                        previous_status=JobStatus.QUEUED,
+                    ),
+                    producer_id="coordinator:job-queue",
+                    occurred_at=now,
+                    observed_at=now,
+                )
+                claimed.append(job)
 
-        return [job for job in (self.get(job_id) for job_id in job_ids) if job is not None]
+        return claimed
 
     def authorize_worker(self, token: str | None) -> None:
         """Verify a worker credential for coordinator operations."""
@@ -666,82 +1027,20 @@ class JobQueue:
         occurred_at: str | None = None,
     ) -> dict[str, Any]:
         """Append an immutable, resumable, idempotent execution event."""
-        if not self.get(job_id):
-            raise KeyError(f"Job not found: {job_id}")
-        if not isinstance(event, dict) or not event.get("type"):
-            raise ValueError("Job events require a non-empty type")
-        normalized_producer = str(producer_id or "coordinator").strip()
-        if not normalized_producer or len(normalized_producer) > 256:
-            raise ValueError("Job event producer_id must contain 1 to 256 characters")
-        if producer_sequence is not None:
-            try:
-                producer_sequence = int(producer_sequence)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Job event producer_sequence must be an integer") from exc
-            if producer_sequence < 0:
-                raise ValueError("Job event producer_sequence cannot be negative")
-        try:
-            encoded = json.dumps(event, allow_nan=False, separators=(",", ":"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Job event is not finite JSON") from exc
-        if len(encoded.encode("utf-8")) > 4 * 1024 * 1024:
-            raise ValueError("Job event exceeds the 4 MiB limit")
-        observed_at = datetime.utcnow().isoformat()
-        normalized_occurred_at = str(
-            occurred_at or event.get("occurred_at") or observed_at
-        )
-        if len(normalized_occurred_at) > 128:
-            raise ValueError("Job event occurred_at is too long")
-        event_type = str(event["type"])
-        phase = str(event["phase"]) if event.get("phase") is not None else None
         with sqlite3.connect(self.db_path) as conn:
-            if producer_sequence is not None:
-                existing = conn.execute(
-                    """
-                    SELECT sequence, job_id, event_json, created_at,
-                           producer_id, producer_sequence, occurred_at,
-                           observed_at, event_type, phase
-                    FROM job_events
-                    WHERE job_id = ? AND producer_id = ? AND producer_sequence = ?
-                    """,
-                    (job_id, normalized_producer, producer_sequence),
-                ).fetchone()
-                if existing:
-                    if existing[2] != encoded:
-                        raise ValueError(
-                            "Job event producer sequence was reused with different data"
-                        )
-                    return _job_event_envelope(existing)
-            cursor = conn.execute(
-                """
-                INSERT INTO job_events (
-                    job_id, event_json, created_at, producer_id,
-                    producer_sequence, occurred_at, observed_at, event_type, phase
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    encoded,
-                    observed_at,
-                    normalized_producer,
-                    producer_sequence,
-                    normalized_occurred_at,
-                    observed_at,
-                    event_type,
-                    phase,
-                ),
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute(
+                "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone():
+                raise KeyError(f"Job not found: {job_id}")
+            return self._append_event_in_transaction(
+                conn,
+                job_id,
+                event,
+                producer_id=producer_id,
+                producer_sequence=producer_sequence,
+                occurred_at=occurred_at,
             )
-            sequence = int(cursor.lastrowid)
-            row = conn.execute(
-                """
-                SELECT sequence, job_id, event_json, created_at,
-                       producer_id, producer_sequence, occurred_at,
-                       observed_at, event_type, phase
-                FROM job_events WHERE sequence = ?
-                """,
-                (sequence,),
-            ).fetchone()
-        return _job_event_envelope(row)
 
     def list_events(
         self, job_id: str, *, after: int = 0, limit: int = 250
@@ -798,32 +1097,56 @@ class JobQueue:
                 """,
                 (job_id,),
             ).fetchone()
-            phase_row = conn.execute(
+            lifecycle_row = conn.execute(
                 """
-                SELECT phase FROM job_events
-                WHERE job_id = ? AND phase IS NOT NULL
+                SELECT sequence, event_json, observed_at FROM job_events
+                WHERE job_id = ?
+                  AND event_type IN (?, ?, ?)
+                  AND json_extract(event_json, '$.status') IS NOT NULL
                 ORDER BY sequence DESC LIMIT 1
                 """,
-                (job_id,),
+                (job_id, *JOB_LIFECYCLE_EVENT_TYPES),
             ).fetchone()
+            phase_rows = conn.execute(
+                """
+                SELECT phase, sequence FROM job_events
+                WHERE job_id = ? AND phase IS NOT NULL
+                """,
+                (job_id,),
+            ).fetchall()
         event_count, event_cursor, event_progress = stats
-        progress = max(int(job.progress or 0), int(event_progress or 0))
-        if job.status == JobStatus.COMPLETED:
+        journal_status = None
+        if lifecycle_row:
+            candidate = json.loads(lifecycle_row[1]).get("status")
+            if candidate in {item.value for item in JobStatus}:
+                journal_status = str(candidate)
+        status = journal_status or job.status.value
+        progress = (
+            int(event_progress or 0) if journal_status else int(job.progress or 0)
+        )
+        if status == JobStatus.COMPLETED.value:
             progress = 100
+        ranked_phases = [
+            (JOB_PHASE_ORDER[phase], int(sequence), phase)
+            for phase, sequence in phase_rows
+            if phase in JOB_PHASE_ORDER
+        ]
+        lifecycle_phase = (
+            max(ranked_phases)[2]
+            if ranked_phases
+            else (latest[9] if latest and latest[9] else status)
+        )
         return {
             "schema": "cloud-offload.job-snapshot.v1",
             "job": job.to_dict(),
-            "status": job.status.value,
-            "lifecycle_phase": (
-                phase_row[0]
-                if phase_row
-                else (latest[8] if latest else job.status.value)
-            ),
+            "status": status,
+            "state_source": "journal" if journal_status else "job_row",
+            "lifecycle_phase": lifecycle_phase,
             "progress": max(0, min(100, progress)),
             "event_cursor": int(event_cursor),
             "event_count": int(event_count),
             "last_event": _job_event_envelope(latest) if latest else None,
-            "updated_at": job.updated_at,
+            "updated_at": lifecycle_row[2] if lifecycle_row else job.updated_at,
         }
 
     def complete_job(self, job_id: str, result: dict) -> Job | None:
@@ -958,7 +1281,9 @@ class JobQueue:
                 "idle_seconds": max(
                     0,
                     int((now - datetime.fromisoformat(row[4])).total_seconds()),
-                ) if row[4] else 0,
+                )
+                if row[4]
+                else 0,
                 "runtime_profile": row[5],
                 "capabilities": json.loads(row[6]) if row[6] else [],
                 "detail": row[7],
@@ -968,27 +1293,45 @@ class JobQueue:
 
     def fail_job(self, job_id: str, error: str) -> Job | None:
         """Record a worker failure, requeueing until retry attempts are exhausted."""
-        job = self.get(job_id)
-        if not job:
-            return None
-        if job.status in {
-            JobStatus.COMPLETED,
-            JobStatus.FAILED,
-            JobStatus.DEAD_LETTER,
-        }:
-            return job
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            job = self._row_to_job(row)
+            if job.status in {
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.DEAD_LETTER,
+            }:
+                return job
 
-        job.error = error
-        job.worker_id = None
-        now = datetime.utcnow().isoformat()
-        if job.attempts >= job.max_attempts:
-            job.status = JobStatus.DEAD_LETTER
-            job.completed_at = now
-        else:
-            job.status = JobStatus.QUEUED
-        job.updated_at = now
-        self.update(job)
-        return job
+            previous_status = job.status
+            job.error = error
+            job.worker_id = None
+            now = datetime.utcnow().isoformat()
+            if job.attempts >= job.max_attempts:
+                job.status = JobStatus.DEAD_LETTER
+                job.completed_at = now
+            else:
+                job.status = JobStatus.QUEUED
+                job.completed_at = None
+            job.updated_at = now
+            self._write_job(conn, job)
+            if previous_status != job.status:
+                self._append_event_in_transaction(
+                    conn,
+                    job.id,
+                    _lifecycle_event(
+                        job,
+                        "job_status_changed",
+                        previous_status=previous_status,
+                    ),
+                    producer_id="coordinator:job-queue",
+                    occurred_at=now,
+                    observed_at=now,
+                )
+            return job
 
     def delete(self, job_id: str) -> bool:
         """Delete a job."""
