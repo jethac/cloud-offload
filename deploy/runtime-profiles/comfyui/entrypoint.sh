@@ -5,6 +5,7 @@ set -euo pipefail
 # makes, the reason it reports if it never starts, and the worker that will
 # claim jobs are all the same worker to the coordinator.
 export CLOUD_OFFLOAD_WORKER_ID="${CLOUD_OFFLOAD_WORKER_ID:-worker-$(python -c 'import uuid; print(uuid.uuid4().hex[:8])')}"
+export CLOUD_OFFLOAD_BOOT_RESTORE_REPORT="${CLOUD_OFFLOAD_BOOT_RESTORE_REPORT:-/tmp/cloud-offload-boot-cache.json}"
 
 # Registers this runner as starting, and stages the profile's node packs. Both
 # happen before ComfyUI: it builds its node registry while it imports, so a pack
