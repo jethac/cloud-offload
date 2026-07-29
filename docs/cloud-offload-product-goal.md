@@ -170,18 +170,18 @@ validate the product journey.
 | ID | Requirement | Primary milestone | Current state |
 | --- | --- | --- | --- |
 | `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; recommendation and preflight remain. |
-| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | Planned. |
-| `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Planned. |
-| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Planned. |
-| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Planned. |
-| `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Implemented and merged; production evidence pending. |
+| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | In progress; M0 is closed. |
+| `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | In progress; M0 is closed. |
+| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | In progress; M0 is closed. |
+| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | In progress; M0 is closed. |
+| `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
 | `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Initial canvas feedback merged; durable drawer pending. |
 | `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Logical cancellation baseline exists; leases and provider receipt pending. |
 | `STORAGE-1` | Opt into or adopt RunPod storage before cached rental and attach it to compatible future Pods. | M4 foundation | Initial managed/adopted-volume MVP merged. |
 | `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
 | `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Durable population/restore baseline merged; fast trust and capsules pending. |
 | `REPLICA-1` | Replicate prepared state only for measured benefit, within budget and TTL. | M6 | Planned; shadow mode first. |
-| `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Cold/hot plus cancellation, provider, storage, and restart canaries are accepted; corruption and the committed redacted projection remain. |
+| `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Complete; all seven scenarios are accepted and the compact redacted projection is committed. |
 | `RELEASE-1` | Pass the continuous production matrix and budget gates. | M7 | Pending. |
 
 ## Product principles
@@ -634,7 +634,8 @@ This ledger records merged implementation evidence across both repositories.
 | [#20](https://github.com/jethac/cloud-offload/pull/20) | Writes corrupt bytes as the first and only value of the synthetic S3 key, keeps valid bytes only in coordinator fallback storage, and records the exact-selection replay. | Merged as `b1e6509`; 530 tests passed. Its bounded replay proved that a deterministic canary still reused the same digest and mounted object identity across campaigns. |
 | [#21](https://github.com/jethac/cloud-offload/pull/21) | Gives every corruption campaign a safe random nonce and uses it to create a new payload, digest, object key, file name, and state path across all hook stages. It also records the deterministic-identity replay. | Merged as `a33fd16`; 531 tests passed. Its replay proved unique identity and exact placement, but the mounted view could not read the new manifest and automated cleanup missed one fallback-created registry projection. |
 | [#22](https://github.com/jethac/cloud-offload/pull/22) | Persists the exact placement manifest on the assigned job, adds an active-job and volume-bound signed manifest fetch for stale mounted views, keeps exact placement authoritative in the worker, and removes fallback-created synthetic manifests during cleanup. It also records the unique-identity replay. | Merged as `3a60f7e`; 533 tests passed. Two bounded replays proved exact fetch, quarantine, fallback, and complete cleanup, then showed that the 105-second observation window is shorter than a worst-case prepared-asset verification pass. |
-| [#23](https://github.com/jethac/cloud-offload/pull/23) | Gives only corruption observation a 240-second event window inside a 270-second hook process limit and records both PR #22 production replays. | 534 tests pass; merge and one bounded passing scorecard remain the evidence gate. |
+| [#23](https://github.com/jethac/cloud-offload/pull/23) | Gives only corruption observation a 240-second event window inside a 270-second hook process limit and records both PR #22 production replays. | Merged as `c0114c5`; 534 tests passed. The bounded replay then produced accepted corruption evidence. |
+| [#24](https://github.com/jethac/cloud-offload/pull/24) | Commits the compact redacted seven-scenario production projection, checks its completeness and redaction contract, records the accepted corruption replay, and audits every M0 exit. | 535 tests passed; M0 is complete and M1 is active. |
 
 ### ComfyUI extension repository
 
@@ -840,10 +841,27 @@ not blanket production-readiness claims:
   scorecard took 326.718 seconds with a conservative $0.135225 compute upper
   bound. A 240-second corruption observation window inside a 270-second hook
   process limit now passes 534 tests on the next PR branch.
+- The merged PR #23 replay created job
+  `64c04e33-d5d2-4b98-9798-a875bbd6f949` and exact Pod
+  `ogiwnmulhvcars`. Placement and the assigned job used only exact manifest
+  `sha256:a02980bac25a108253aff5f214ddf0f7db93ec1df587b5bf8a1e310e9b113eda`.
+  The worker verified that manifest, quarantined unique 82-byte digest
+  `sha256:3924e26961a9aa28806d7113e3ca367b3aa5124ad291f4138bdf0c685ef09bad`
+  40.374 seconds after mount, and reached the documented safe `dead_letter`
+  status. Preparation, observation, and cleanup actions all exited successfully.
+  The scorecard passed in 135.656 seconds with a conservative $0.056147 compute
+  upper bound.
+- The accepted corruption cleanup removed the exact Pod and every synthetic
+  blob, manifest, registry projection, invalidation, quarantine object,
+  coordinator fallback, and local state object. Provider inventory and the
+  queued/running job count were zero, the storage policy was restored to
+  `smart`, and no orphan or audit error remained.
 
-The accepted cold/hot scorecard and four accepted failure canaries prove a
-larger part of M0, but M0 is not complete until the corruption canary passes and
-a compact redacted evidence projection is committed.
+The accepted cold/hot scorecard and all five failure classes now prove M0. The
+compact projection in
+[`evidence/m0-production-evidence-2026-07-29.json`](evidence/m0-production-evidence-2026-07-29.json)
+makes the accepted results durable and comparable without committing sensitive
+operational data.
 
 ### M0 evidence matrix
 
@@ -862,7 +880,8 @@ a compact redacted evidence projection is committed.
 | Corruption, unique campaign attempt | **Failed; cleaned manually** | Unique digest and exact placement passed, but the mounted view missed the new manifest and used coordinator fallback. Automated cleanup missed its derived registry projection; exact manual cleanup removed it. |
 | Corruption, authority-fetch attempt | **Behavior passed; scorecard failed** | Exact assigned-manifest fetch, quarantine, fallback, and automated cleanup passed. The job reached documented safe `dead_letter`, but the plan expected only `completed`. |
 | Corruption, observation-window attempt | **Behavior passed; harness timed out** | Exact fetch and quarantine passed again, but six normal prepared reads delayed quarantine to 135.756 seconds after mount, beyond the 105-second hook window. Cleanup was complete. |
-| Compact redacted projection | **Required** | Accepted raw scorecards remain local under `.runlogs/`; a safe comparable projection still must be committed. |
+| Corruption, accepted replay | **Accepted** | Exact manifest authority, unique-object quarantine, explicit safe terminal behavior, automated cleanup, restored policy, and empty provider inventory all passed. |
+| Compact redacted projection | **Accepted** | The committed safe projection compares cold, hot, cancellation, provider, storage, restart, and corruption evidence. A test enforces its scenario set, finite values, cleanup receipts, and redaction rules. |
 
 ## Current execution state and immediate next work
 
@@ -908,23 +927,17 @@ Status snapshot as of 2026-07-29:
   Its replay proved that a fresh mounted view can still miss a newly published
   exact manifest and that fallback publication expands the cleanup target set.
   PR #22 added authenticated exact-manifest fetch and complete derived-manifest
-  cleanup. Its pinned worker passed those behaviors twice in production. The
-  first scorecard rejected a documented safe terminal status, and the second
-  let a 105-second hook expire 30.756 seconds before quarantine. A bounded
-  observation-window correction now passes 534 tests on its PR branch.
-  Corruption remains unaccepted until that change merges and one bounded replay
-  produces a passing scorecard and complete cleanup audit.
-- The first unmet M0 work is therefore: compute the corruption manifest from the
-  actual injected requirement profile; publish and resolve it through an
-  immutable manifest-by-ID path when a mounted mutable index is stale; trigger
-  observation from durable `cache_mount_ready`; prove the worker quarantines the
-  synthetic artifact while the valid fallback lets the job continue; verify
-  complete cleanup; commit a compact redacted evidence projection; and audit
-  every M0 exit before starting M1.
+  cleanup. Its pinned worker passed those behaviors twice in production. PR #23
+  then extended only the bounded corruption observation window. The accepted
+  replay proved exact manifest authority, quarantine, safe terminal behavior,
+  and complete automated cleanup in production.
+- M0 is complete. The first unmet work is M1: implement the versioned preflight
+  report and endpoint, then connect recommendation and confirmation to it.
 
-### Active engineering handoff
+### Completed M0 corruption contract
 
-The direct-manifest corruption fix is bounded to these contracts:
+The accepted direct-manifest corruption implementation is bounded to these
+contracts:
 
 1. The benchmark hook receives only the safe requested worker capability and
    declared asset digests, never the workflow body or credentials.
@@ -962,17 +975,16 @@ The direct-manifest corruption fix is bounded to these contracts:
     fetch is a narrow exact-ID recovery path, not a second source of unsigned
     truth or a general manifest query surface.
 
-Before this change can become accepted evidence it must pass focused and full
-tests, merge through a reviewed PR, and pass one spend-capped production replay.
-That replay must show a nonempty exact `manifest_ids` placement, a
+Acceptance required focused and full tests, a reviewed PR, and one spend-capped
+production replay. The replay showed a nonempty exact `manifest_ids` placement, a
 `cache_artifact_quarantined` event for the synthetic digest, successful valid
 fallback or explicit safe terminal behavior, hook cleanup success, exact Pod
 absence, empty provider inventory, restored storage policy, and absence of every
 synthetic manifest, blob, registry projection, invalidation, quarantine object,
-and coordinator fallback. A completed job without quarantine is still a failed
-canary.
+and coordinator fallback. A completed job without quarantine remains a failed
+canary. The accepted replay satisfied all of these conditions.
 
-### M0 evidence still required
+### M0 evidence audit
 
 1. **Proved:** a validated safe summary identifies the repeated workload by
    request digest while its workflow body stays local.
@@ -982,14 +994,40 @@ canary.
    and conservative compute cost are separately represented in its scorecard.
 4. **Proved:** the full prepared-storage configuration was restored and verified
    after every completed scenario and campaign cleanup.
-5. **Partial:** cancellation, provider, storage, and coordinator-restart canaries
-   passed. Corruption still requires direct accepted evidence.
+5. **Proved:** cancellation, provider, storage, corruption, and
+   coordinator-restart canaries passed with direct accepted evidence.
 6. **Proved for completed campaigns:** final provider inventory was empty and
    attributable Pods had provider-absence receipts.
-7. **Required:** commit a compact redacted scorecard projection or durable CI
-   artifact reference that is comparable across runs and contains no prompts,
-   raw workflow, asset paths, hook arguments/output, credentials, or secret
-   endpoints.
+7. **Proved:** the compact committed projection is comparable across runs and
+   contains no prompts, raw workflow, asset paths, failure action
+   arguments/output, credentials, or secret endpoints. A repository test checks
+   the redaction contract.
+
+### M0 exit audit
+
+1. **Explainable critical path:** the cold and hot records separate provider
+   request, provisioning, readiness, runner startup, preparation, execution,
+   result availability, and provider closure time.
+2. **Authoritative reload:** journal reload tests and the accepted coordinator
+   restart canary reconstruct current state from persisted events.
+3. **Order safety:** duplicate-event collapse and reordered-event
+   non-regression tests pass.
+4. **Direct production evidence:** cancellation, provider, storage, corruption,
+   and restart passed with finite runtime and spend limits.
+5. **Safe comparable evidence:** the compact redacted projection contains all
+   seven accepted scenario classes.
+6. **Resource closure:** every accepted scenario has provider-absence receipts;
+   campaign audits found no orphaned Pod, and corruption cleanup left zero
+   synthetic state objects.
+
+### Active engineering handoff
+
+M1 starts with the backend contract. Implement `PreflightReportV1` and
+`POST /api/preflight` before the confirmation UI. The report must separate
+deterministic proof from volatile observations, bind a canonical execution plan
+to `preflight_id` and `manifest_digest`, and make no provider mutation. The next
+slice is complete only when blocked work cannot create a Pod and a ready report
+contains enough safe data for a ranked GPU recommendation and cost range.
 
 ### Operational safety rules
 
@@ -1013,8 +1051,8 @@ canary.
 
 | Milestone | Status on 2026-07-29 | Gate |
 | --- | --- | --- |
-| M0 — measurement and scorecard | **In progress** | Cold/hot plus four failure classes accepted; corruption and durable redacted evidence remain. |
-| M1 — preflight, recommendation, confirmation | **Not started** | Begins after M0 evidence is trustworthy. |
+| M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
+| M1 — preflight, recommendation, confirmation | **In progress** | Implement the backend preflight contract first. |
 | M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |

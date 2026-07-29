@@ -1,0 +1,280 @@
+{
+  "schema": "cloud-offload.m0-production-evidence.v1",
+  "recorded_date": "2026-07-29",
+  "production_source_revision": "c0114c5cf703d2d0f7882330c0d70bd24a700735",
+  "worker_image": "ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:321f6931d08b159359ed6df15f4bac890872affff9af17252fbf3fd934320c8d",
+  "redaction_contract": {
+    "included": [
+      "request digests",
+      "aggregate timing and cost",
+      "opaque job and provider resource identifiers",
+      "provider cleanup receipts",
+      "pass conclusions"
+    ],
+    "excluded": [
+      "prompts",
+      "workflows",
+      "asset locations",
+      "failure action commands and output",
+      "credentials",
+      "secret endpoints",
+      "private file locations"
+    ]
+  },
+  "verification": {
+    "production_revision_tests_passed": 534,
+    "evidence_revision_tests_passed": 535,
+    "journal_reload_tested": true,
+    "duplicate_event_collapse_tested": true,
+    "reordered_event_non_regression_tested": true,
+    "campaign_limits_enabled": true,
+    "provider_inventory_empty_after_each_accepted_campaign": true,
+    "prepared_storage_policy_restored_to": "smart"
+  },
+  "campaigns": {
+    "cold_hot": {
+      "accepted": true,
+      "request_digest": "db85d75dd5ee549db250d27fdf1679a7b1ddea16a01e0afcba4ade0a53afa527",
+      "estimated_compute_cost_upper_usd": 0.342299,
+      "hot_end_to_end_improvement_percent": 8.8,
+      "orphaned_resources": 0
+    },
+    "failure": {
+      "accepted_scenarios": [
+        "cancellation",
+        "provider",
+        "storage"
+      ],
+      "estimated_compute_cost_upper_usd": 0.920037,
+      "orphaned_resources": 0,
+      "note": "The campaign also contained early corruption and restart attempts. Those attempts failed safely and are not the accepted records below."
+    },
+    "restart": {
+      "accepted": true,
+      "estimated_compute_cost_upper_usd": 0.0121,
+      "orphaned_resources": 0
+    },
+    "corruption": {
+      "accepted": true,
+      "estimated_compute_cost_upper_usd": 0.056147,
+      "orphaned_resources": 0,
+      "synthetic_state_objects_after_cleanup": 0
+    }
+  },
+  "scenarios": [
+    {
+      "kind": "cold",
+      "accepted": true,
+      "job_id": "34172fcd-4a6b-4ffb-aa6e-562ff709f841",
+      "request_digest": "db85d75dd5ee549db250d27fdf1679a7b1ddea16a01e0afcba4ade0a53afa527",
+      "provider": "runpod",
+      "instance_ids": [
+        "r4mz9621kbwzou"
+      ],
+      "terminal_status": "completed",
+      "duration_seconds": 432.5,
+      "estimated_compute_cost_upper_usd": 0.179007,
+      "phase_durations_seconds": {
+        "provider_request": 3.762379,
+        "provisioning": 0.483499,
+        "readiness": 13.406752,
+        "runner_starting": 129.972609,
+        "staging_started": 6.964707,
+        "weight_download_progress": 80.864068,
+        "execution_started": 162.885469,
+        "first_sampler": 20.277094,
+        "execution": 0.175555,
+        "result_available": 0.170281,
+        "resource_closure": 9.047
+      },
+      "prepared_artifact_hits": 0,
+      "conclusion": "A new provider instance downloaded the required model data and completed the job.",
+      "cleanup": [
+        {
+          "instance_id": "r4mz9621kbwzou",
+          "termination_requested": true,
+          "termination_attempts": 1,
+          "provider_absent": true
+        }
+      ]
+    },
+    {
+      "kind": "hot",
+      "accepted": true,
+      "job_id": "c431bfb2-98df-490a-a7d5-bde3a950e485",
+      "request_digest": "db85d75dd5ee549db250d27fdf1679a7b1ddea16a01e0afcba4ade0a53afa527",
+      "provider": "runpod",
+      "instance_ids": [
+        "0fjdqerikl204h"
+      ],
+      "terminal_status": "completed",
+      "duration_seconds": 394.531,
+      "estimated_compute_cost_upper_usd": 0.163292,
+      "phase_durations_seconds": {
+        "provider_request": 6.042801,
+        "provisioning": 0.478692,
+        "readiness": 9.103614,
+        "runner_starting": 113.815185,
+        "mount_ready": 0.242853,
+        "manifest_verified": 1.394243,
+        "artifact_hit": 64.425223,
+        "restore_started": 0.956339,
+        "restore_completed": 1.611842,
+        "staging_started": 0.188873,
+        "execution_started": 167.361767,
+        "first_sampler": 12.841402,
+        "execution": 0.20054,
+        "result_available": 0.192666,
+        "resource_closure": 10.109
+      },
+      "prepared_artifact_hits": 6,
+      "prepared_artifact_misses": 0,
+      "model_downloads": 0,
+      "conclusion": "A new provider instance verified and restored all six prepared artifacts, then completed the job.",
+      "cleanup": [
+        {
+          "instance_id": "0fjdqerikl204h",
+          "termination_requested": true,
+          "termination_attempts": 1,
+          "provider_absent": true
+        }
+      ]
+    },
+    {
+      "kind": "cancellation",
+      "accepted": true,
+      "job_id": "ccfd2904-d33a-463d-a156-15ee757d87a8",
+      "request_digest": "db85d75dd5ee549db250d27fdf1679a7b1ddea16a01e0afcba4ade0a53afa527",
+      "provider": "runpod",
+      "instance_ids": [
+        "9p3eygn3lisgyd"
+      ],
+      "terminal_status": "failed",
+      "duration_seconds": 34.5,
+      "estimated_compute_cost_upper_usd": 0.014279,
+      "cancellation_accepted": true,
+      "conclusion": "The cancellation request was accepted and the exact provider instance became absent.",
+      "cleanup": [
+        {
+          "instance_id": "9p3eygn3lisgyd",
+          "termination_requested": true,
+          "termination_attempts": 1,
+          "provider_absent": true
+        }
+      ]
+    },
+    {
+      "kind": "provider",
+      "accepted": true,
+      "job_id": "c66b8378-15d5-4b48-887e-41a349821a16",
+      "request_digest": "db85d75dd5ee549db250d27fdf1679a7b1ddea16a01e0afcba4ade0a53afa527",
+      "provider": "runpod",
+      "instance_ids": [
+        "493p2w7xzvle55",
+        "kkrlq54vssz3bh"
+      ],
+      "terminal_status": "completed",
+      "duration_seconds": 347.391,
+      "estimated_compute_cost_upper_usd": 0.287563,
+      "replacement_instance_observed": true,
+      "conclusion": "The first provider instance was stopped. A replacement instance completed the job.",
+      "cleanup": [
+        {
+          "instance_id": "493p2w7xzvle55",
+          "termination_attempts": 0,
+          "provider_absent": true
+        },
+        {
+          "instance_id": "kkrlq54vssz3bh",
+          "termination_requested": true,
+          "termination_attempts": 1,
+          "provider_absent": true
+        }
+      ]
+    },
+    {
+      "kind": "storage",
+      "accepted": true,
+      "job_id": "ef755c70-bf58-48ab-a4ad-7e426f17074c",
+      "request_digest": "db85d75dd5ee549db250d27fdf1679a7b1ddea16a01e0afcba4ade0a53afa527",
+      "provider": "runpod",
+      "instance_ids": [
+        "qg9ih8dzhfxb78"
+      ],
+      "terminal_status": "completed",
+      "duration_seconds": 395.375,
+      "estimated_compute_cost_upper_usd": 0.163641,
+      "strict_probe_blocked_before_provider": true,
+      "configuration_restored": true,
+      "conclusion": "The invalid strict storage setup stopped before provider mutation. The restored setup then completed the job.",
+      "cleanup": [
+        {
+          "instance_id": "qg9ih8dzhfxb78",
+          "termination_requested": true,
+          "termination_attempts": 1,
+          "provider_absent": true
+        }
+      ]
+    },
+    {
+      "kind": "restart",
+      "accepted": true,
+      "job_id": "05156c58-cff6-4164-915d-5273ec72519f",
+      "request_digest": "db85d75dd5ee549db250d27fdf1679a7b1ddea16a01e0afcba4ade0a53afa527",
+      "provider": "runpod",
+      "instance_ids": [
+        "tpoita6ieh2bq5"
+      ],
+      "terminal_status": "failed",
+      "duration_seconds": 29.234,
+      "estimated_compute_cost_upper_usd": 0.0121,
+      "replacement_health_observed": true,
+      "journal_replay_observed": true,
+      "replacement_owned_cancellation": true,
+      "conclusion": "A replacement coordinator reconstructed the running job and canceled it. The exact provider instance became absent.",
+      "cleanup": [
+        {
+          "instance_id": "tpoita6ieh2bq5",
+          "termination_requested": true,
+          "termination_attempts": 1,
+          "provider_absent": true
+        }
+      ]
+    },
+    {
+      "kind": "corruption",
+      "accepted": true,
+      "job_id": "64c04e33-d5d2-4b98-9798-a875bbd6f949",
+      "request_digest": "8ec6b85f7bb0e8fa2ad6eb1f0e986b012f5761d43b39ca38a0f223cd8436ee8f",
+      "provider": "runpod",
+      "instance_ids": [
+        "ogiwnmulhvcars"
+      ],
+      "terminal_status": "dead_letter",
+      "duration_seconds": 135.656,
+      "estimated_compute_cost_upper_usd": 0.056147,
+      "selected_manifest_id": "sha256:a02980bac25a108253aff5f214ddf0f7db93ec1df587b5bf8a1e310e9b113eda",
+      "synthetic_artifact_digest": "sha256:3924e26961a9aa28806d7113e3ca367b3aa5124ad291f4138bdf0c685ef09bad",
+      "synthetic_artifact_size_bytes": 82,
+      "manifest_verified": true,
+      "quarantine_events": 1,
+      "mount_to_quarantine_seconds": 40.373634,
+      "valid_fallback_or_safe_terminal_behavior": true,
+      "failure_action_exit_codes": [
+        0,
+        0,
+        0
+      ],
+      "synthetic_state_objects_after_cleanup": 0,
+      "conclusion": "The worker verified the exact manifest, rejected and quarantined the corrupt artifact, and reached the documented safe terminal state.",
+      "cleanup": [
+        {
+          "instance_id": "ogiwnmulhvcars",
+          "termination_requested": true,
+          "termination_attempts": 1,
+          "provider_absent": true
+        }
+      ]
+    }
+  ]
+}
