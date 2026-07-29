@@ -2,12 +2,19 @@
 
 > Status: **canonical product goal**
 > Last updated: **2026-07-29**
+> Program status: **in progress — Milestone 0 production evidence is the current gate**
 > Scope: the end-to-end Cloud Offload product across the coordinator, dispatcher,
 > workers, provider connectors, prepared storage, and ComfyUI extension.
 >
 > The detailed storage subsystem design remains in
 > [Storage-aware Cloud Offload](storage-aware-cloud-offload.md). That PRD is a
 > supporting design; this document defines the product outcome it serves.
+
+This is the single source of truth for the goal, product promises, requirements,
+decisions, delivery sequence, current implementation state, and release evidence.
+Supporting design documents may add implementation detail but may not weaken an
+acceptance criterion here. A milestone is complete only when its exit criteria
+have evidence; merged code alone is not completion.
 
 ## Product goal
 
@@ -26,6 +33,30 @@ The complete product contract is:
 > meter starts, shows exactly what is happening while it runs, proves billing
 > stopped when it ends or is cancelled, and accelerates the next compatible
 > run.**
+
+## Definition of program completion
+
+The goal is complete only when all eight milestones in this document have met
+their exits and the Milestone 7 production release gate has passed. In
+particular, completion requires all of the following at the same time:
+
+- a ComfyUI user can submit a supported workflow without managing provider
+  infrastructure;
+- deterministic readiness failures stop before paid compute is created;
+- Cloud Offload recommends a compatible GPU and discloses expected total cost;
+- the default ten-second confirmation behaves as specified and can be controlled
+  by both “Don't show again” and persistent settings;
+- the lifecycle survives reload and explains progress, uncertainty, spend, and
+  resource identity from an authoritative journal;
+- cancellation and normal completion end with provider-confirmed billing closure;
+- compatible repeat runs are measurably faster without weakening integrity;
+- storage placement, replication, retention, and spend stay within user policy;
+- cold, hot, cancellation, provider, storage, corruption, restart, and regional
+  fallback canaries pass continuously; and
+- the coordinator and ComfyUI extension changes are released together wherever
+  the user contract crosses both repositories.
+
+Anything less is an intermediate delivery, not the completed goal.
 
 ## Promise stack
 
@@ -73,6 +104,58 @@ The remaining beta gaps are:
 - custom-node prepared bundles are incomplete;
 - regional replication is not yet demand- and budget-controlled; and
 - validation is not yet a continuous cold/hot/failure-injection matrix.
+
+## Why these requirements exist
+
+The roadmap is grounded in observed end-to-end failures rather than hypothetical
+polish work.
+
+| Observation | What it revealed | Product consequence |
+| --- | --- | --- |
+| ComfyUI reported `Cloud Offload partition references missing node 70` for the `inpainting` workflow. | Visible boxed-subgraph node IDs differ from the executable IDs emitted by `graphToPrompt`; model declarations can also live inside subgraph definitions. | Compilation must expand nested boxed subgraphs and preflight must resolve the exact executable closure. This was fixed and proven by extension PR #2. |
+| Prompt `4009468b-129a-4018-b5dd-d9e7fe1a2c13` existed in ComfyUI but returned 404 from the coordinator job APIs. | A local prompt ID can be mistaken for a cloud job ID, making support and cancellation ambiguous. | Every surface and support bundle must expose correlated prompt, job, partition, lease, and provider-resource identities. |
+| ComfyUI was started without the dispatcher during an end-to-end debugging session. | A healthy UI and coordinator do not prove the rental path is operating. | Readiness and operator status must cover the dispatcher, ingress, provider credentials, worker profile, and ability to launch—not just HTTP health. |
+| Healthy provisioning and model preparation appeared frozen at a static early percentage. | Canvas-only coarse progress makes long paid startup look hung. | Durable phase events, byte telemetry, elapsed time, ETA confidence, and a persistent Cloud Jobs surface are required. Extension PR #4 added an initial canvas improvement; it is not the final visibility milestone. |
+| A large model download was slow and authentication was uncertain. | Hugging Face authentication affects throttling as well as gated-model access. | Preflight must verify credential presence, workers must receive authenticated download capability, and transfer telemetry must expose bytes and throughput without exposing tokens. |
+| Prepared-state restore controls were hard to discover. | A capability is not complete when its control and current state are obscure. | Prepared storage needs an explicit settings entry, action-bar access, policy explanation, cache status, and visible cold fallback. |
+| Local interruption did not originally guarantee cloud cancellation. | Stopping a prompt and stopping provider billing are different operations. | ComfyUI interruption must revoke the cloud job, and the coordinator must independently terminate and reconcile the exact paid resource. |
+| The first prepared-storage run still performed a 4.23 GB authenticated download and complete verification. | Durable storage helps only after population, and a nominal cache hit can remain I/O-bound. | Cold and hot paths must be measured separately; trusted hot restore, capsules, and placement must prove time and cost saved. |
+
+## System boundary and repositories
+
+The product is one system delivered through multiple components:
+
+| Component | Repository or artifact | Responsibility |
+| --- | --- | --- |
+| Coordinator, dispatcher, providers, worker, storage controller, benchmark | `jethac/cloud-offload` | Authoritative job state, preflight, recommendation, scheduling, paid lifecycle, prepared state, and evidence. |
+| ComfyUI extension | `jethac/ComfyUI-Cloud-Offload` | Partition compilation, settings, confirmation, persistent job UX, cancellation intent, and local/cloud identity correlation. |
+| Worker runtime | `ghcr.io/jethac/cloud-offload-worker-comfyui` | Reproducible ComfyUI environment, authenticated staging, prepared-state restore/population, execution, and cooperative abort. |
+| RunPod | Provider API, Pods, network volumes, and S3-compatible object API | Paid compute truth, region-constrained volume attachment, durable prepared bytes, and termination evidence. |
+| Hugging Face | Authenticated artifact source | Immutable model resolution and authenticated transfers for gated and rate-sensitive downloads. |
+
+An end-to-end acceptance test uses the extension to submit through the real
+coordinator and dispatcher to a real provider worker. Starting ComfyUI alone,
+calling the coordinator directly, or passing backend tests does not by itself
+validate the product journey.
+
+## Requirement inventory and traceability
+
+| ID | Requirement | Primary milestone | Current state |
+| --- | --- | --- | --- |
+| `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; recommendation and preflight remain. |
+| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | Planned. |
+| `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Planned. |
+| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Planned. |
+| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Planned. |
+| `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Implemented and merged; production evidence pending. |
+| `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Initial canvas feedback merged; durable drawer pending. |
+| `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Logical cancellation baseline exists; leases and provider receipt pending. |
+| `STORAGE-1` | Opt into or adopt RunPod storage before cached rental and attach it to compatible future Pods. | M4 foundation | Initial managed/adopted-volume MVP merged. |
+| `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
+| `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Durable population/restore baseline merged; fast trust and capsules pending. |
+| `REPLICA-1` | Replicate prepared state only for measured benefit, within budget and TTL. | M6 | Planned; shadow mode first. |
+| `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Harness merged; live campaign pending. |
+| `RELEASE-1` | Pass the continuous production matrix and budget gates. | M7 | Pending. |
 
 ## Product principles
 
@@ -493,7 +576,130 @@ Every replica has a spend ceiling, single-flight protection, and expiry or
 eviction plan. Scheduling prefers compatible replicas while preserving explicit
 cold fallback.
 
+## Delivery ledger
+
+This ledger records merged implementation evidence across both repositories.
+“Merged” means the code landed; it does not override the milestone exits below.
+
+### Coordinator, dispatcher, worker, and provider repository
+
+| PR | Delivered | Evidence status |
+| --- | --- | --- |
+| [#1](https://github.com/jethac/cloud-offload/pull/1) | Worker reliability, runner readiness, node-pack staging, VRAM/profile matching, and early worker status. | Merged as `4c3911a`. |
+| [#2](https://github.com/jethac/cloud-offload/pull/2) | Storage-aware Cloud Offload PRD. | Merged as `60a2588`. |
+| [#3](https://github.com/jethac/cloud-offload/pull/3) | RunPod volume lifecycle, prepared manifests/CAS, storage-aware placement, worker restore/population, and API foundations. | Merged as `efc8ceb`; live validation followed in #4. |
+| [#4](https://github.com/jethac/cloud-offload/pull/4) | Durable publication and detailed prepared-storage/startup events. | Merged as `0059e31`; reference prepared run completed. |
+| [#5](https://github.com/jethac/cloud-offload/pull/5) | Initial canonical product goal. | Merged as `5854bce`; this document now supersedes that initial snapshot. |
+| [#6](https://github.com/jethac/cloud-offload/pull/6) | `JobEventV2`, producer idempotency, replay/snapshot/support-bundle APIs, redaction, anti-spoofing, and terminal precedence. | Merged as `92bbbf9`; 499 tests passed at merge. |
+| [#7](https://github.com/jethac/cloud-offload/pull/7) | Atomic lifecycle journal, semantic phase protection, state seeding, duplicate collapse, and rollback proof. | Merged as `91864a9`; 504 tests passed at merge. |
+| [#8](https://github.com/jethac/cloud-offload/pull/8) | Spend-capped production benchmark/scorecard, provider attribution and cleanup, cold/hot validation, and five-class failure injection. | Merged as `c1383fe`; 513 tests passed at merge. |
+| [#9](https://github.com/jethac/cloud-offload/pull/9) | Explicit `force_execution` for fresh-Pod partition benchmarks without disabling prepared-state caching. | Merged as `781f212`; 513 tests passed at merge. |
+| [#10](https://github.com/jethac/cloud-offload/pull/10) | Runtime `keyring` dependency required for Windows credential resolution. | Merged as `ce20543`; credential tests passed. |
+
+### ComfyUI extension repository
+
+| PR | Delivered | Evidence status |
+| --- | --- | --- |
+| [#1](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/1) | Cancel the associated cloud job when ComfyUI execution is interrupted. | Merged as `66b1814`; provider-confirmed closure remains M3. |
+| [#2](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/2) | Expand nested boxed subgraphs and resolve workflow-declared Hugging Face assets. | Merged as `d976769`; 73 Python tests passed, 3 skipped, 45 JavaScript tests passed, and live inpainting completed. |
+| [#3](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/3) | Prepared-storage opt-in and policy controls. | Merged as `21e66ca`; broader settings/visibility remain. |
+| [#4](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/4) | Action-bar discovery, write-only RunPod S3 credential setup, and monotonic startup/cache feedback in the partition title. | Merged as `40c3cf6`; 74 Python tests passed, 3 skipped, and 5 focused JavaScript tests passed. |
+
+## Validation record
+
+The following production observations are evidence for specific capabilities,
+not blanket production-readiness claims:
+
+- Inpainting job `f86f0bc6-860e-403f-aa1a-87b4b57505d4` completed at 100% on
+  RunPod with six resolved assets after the boxed-subgraph/Hugging Face fix.
+- Prepared-storage job `b9d44715-7161-4f7c-994a-bd7dc1792d3f` completed on
+  RunPod using partition `fdf3fdd1-35b0-44bd-83ef-81dddbb87666` and the
+  `comfyui-partition-v1` runtime profile. It recorded five prepared-cache hits
+  and one authenticated 4.23 GB model download. Durable copy took approximately
+  7.5 seconds; read-back verification and publication took approximately 15.3
+  seconds.
+- The validated worker artifact for that path is
+  `ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:ee3c8b1e4288509c5dd6e0b9d7640933d33be86a459826c23179265b82e2b705`.
+- Replay, snapshot, support-bundle, journal-authority, concurrency, rollback,
+  benchmark validation, force-execution, and credential-resolution tests pass in
+  the merged backend history shown above.
+
+No production cold/hot scorecard or five-class failure campaign has yet been
+accepted. The two successful jobs above therefore prove that the connected path
+can work, but not that it is fast, continuously reliable, or leak-free.
+
+## Current execution state and immediate next work
+
+Status snapshot as of 2026-07-29:
+
+- M0 journal transport and lifecycle authority are merged.
+- M0 benchmark and scorecard automation are merged.
+- The coordinator and dispatcher were restarted from merged `main`; coordinator
+  health and `/api/active-workers` passed at restart, and provider inventory was
+  empty. This is an operational handoff observation, not durable acceptance
+  evidence.
+- RunPod, Hugging Face, RunPod S3, and provider credentials resolve through the
+  configured environment/keychain paths without logging their values.
+- Local runtime plans, scorecards, and service logs belong under `.runlogs/` and
+  must never be committed because they may contain workflow or operational data.
+- The current implementation task is benchmark scenario-level prepared-storage
+  policy orchestration: run a cold scenario with policy `off`, run the matching
+  hot scenario with policy `smart`, and restore the user's complete prior
+  prepared-storage configuration in every success or failure path.
+- After that change, run a spend-capped alternating fresh-Pod cold/hot campaign
+  against the same forced-execution partition, verify exact provider cleanup,
+  and retain only the redacted scorecard as evidence.
+- Then run cancellation, provider, storage, corruption, and restart injections
+  with narrow, reviewed, idempotent hooks and again prove final provider
+  inventory is empty.
+
+### M0 evidence still required
+
+1. A validated benchmark plan whose safe summary identifies the same workload
+   by request digest while keeping the workflow body local.
+2. At least one alternating fresh-Pod cold/hot campaign with explicit campaign,
+   scenario, runtime, and cleanup ceilings.
+3. Separate startup, preparation, execution, closure, and conservative compute
+   cost distributions.
+4. Confirmed policy restoration after every benchmark scenario.
+5. Successful cancellation, provider, storage, corruption, and restart failure
+   cases with redacted support bundles.
+6. An empty final provider inventory and provider-absence receipts for every
+   attributable Pod.
+7. A committed redacted scorecard or durable CI artifact reference that can be
+   compared with future runs without exposing prompts, asset paths, hook
+   arguments, credentials, or secret endpoints.
+
+### Operational safety rules
+
+- A paid benchmark never starts without explicit spend confirmation and finite
+  circuit breakers. Limits reduce risk but are not provider-side escrow.
+- Attribute provider resources before terminating them; never delete an
+  unverified baseline or unrelated Pod.
+- Terminate attributable Pods after each scenario and audit provider inventory
+  again at campaign end.
+- Never persist or print credential values. Configuration and support surfaces
+  expose presence, provenance category, and actionable absence only.
+- Never include raw workflow bodies, prompts, private asset paths, signed URLs,
+  hook arguments, or hook output in a scorecard or support bundle.
+- Managed-volume deletion and adopted-volume detachment are distinct; destructive
+  provider storage deletion always requires explicit user intent.
+- Benchmark policy mutation must be reversible and restore the full prior object,
+  not a reconstructed subset that could lose region, volume, tenant, or privacy
+  settings.
+
 ## Delivery milestones
+
+| Milestone | Status on 2026-07-29 | Gate |
+| --- | --- | --- |
+| M0 — measurement and scorecard | **In progress** | Live cold/hot and five-class failure evidence remains. |
+| M1 — preflight, recommendation, confirmation | **Not started** | Begins after M0 evidence is trustworthy. |
+| M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
+| M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
+| M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
+| M5 — workflow capsules | **Not started** | Schema and custom-node readiness contracts remain. |
+| M6 — regional replication | **Not started** | Shadow recommendations precede automation. |
+| M7 — production release gate | **Not started** | Requires all prior exits and continuous canaries. |
 
 ### Milestone 0 — Measurement contract and production scorecard
 
