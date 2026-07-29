@@ -10,9 +10,11 @@ import base64
 import hashlib
 import logging
 import os
+import platform as platform_module
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import tempfile
@@ -156,6 +158,28 @@ class Worker:
                 f"expected image profile {expected_image_profile} for configured "
                 f"profile {requested_profile or '(unset)'}"
             )
+        actual_runtime = {
+            "platform": f"{sys.platform}-{platform_module.machine().lower()}",
+            "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+        }
+        configured_runtime = {
+            "platform": os.environ.get("CLOUD_OFFLOAD_WORKER_PLATFORM", "").strip(),
+            "python_abi": os.environ.get(
+                "CLOUD_OFFLOAD_WORKER_PYTHON_ABI", ""
+            ).strip(),
+        }
+        for field, actual in actual_runtime.items():
+            declared = str(manifest.get(field) or "")
+            configured = configured_runtime[field]
+            if configured and declared != configured:
+                raise RuntimeError(
+                    f"Worker image {field} {declared or '(missing)'} does not match "
+                    f"configured {field} {configured}"
+                )
+            if declared and declared != actual:
+                raise RuntimeError(
+                    f"Worker image declares {field} {declared}, but runtime is {actual}"
+                )
         # Keep the configured routing name. Workers and leases must answer to
         # that name even when several configured profiles use one image family.
         self.runtime_profile = requested_profile or manifest["profile"]

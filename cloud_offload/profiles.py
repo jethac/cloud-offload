@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -18,6 +19,7 @@ from typing import Any
 # arbitrary API-format workflow; ``comfyui-partition-v1`` runs a compiled
 # subgraph with typed boundary artifacts.
 WORKFLOW_CAPABILITIES = frozenset({"comfyui-workflow", "comfyui-partition-v1"})
+_RUNTIME_IDENTITY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 
 
 def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
@@ -50,6 +52,12 @@ def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
             # identity explicitly.
             "image_profile": str(value.get("image_profile") or "").strip() or str(name),
             "image": image,
+            "platform": normalized_profile_runtime_identity(
+                str(name), "platform", value.get("platform")
+            ),
+            "python_abi": normalized_profile_runtime_identity(
+                str(name), "python_abi", value.get("python_abi")
+            ),
             "models": models,
             "providers": list(dict.fromkeys(providers)),
             "gpu_type": str(value.get("gpu_type") or "").strip(),
@@ -76,6 +84,19 @@ def configured_worker_profiles(config: Any) -> dict[str, dict[str, Any]]:
             ),
         }
     return result
+
+
+def normalized_profile_runtime_identity(name: str, field: str, value: Any) -> str:
+    """Normalize one runtime identity that is fixed by a pinned image digest."""
+
+    identity = str(value or "").strip().lower()
+    if not identity:
+        return ""
+    if not _RUNTIME_IDENTITY.fullmatch(identity):
+        raise ValueError(
+            f"Worker profile {name!r}: {field} must be a simple runtime identity"
+        )
+    return identity
 
 
 def normalized_profile_digest(name: str, field: str, value: Any) -> str:
@@ -355,6 +376,12 @@ def load_worker_manifest(path: str | Path) -> dict[str, Any]:
         "profile": profile,
         "models": list(dict.fromkeys(models)),
         "version": str(data.get("version") or ""),
+        "platform": normalized_profile_runtime_identity(
+            profile, "platform", data.get("platform")
+        ),
+        "python_abi": normalized_profile_runtime_identity(
+            profile, "python_abi", data.get("python_abi")
+        ),
         "partition_protocol": str(data.get("partition_protocol") or ""),
         "source": str(manifest_path),
     }

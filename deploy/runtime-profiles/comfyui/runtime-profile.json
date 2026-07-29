@@ -1,6 +1,8 @@
 {
   "profile": "comfyui",
   "version": "0.1.0",
+  "platform": "linux-x86_64",
+  "python_abi": "cp311",
   "models": [
     "comfyui-workflow",
     "comfyui-partition-v1"

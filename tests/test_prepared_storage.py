@@ -1326,6 +1326,27 @@ def test_scheduler_normalizes_pinned_image_but_keeps_unknown_abi_as_miss(tmp_pat
     assert known["complete"]
 
 
+def test_scheduler_uses_runtime_identity_declared_by_pinned_profile():
+    image_digest = "sha256:" + "b" * 64
+    requirements = {
+        "runtime_identity": {
+            "image": "example/runner@" + image_digest,
+            "custom_nodes": [],
+            "wheelhouse_sha256": None,
+        },
+        "runtime_constraints": {
+            "platform": "linux-x86_64",
+            "python_abi": "cp311",
+        },
+    }
+
+    runtime = scheduler_runtime(requirements)
+
+    assert runtime["image_digest"] == image_digest
+    assert runtime["platform"] == "linux-x86_64"
+    assert runtime["python_abi"] == "cp311"
+
+
 def test_corruption_observation_invalidates_future_scheduler_coverage(tmp_path):
     registry = CacheRegistry(tmp_path / "queue.db")
     volume = registered_volume(registry, "corrupt-volume", "A")

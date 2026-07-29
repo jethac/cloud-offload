@@ -556,6 +556,10 @@ class Dispatcher:
             "CLOUD_OFFLOAD_WORKER_IMAGE_PROFILE": profile["image_profile"],
             "CLOUD_OFFLOAD_WORKER_MODELS": ",".join(profile["models"]),
         }
+        if profile.get("platform"):
+            env_vars["CLOUD_OFFLOAD_WORKER_PLATFORM"] = profile["platform"]
+        if profile.get("python_abi"):
+            env_vars["CLOUD_OFFLOAD_WORKER_PYTHON_ABI"] = profile["python_abi"]
         if profile.get("weights"):
             # The worker stages these before its first job. Pass the configured
             # Hub token for public weights too: authenticated downloads avoid

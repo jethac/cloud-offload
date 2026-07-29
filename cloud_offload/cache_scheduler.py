@@ -165,6 +165,11 @@ def resolve_prepared_requirements(
     return {
         "profile_fingerprint": profile_key(profile_name, keys),
         "runtime_identity": runtime_identity,
+        "runtime_constraints": {
+            key: str(profile.get(key) or "")
+            for key in ("platform", "python_abi")
+            if str(profile.get(key) or "")
+        },
         "artifacts": [artifacts[key] for key in sorted(artifacts)],
         "required": {key: item["size"] for key, item in sorted(artifacts.items())},
         "logical_required": sorted(set(logical_required)),
@@ -182,7 +187,7 @@ def scheduler_runtime(requirements: dict[str, Any]) -> dict[str, Any]:
         if "@sha256:" in image
         else ""
     )
-    return {
+    runtime = {
         "image_digest": image_digest,
         "dependency_lock": fingerprint(
             {
@@ -191,6 +196,14 @@ def scheduler_runtime(requirements: dict[str, Any]) -> dict[str, Any]:
             }
         ),
     }
+    runtime.update(
+        {
+            key: str(value)
+            for key, value in (requirements.get("runtime_constraints") or {}).items()
+            if key in {"platform", "python_abi"} and str(value)
+        }
+    )
+    return runtime
 
 
 def json_fingerprint(value: Any) -> str:

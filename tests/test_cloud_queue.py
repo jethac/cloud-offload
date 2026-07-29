@@ -914,6 +914,8 @@ def test_dispatcher_passes_configured_and_image_profile_names(tmp_path):
             "comfyui-runtime-proof": {
                 "image_profile": "comfyui",
                 "image": "ghcr.io/example/comfyui@sha256:abc",
+                "platform": "linux-x86_64",
+                "python_abi": "cp311",
                 "models": ["comfyui-workflow"],
                 "providers": ["runpod"],
             }
@@ -926,6 +928,8 @@ def test_dispatcher_passes_configured_and_image_profile_names(tmp_path):
 
     assert provider.env_vars["CLOUD_OFFLOAD_WORKER_PROFILE"] == "comfyui-runtime-proof"
     assert provider.env_vars["CLOUD_OFFLOAD_WORKER_IMAGE_PROFILE"] == "comfyui"
+    assert provider.env_vars["CLOUD_OFFLOAD_WORKER_PLATFORM"] == "linux-x86_64"
+    assert provider.env_vars["CLOUD_OFFLOAD_WORKER_PYTHON_ABI"] == "cp311"
 
 
 def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_path):
