@@ -1,4 +1,5 @@
 import pytest
+import os
 from fastapi.testclient import TestClient
 
 from cloud_offload import server
@@ -54,6 +55,7 @@ def test_health_endpoint_reports_service_name():
     body = response.json()
     assert body["name"] == SERVICE_NAME
     assert body["status"] == "ok"
+    assert body["pid"] == os.getpid()
 
 
 def test_root_endpoint_reports_service_name():
@@ -61,7 +63,9 @@ def test_root_endpoint_reports_service_name():
     assert response.json()["name"] == SERVICE_NAME
 
 
-def test_lan_bearer_middleware_challenges_and_exempts_worker_channel(monkeypatch, tmp_path):
+def test_lan_bearer_middleware_challenges_and_exempts_worker_channel(
+    monkeypatch, tmp_path
+):
     config = CloudConfig(queue_db_path=str(tmp_path / "queue.db"))
     queue = JobQueue(config.queue_db_path)
     monkeypatch.setattr(server, "_queue", lambda: (config, queue))
@@ -75,9 +79,12 @@ def test_lan_bearer_middleware_challenges_and_exempts_worker_channel(monkeypatch
     assert challenged.json()["error"]["code"] == "cloud_offload.auth_required"
 
     # The same route with the token passes.
-    assert client.get(
-        "/api/health", headers={"Authorization": "Bearer lan-token"}
-    ).status_code == 200
+    assert (
+        client.get(
+            "/api/health", headers={"Authorization": "Bearer lan-token"}
+        ).status_code
+        == 200
+    )
 
     # The worker channel is exempt from the global bearer, so it reaches the
     # handler (which then enforces its own worker-token auth) instead of being

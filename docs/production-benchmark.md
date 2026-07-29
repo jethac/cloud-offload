@@ -135,6 +135,33 @@ Hooks are an explicit operator boundary: they may mutate external state. Keep
 them narrow, idempotent, and reversible, and make the hook wait until its intended
 failure or restart is observable before it exits.
 
+Cloud Offload ships three reviewed canaries for its own production matrix. They
+still require a matching benchmark-hook environment and `--allow-hooks`; direct
+invocation is refused:
+
+```json
+{"kind": "storage", "hook_argv": ["cloud-offload", "benchmark-hook", "storage"]}
+{"kind": "corruption", "hook_argv": ["cloud-offload", "benchmark-hook", "corruption"]}
+{"kind": "restart", "hook_argv": ["cloud-offload", "benchmark-hook", "restart"]}
+```
+
+- `storage` requires strict prepared placement, temporarily substitutes a
+  nonexistent volume binding, requires `provisioning_failed` before any provider
+  launch, and restores the complete scenario config. It never mutates provider
+  storage.
+- `corruption` selects the smallest digest-addressed model object required by the
+  job, makes a server-side backup, writes a wrong-sized canary, requires the
+  worker to emit `cache_artifact_quarantined`, restores the canonical object if
+  the worker has not already repopulated it, and deletes the backup.
+- `restart` supports a local HTTP coordinator. It requires the service-file PID
+  and authenticated health PID to agree, stops that exact process, starts a
+  replacement on the same address, and succeeds only when health and the active
+  job journal are available again.
+
+The corruption canary is intentionally integrity-destructive for one immutable
+object during its bounded window. Its backup and `finally` recovery path are why
+it is suitable for the production matrix; arbitrary corruption commands are not.
+
 ## Commands
 
 Validate without submitting work or loading provider credentials:
