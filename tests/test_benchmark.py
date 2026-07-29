@@ -8,9 +8,11 @@ from cloud_offload.benchmark import (
     PLAN_SCHEMA,
     BenchmarkPlan,
     BenchmarkRunner,
+    CoordinatorBenchmarkDriver,
     InstanceObservation,
     write_scorecard,
 )
+from cloud_offload.config import CloudConfig
 
 
 def event(
@@ -41,6 +43,19 @@ class Script:
     terminate_succeeds: bool = True
 
 
+class FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self.payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
 class FakeDriver:
     def __init__(self, scripts):
         self.clock = 0.0
@@ -52,6 +67,10 @@ class FakeDriver:
         self.termination_attempts = []
         self.hooks = []
         self.active_until = 0.0
+        self.prepared_storage_policy = "smart"
+        self.preparation_calls = []
+        self.restoration_calls = []
+        self._restore_policies = {}
 
     def monotonic(self):
         return self.clock
@@ -86,6 +105,35 @@ class FakeDriver:
             if self.clock < self.active_until
             else []
         )
+
+    def prepare_scenario(self, scenario):
+        previous = self.prepared_storage_policy
+        self._restore_policies[scenario.name] = previous
+        if scenario.prepared_storage_policy is not None:
+            self.prepared_storage_policy = scenario.prepared_storage_policy
+        self.preparation_calls.append(
+            (scenario.name, scenario.prepared_storage_policy, previous)
+        )
+        return {
+            "required": scenario.prepared_storage_policy is not None,
+            "prepared": True,
+            "requested_policy": scenario.prepared_storage_policy,
+            "previous_policy": previous,
+            "changed": self.prepared_storage_policy != previous,
+        }
+
+    def restore_scenario(self, scenario):
+        previous = self._restore_policies.pop(scenario.name, None)
+        changed = previous is not None and previous != self.prepared_storage_policy
+        if previous is not None:
+            self.prepared_storage_policy = previous
+        self.restoration_calls.append((scenario.name, previous))
+        return {
+            "required": scenario.prepared_storage_policy is not None,
+            "restored": True,
+            "restored_policy": previous,
+            "changed": changed,
+        }
 
     def submit(self, scenario):
         job_id = f"job-{len(self.jobs) + 1}"
@@ -171,6 +219,10 @@ def scenario(name, cache_state, **overrides):
         "expected_statuses": ["completed"],
         "fresh_instance": True,
     }
+    if cache_state == "cold":
+        value["prepared_storage_policy"] = "off"
+    elif cache_state == "hot":
+        value["prepared_storage_policy"] = "smart"
     value.update(overrides)
     return value
 
@@ -240,6 +292,15 @@ def test_plan_requires_alternating_cold_hot_and_explicit_failure_hooks():
     with pytest.raises(ValueError, match="force_execution=true"):
         BenchmarkPlan.from_dict(plan_dict([unsafe_fresh]))
 
+    unproven_cold = scenario("cold", "cold")
+    unproven_cold.pop("prepared_storage_policy")
+    with pytest.raises(ValueError, match="cold runs require"):
+        BenchmarkPlan.from_dict(plan_dict([unproven_cold]))
+
+    unproven_hot = scenario("hot", "hot", prepared_storage_policy="off")
+    with pytest.raises(ValueError, match="hot runs require"):
+        BenchmarkPlan.from_dict(plan_dict([unproven_hot]))
+
 
 def test_cold_hot_campaign_records_comparable_json_and_removes_exact_pods(tmp_path):
     plan = BenchmarkPlan.from_dict(
@@ -267,6 +328,20 @@ def test_cold_hot_campaign_records_comparable_json_and_removes_exact_pods(tmp_pa
         ("runpod", "pod-hot"),
     ]
     assert scorecard["orphaned_resources"] == []
+    assert driver.preparation_calls == [
+        ("cold", "off", "smart"),
+        ("hot", "smart", "smart"),
+    ]
+    assert driver.restoration_calls == [("cold", "smart"), ("hot", "smart")]
+    assert driver.prepared_storage_policy == "smart"
+    assert scorecard["results"][0]["scenario_preparation"] == {
+        "required": True,
+        "prepared": True,
+        "requested_policy": "off",
+        "previous_policy": "smart",
+        "changed": True,
+    }
+    assert scorecard["results"][0]["scenario_restoration"]["restored"] is True
     assert "private-cold" not in encoded
     assert "private-hot" not in encoded
     assert json.loads(encoded)["schema"] == "cloud-offload.benchmark-scorecard.v1"
@@ -390,6 +465,138 @@ def test_fresh_pod_waits_for_stale_worker_heartbeat_without_charging_scenario_ti
     # seconds, but excludes the three seconds spent aging out the stale worker.
     assert scorecard["results"][0]["duration_seconds"] == 3
     assert driver.clock >= 6
+
+
+def test_scenario_restores_storage_policy_when_submission_fails():
+    class BrokenSubmitDriver(FakeDriver):
+        def submit(self, scenario):
+            raise RuntimeError("submission failed")
+
+    driver = BrokenSubmitDriver({})
+    plan = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+    result = scorecard["results"][0]
+
+    assert result["passed"] is False
+    assert result["harness_error"] == "RuntimeError: submission failed"
+    assert result["scenario_restoration"]["restored"] is True
+    assert driver.prepared_storage_policy == "smart"
+    assert driver.restoration_calls == [("cold", "smart")]
+
+
+def test_operator_interrupt_cleans_up_paid_resource_and_restores_policy():
+    class InterruptDriver(FakeDriver):
+        snapshot_calls = 0
+
+        def snapshot(self, job_id):
+            self.snapshot_calls += 1
+            if self.snapshot_calls == 1:
+                raise KeyboardInterrupt
+            return {"status": "failed", "lifecycle_phase": "closure"}
+
+    driver = InterruptDriver({"cold": successful_script("pod-interrupted")})
+    plan = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+
+    with pytest.raises(KeyboardInterrupt):
+        BenchmarkRunner(driver).run(plan)
+
+    assert driver.termination_attempts == [("runpod", "pod-interrupted")]
+    assert ("runpod", "pod-interrupted") in driver.terminated
+    assert driver.prepared_storage_policy == "smart"
+    assert driver.restoration_calls == [("cold", "smart")]
+
+
+def test_coordinator_driver_restores_the_exact_prepared_storage_object():
+    original = CloudConfig(
+        prepared_storage={
+            "enabled": True,
+            "provider": "runpod",
+            "policy": "smart",
+            "region": "EU-RO-1",
+            "cold_fallback": "ask",
+            "managed_size_gb": 321,
+            "existing_volume_id": "volume-existing",
+            "max_monthly_storage_cost": 24.5,
+            "confirmed": True,
+            "tenant": "benchmark-tenant",
+            "cache_private_assets": True,
+            "shadow_admission": False,
+        }
+    ).prepared_storage
+    state = {"prepared_storage": dict(original)}
+    posts = []
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+
+    def request(method, path, **kwargs):
+        assert path == "/api/config"
+        if method == "POST":
+            posted = json.loads(json.dumps(kwargs["json"]["prepared_storage"]))
+            posts.append(posted)
+            state["prepared_storage"] = posted
+        return FakeResponse(json.loads(json.dumps(state)))
+
+    driver._request = request
+    cold = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")])).scenarios[0]
+
+    prepared = driver.prepare_scenario(cold)
+
+    assert prepared == {
+        "required": True,
+        "prepared": True,
+        "requested_policy": "off",
+        "previous_policy": "smart",
+        "changed": True,
+    }
+    assert state["prepared_storage"]["policy"] == "off"
+    assert state["prepared_storage"]["enabled"] is False
+    assert state["prepared_storage"]["existing_volume_id"] == "volume-existing"
+    assert state["prepared_storage"]["tenant"] == "benchmark-tenant"
+
+    restored = driver.restore_scenario(cold)
+
+    assert restored == {
+        "required": True,
+        "restored": True,
+        "restored_policy": "smart",
+        "changed": True,
+    }
+    assert state["prepared_storage"] == original
+    assert posts[-1] == original
+
+
+def test_coordinator_driver_refuses_to_overwrite_a_concurrent_config_change():
+    original = CloudConfig(
+        prepared_storage={
+            "enabled": True,
+            "policy": "smart",
+            "confirmed": True,
+            "existing_volume_id": "volume-existing",
+        }
+    ).prepared_storage
+    state = {"prepared_storage": dict(original)}
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+
+    def request(method, path, **kwargs):
+        if method == "POST":
+            state["prepared_storage"] = json.loads(
+                json.dumps(kwargs["json"]["prepared_storage"])
+            )
+        return FakeResponse(json.loads(json.dumps(state)))
+
+    driver._request = request
+    cold = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")])).scenarios[0]
+    driver.prepare_scenario(cold)
+    state["prepared_storage"]["tenant"] = "changed-concurrently"
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        driver.restore_scenario(cold)
+
+    assert state["prepared_storage"]["tenant"] == "changed-concurrently"
 
 
 def test_cli_validation_redacts_request_and_run_requires_spend_confirmation(

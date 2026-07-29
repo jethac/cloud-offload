@@ -32,6 +32,7 @@ SCENARIO_SCHEMA = "cloud-offload.benchmark-scenario-result.v1"
 TERMINAL_STATUSES = {"completed", "failed", "dead_letter"}
 FAILURE_KINDS = {"cancellation", "provider", "storage", "corruption", "restart"}
 CACHE_STATES = {"cold", "hot", "failure"}
+PREPARED_STORAGE_POLICIES = {"off", "smart", "strict", "pinned"}
 SUBMISSION_ENDPOINTS = {"/api/partitions", "/api/workflows"}
 MANAGED_INSTANCE_PREFIX = "cloud-offload-worker-"
 
@@ -145,6 +146,7 @@ class BenchmarkScenario:
     timeout_seconds: float
     expected_statuses: tuple[str, ...]
     fresh_instance: bool = True
+    prepared_storage_policy: str | None = None
     failure: FailureInjection | None = None
 
     @classmethod
@@ -193,6 +195,33 @@ class BenchmarkScenario:
         failure = value.get("failure")
         if failure is not None and not isinstance(failure, dict):
             raise ValueError(f"scenarios[{index}].failure must be an object")
+        raw_storage_policy = value.get("prepared_storage_policy")
+        storage_policy = (
+            str(raw_storage_policy).strip().lower()
+            if raw_storage_policy is not None
+            else None
+        )
+        if (
+            storage_policy is not None
+            and storage_policy not in PREPARED_STORAGE_POLICIES
+        ):
+            raise ValueError(
+                f"scenarios[{index}].prepared_storage_policy must be one of "
+                + ", ".join(sorted(PREPARED_STORAGE_POLICIES))
+            )
+        if cache_state == "cold" and storage_policy != "off":
+            raise ValueError(
+                f"scenarios[{index}] cold runs require prepared_storage_policy='off'"
+            )
+        if cache_state == "hot" and storage_policy not in {
+            "smart",
+            "strict",
+            "pinned",
+        }:
+            raise ValueError(
+                f"scenarios[{index}] hot runs require an enabled "
+                "prepared_storage_policy"
+            )
         return cls(
             name=name,
             cache_state=cache_state,
@@ -203,6 +232,7 @@ class BenchmarkScenario:
             ),
             expected_statuses=normalized_statuses,
             fresh_instance=bool(value.get("fresh_instance", True)),
+            prepared_storage_policy=storage_policy,
             failure=FailureInjection.from_dict(failure) if failure else None,
         )
 
@@ -285,6 +315,7 @@ class BenchmarkPlan:
                     "request_digest": _canonical_digest(item.request),
                     "timeout_seconds": item.timeout_seconds,
                     "fresh_instance": item.fresh_instance,
+                    "prepared_storage_policy": item.prepared_storage_policy,
                     "failure_kind": item.failure.kind if item.failure else None,
                 }
                 for item in self.scenarios
@@ -312,6 +343,10 @@ class BenchmarkDriver(Protocol):
     ) -> dict[str, dict[str, InstanceObservation]]: ...
 
     def active_workers(self, providers: tuple[str, ...]) -> list[dict[str, Any]]: ...
+
+    def prepare_scenario(self, scenario: BenchmarkScenario) -> dict[str, Any]: ...
+
+    def restore_scenario(self, scenario: BenchmarkScenario) -> dict[str, Any]: ...
 
     def submit(self, scenario: BenchmarkScenario) -> str: ...
 
@@ -542,9 +577,13 @@ class BenchmarkRunner:
         failure_result: dict[str, Any] | None = None
         limit_triggered: str | None = None
         harness_error: str | None = None
+        fatal_error: BaseException | None = None
         support_bundle: dict[str, Any] | None = None
+        preparation: dict[str, Any] | None = None
+        restoration: dict[str, Any] | None = None
 
         try:
+            preparation = self.driver.prepare_scenario(scenario)
             job_id = self.driver.submit(scenario)
             while True:
                 now = self.driver.monotonic()
@@ -631,6 +670,10 @@ class BenchmarkRunner:
                 if status in TERMINAL_STATUSES:
                     break
                 self.driver.sleep(plan.limits.poll_seconds)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            # Paid resource cleanup and config restoration still run before the
+            # operator interrupt is allowed to escape.
+            fatal_error = exc
         except Exception as exc:  # noqa: BLE001 - preserve cleanup on harness faults
             harness_error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -651,6 +694,14 @@ class BenchmarkRunner:
             plan.limits.cleanup_timeout_seconds,
             include_untracked=plan.exclusive,
         )
+        try:
+            restoration = self.driver.restore_scenario(scenario)
+        except Exception as exc:  # noqa: BLE001 - report without leaking config
+            restoration = {
+                "required": scenario.prepared_storage_policy is not None,
+                "restored": False,
+                "error_type": type(exc).__name__,
+            }
         completed = self.driver.monotonic()
         cleanup_duration = max(0.0, completed - cleanup_started)
         estimated_cost = self._estimated_cost(resources, completed)
@@ -672,9 +723,13 @@ class BenchmarkRunner:
             and limit_triggered is None
             and status in scenario.expected_statuses
             and not orphaned_resources
+            and bool((preparation or {}).get("prepared"))
+            and bool((restoration or {}).get("restored"))
             and (not failure_expected or (failure_triggered and failure_succeeded))
             and (not scenario.fresh_instance or bool(resources))
         )
+        if fatal_error is not None:
+            raise fatal_error
         return {
             "schema": SCENARIO_SCHEMA,
             "name": scenario.name,
@@ -690,6 +745,8 @@ class BenchmarkRunner:
             "passed": passed,
             "fresh_instance_required": scenario.fresh_instance,
             "fresh_instance_observed": bool(resources),
+            "scenario_preparation": preparation,
+            "scenario_restoration": restoration,
             "event_count": len(events),
             "event_cursor": cursor,
             "phase_durations_seconds": _phase_durations(events),
@@ -920,6 +977,7 @@ class CoordinatorBenchmarkDriver:
             provider: create_connector(provider, config) for provider in providers
         }
         self.allow_hooks = allow_hooks
+        self._prepared_storage_restore: dict[str, dict[str, dict[str, Any]]] = {}
 
     def _request(
         self,
@@ -996,6 +1054,98 @@ class CoordinatorBenchmarkDriver:
             for item in response.json().get("workers") or []
             if str(item.get("provider") or "") in allowed
         ]
+
+    def _prepared_storage_config(self) -> dict[str, Any]:
+        response = self._request("GET", "/api/config", retry_safe=True, timeout=30)
+        response.raise_for_status()
+        prepared = response.json().get("prepared_storage")
+        if not isinstance(prepared, dict):
+            raise RuntimeError("Coordinator returned no prepared-storage config")
+        # The coordinator contract is finite JSON. Round-tripping makes the
+        # private restoration copy independent from the response object.
+        return json.loads(json.dumps(prepared, allow_nan=False))
+
+    def _set_prepared_storage_config(self, prepared: dict[str, Any]) -> None:
+        response = self._request(
+            "POST",
+            "/api/config",
+            retry_safe=True,
+            timeout=30,
+            json={"prepared_storage": prepared},
+        )
+        response.raise_for_status()
+
+    def prepare_scenario(self, scenario: BenchmarkScenario) -> dict[str, Any]:
+        requested = scenario.prepared_storage_policy
+        if requested is None:
+            return {"required": False, "prepared": True}
+        if scenario.name in self._prepared_storage_restore:
+            raise RuntimeError("Scenario prepared-storage policy is already active")
+
+        previous = self._prepared_storage_config()
+        target = json.loads(json.dumps(previous, allow_nan=False))
+        if requested == "off":
+            target["policy"] = "off"
+            target["enabled"] = False
+        else:
+            if not previous.get("confirmed"):
+                raise RuntimeError(
+                    "Hot benchmark requires previously confirmed prepared storage"
+                )
+            if not previous.get("existing_volume_id"):
+                raise RuntimeError(
+                    "Hot benchmark requires an already-bound prepared volume"
+                )
+            target["policy"] = requested
+            target["enabled"] = True
+
+        # Store the complete original before the idempotent POST. If the response
+        # is lost after the coordinator applies it, restoration still knows both
+        # legitimate states and can safely recover.
+        self._prepared_storage_restore[scenario.name] = {
+            "previous": previous,
+            "target": target,
+        }
+        changed = target != previous
+        if changed:
+            self._set_prepared_storage_config(target)
+        observed = self._prepared_storage_config()
+        if observed != target:
+            raise RuntimeError("Coordinator did not apply benchmark storage policy")
+        return {
+            "required": True,
+            "prepared": True,
+            "requested_policy": requested,
+            "previous_policy": str(previous.get("policy") or ""),
+            "changed": changed,
+        }
+
+    def restore_scenario(self, scenario: BenchmarkScenario) -> dict[str, Any]:
+        saved = self._prepared_storage_restore.get(scenario.name)
+        if saved is None:
+            return {"required": False, "restored": True, "changed": False}
+        previous = saved["previous"]
+        target = saved["target"]
+        current = self._prepared_storage_config()
+        if current == previous:
+            changed = False
+        elif current == target:
+            self._set_prepared_storage_config(previous)
+            changed = True
+        else:
+            raise RuntimeError(
+                "Prepared-storage config changed during benchmark; refusing to overwrite it"
+            )
+        observed = self._prepared_storage_config()
+        if observed != previous:
+            raise RuntimeError("Coordinator did not restore prepared-storage config")
+        self._prepared_storage_restore.pop(scenario.name, None)
+        return {
+            "required": True,
+            "restored": True,
+            "restored_policy": str(previous.get("policy") or ""),
+            "changed": changed,
+        }
 
     def submit(self, scenario: BenchmarkScenario) -> str:
         # Submission is not transport-idempotent yet, so it is deliberately not

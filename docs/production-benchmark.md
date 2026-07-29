@@ -63,6 +63,7 @@ A plan uses `cloud-offload.benchmark-plan.v1`:
         "partition": { "...": "ordinary request body" },
         "force_execution": true
       },
+      "prepared_storage_policy": "off",
       "timeout_seconds": 900,
       "expected_statuses": ["completed"],
       "fresh_instance": true
@@ -75,6 +76,7 @@ A plan uses `cloud-offload.benchmark-plan.v1`:
         "partition": { "...": "same manifest and inputs" },
         "force_execution": true
       },
+      "prepared_storage_policy": "smart",
       "timeout_seconds": 600,
       "expected_statuses": ["completed"],
       "fresh_instance": true
@@ -83,11 +85,22 @@ A plan uses `cloud-offload.benchmark-plan.v1`:
 }
 ```
 
-Cold and hot scenarios must begin cold and alternate. Every fresh scenario waits
-until the coordinator reports no active heartbeat for the selected providers;
-this prevents a recently terminated Pod's stale worker record from suppressing
-the next rental. The harness verifies that a fresh provider instance actually
-appeared, so a result-cache hit cannot masquerade as a fresh-Pod hot restore.
+Cold and hot scenarios must begin cold and alternate. A cold scenario must set
+`prepared_storage_policy: off`; a hot scenario must select `smart`, `strict`, or
+`pinned`. This makes the cache-state label an enforced control rather than a
+comment. Before submission, the harness snapshots the complete prepared-storage
+object, applies and verifies the scenario policy, and records only a safe policy
+receipt. A hot scenario refuses to proceed unless storage was already confirmed
+and an existing volume is bound, so a benchmark cannot silently create durable
+storage. After exact Pod cleanup, the harness restores and verifies the complete
+prior object on success, failure, or operator interrupt. If settings changed
+concurrently, it fails rather than overwriting the newer state.
+
+Every fresh scenario waits until the coordinator reports no active heartbeat for
+the selected providers; this prevents a recently terminated Pod's stale worker
+record from suppressing the next rental. The harness verifies that a fresh
+provider instance actually appeared, so a result-cache hit cannot masquerade as
+a fresh-Pod hot restore.
 Fresh partition scenarios are rejected at plan validation unless their ordinary
 submission request explicitly sets `force_execution: true`; the coordinator then
 bypasses only the completed-result cache while leaving prepared-state caching in
@@ -155,6 +168,7 @@ failed scorecard and exits non-zero.
 - provider, Pod ID, rate, and attribution source;
 - conservative compute-cost estimate;
 - failure-trigger receipt;
+- safe scenario preparation and full-config restoration receipts;
 - exact termination attempts and provider-absence receipt;
 - cold/hot duration and cost distributions;
 - phase distributions; and
