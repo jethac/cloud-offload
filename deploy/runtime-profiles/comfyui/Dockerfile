@@ -49,6 +49,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CLOUD_OFFLOAD_COMFYUI_URL=http://127.0.0.1:8188 \
     CLOUD_OFFLOAD_COMFYUI_ROOT=/opt/ComfyUI \
     COMFY_PARTITION_ROOT=/opt/cloud-offload/partitions \
+    CLOUD_OFFLOAD_BOOT_RESTORE_REPORT=/tmp/cloud-offload-boot-cache.json \
     HF_HUB_ENABLE_HF_TRANSFER=1
 
 RUN apt-get update \

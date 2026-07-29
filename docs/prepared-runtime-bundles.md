@@ -36,6 +36,12 @@ before ComfyUI starts. The entrypoint puts the restored environment first on
 `PYTHONPATH`. ComfyUI therefore builds its node registry from the restored code
 and packages. It does not repeat Git, registry, or pip downloads.
 
+The boot process writes a small container-local restore report. The first
+claimed job accepts it only when its worker ID, profile fingerprint, manifest
+ID, artifact digests, sizes, types, and destinations match the selected signed
+manifest. The job then emits the cache-hit events and restore receipt. It does
+not publish the same bundles again.
+
 Each restore verifies the signed manifest and compatibility contract. Bundle
 extraction permits only regular files and directories. A corrupt environment
 bundle is quarantined. The configured cold-fallback policy then decides whether

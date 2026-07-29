@@ -14,6 +14,7 @@ from cloud_offload.config import CloudConfig
 from cloud_offload.prepared_state import (
     ManifestSigner,
     PreparedStateCAS,
+    RestoreReceipt,
     bundle_key,
     fingerprint,
 )
@@ -119,6 +120,76 @@ def test_worker_builds_and_restores_signed_runtime_bundles(monkeypatch, tmp_path
     assert (restored_root / "dependency.py").read_text(encoding="utf-8") == (
         "ready = True"
     )
+
+
+def test_boot_restores_are_attributed_and_not_republished(monkeypatch, tmp_path):
+    signer = ManifestSigner(b"b" * 32)
+    cas = PreparedStateCAS(tmp_path / "volume", signer)
+    profile = fingerprint({"profile": "boot-restore"})
+    producer = cache_worker(cas, profile, "producer")
+    producer.custom_nodes = [PACK]
+    producer._pending_prepared_artifacts = []
+    producer._verified_prepared_digests = set()
+    producer._raise_if_cancelled = lambda active_job: None
+    producer.queue = SimpleNamespace(append_event=lambda *args, **kwargs: None)
+    job = SimpleNamespace(id="job-boot-restore")
+    pack = tmp_path / "custom_nodes" / "example-pack"
+    pack.mkdir(parents=True)
+    (pack / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}", encoding="utf-8")
+    environment = tmp_path / "environment"
+    monkeypatch.setenv("CLOUD_OFFLOAD_ENV_ROOT", str(environment))
+    producer._mark_environment_ready()
+    (environment / "dependency.py").write_text("ready = True", encoding="utf-8")
+    producer._populate_custom_node_bundle("example-pack", PACK, pack, job)
+    producer._populate_environment_bundle(job)
+    producer._flush_prepared_manifest(job)
+
+    report = tmp_path / "boot-cache.json"
+    restored_environment = tmp_path / "restored-environment"
+    monkeypatch.setenv("CLOUD_OFFLOAD_BOOT_RESTORE_REPORT", str(report))
+    monkeypatch.setenv("CLOUD_OFFLOAD_ENV_ROOT", str(restored_environment))
+    boot = cache_worker(cas, profile, "boot-worker")
+    boot.custom_nodes = [PACK]
+    restored_pack = tmp_path / "restored-pack"
+
+    assert boot._restore_custom_node_bundle("example-pack", restored_pack, None)
+    assert boot._restore_environment_bundle(None)
+    assert report.is_file()
+
+    events = []
+    claimed = cache_worker(cas, profile, "boot-worker")
+    claimed.custom_nodes = [PACK]
+    claimed.queue = SimpleNamespace(
+        append_event=lambda job_id, event: events.append((job_id, event))
+    )
+    claimed.cache_receipt = RestoreReceipt(
+        manifest_id=None,
+        volume_id="volume-1",
+        datacenter_id="US-MD-1",
+        worker_class="GPU",
+    )
+    claimed._consume_boot_cache_hits(job)
+
+    hits = [event for _, event in events if event["type"] == "cache_artifact_hit"]
+    assert {event["kind"] for event in hits} == {
+        "custom-node-bundle",
+        "environment-bundle",
+    }
+    assert all(event["restored_before_claim"] for event in hits)
+    assert {item["kind"] for item in claimed.cache_receipt.artifacts} == {
+        "custom-node-bundle",
+        "environment-bundle",
+    }
+    assert not report.exists()
+
+    claimed._custom_nodes_staged = True
+    claimed._populate_custom_node_bundle = lambda *args: pytest.fail(
+        "restored custom-node bundle was republished"
+    )
+    claimed._populate_environment_bundle = lambda *args: pytest.fail(
+        "restored environment bundle was republished"
+    )
+    claimed._stage_custom_nodes(job)
 
 
 def _bundle_artifact(data: bytes, *, kind: str, **fields):

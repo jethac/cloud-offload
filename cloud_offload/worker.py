@@ -136,6 +136,7 @@ class Worker:
         self._weights_staged = False
         self.custom_nodes = self._load_custom_nodes_env()
         self._custom_nodes_staged = False
+        self._restored_runtime_keys: set[tuple[str, str]] = set()
         self._initialize_prepared_cache()
 
         # Setup signal handlers for graceful shutdown
@@ -297,6 +298,10 @@ class Worker:
         claimed job still runs staging, finds every directory already present,
         and says so in its own events.
         """
+        report = self._boot_cache_report_path()
+        if report:
+            report.unlink(missing_ok=True)
+        self._restored_runtime_keys = set()
         self._stage_custom_nodes(None)
 
     def _handle_signal(self, signum, frame):
@@ -637,8 +642,6 @@ class Worker:
         """
         environment_ready = self._restore_environment_bundle(job)
         if self._custom_nodes_staged:
-            if job is not None:
-                self._populate_staged_runtime_bundles(job)
             self._publish_node_pack_skip(job, "already_staged")
             return
         if not self.custom_nodes:
@@ -702,7 +705,12 @@ class Worker:
                     and entry.get("install_requirements", True)
                 ):
                     self._install_pack_requirements(job, pack_id, target)
-                if job is not None:
+                if (
+                    job is not None
+                    and not restored
+                    and ("custom-node-bundle", pack_id)
+                    not in getattr(self, "_restored_runtime_keys", set())
+                ):
                     self._populate_custom_node_bundle(pack_id, entry, target, job)
                 downloaded += 1
                 continue
@@ -718,7 +726,11 @@ class Worker:
 
         publish(None, None)
         self._mark_environment_ready()
-        if job is not None:
+        if (
+            job is not None
+            and ("environment-bundle", self._dependency_lock())
+            not in getattr(self, "_restored_runtime_keys", set())
+        ):
             self._populate_environment_bundle(job)
         self._custom_nodes_staged = True
         logger.info("Staged %d custom node pack(s) into %s", total_packs, root)
@@ -795,6 +807,7 @@ class Worker:
                 self._environment_root(),
                 manifest=manifest,
             )
+            self._remember_runtime_restore(("environment-bundle", dependency_lock))
             if job:
                 self._cache_event(
                     job,
@@ -806,6 +819,19 @@ class Worker:
                     verification_mode=verification.get("mode"),
                     verification_bytes=verification.get("bytes_read"),
                 )
+                if self.cache_receipt:
+                    self.cache_receipt.manifest_id = manifest["manifest_id"]
+                    self.cache_receipt.record(
+                        digest=artifact["digest"],
+                        kind="environment-bundle",
+                        result="hit",
+                        bytes=artifact["size"],
+                        reason=str(verification.get("mode") or "full_digest"),
+                        verification_mode=verification.get("mode"),
+                        verification_bytes=verification.get("bytes_read"),
+                    )
+            else:
+                self._record_boot_cache_hit(artifact, manifest, verification)
             return self._environment_is_ready()
         except CacheCorruptionError as exc:
             cache.quarantine(
@@ -835,19 +861,6 @@ class Worker:
                 raise
             self._environment_root().mkdir(parents=True, exist_ok=True)
             return False
-
-    def _populate_staged_runtime_bundles(self, job: Job) -> None:
-        from cloud_offload.comfyui import comfyui_custom_nodes_dir
-        from cloud_offload.profiles import profile_pack_identifier
-
-        root = comfyui_custom_nodes_dir().resolve()
-        for entry in self.custom_nodes:
-            pack_id = profile_pack_identifier(entry)
-            target = (root / pack_id).resolve()
-            if target.is_dir():
-                self._populate_custom_node_bundle(pack_id, entry, target, job)
-        self._mark_environment_ready()
-        self._populate_environment_bundle(job)
 
     def _restore_custom_node_bundle(
         self, pack_id: str, target: Path, job: Job | None
@@ -879,6 +892,7 @@ class Worker:
                 target,
                 manifest=manifest,
             )
+            self._remember_runtime_restore(("custom-node-bundle", pack_id))
             if job:
                 self._cache_event(
                     job,
@@ -892,6 +906,7 @@ class Worker:
                     background_sampled=verification.get("background_sampled"),
                 )
             if self.cache_receipt:
+                self.cache_receipt.manifest_id = manifest["manifest_id"]
                 self.cache_receipt.record(
                     digest=artifact["digest"],
                     kind="custom-node-bundle",
@@ -903,6 +918,8 @@ class Worker:
                     background_sampled=verification.get("background_sampled"),
                     total_ms=round((time.monotonic() - started) * 1000, 3),
                 )
+            if job is None:
+                self._record_boot_cache_hit(artifact, manifest, verification)
             return True
         except CacheCorruptionError as exc:
             if artifact:
@@ -2094,6 +2111,168 @@ class Worker:
                 },
             )
 
+    @staticmethod
+    def _runtime_bundle_key(artifact: dict) -> tuple[str, str] | None:
+        kind = str(artifact.get("kind") or "")
+        destination = artifact.get("destination") or {}
+        if kind == "custom-node-bundle":
+            value = str(destination.get("pack_id") or "")
+        elif kind == "environment-bundle":
+            value = str(destination.get("dependency_lock") or "")
+        else:
+            return None
+        return (kind, value) if value else None
+
+    def _remember_runtime_restore(self, runtime_key: tuple[str, str]) -> None:
+        restored = set(getattr(self, "_restored_runtime_keys", set()))
+        restored.add(runtime_key)
+        self._restored_runtime_keys = restored
+
+    @staticmethod
+    def _boot_cache_report_path() -> Path | None:
+        value = os.environ.get("CLOUD_OFFLOAD_BOOT_RESTORE_REPORT", "").strip()
+        return Path(value).resolve() if value else None
+
+    def _record_boot_cache_hit(
+        self,
+        artifact: dict,
+        manifest: dict,
+        verification: dict,
+    ) -> None:
+        """Persist a verified pre-ComfyUI restore for the first claimed job."""
+
+        path = self._boot_cache_report_path()
+        runtime_key = self._runtime_bundle_key(artifact)
+        if path is None or runtime_key is None:
+            return
+        import json
+
+        report = {
+            "schema": "cloud-offload.boot-cache-restore.v1",
+            "worker_id": self.worker_id,
+            "profile_fingerprint": str(
+                self.cache_requirements.get("profile_fingerprint") or ""
+            ),
+            "manifest_id": manifest["manifest_id"],
+            "artifacts": [],
+        }
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if all(
+                existing.get(key) == report[key]
+                for key in (
+                    "schema",
+                    "worker_id",
+                    "profile_fingerprint",
+                    "manifest_id",
+                )
+            ):
+                report["artifacts"] = list(existing.get("artifacts") or [])
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        entry = {
+            "kind": artifact["kind"],
+            "digest": artifact["digest"],
+            "bytes": int(artifact["size"]),
+            "destination": dict(artifact.get("destination") or {}),
+            "verification_mode": verification.get("mode"),
+            "verification_bytes": int(verification.get("bytes_read") or 0),
+            "background_sampled": bool(verification.get("background_sampled")),
+        }
+        report["artifacts"] = [
+            item
+            for item in report["artifacts"]
+            if self._runtime_bundle_key(item) != runtime_key
+        ]
+        report["artifacts"].append(entry)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + f".{uuid.uuid4().hex}.tmp")
+        temporary.write_text(
+            json.dumps(report, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+
+    def _consume_boot_cache_hits(self, job: Job) -> None:
+        """Project trusted boot restores into the job event and receipt streams."""
+
+        path = self._boot_cache_report_path()
+        if path is None or not path.is_file():
+            return
+        import json
+
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+            manifest = self._selected_prepared_manifest()
+            if (
+                report.get("schema") != "cloud-offload.boot-cache-restore.v1"
+                or report.get("worker_id") != self.worker_id
+                or report.get("profile_fingerprint")
+                != str(self.cache_requirements.get("profile_fingerprint") or "")
+                or not manifest
+                or report.get("manifest_id") != manifest.get("manifest_id")
+            ):
+                raise ValueError("Boot cache report does not match this job")
+            manifest_artifacts = {
+                self._runtime_bundle_key(artifact): artifact
+                for artifact in manifest.get("artifacts") or []
+                if self._runtime_bundle_key(artifact)
+            }
+            accepted = []
+            for item in report.get("artifacts") or []:
+                runtime_key = self._runtime_bundle_key(item)
+                artifact = manifest_artifacts.get(runtime_key)
+                if (
+                    not runtime_key
+                    or not artifact
+                    or item.get("digest") != artifact.get("digest")
+                    or int(item.get("bytes") or -1) != int(artifact.get("size") or 0)
+                ):
+                    raise ValueError("Boot cache artifact does not match the manifest")
+                accepted.append((runtime_key, artifact, item))
+            self.cache_receipt.manifest_id = manifest["manifest_id"]
+            for runtime_key, artifact, item in accepted:
+                self._remember_runtime_restore(runtime_key)
+                self._cache_event(
+                    job,
+                    "cache_artifact_hit",
+                    digest=artifact["digest"],
+                    kind=artifact["kind"],
+                    bytes=artifact["size"],
+                    result="hit",
+                    verification_mode=item.get("verification_mode"),
+                    verification_bytes=item.get("verification_bytes"),
+                    background_sampled=bool(item.get("background_sampled")),
+                    restored_before_claim=True,
+                )
+                self.cache_receipt.record(
+                    digest=artifact["digest"],
+                    kind=artifact["kind"],
+                    result="hit",
+                    bytes=artifact["size"],
+                    reason=str(item.get("verification_mode") or "full_digest"),
+                    verification_mode=item.get("verification_mode"),
+                    verification_bytes=int(item.get("verification_bytes") or 0),
+                    background_sampled=bool(item.get("background_sampled")),
+                    total_ms=0,
+                    restored_before_claim=True,
+                )
+        except (
+            AttributeError,
+            OSError,
+            ValueError,
+            TypeError,
+            json.JSONDecodeError,
+        ) as exc:
+            logger.warning("Boot cache restore report was refused: %s", exc)
+            self._cache_event(
+                job,
+                "cache_boot_restore_report_refused",
+                reason="invalid_boot_restore_report",
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
     def _begin_cache_restore(self, job: Job) -> None:
         self._active_cache_job = job
         self._pending_prepared_artifacts = []
@@ -2128,6 +2307,7 @@ class Worker:
             datacenter_id=self.cache_receipt.datacenter_id,
         )
         self._cache_event(job, "cache_restore_started")
+        self._consume_boot_cache_hits(job)
 
     def _complete_cache_restore(self, job: Job) -> None:
         if not getattr(self, "cache_receipt", None):
