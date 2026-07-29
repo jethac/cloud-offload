@@ -2,7 +2,7 @@
 
 > Status: **canonical product goal**
 > Last updated: **2026-07-29**
-> Program status: **in progress — Milestone 0 production evidence is the current gate**
+> Program status: **in progress — Milestone 1 end-to-end evidence and recommendation accuracy are the current gate**
 > Scope: the end-to-end Cloud Offload product across the coordinator, dispatcher,
 > workers, provider connectors, prepared storage, and ComfyUI extension.
 >
@@ -171,10 +171,10 @@ validate the product journey.
 | ID | Requirement | Primary milestone | Current state |
 | --- | --- | --- | --- |
 | `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; confirmed launch now binds to the selected offer and prepared volume. |
-| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | `PreflightReportV1`, paid-submit binding, and launch-time revalidation exist; UI confirmation evidence remains. |
+| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | `PreflightReportV1`, paid-submit binding, launch-time revalidation, and the ComfyUI handoff exist; merged-stack production evidence remains. |
 | `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Initial explainable ranking exists; measured history and complete cost components remain. |
-| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Backend countdown enforcement exists; the ComfyUI surface remains. |
-| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Persistent backend policy exists; the ComfyUI actions and settings remain. |
+| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Implemented across backend PRs #25–#27 and extension PR #5; merged-stack production evidence remains. |
+| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Implemented in extension PR #5 with persistent coordinator policy from backend PR #27; merged-stack production evidence remains. |
 | `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
 | `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Initial canvas feedback merged; durable drawer pending. |
 | `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Logical cancellation baseline exists; leases and provider receipt pending. |
@@ -649,6 +649,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#2](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/2) | Expand nested boxed subgraphs and resolve workflow-declared Hugging Face assets. | Merged as `d976769`; 73 Python tests passed, 3 skipped, 45 JavaScript tests passed, and live inpainting completed. |
 | [#3](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/3) | Prepared-storage opt-in and policy controls. | Merged as `21e66ca`; broader settings/visibility remain. |
 | [#4](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/4) | Action-bar discovery, write-only RunPod S3 credential setup, and monotonic startup/cache feedback in the partition title. | Merged as `40c3cf6`; 74 Python tests passed, 3 skipped, and 5 focused JavaScript tests passed. |
+| [#5](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/5) | Runs free preflight after final boundary upload; presents one-time GPU rental confirmation with cost, timing, prepared coverage, rationale, uncertainty, countdown, alternate GPU choice, cancellation, and persistent settings; submits only the exact confirmed plan. | Merged as `ff872b4`; 81 Python tests passed, 3 skipped, 60 JavaScript tests passed, syntax and compile checks passed, and the settings, confirmation, details, and GPU-choice states passed a 1440×1000 visual check. Cancellation during the countdown cannot retry paid submission. |
 
 ## Validation record
 
@@ -936,8 +937,9 @@ Status snapshot as of 2026-07-29:
   replay proved exact manifest authority, quarantine, safe terminal behavior,
   and complete automated cleanup in production.
 - M0 is complete. M1 now has the versioned report, recommendation, paid-submit
-  binding, exact launch revalidation, and persistent backend confirmation
-  policy. The first unmet work is the ten-second ComfyUI confirmation surface.
+  binding, exact launch revalidation, persistent backend policy, and the merged
+  ten-second ComfyUI confirmation surface. The first unmet work is a merged-stack
+  end-to-end run, followed by measured history and complete cost components.
 
 ### Completed M0 corruption contract
 
@@ -1045,10 +1047,22 @@ hourly, total-cost, or region limits. A material price, cost, storage, capacity,
 quote, or confirmation-policy change returns a revised report with mandatory
 confirmation, even when normal confirmation is set to `never`.
 
-The active slice is the ComfyUI user interaction. Add the default ten-second
-countdown with Start now, Cancel, Choose another GPU, and Don't show again, plus
-the equivalent persistent settings. Measured history and the missing transfer
-and storage cost components must also improve the initial low-confidence
+Extension PR #5 completes the user interaction. It runs free preflight after
+the final boundary artifacts exist, sends only the safe report to one active
+ComfyUI browser, and uses a random one-time decision ID. The panel shows the
+recommended provider, GPU, region, hourly price, total-cost range, startup and
+execution ranges, prepared coverage, rationale, confidence, and uncertainty.
+It provides Start now, Cancel, Choose another GPU, Don't show again, a default
+countdown, mandatory changed-plan review, and the equivalent persistent settings.
+Opening details or choosing another GPU pauses automatic start. A required
+confirmation with no active browser creates no job, and cancellation during the
+server countdown cannot retry paid submission.
+
+The active slice is merged-stack end-to-end validation. Build and pin the worker
+that understands the exact prepared-volume claim, restart the coordinator,
+dispatcher, and ComfyUI from merged revisions, then prove non-paid confirmation
+behavior and one controlled paid journey. Measured history and the missing
+transfer and storage cost components must then improve the initial low-confidence
 recommendation before M1 closes.
 
 ### Operational safety rules
@@ -1074,7 +1088,7 @@ recommendation before M1 closes.
 | Milestone | Status on 2026-07-29 | Gate |
 | --- | --- | --- |
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
-| M1 — preflight, recommendation, confirmation | **In progress** | Backend report, ranking, binding, revalidation, and confirmation policy exist; the ComfyUI confirmation surface is next. |
+| M1 — preflight, recommendation, confirmation | **In progress** | Backend and ComfyUI confirmation paths are merged; merged-stack end-to-end evidence, measured history, and complete cost components remain. |
 | M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
