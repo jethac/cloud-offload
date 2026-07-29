@@ -178,7 +178,7 @@ validate the product journey.
 | `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Complete; extension PR #5, backend PR #27, and the accepted merged-stack journey prove the interaction and persistent policy. |
 | `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
 | `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Complete; the persistent Cloud Jobs surface reconstructs safe authoritative state after reload and exposes complete M2 telemetry. |
-| `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Logical cancellation baseline exists; leases and provider receipt pending. |
+| `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Implementation is complete in backend PR #34 and extension PR #8; the bounded paid cancellation and restart matrix remains before acceptance. |
 | `STORAGE-1` | Opt into or adopt RunPod storage before cached rental and attach it to compatible future Pods. | M4 foundation | Initial managed/adopted-volume MVP merged. |
 | `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
 | `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Durable population/restore baseline merged; fast trust and capsules pending. |
@@ -647,6 +647,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#31](https://github.com/jethac/cloud-offload/pull/31) | Records the accepted merged-stack replay and its automatic exact-Pod cleanup receipt. | Merged as `de49afa`; the accepted replay below closes the paid journey and cleanup evidence. |
 | [#32](https://github.com/jethac/cloud-offload/pull/32) | Adds private-data-free workload identity, read-only matched timing history, candidate-class measurement, full RunPod compute/transfer/container-storage estimates, the paid idle window, and the compact M1 evidence record. | 25 focused tests and 571 full tests passed; two repeated live free preflights were stable and created no job or Pod. M1 is complete. |
 | [#33](https://github.com/jethac/cloud-offload/pull/33) | Adds a reloadable safe job projection with lifecycle phase, monotonic progress, transfer telemetry, ETA confidence, resource identity, estimated spend, cache results, cancellation state, billing state, and bounded event summaries. It also records the compact M2 evidence. | 579 full tests passed. A live same-origin read returned 20 jobs in 350.7 ms, and privacy tests reject raw requests, workflows, prompts, paths, URLs, and provider payloads. M2 is complete. |
+| [#34](https://github.com/jethac/cloud-offload/pull/34) | Adds durable pre-mutation provider-resource leases, worker renewal and identity binding, exact cancellation revocation, restart and uncertain-launch reconciliation, independent idempotent termination, provider closure receipts, hard runtime and dollar limits, and cancelled-cache publication guards. | 593 tests passed. The automated M3 matrix covers five cancellation phases, delayed closure, a stopped but present resource, provider loss, restart recovery, both circuit breakers, late state, and cache safety. Paid RunPod proof remains. |
 
 ### ComfyUI extension repository
 
@@ -659,6 +660,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#5](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/5) | Runs free preflight after final boundary upload; presents one-time GPU rental confirmation with cost, timing, prepared coverage, rationale, uncertainty, countdown, alternate GPU choice, cancellation, and persistent settings; submits only the exact confirmed plan. | Merged as `ff872b4`; 81 Python tests passed, 3 skipped, 60 JavaScript tests passed, syntax and compile checks passed, and the settings, confirmation, details, and GPU-choice states passed a 1440×1000 visual check. Cancellation during the countdown cannot retry paid submission. |
 | [#6](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/6) | Binds ComfyUI `api.fetchApi` before the one-time rental decision POST. | Merged as `5c17b31`; 81 Python tests passed, 3 skipped, and 61 JavaScript tests passed. A failed unbound POST created no paid job. |
 | [#7](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/7) | Adds the persistent Cloud Jobs panel, safe same-origin job and cancellation routes, reload reconstruction, stable details, active/idle polling, and complete M2 telemetry. | 82 Python tests passed, 3 skipped, and 67 JavaScript tests passed. Live reload restored the open panel and 20 safe jobs; expanded details stayed open across polling. |
+| [#8](https://github.com/jethac/ComfyUI-Cloud-Offload/pull/8) | Adds the hard paid-runtime control and shows durable resource-lease identity and provider-confirmed closure time in Cloud Jobs. | 82 Python tests passed, 3 skipped, and 68 JavaScript tests passed; syntax checks passed. |
 
 ## Validation record
 
@@ -1209,7 +1211,7 @@ complete. M3 is the first unmet milestone.
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
 | M1 — preflight, recommendation, confirmation | **Complete** | All exits passed; the merged-stack paid journey, automatic cleanup, stable free preflight, measured recommendation history, and complete RunPod cost are durable. |
 | M2 — persistent visibility | **Complete** | All exits passed; the persistent Cloud Jobs surface, reload reconstruction, complete safe telemetry, and compact evidence are durable. |
-| M3 — leases and billing closure | **In progress** | Logical cancellation exists; persisted leases, independent termination, provider receipts, reconciliation, and circuit breakers are the current gate. |
+| M3 — leases and billing closure | **In progress** | The complete implementation and automated matrix pass; bounded paid RunPod cancellation, restart, exact-removal, and callback/cache evidence are the current gate. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
 | M5 — workflow capsules | **Not started** | Schema and custom-node readiness contracts remain. |
 | M6 — regional replication | **Not started** | Shadow recommendations precede automation. |
@@ -1283,6 +1285,12 @@ Exit:
 - Record provider termination receipts.
 - Reconcile non-closed leases on startup.
 - Add runtime and dollar circuit breakers.
+
+Implementation status: backend PR #34 and extension PR #8 deliver every listed
+mechanism. The automated matrix passes with 593 backend tests, 82 extension
+Python tests with 3 skips, and 68 extension JavaScript tests. M3 remains open
+until the bounded paid RunPod matrix proves exact resource removal and closure
+receipts through the merged stack.
 
 Exit:
 
