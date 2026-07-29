@@ -1,0 +1,107 @@
+{
+  "schema": "cloud-offload.m3-production-evidence.v1",
+  "milestone": "M3",
+  "accepted": true,
+  "captured_at": "2026-07-30T02:41:00+09:00",
+  "merged_stack": {
+    "backend_merge_commit": "95b9aeab0cfa11bcc1243a77faab859986b4119a",
+    "extension_merge_commit": "7b2a60f4f57be2d4b22d1dea0cb8bcd71d39c34c",
+    "worker_image_digest": "sha256:3bf4854172ecfa27a6b38efcc9f281c55843bda23ccda206e84ac58c88b65114",
+    "max_job_runtime_seconds": 7200,
+    "lease_ttl_seconds": 300
+  },
+  "automated_verification": {
+    "backend": {
+      "passed": 593,
+      "failed": 0
+    },
+    "extension_python": {
+      "passed": 82,
+      "skipped": 3,
+      "failed": 0
+    },
+    "extension_javascript": {
+      "passed": 68,
+      "failed": 0
+    },
+    "cancellation_phases": [
+      "provisioning",
+      "worker_boot",
+      "dependency_preparation",
+      "execution",
+      "result_transfer"
+    ],
+    "delayed_provider_confirmation": true,
+    "stopped_resource_is_not_closure": true,
+    "coordinator_restart_reconciliation": true,
+    "provider_loss_requeues_unfinished_work": true,
+    "runtime_breaker": true,
+    "dollar_breaker": true,
+    "late_callback_terminal_precedence": true,
+    "cancelled_cache_publication_blocked": true,
+    "uncertain_launch_recovery": true
+  },
+  "paid_runpod_campaign": {
+    "accepted": true,
+    "spend_limit_usd": 0.3,
+    "scenario_spend_limit_usd": 0.15,
+    "campaign_runtime_limit_seconds": 1200,
+    "cleanup_timeout_seconds": 180,
+    "estimated_compute_cost_upper_usd": 0.033868,
+    "manual_cleanup": false,
+    "final_provider_resource_count": 0,
+    "orphan_audit_error_count": 0,
+    "scenarios": [
+      {
+        "kind": "worker_boot_cancellation",
+        "accepted": true,
+        "job_id": "5d0bb394-b8dd-4352-84f0-93220fb6b60a",
+        "lease_id": "caccaf4a-d0ee-4ef7-a612-dd8fd19c4b86",
+        "provider_resource_id": "ha9hgesfdxgey9",
+        "terminal_status": "failed",
+        "cancellation_requested": true,
+        "duration_seconds": 38.281,
+        "resource_closure_seconds": 9.719,
+        "paid_elapsed_seconds": 14.7,
+        "estimated_compute_cost_upper_usd": 0.015844,
+        "provider_absent": true,
+        "provider_termination_confirmed": true,
+        "provider_termination_confirmed_at": "2026-07-29T17:39:26.442483+00:00"
+      },
+      {
+        "kind": "coordinator_restart_after_provider_creation",
+        "accepted": true,
+        "job_id": "5a037ce8-9eff-4e88-94ac-a54a00ec1620",
+        "lease_id": "7c24361e-b667-43f7-8061-462ccfff2ae8",
+        "provider_resource_id": "k4qg73i4szqq33",
+        "terminal_status": "failed",
+        "cancellation_requested": true,
+        "restart_hook_succeeded": true,
+        "replacement_coordinator_healthy": true,
+        "duration_seconds": 43.547,
+        "resource_closure_seconds": 10.797,
+        "paid_elapsed_seconds": 14.6,
+        "estimated_compute_cost_upper_usd": 0.018024,
+        "provider_absent": true,
+        "provider_termination_confirmed": true,
+        "provider_termination_confirmed_at": "2026-07-29T17:40:07.671024+00:00"
+      }
+    ]
+  },
+  "m3_exit_audit": {
+    "cancellation_during_every_tested_phase_removes_exact_resource": true,
+    "billing_stopped_requires_provider_acknowledgement": true,
+    "death_creates_no_orphan_beyond_reconciliation_slo": true,
+    "late_callbacks_cannot_reopen_terminal_state": true,
+    "cancelled_work_cannot_publish_unverified_cache_state": true,
+    "all_exits_passed": true
+  },
+  "privacy": {
+    "raw_request_included": false,
+    "raw_workflow_included": false,
+    "raw_prompt_included": false,
+    "private_asset_location_included": false,
+    "credential_or_secret_endpoint_included": false,
+    "hook_command_or_output_included": false
+  }
+}
