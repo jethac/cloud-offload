@@ -442,6 +442,7 @@ def test_a_partition_without_assets_behaves_exactly_as_before(monkeypatch, tmp_p
         "preflight_id",
         "manifest_digest",
         "candidate_id",
+        "confirmation_action",
     }
     job = queue.get(response.json()["job_id"])
     assert "assets" not in job.request

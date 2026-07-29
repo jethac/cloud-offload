@@ -391,6 +391,7 @@ def test_a_partition_without_node_packs_behaves_exactly_as_before(
         "preflight_id",
         "manifest_digest",
         "candidate_id",
+        "confirmation_action",
     }
     job = queue.get(response.json()["job_id"])
     assert "node_packs" not in job.request

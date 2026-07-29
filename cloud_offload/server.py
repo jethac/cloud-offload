@@ -9,14 +9,15 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -67,6 +68,16 @@ last_error: str | None = None
 _config_write_lock = threading.RLock()
 _ANY_VOLUME_BINDING = object()
 _HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
+_PREFLIGHT_POLICY_CONFIG_FIELDS = {
+    "max_hourly_rate",
+    "max_total_job_cost",
+    "recommendation_policy",
+    "rental_confirmation",
+    "confirmation_countdown_seconds",
+    "allowed_regions",
+    "material_price_change_percent",
+    "material_cost_change_percent",
+}
 
 
 # === Request/Response Models ===
@@ -97,6 +108,9 @@ class PartitionSubmitRequest(BaseModel):
     preflight_id: str | None = None
     manifest_digest: str | None = None
     candidate_id: str | None = None
+    confirmation_action: Literal[
+        "start_now", "countdown_elapsed", "policy_skip"
+    ] | None = None
     # Production benchmarking must exercise a fresh Pod rather than silently
     # accepting an already-computed partition result.
     force_execution: bool = False
@@ -106,10 +120,10 @@ class PreflightRequest(BaseModel):
     partition: dict[str, Any]
     input_artifacts: dict[str, str] = Field(default_factory=dict)
     provider: str = "auto"
-    recommendation_policy: str = "balanced"
+    recommendation_policy: str | None = None
     max_hourly_rate: float | None = Field(default=None, gt=0)
     max_total_job_cost: float | None = Field(default=None, gt=0)
-    allowed_regions: list[str] = Field(default_factory=list)
+    allowed_regions: list[str] | None = None
 
 
 # === App Setup ===
@@ -838,6 +852,16 @@ async def update_config(updates: dict[str, Any] = Body(...)):
                 payload["prepared_storage"]
             )
         except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload):
+        try:
+            validated = _config(resolve_secrets=False)
+            for field_name in _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload):
+                setattr(validated, field_name, payload[field_name])
+            validated.__post_init__()
+            for field_name in _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload):
+                payload[field_name] = getattr(validated, field_name)
+        except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     _persist_config_updates(payload)
@@ -2053,23 +2077,57 @@ def _report_candidate(
 
 
 def _preflight_changes(
-    previous: dict[str, Any], current: dict[str, Any]
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    policy: dict[str, Any],
 ) -> list[str]:
     fields = (
         "provider",
         "offer_id",
         "gpu_type",
         "gpu_ram_gb",
-        "hourly_rate",
         "region",
         "prepared_volume_id",
     )
     changes = [field for field in fields if previous.get(field) != current.get(field)]
+    if _relative_change_exceeds(
+        previous.get("hourly_rate"),
+        current.get("hourly_rate"),
+        policy.get("material_price_change_percent", 0),
+    ):
+        changes.append("hourly_rate")
     if previous.get("preparation") != current.get("preparation"):
         changes.append("preparation")
-    if previous.get("estimate") != current.get("estimate"):
+    previous_cost = _upper_estimated_cost(previous)
+    current_cost = _upper_estimated_cost(current)
+    if _relative_change_exceeds(
+        previous_cost,
+        current_cost,
+        policy.get("material_cost_change_percent", 0),
+    ):
         changes.append("estimate")
     return changes
+
+
+def _upper_estimated_cost(candidate: dict[str, Any]) -> Any:
+    values = (candidate.get("estimate") or {}).get("total_job_cost_usd") or []
+    return values[-1] if values else None
+
+
+def _relative_change_exceeds(previous: Any, current: Any, percent: Any) -> bool:
+    try:
+        before = float(previous)
+        after = float(current)
+        tolerance = max(0.0, float(percent)) / 100.0
+    except (TypeError, ValueError):
+        return previous != current
+    if not all(math.isfinite(item) for item in (before, after, tolerance)):
+        return True
+    if before == after:
+        return False
+    if before == 0:
+        return True
+    return abs(after - before) / abs(before) > tolerance
 
 
 def _expired(timestamp: str) -> bool:
@@ -2080,6 +2138,85 @@ def _expired(timestamp: str) -> bool:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed <= datetime.now(timezone.utc)
+
+
+def _confirmation_gate(
+    report: dict[str, Any], action: str | None
+) -> dict[str, Any]:
+    confirmation = report.get("confirmation") or {
+        "policy": "always",
+        "required": True,
+        "mandatory": True,
+        "reason": "missing_confirmation_contract",
+        "countdown_seconds": 10,
+        "not_before": report.get("created_at"),
+    }
+    required = bool(confirmation.get("required"))
+    if action == "start_now":
+        return {
+            "accepted": True,
+            "action": action,
+            "policy": confirmation.get("policy"),
+            "mandatory": bool(confirmation.get("mandatory")),
+        }
+    if action == "countdown_elapsed":
+        not_before = str(confirmation.get("not_before") or "")
+        if not not_before or _expired(not_before):
+            return {
+                "accepted": True,
+                "action": action,
+                "policy": confirmation.get("policy"),
+                "mandatory": bool(confirmation.get("mandatory")),
+            }
+        try:
+            start = datetime.fromisoformat(not_before.replace("Z", "+00:00"))
+            remaining = max(
+                1,
+                math.ceil((start - datetime.now(timezone.utc)).total_seconds()),
+            )
+        except ValueError:
+            remaining = int(confirmation.get("countdown_seconds") or 1)
+        return {
+            "accepted": False,
+            "code": "cloud_offload.confirmation_countdown_active",
+            "message": "The rental confirmation countdown is still active.",
+            "details": {
+                "action": "Wait for the countdown or select Start now.",
+                "remaining_seconds": remaining,
+                "confirmation": confirmation,
+            },
+        }
+    if required:
+        return {
+            "accepted": False,
+            "code": "cloud_offload.confirmation_required",
+            "message": "Confirm the recommended rental before paid launch.",
+            "details": {
+                "action": "Select Start now or wait for the countdown.",
+                "confirmation": confirmation,
+            },
+        }
+    return {
+        "accepted": True,
+        "action": "policy_skip",
+        "policy": confirmation.get("policy"),
+        "mandatory": bool(confirmation.get("mandatory")),
+    }
+
+
+def _iso_confirmation_not_before(report: dict[str, Any]) -> str:
+    confirmation = report.get("confirmation") or {}
+    try:
+        created = datetime.fromisoformat(
+            str(report.get("created_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        created = datetime.now(timezone.utc)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    countdown = max(0, int(confirmation.get("countdown_seconds") or 0))
+    value = created + timedelta(seconds=countdown)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _revalidate_partition_preflight(
@@ -2130,6 +2267,10 @@ def _revalidate_partition_preflight(
             "details": {"action": "Resolve its blockers or unknown provider state."},
         }
 
+    confirmation = _confirmation_gate(previous, request.confirmation_action)
+    if not confirmation["accepted"]:
+        return confirmation
+
     policy = previous.get("request_policy") or {}
     current = build_partition_preflight(
         config=config,
@@ -2150,7 +2291,6 @@ def _revalidate_partition_preflight(
             "message": "Preflight revalidation produced an invalid report.",
             "details": {"action": "Check coordinator logs and run preflight again."},
         }
-    store.put(current)
     current_candidate = _report_candidate(current, request.candidate_id)
     changes = (
         ["manifest_digest"]
@@ -2160,13 +2300,30 @@ def _revalidate_partition_preflight(
     if current_candidate is None:
         changes.append("candidate_availability")
     else:
-        changes.extend(_preflight_changes(previous_candidate, current_candidate))
+        changes.extend(
+            _preflight_changes(previous_candidate, current_candidate, policy)
+        )
     if _expired(str(previous.get("expires_at") or "")):
         changes.append("quote_expired")
     if current.get("status") not in {"ready", "ready_with_preparation"}:
         changes.append("readiness")
+    previous_confirmation = previous.get("confirmation") or {}
+    current_confirmation = current.get("confirmation") or {}
+    for field_name in ("policy", "countdown_seconds"):
+        if previous_confirmation.get(field_name) != current_confirmation.get(field_name):
+            changes.append("confirmation_policy")
     changes = list(dict.fromkeys(changes))
     if changes:
+        current_confirmation.update(
+            {
+                "required": True,
+                "mandatory": True,
+                "reason": "material_change",
+                "not_before": _iso_confirmation_not_before(current),
+            }
+        )
+        current["confirmation"] = current_confirmation
+        store.put(current)
         return {
             "accepted": False,
             "code": "cloud_offload.preflight_changed",
@@ -2177,10 +2334,12 @@ def _revalidate_partition_preflight(
                 "revised_preflight": current,
             },
         }
+    store.put(current)
     return {
         "accepted": True,
         "report": current,
         "candidate": current_candidate,
+        "confirmation": confirmation,
     }
 
 
@@ -2418,6 +2577,12 @@ async def submit_partition(request: PartitionSubmitRequest):
         )
     confirmed_report = preflight_binding["report"]
     confirmed_candidate = preflight_binding["candidate"]
+    confirmation_evidence = preflight_binding.get("confirmation") or {
+        "accepted": True,
+        "action": request.confirmation_action or "policy_skip",
+        "policy": "test_or_legacy_binding",
+        "mandatory": False,
+    }
     confirmed_offer = {
         "id": confirmed_candidate["offer_id"],
         "provider": confirmed_candidate["provider"],
@@ -2440,6 +2605,7 @@ async def submit_partition(request: PartitionSubmitRequest):
         "prepared_volume_id": confirmed_candidate.get("prepared_volume_id"),
         "estimate": confirmed_candidate["estimate"],
         "request_policy": confirmed_report["request_policy"],
+        "confirmation": confirmation_evidence,
     }
     job = queue.create(
         model="comfyui-partition-v1",
@@ -2476,6 +2642,7 @@ async def submit_partition(request: PartitionSubmitRequest):
         "preflight_id": confirmed_report["preflight_id"],
         "manifest_digest": confirmed_report["manifest_digest"],
         "candidate_id": confirmed_candidate["candidate_id"],
+        "confirmation_action": confirmation_evidence["action"],
         **({"cache_bypassed": True} if request.force_execution else {}),
         "storage": storage_summary,
         **_asset_warnings(assets),

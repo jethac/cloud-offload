@@ -26,10 +26,10 @@ The request contains:
 | `partition` | A `comfy.partition.job.v1` compiled partition. |
 | `input_artifacts` | Boundary key to immutable artifact digest. |
 | `provider` | `auto` or one allowed provider. |
-| `recommendation_policy` | `balanced`, `cheapest`, `fastest`, or `manual`. |
-| `max_hourly_rate` | Optional hard hourly price limit. |
-| `max_total_job_cost` | Optional hard limit applied to the current upper compute-cost estimate. |
-| `allowed_regions` | Optional hard region allowlist. |
+| `recommendation_policy` | Optional request override for `balanced`, `cheapest`, `fastest`, or `manual`. The configured policy is the default. |
+| `max_hourly_rate` | Optional stricter hourly price limit. It cannot loosen the configured hard limit. |
+| `max_total_job_cost` | Optional stricter limit applied to the current upper total-cost estimate. It cannot loosen the configured hard limit. |
+| `allowed_regions` | Optional stricter region allowlist. It cannot add a region outside the configured allowlist. |
 
 ## Deterministic proof
 
@@ -90,6 +90,29 @@ The report identifies missing execution history and unmeasured incremental
 transfer or storage charges as unknowns. It does not present these unknowns as
 proof. Later M1 slices will use measured history and complete cost components.
 
+## Rental confirmation
+
+The safe report includes a `confirmation` object. It contains the configured
+policy, the countdown duration, whether confirmation is required, whether the
+interruption is mandatory, and the server-controlled `not_before` time.
+
+The durable settings are:
+
+| Setting | Values and default |
+| --- | --- |
+| `rental_confirmation` | `always` by default, `material_changes`, or `never`. |
+| `confirmation_countdown_seconds` | 0 through 60; 10 by default. |
+| `recommendation_policy` | `balanced` by default, `cheapest`, `fastest`, or `manual`. |
+| `max_hourly_rate` | Hard positive hourly limit. |
+| `max_total_job_cost` | Optional hard positive total-cost limit. |
+| `allowed_regions` | Optional hard region allowlist. |
+| `material_price_change_percent` | Price-change tolerance; 5% by default. |
+| `material_cost_change_percent` | Estimated total-cost tolerance; 10% by default. |
+
+`POST /api/config` validates and persists these non-secret settings. Skipping
+normal confirmation does not disable price, total-cost, region, residency, GPU,
+or provider constraints.
+
 ## Status
 
 | Status | Meaning |
@@ -115,14 +138,23 @@ A partition that needs paid execution must submit:
 - `manifest_digest`; and
 - one `candidate_id` from that report.
 
+When confirmation is required, the request must also submit
+`confirmation_action` as `start_now` or `countdown_elapsed`. `start_now` is the
+explicit user action. The coordinator accepts `countdown_elapsed` only after
+the report's server-controlled `not_before` time. When the active policy does
+not require normal confirmation, the action can be omitted and the accepted
+job records `policy_skip`.
+
 A valid completed partition-cache hit stays free and does not require these
 fields. Every cache miss requires them before the coordinator queues the job.
 
 The submit route reads current facts again. It returns HTTP 409 without queuing
 the job when the report is absent, blocked, expired, or does not match the
 partition, or when the chosen offer, GPU, price, region, volume, preparation, or
-estimate changed. A changed response includes a new safe preflight report for a
-new user decision.
+estimate changed beyond the configured tolerances. A changed response includes
+a new safe preflight report for a new user decision. That report has mandatory
+confirmation even when normal confirmation is set to `material_changes` or
+`never`.
 
 The queued job contains only the safe confirmed launch projection. Immediately
 before provider launch, the dispatcher reads the exact offer and prepared volume

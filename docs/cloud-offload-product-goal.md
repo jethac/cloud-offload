@@ -173,8 +173,8 @@ validate the product journey.
 | `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; confirmed launch now binds to the selected offer and prepared volume. |
 | `READY-1` | Prove deterministic requirements before provider mutation. | M1 | `PreflightReportV1`, paid-submit binding, and launch-time revalidation exist; UI confirmation evidence remains. |
 | `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Initial explainable ranking exists; measured history and complete cost components remain. |
-| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | In progress; M0 is closed. |
-| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | In progress; M0 is closed. |
+| `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | Backend countdown enforcement exists; the ComfyUI surface remains. |
+| `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | Persistent backend policy exists; the ComfyUI actions and settings remain. |
 | `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
 | `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Initial canvas feedback merged; durable drawer pending. |
 | `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Logical cancellation baseline exists; leases and provider receipt pending. |
@@ -639,6 +639,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#24](https://github.com/jethac/cloud-offload/pull/24) | Commits the compact redacted seven-scenario production projection, checks its completeness and redaction contract, records the accepted corruption replay, and audits every M0 exit. | 535 tests passed; M0 is complete and M1 is active. |
 | [#25](https://github.com/jethac/cloud-offload/pull/25) | Adds the read-only `cloud-offload.preflight.v1` report and endpoint, deterministic blockers, safe volatile offer reads, storage-local candidate ranking, cost/time ranges, quote expiry, and explicit unknowns. | 541 tests passed. Provider-mutation guard tests pass; submission binding is the next M1 slice. |
 | [#26](https://github.com/jethac/cloud-offload/pull/26) | Persists the safe preflight report, binds each paid cache miss to one confirmed candidate, revalidates provider facts before queue creation and launch, prevents silent offer or storage substitution, constrains prepared workers to the exact volume, and makes benchmarks use preflight. | 552 tests passed. Failed revalidation creates no job or provider resource; confirmation policy and UI remain. |
+| [#27](https://github.com/jethac/cloud-offload/pull/27) | Adds durable rental-confirmation, countdown, recommendation, hard cost, region, and material-change settings; enforces Start now or server-timed countdown completion; and makes material changes restart mandatory confirmation even under `never`. | 558 tests passed. Early or missing confirmation and disjoint region policy create no job or provider resource. |
 
 ### ComfyUI extension repository
 
@@ -935,8 +936,8 @@ Status snapshot as of 2026-07-29:
   replay proved exact manifest authority, quarantine, safe terminal behavior,
   and complete automated cleanup in production.
 - M0 is complete. M1 now has the versioned report, recommendation, paid-submit
-  binding, and exact launch revalidation. The first unmet work is the persistent
-  confirmation policy, followed by the ten-second ComfyUI confirmation surface.
+  binding, exact launch revalidation, and persistent backend confirmation
+  policy. The first unmet work is the ten-second ComfyUI confirmation surface.
 
 ### Completed M0 corruption contract
 
@@ -1037,12 +1038,18 @@ storage. A prepared worker can claim the job only when it mounted the exact
 confirmed volume. Confirmed work starts at queue depth one so that normal batch
 delay does not consume the 60-second quote lifetime.
 
-The active slice is confirmation policy and user interaction. Add the durable
-setting that controls normal confirmation, keep hard spend and policy checks
-active in all modes, and then add the default ten-second ComfyUI countdown with
-Start now, Cancel, Choose another GPU, and Don't show again. Measured history
-and the missing transfer and storage cost components must also improve the
-initial low-confidence recommendation before M1 closes.
+PR #27 adds the durable confirmation policy and enforces it at the coordinator.
+The server controls countdown timing, accepts explicit Start now, and records
+the accepted action. Preflight requests can tighten but cannot loosen configured
+hourly, total-cost, or region limits. A material price, cost, storage, capacity,
+quote, or confirmation-policy change returns a revised report with mandatory
+confirmation, even when normal confirmation is set to `never`.
+
+The active slice is the ComfyUI user interaction. Add the default ten-second
+countdown with Start now, Cancel, Choose another GPU, and Don't show again, plus
+the equivalent persistent settings. Measured history and the missing transfer
+and storage cost components must also improve the initial low-confidence
+recommendation before M1 closes.
 
 ### Operational safety rules
 
@@ -1067,7 +1074,7 @@ initial low-confidence recommendation before M1 closes.
 | Milestone | Status on 2026-07-29 | Gate |
 | --- | --- | --- |
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
-| M1 — preflight, recommendation, confirmation | **In progress** | Report, initial ranking, paid-submit binding, and exact launch revalidation exist; confirmation policy and UI are next. |
+| M1 — preflight, recommendation, confirmation | **In progress** | Backend report, ranking, binding, revalidation, and confirmation policy exist; the ComfyUI confirmation surface is next. |
 | M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
