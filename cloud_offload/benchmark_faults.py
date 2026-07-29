@@ -7,6 +7,7 @@ still gated by the campaign's explicit ``--allow-hooks`` acknowledgement.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -427,10 +428,51 @@ def observe_corruption(
     }
 
 
+def _windows_process_exists(pid: int, *, kernel32: Any | None = None) -> bool:
+    """Query a Windows process without using ``os.kill(pid, 0)``.
+
+    CPython implements ``os.kill`` through Windows termination APIs rather than
+    the POSIX existence probe. During process exit, signal 0 can surface as a
+    ``SystemError`` and strand the restart canary after it has stopped the old
+    coordinator. ``OpenProcess`` plus ``GetExitCodeProcess`` gives the state we
+    actually need and never signals the target.
+    """
+
+    if pid <= 0:
+        return False
+    configure = kernel32 is None
+    if kernel32 is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if configure:
+        kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+    process_query_limited_information = 0x1000
+    still_active = 259
+    handle = kernel32.OpenProcess(process_query_limited_information, 0, pid)
+    if not handle:
+        return False
+    exit_code = ctypes.c_ulong()
+    try:
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _process_exists(pid: int) -> bool:
+    if os.name == "nt":
+        return _windows_process_exists(pid)
     try:
         os.kill(pid, 0)
-    except OSError:
+    except (OSError, SystemError):
         return False
     return True
 
