@@ -1274,6 +1274,7 @@ class PlacementProvider(CloudConnector):
         startup_script=None,
         disk_gb=None,
         placement=None,
+        resource_name=None,
     ):
         self.launches.append(placement)
         self.launch_environments.append(dict(env_vars or {}))
@@ -1286,6 +1287,7 @@ class PlacementProvider(CloudConnector):
             1,
             0.4,
             "running",
+            metadata={"name": resource_name},
         )
 
     def get_storage(self, storage_id):

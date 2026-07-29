@@ -14,7 +14,7 @@ Each job includes only allow-listed fields:
 - status, lifecycle stage, current operation, monotonic progress, and elapsed
   time;
 - measured transfer bytes, smoothed throughput, and a confidence-bounded ETA;
-- provider, GPU, region, Pod, and prepared-volume IDs;
+- provider, GPU, region, Pod, resource-lease, and prepared-volume IDs;
 - hourly rate, estimated accrued spend, and the confirmed preflight cost range;
 - cache hit, miss, restored-byte, and saved-item counts;
 - preflight confidence and matched-history count;
@@ -58,5 +58,8 @@ The browser can show these states:
   receipt exists; and
 - `stopped`: a provider termination receipt exists.
 
-The M2 view does not infer that billing stopped from job completion. M3 will
-make provider closure receipts and lease reconciliation authoritative.
+The view does not infer that billing stopped from job completion, worker exit,
+or a provider status of `stopped`. The dispatcher writes the closure receipt
+only after the provider reports the exact resource absent or `terminated`.
+Paid elapsed time then stops at the receipt time. See
+[Job leases and provider closure](job-leases.md).

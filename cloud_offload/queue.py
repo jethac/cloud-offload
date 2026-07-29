@@ -43,6 +43,7 @@ JOB_EVENT_RESOURCE_FIELDS = (
     "cache_provider_volume_id",
     "gpu_type",
     "hourly_rate",
+    "lease_id",
 )
 JOB_LIFECYCLE_EVENT_TYPES = (
     "job_created",
@@ -193,6 +194,45 @@ class JobStatus(str, Enum):
     DEAD_LETTER = "dead_letter"  # Retry limit exceeded
 
 
+LEASE_OPEN_STATUSES = (
+    "provisioning",
+    "active",
+    "revocation_requested",
+    "terminating",
+)
+
+
+@dataclass(frozen=True)
+class JobLease:
+    """Durable control-plane authority for one paid provider resource."""
+
+    id: str
+    provider: str
+    resource_name: str
+    runtime_profile: str
+    status: str
+    created_at: str
+    updated_at: str
+    expires_at: str
+    renewed_at: str
+    instance_id: str | None = None
+    worker_id: str | None = None
+    hourly_rate: float | None = None
+    max_runtime_seconds: int | None = None
+    max_cost_usd: float | None = None
+    runtime_deadline: str | None = None
+    cost_deadline: str | None = None
+    revoked_at: str | None = None
+    termination_requested_at: str | None = None
+    termination_confirmed_at: str | None = None
+    termination_attempts: int = 0
+    reason: str | None = None
+    last_error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class Job:
     """A cloud offload job."""
@@ -245,7 +285,7 @@ class Job:
 class JobQueue:
     """SQLite-backed job queue."""
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -462,6 +502,55 @@ class JobQueue:
                 conn.execute("ALTER TABLE workers ADD COLUMN idle_since TEXT")
             if "detail" not in worker_columns:
                 conn.execute("ALTER TABLE workers ADD COLUMN detail TEXT")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS job_leases (
+                    id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    instance_id TEXT,
+                    resource_name TEXT NOT NULL,
+                    runtime_profile TEXT NOT NULL,
+                    worker_id TEXT,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    renewed_at TEXT NOT NULL,
+                    hourly_rate REAL,
+                    max_runtime_seconds INTEGER,
+                    max_cost_usd REAL,
+                    runtime_deadline TEXT,
+                    cost_deadline TEXT,
+                    revoked_at TEXT,
+                    termination_requested_at TEXT,
+                    termination_confirmed_at TEXT,
+                    termination_attempts INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    last_error TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_job_leases_instance
+                ON job_leases(provider, instance_id)
+                WHERE instance_id IS NOT NULL
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_job_leases_status
+                ON job_leases(status, updated_at)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS job_lease_jobs (
+                    lease_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    attached_at TEXT NOT NULL,
+                    PRIMARY KEY (lease_id, job_id),
+                    FOREIGN KEY(lease_id) REFERENCES job_leases(id) ON DELETE CASCADE,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_job_lease_jobs_job
+                ON job_lease_jobs(job_id, lease_id)
+            """)
 
     def _get_meta(self, key: str) -> str | None:
         with sqlite3.connect(self.db_path) as conn:
@@ -670,6 +759,529 @@ class JobQueue:
             (sequence,),
         ).fetchone()
         return _job_event_envelope(row)
+
+    @staticmethod
+    def _row_to_lease(row: tuple) -> JobLease:
+        return JobLease(
+            id=row[0],
+            provider=row[1],
+            instance_id=row[2],
+            resource_name=row[3],
+            runtime_profile=row[4],
+            worker_id=row[5],
+            status=row[6],
+            created_at=row[7],
+            updated_at=row[8],
+            expires_at=row[9],
+            renewed_at=row[10],
+            hourly_rate=row[11],
+            max_runtime_seconds=row[12],
+            max_cost_usd=row[13],
+            runtime_deadline=row[14],
+            cost_deadline=row[15],
+            revoked_at=row[16],
+            termination_requested_at=row[17],
+            termination_confirmed_at=row[18],
+            termination_attempts=int(row[19] or 0),
+            reason=row[20],
+            last_error=row[21],
+        )
+
+    @staticmethod
+    def _lease_select() -> str:
+        return (
+            "SELECT id, provider, instance_id, resource_name, runtime_profile, "
+            "worker_id, status, created_at, updated_at, expires_at, renewed_at, "
+            "hourly_rate, max_runtime_seconds, max_cost_usd, runtime_deadline, "
+            "cost_deadline, revoked_at, termination_requested_at, "
+            "termination_confirmed_at, termination_attempts, reason, last_error "
+            "FROM job_leases"
+        )
+
+    @staticmethod
+    def _attached_job_ids(conn: sqlite3.Connection, lease_id: str) -> list[str]:
+        return [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT job_id FROM job_lease_jobs WHERE lease_id = ? ORDER BY attached_at",
+                (lease_id,),
+            ).fetchall()
+        ]
+
+    def _append_lease_event(
+        self,
+        conn: sqlite3.Connection,
+        lease_id: str,
+        event: dict[str, Any],
+        *,
+        observed_at: str,
+    ) -> None:
+        for job_id in self._attached_job_ids(conn, lease_id):
+            self._append_event_in_transaction(
+                conn,
+                job_id,
+                event,
+                producer_id="dispatcher:lease-control",
+                occurred_at=observed_at,
+                observed_at=observed_at,
+            )
+
+    def create_lease(
+        self,
+        *,
+        provider: str,
+        runtime_profile: str,
+        job_ids: list[str] | None = None,
+        hourly_rate: float | None = None,
+        max_runtime_seconds: int | None = None,
+        max_cost_usd: float | None = None,
+        ttl_seconds: int = 300,
+        lease_id: str | None = None,
+    ) -> JobLease:
+        """Create durable authority before the provider mutation starts."""
+        normalized_provider = str(provider).strip()
+        normalized_profile = str(runtime_profile).strip()
+        if not normalized_provider or not normalized_profile:
+            raise ValueError("A lease requires provider and runtime profile")
+        ttl = max(1, int(ttl_seconds))
+        now = datetime.utcnow()
+        now_text = now.isoformat()
+        identifier = str(lease_id or uuid.uuid4())
+        resource_name = f"cloud-offload-{identifier.replace('-', '')[:16]}"
+        rate = float(hourly_rate) if hourly_rate is not None else None
+        runtime_limit = (
+            max(1, int(max_runtime_seconds))
+            if max_runtime_seconds is not None
+            else None
+        )
+        cost_limit = float(max_cost_usd) if max_cost_usd is not None else None
+        if rate is not None and rate < 0:
+            raise ValueError("Lease hourly rate cannot be negative")
+        if cost_limit is not None and cost_limit <= 0:
+            raise ValueError("Lease cost limit must be greater than zero")
+        if cost_limit is not None and (rate is None or rate <= 0):
+            raise ValueError("A lease cost limit requires a positive hourly rate")
+        runtime_deadline = (
+            (now + timedelta(seconds=runtime_limit)).isoformat()
+            if runtime_limit is not None
+            else None
+        )
+        cost_deadline = (
+            (now + timedelta(seconds=3600 * cost_limit / rate)).isoformat()
+            if cost_limit is not None and rate is not None and rate > 0
+            else None
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO job_leases (
+                    id, provider, instance_id, resource_name, runtime_profile,
+                    worker_id, status, created_at, updated_at, expires_at,
+                    renewed_at, hourly_rate, max_runtime_seconds, max_cost_usd,
+                    runtime_deadline, cost_deadline, revoked_at,
+                    termination_requested_at, termination_confirmed_at,
+                    termination_attempts, reason, last_error
+                ) VALUES (?, ?, NULL, ?, ?, NULL, 'provisioning', ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          NULL, NULL, NULL, 0, NULL, NULL)
+                """,
+                (
+                    identifier,
+                    normalized_provider,
+                    resource_name,
+                    normalized_profile,
+                    now_text,
+                    now_text,
+                    (now + timedelta(seconds=ttl)).isoformat(),
+                    now_text,
+                    rate,
+                    runtime_limit,
+                    cost_limit,
+                    runtime_deadline,
+                    cost_deadline,
+                ),
+            )
+            for job_id in dict.fromkeys(str(item) for item in (job_ids or [])):
+                if not conn.execute(
+                    "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone():
+                    raise KeyError(f"Job not found: {job_id}")
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO job_lease_jobs (lease_id, job_id, attached_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (identifier, job_id, now_text),
+                )
+            self._append_lease_event(
+                conn,
+                identifier,
+                {
+                    "type": "lease_created",
+                    "phase": "provisioning",
+                    "lease_id": identifier,
+                    "provider": normalized_provider,
+                    "runtime_profile": normalized_profile,
+                    "hourly_rate": rate,
+                    "runtime_deadline": runtime_deadline,
+                    "cost_deadline": cost_deadline,
+                },
+                observed_at=now_text,
+            )
+            row = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (identifier,)
+            ).fetchone()
+        return self._row_to_lease(row)
+
+    def get_lease(self, lease_id: str) -> JobLease | None:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+        return self._row_to_lease(row) if row else None
+
+    def list_open_leases(self) -> list[JobLease]:
+        placeholders = ",".join("?" * len(LEASE_OPEN_STATUSES))
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                f"{self._lease_select()} WHERE status IN ({placeholders}) ORDER BY created_at",
+                LEASE_OPEN_STATUSES,
+            ).fetchall()
+        return [self._row_to_lease(row) for row in rows]
+
+    def leases_for_job(self, job_id: str, *, open_only: bool = False) -> list[JobLease]:
+        clause = ""
+        values: list[Any] = [str(job_id)]
+        if open_only:
+            clause = f" AND lease.status IN ({','.join('?' * len(LEASE_OPEN_STATUSES))})"
+            values.extend(LEASE_OPEN_STATUSES)
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                self._lease_select().replace(
+                    "FROM job_leases",
+                    "FROM job_leases AS lease JOIN job_lease_jobs AS link ON link.lease_id = lease.id",
+                )
+                + " WHERE link.job_id = ?"
+                + clause
+                + " ORDER BY lease.created_at",
+                values,
+            ).fetchall()
+        return [self._row_to_lease(row) for row in rows]
+
+    def jobs_for_lease(self, lease_id: str) -> list[Job]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT jobs.* FROM jobs
+                JOIN job_lease_jobs ON job_lease_jobs.job_id = jobs.id
+                WHERE job_lease_jobs.lease_id = ?
+                ORDER BY jobs.created_at
+                """,
+                (str(lease_id),),
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
+
+    def attach_job_to_lease(self, lease_id: str, job_id: str) -> None:
+        now = datetime.utcnow().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute(
+                "SELECT 1 FROM job_leases WHERE id = ?", (str(lease_id),)
+            ).fetchone():
+                raise KeyError(f"Lease not found: {lease_id}")
+            if not conn.execute("SELECT 1 FROM jobs WHERE id = ?", (str(job_id),)).fetchone():
+                raise KeyError(f"Job not found: {job_id}")
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO job_lease_jobs (lease_id, job_id, attached_at)
+                VALUES (?, ?, ?)
+                """,
+                (str(lease_id), str(job_id), now),
+            )
+            if cursor.rowcount:
+                self._append_event_in_transaction(
+                    conn,
+                    str(job_id),
+                    {
+                        "type": "lease_job_attached",
+                        "phase": "provisioning",
+                        "lease_id": str(lease_id),
+                    },
+                    producer_id="coordinator:lease-control",
+                    occurred_at=now,
+                    observed_at=now,
+                )
+
+    def bind_lease(
+        self,
+        lease_id: str,
+        instance_id: str,
+        *,
+        worker_id: str | None = None,
+        ttl_seconds: int = 300,
+    ) -> JobLease:
+        """Bind the pre-mutation lease to the exact provider resource."""
+        now = datetime.utcnow()
+        now_text = now.isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Lease not found: {lease_id}")
+            current = self._row_to_lease(row)
+            if current.instance_id and current.instance_id != str(instance_id):
+                raise ValueError("Lease is already bound to a different provider resource")
+            if current.status not in {"provisioning", "active"}:
+                return current
+            conn.execute(
+                """
+                UPDATE job_leases SET instance_id = ?, worker_id = COALESCE(worker_id, ?),
+                    status = 'active', updated_at = ?, renewed_at = ?, expires_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(instance_id),
+                    str(worker_id) if worker_id else None,
+                    now_text,
+                    now_text,
+                    (now + timedelta(seconds=max(1, int(ttl_seconds)))).isoformat(),
+                    str(lease_id),
+                ),
+            )
+            self._append_lease_event(
+                conn,
+                str(lease_id),
+                {
+                    "type": "lease_bound",
+                    "phase": "provisioning",
+                    "lease_id": str(lease_id),
+                    "provider": current.provider,
+                    "worker_instance_id": str(instance_id),
+                    "hourly_rate": current.hourly_rate,
+                },
+                observed_at=now_text,
+            )
+            updated = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+        return self._row_to_lease(updated)
+
+    def renew_lease(
+        self,
+        lease_id: str,
+        *,
+        worker_id: str | None = None,
+        ttl_seconds: int = 300,
+    ) -> JobLease:
+        now = datetime.utcnow()
+        now_text = now.isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Lease not found: {lease_id}")
+            lease = self._row_to_lease(row)
+            if lease.status != "active":
+                return lease
+            if lease.worker_id and worker_id and lease.worker_id != str(worker_id):
+                raise PermissionError("Lease is bound to a different worker")
+            conn.execute(
+                """
+                UPDATE job_leases SET worker_id = COALESCE(worker_id, ?),
+                    updated_at = ?, renewed_at = ?, expires_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (
+                    str(worker_id) if worker_id else None,
+                    now_text,
+                    now_text,
+                    (now + timedelta(seconds=max(1, int(ttl_seconds)))).isoformat(),
+                    str(lease_id),
+                ),
+            )
+            updated = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+        return self._row_to_lease(updated)
+
+    def request_lease_revocation(self, lease_id: str, reason: str) -> JobLease:
+        now = datetime.utcnow().isoformat()
+        safe_reason = str(reason).strip()[:256] or "revoked"
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Lease not found: {lease_id}")
+            current = self._row_to_lease(row)
+            if current.status not in LEASE_OPEN_STATUSES:
+                return current
+            if current.status not in {"revocation_requested", "terminating"}:
+                conn.execute(
+                    """
+                    UPDATE job_leases SET status = 'revocation_requested',
+                        revoked_at = ?, updated_at = ?, expires_at = ?, reason = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, now, safe_reason, str(lease_id)),
+                )
+                self._append_lease_event(
+                    conn,
+                    str(lease_id),
+                    {
+                        "type": "lease_revoked",
+                        "phase": "resource_closure",
+                        "lease_id": str(lease_id),
+                        "provider": current.provider,
+                        "worker_instance_id": current.instance_id,
+                        "reason": safe_reason,
+                    },
+                    observed_at=now,
+                )
+            updated = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+        return self._row_to_lease(updated)
+
+    def request_job_lease_revocation(self, job_id: str, reason: str) -> list[JobLease]:
+        leases = self.leases_for_job(job_id, open_only=True)
+        return [self.request_lease_revocation(item.id, reason) for item in leases]
+
+    def record_termination_attempt(
+        self, lease_id: str, *, error: str | None = None
+    ) -> JobLease:
+        now = datetime.utcnow().isoformat()
+        safe_error = str(error)[:256] if error else None
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Lease not found: {lease_id}")
+            current = self._row_to_lease(row)
+            if current.status not in LEASE_OPEN_STATUSES:
+                return current
+            conn.execute(
+                """
+                UPDATE job_leases SET status = 'terminating', updated_at = ?,
+                    termination_requested_at = COALESCE(termination_requested_at, ?),
+                    termination_attempts = termination_attempts + 1,
+                    last_error = ? WHERE id = ?
+                """,
+                (now, now, safe_error, str(lease_id)),
+            )
+            updated = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+            updated_lease = self._row_to_lease(updated)
+            self._append_lease_event(
+                conn,
+                str(lease_id),
+                {
+                    "type": "provider_termination_requested",
+                    "phase": "resource_closure",
+                    "lease_id": str(lease_id),
+                    "provider": current.provider,
+                    "worker_instance_id": current.instance_id,
+                    "attempt": updated_lease.termination_attempts,
+                },
+                observed_at=now,
+            )
+        return updated_lease
+
+    def confirm_lease_termination(
+        self,
+        lease_id: str,
+        *,
+        observed_state: str,
+        provider_absent: bool,
+    ) -> JobLease:
+        """Persist the provider observation that ends the billing claim."""
+        now = datetime.utcnow().isoformat()
+        state = str(observed_state).strip()[:64] or "absent"
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Lease not found: {lease_id}")
+            current = self._row_to_lease(row)
+            if current.status == "closed" and current.termination_confirmed_at:
+                return current
+            conn.execute(
+                """
+                UPDATE job_leases SET status = 'closed', updated_at = ?,
+                    termination_confirmed_at = ?, expires_at = ?, last_error = NULL
+                WHERE id = ?
+                """,
+                (now, now, now, str(lease_id)),
+            )
+            self._append_lease_event(
+                conn,
+                str(lease_id),
+                {
+                    "type": "provider_termination_completed",
+                    "phase": "resource_closure",
+                    "lease_id": str(lease_id),
+                    "provider": current.provider,
+                    "worker_instance_id": current.instance_id,
+                    "evidence": {
+                        "provider_acknowledged": True,
+                        "provider_absent": bool(provider_absent),
+                        "observed_state": state,
+                        "termination_attempts": current.termination_attempts,
+                    },
+                },
+                observed_at=now,
+            )
+            updated = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+        return self._row_to_lease(updated)
+
+    def close_unbound_lease(self, lease_id: str, reason: str) -> JobLease:
+        """Close a launch intent only after the provider reports no resource."""
+        now = datetime.utcnow().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Lease not found: {lease_id}")
+            current = self._row_to_lease(row)
+            if current.instance_id:
+                raise ValueError("A bound lease requires provider termination evidence")
+            conn.execute(
+                """
+                UPDATE job_leases SET status = 'closed', updated_at = ?, expires_at = ?,
+                    reason = ? WHERE id = ?
+                """,
+                (now, now, str(reason)[:256], str(lease_id)),
+            )
+            self._append_lease_event(
+                conn,
+                str(lease_id),
+                {
+                    "type": "lease_closed_without_resource",
+                    "phase": "provisioning",
+                    "lease_id": str(lease_id),
+                    "provider": current.provider,
+                    "reason": str(reason)[:256],
+                },
+                observed_at=now,
+            )
+            updated = conn.execute(
+                f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+            ).fetchone()
+        return self._row_to_lease(updated)
 
     def create(
         self,
@@ -925,6 +1537,8 @@ class JobQueue:
         gpu_vram_gb: float | None = None,
         gpu_name: str | None = None,
         cache_volume_id: str | None = None,
+        lease_id: str | None = None,
+        lease_ttl_seconds: int = 300,
     ) -> list[Job]:
         """
         Atomically claim queued jobs for a worker.
@@ -933,6 +1547,41 @@ class JobQueue:
         self._verify_worker_token(token)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            lease = None
+            now = datetime.utcnow()
+            now_text = now.isoformat()
+            if lease_id:
+                lease_row = conn.execute(
+                    f"{self._lease_select()} WHERE id = ?", (str(lease_id),)
+                ).fetchone()
+                if not lease_row:
+                    raise PermissionError("Worker lease does not exist")
+                lease = self._row_to_lease(lease_row)
+                if lease.status != "active":
+                    raise PermissionError("Worker lease is not active")
+                if provider and lease.provider != provider:
+                    raise PermissionError("Worker lease provider does not match")
+                if lease.worker_id and lease.worker_id != worker_id:
+                    raise PermissionError("Worker lease is bound to a different worker")
+                if datetime.fromisoformat(lease.expires_at) <= now:
+                    raise PermissionError("Worker lease expired")
+                conn.execute(
+                    """
+                    UPDATE job_leases SET worker_id = COALESCE(worker_id, ?),
+                        updated_at = ?, renewed_at = ?, expires_at = ?
+                    WHERE id = ? AND status = 'active'
+                    """,
+                    (
+                        worker_id,
+                        now_text,
+                        now_text,
+                        (
+                            now
+                            + timedelta(seconds=max(1, int(lease_ttl_seconds)))
+                        ).isoformat(),
+                        str(lease_id),
+                    ),
+                )
             # Get job IDs to claim
             provider_clause = " AND provider = ?" if provider else ""
             models_clause = ""
@@ -1002,7 +1651,7 @@ class JobQueue:
                 return []
 
             # Claim them atomically
-            now = datetime.utcnow().isoformat()
+            claimed_at = datetime.utcnow().isoformat()
             placeholders = ",".join("?" * len(job_ids))
             conn.execute(
                 f"""
@@ -1013,7 +1662,7 @@ class JobQueue:
                     updated_at = ?
                 WHERE id IN ({placeholders})
                 """,
-                [JobStatus.DISPATCHED.value, worker_id, now] + job_ids,
+                [JobStatus.DISPATCHED.value, worker_id, claimed_at] + job_ids,
             )
             claimed = []
             for job_id in job_ids:
@@ -1023,6 +1672,14 @@ class JobQueue:
                 if not row:
                     continue
                 job = self._row_to_job(row)
+                if lease is not None:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO job_lease_jobs (lease_id, job_id, attached_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (lease.id, job.id, claimed_at),
+                    )
                 self._append_event_in_transaction(
                     conn,
                     job.id,
@@ -1032,9 +1689,25 @@ class JobQueue:
                         previous_status=JobStatus.QUEUED,
                     ),
                     producer_id="coordinator:job-queue",
-                    occurred_at=now,
-                    observed_at=now,
+                    occurred_at=claimed_at,
+                    observed_at=claimed_at,
                 )
+                if lease is not None:
+                    self._append_event_in_transaction(
+                        conn,
+                        job.id,
+                        {
+                            "type": "lease_job_claimed",
+                            "phase": "worker_boot",
+                            "lease_id": lease.id,
+                            "provider": lease.provider,
+                            "worker_instance_id": lease.instance_id,
+                            "worker_id": worker_id,
+                        },
+                        producer_id="coordinator:lease-control",
+                        occurred_at=claimed_at,
+                        observed_at=claimed_at,
+                    )
                 claimed.append(job)
 
         return claimed
@@ -1044,6 +1717,40 @@ class JobQueue:
         if not self._get_meta("worker_token_sha256"):
             raise PermissionError("Worker authentication is not configured")
         self._verify_worker_token(token)
+
+    def authorize_worker_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str | None,
+        lease_id: str | None,
+        lease_ttl_seconds: int = 300,
+    ) -> Job:
+        """Bind a worker callback to its claimed job and live resource lease."""
+        job = self.get(job_id)
+        if not job:
+            raise KeyError(f"Job not found: {job_id}")
+        leases = self.leases_for_job(job_id, open_only=True)
+        if not leases:
+            # Local and pre-M3 workers have no lease. Keep that established path.
+            return job
+        if not worker_id or job.worker_id != str(worker_id):
+            raise PermissionError("Worker identity does not match the claimed job")
+        lease = next((item for item in leases if item.id == str(lease_id or "")), None)
+        if lease is None:
+            raise PermissionError("Worker lease does not match the claimed job")
+        if lease.status in {"revocation_requested", "terminating"}:
+            return job
+        if datetime.fromisoformat(lease.expires_at) <= datetime.utcnow():
+            raise PermissionError("Worker lease expired")
+        renewed = self.renew_lease(
+            lease.id,
+            worker_id=str(worker_id),
+            ttl_seconds=lease_ttl_seconds,
+        )
+        if renewed.status != "active":
+            raise PermissionError("Worker lease is not active")
+        return job
 
     def set_progress(self, job_id: str, progress: int) -> Job | None:
         """Update bounded job progress."""
@@ -1271,6 +1978,8 @@ class JobQueue:
         capabilities: list[str] | None = None,
         idle: bool = False,
         detail: str | None = None,
+        lease_id: str | None = None,
+        lease_ttl_seconds: int = 300,
     ) -> None:
         """Record a worker heartbeat, or its own report of what went wrong.
 
@@ -1278,6 +1987,14 @@ class JobQueue:
         reason. A container that dies takes its logs with it, so the row is the
         only place the answer can survive.
         """
+        if lease_id:
+            renewed = self.renew_lease(
+                str(lease_id),
+                worker_id=str(worker_id),
+                ttl_seconds=lease_ttl_seconds,
+            )
+            if renewed.status != "active":
+                raise PermissionError("Worker lease is not active")
         now = datetime.utcnow().isoformat()
         idle_since = now if idle else None
         with sqlite3.connect(self.db_path) as conn:

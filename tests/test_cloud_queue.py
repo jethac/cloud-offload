@@ -283,7 +283,7 @@ def test_queue_migrates_legacy_schema(tmp_path):
         "event_type",
         "phase",
     } <= event_columns
-    assert version == "7"
+    assert version == "8"
     migrated_events = queue.list_events("legacy-job")
     legacy_event = migrated_events[0]
     assert legacy_event["schema"] == "cloud-offload.job-event.v2"
@@ -938,15 +938,24 @@ def test_dispatcher_reports_provisioning_and_backs_off_after_launch_failure(tmp_
     assert provider.launch_count == 1
     assert [item["type"] for item in events] == [
         "provisioning_started",
+        "lease_created",
         "provider_request_started",
         "provider_request_failed",
+        "lease_closed_without_resource",
         "provisioning_failed",
     ]
     assert events[-1]["retry_seconds"] == 10
     assert events[-1]["error"] == "private image cannot be pulled"
     assert all(item["producer"]["id"].startswith("dispatcher:") for item in envelopes)
     assert all(item["phase_owner"] == "dispatcher" for item in envelopes)
-    assert [item["producer"]["sequence"] for item in envelopes] == [1, 2, 3, 4]
+    assert [item["producer"]["sequence"] for item in envelopes] == [
+        1,
+        None,
+        2,
+        3,
+        None,
+        4,
+    ]
 
 
 def test_worker_token_required_when_queue_is_configured(tmp_path):

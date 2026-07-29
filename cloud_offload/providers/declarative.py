@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any
 
 from cloud_offload import config as _config
-from cloud_offload.providers.base import CloudConnector, Instance
+from cloud_offload.providers.base import CloudConnector, Instance, PlacementConstraints
 
 logger = logging.getLogger(__name__)
 
@@ -861,6 +861,8 @@ class DeclarativeRestConnector(CloudConnector):
         env_vars: dict | None = None,
         startup_script: str | None = None,
         disk_gb: int | None = None,
+        placement: PlacementConstraints | None = None,
+        resource_name: str | None = None,
     ) -> Instance:
         """Launch an instance, optionally polling until it reports ready.
 
@@ -876,6 +878,7 @@ class DeclarativeRestConnector(CloudConnector):
             env_vars=env_vars or {},
             startup_script=startup_script,
             disk_gb=disk_gb,
+            resource_name=resource_name,
         )
         payload = self._request("launch", variables)
         if not isinstance(payload, dict):

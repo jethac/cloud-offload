@@ -106,6 +106,7 @@ class CloudConnector(ABC):
         startup_script: str | None = None,
         disk_gb: int | None = None,
         placement: PlacementConstraints | None = None,
+        resource_name: str | None = None,
     ) -> Instance:
         """Launch an instance with the given offer. Returns Instance object.
 
@@ -114,6 +115,8 @@ class CloudConnector(ABC):
         rather than discovered when the pod runs out of space. A connector that
         cannot size its disk per launch may ignore it and use its configured
         default; ``None`` means the caller had nothing to say.
+        ``resource_name`` is a durable, non-secret reconciliation key chosen
+        before provider mutation.
         """
 
     @abstractmethod

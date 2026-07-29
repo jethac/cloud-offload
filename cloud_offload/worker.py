@@ -8,6 +8,7 @@ publishes results/artifacts back to the coordinator. The worker never loads a
 
 import hashlib
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -58,7 +59,7 @@ def resolve_worker_id(explicit: str | None = None) -> str:
     )
 
 
-def worker_queue(config: CloudConfig, worker_id: str):
+def worker_queue(config: CloudConfig, worker_id: str, lease_id: str | None = None):
     """The queue channel a runner with this configuration talks to."""
     if config.coordinator_url:
         from cloud_offload.coordinator import CoordinatorQueue
@@ -72,6 +73,7 @@ def worker_queue(config: CloudConfig, worker_id: str):
             config.worker_token,
             config.provider,
             worker_id,
+            lease_id,
         )
     return JobQueue(config.queue_db_path)
 
@@ -107,8 +109,11 @@ class Worker:
     ):
         self.config = config
         self.worker_id = resolve_worker_id(worker_id)
+        self.lease_id = os.environ.get("CLOUD_OFFLOAD_LEASE_ID", "").strip() or None
         self.queue = (
-            queue if queue is not None else worker_queue(config, self.worker_id)
+            queue
+            if queue is not None
+            else worker_queue(config, self.worker_id, self.lease_id)
         )
         self.storage = storage or create_storage(config)
 
@@ -238,6 +243,7 @@ class Worker:
                 capabilities=self.capabilities,
                 idle=idle,
                 detail=detail,
+                lease_id=getattr(self, "lease_id", None),
             )
         except Exception as exc:
             logger.warning(
@@ -344,6 +350,7 @@ class Worker:
                     gpu_vram_gb=self.gpu_vram_gb,
                     gpu_name=self.gpu_name,
                     cache_volume_id=self.cache_volume_id,
+                    lease_id=getattr(self, "lease_id", None),
                 )
 
                 if jobs:
@@ -414,6 +421,8 @@ class Worker:
             logger.info("Skipping terminal job %s (%s)", job.id, current.status.value)
             return
 
+        self._raise_if_cancelled(job)
+
         if job.model not in WORKFLOW_CAPABILITIES:
             raise RuntimeError(f"Unsupported job model: {job.model}")
 
@@ -425,20 +434,48 @@ class Worker:
         self._begin_cache_restore(job)
         try:
             self._stage_custom_nodes(job)
+            self._raise_if_cancelled(job)
             self._stage_profile_weights(job)
+            self._raise_if_cancelled(job)
             self._flush_prepared_manifest(job)
         finally:
             self._complete_cache_restore(job)
 
         # Mark as running
+        self._raise_if_cancelled(job)
         self.queue.update_status(job.id, JobStatus.RUNNING)
         self._phase_event(job, "comfyui_ready")
         self._phase_event(job, "execution_started")
 
         result = self._run_comfyui_workflow(job)
+        self._raise_if_cancelled(job)
         self._phase_event(job, "result_available")
         self.queue.update_status(job.id, JobStatus.COMPLETED, result=result)
         logger.info(f"Job {job.id} completed")
+
+    def _job_cancelled(self, job: Job) -> bool:
+        queue = getattr(self, "queue", None)
+        reader = getattr(queue, "get", None)
+        if not callable(reader):
+            return False
+        try:
+            current = reader(job.id)
+        except Exception as exc:
+            logger.warning("Could not read cancellation state for %s: %s", job.id, exc)
+            return False
+        return bool(
+            current
+            and current.status in {JobStatus.FAILED, JobStatus.DEAD_LETTER}
+            and str(current.error or "").lower().startswith("cancel")
+        )
+
+    def _raise_if_cancelled(self, job: Job) -> None:
+        """Stop at every safe boundary after coordinator revocation."""
+        if not self._job_cancelled(job):
+            return
+        if getattr(self, "lease_id", None):
+            self.running = False
+        raise RuntimeError("Cancelled")
 
     def _phase_event(self, job: Job, phase: str, **fields) -> None:
         writer = getattr(self.queue, "append_event", None)
@@ -486,6 +523,7 @@ class Worker:
         while thread.is_alive():
             thread.join(timeout=max(0.01, float(interval_seconds)))
             if thread.is_alive():
+                self._raise_if_cancelled(job)
                 progress = {}
                 if callable(progress_reader):
                     try:
@@ -2039,6 +2077,8 @@ class Worker:
     ) -> None:
         if not additions:
             return
+        if job is not None:
+            self._raise_if_cancelled(job)
         from cloud_offload.prepared_state import build_manifest
         from cloud_offload.service_config import VERSION
 
@@ -2411,6 +2451,7 @@ class Worker:
         )
         output_artifacts = {}
         for boundary_key, path in output_paths.items():
+            self._raise_if_cancelled(job)
             if not path.is_file():
                 raise RuntimeError(
                     f"ComfyUI produced no partition output: {boundary_key}"

@@ -1240,6 +1240,9 @@ def build_partition_preflight(
             "recommendation_policy": policy,
             "max_hourly_rate": rate_limit,
             "max_total_job_cost": total_cost_limit,
+            "max_job_runtime_seconds": int(
+                getattr(config, "max_job_runtime_seconds", 7200)
+            ),
             "allowed_regions": region_allowlist,
             "material_price_change_percent": float(
                 getattr(config, "material_price_change_percent", 5.0)

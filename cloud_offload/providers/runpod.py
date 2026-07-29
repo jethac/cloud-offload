@@ -237,6 +237,7 @@ class RunPodConnector(CloudConnector):
         startup_script: str | None = None,
         disk_gb: int | None = None,
         placement: PlacementConstraints | None = None,
+        resource_name: str | None = None,
     ) -> Instance:
         """Launch a RunPod pod and wait until it reaches running state.
 
@@ -279,7 +280,7 @@ class RunPodConnector(CloudConnector):
             "gpuCount": 1,
             "gpuTypeId": offer_id,
             "imageName": docker_image,
-            "name": f"cloud-offload-worker-{uuid.uuid4().hex[:8]}",
+            "name": str(resource_name or f"cloud-offload-worker-{uuid.uuid4().hex[:8]}"),
             "startSsh": True,
             "volumeInGb": self.volume_gb,
             "volumeMountPath": "/workspace",

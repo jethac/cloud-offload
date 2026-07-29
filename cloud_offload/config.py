@@ -172,6 +172,7 @@ class CloudConfig:
     gpu_type: str = "RTX_4090"
     max_hourly_rate: float = 0.50  # USD, skip instances above this
     max_total_job_cost: float | None = None
+    max_job_runtime_seconds: int = 7200
     recommendation_policy: Literal["balanced", "cheapest", "fastest", "manual"] = (
         "balanced"
     )
@@ -186,6 +187,7 @@ class CloudConfig:
     keep_warm: bool = False  # Explicitly keep cloud workers alive while idle
     keep_warm_warning_seconds: int = 3600  # Warn for each idle interval while pinned
     poll_interval_seconds: int = 10
+    lease_ttl_seconds: int = 300
     worker_token: str = field(
         default_factory=lambda: os.environ.get("CLOUD_OFFLOAD_WORKER_TOKEN", "")
     )
@@ -319,6 +321,9 @@ class CloudConfig:
                 or self.max_total_job_cost <= 0
             ):
                 raise ValueError("max_total_job_cost must be greater than zero")
+        self.max_job_runtime_seconds = int(self.max_job_runtime_seconds)
+        if self.max_job_runtime_seconds < 60:
+            raise ValueError("max_job_runtime_seconds must be at least 60")
         self.recommendation_policy = str(self.recommendation_policy).strip().lower()
         if self.recommendation_policy not in {
             "balanced",
@@ -374,6 +379,9 @@ class CloudConfig:
             raise ValueError("idle_shutdown_seconds must be at least 1")
         if self.keep_warm_warning_seconds < 60:
             raise ValueError("keep_warm_warning_seconds must be at least 60")
+        self.lease_ttl_seconds = int(self.lease_ttl_seconds)
+        if self.lease_ttl_seconds < 30:
+            raise ValueError("lease_ttl_seconds must be at least 30")
         if not self.queue_db_path:
             self.queue_db_path = str(CONFIG_DIR / "jobs.db")
         if not self.storage_path:
@@ -440,6 +448,9 @@ class CloudConfig:
                 if os.environ.get("CLOUD_OFFLOAD_MAX_TOTAL_JOB_COST")
                 else None
             ),
+            max_job_runtime_seconds=int(
+                os.environ.get("CLOUD_OFFLOAD_MAX_JOB_RUNTIME_SECONDS", "7200")
+            ),
             recommendation_policy=os.environ.get(
                 "CLOUD_OFFLOAD_RECOMMENDATION_POLICY", "balanced"
             ),
@@ -466,6 +477,7 @@ class CloudConfig:
                 os.environ.get("CLOUD_OFFLOAD_KEEP_WARM_WARNING", "3600")
             ),
             poll_interval_seconds=int(os.environ.get("CLOUD_OFFLOAD_POLL_INTERVAL", "10")),
+            lease_ttl_seconds=int(os.environ.get("CLOUD_OFFLOAD_LEASE_TTL", "300")),
             worker_token=os.environ.get("CLOUD_OFFLOAD_WORKER_TOKEN", ""),
             worker_wheelhouse_url=os.environ.get("CLOUD_OFFLOAD_WORKER_WHEELHOUSE_URL", ""),
             worker_wheelhouse_sha256=os.environ.get("CLOUD_OFFLOAD_WORKER_WHEELHOUSE_SHA256", ""),
@@ -531,6 +543,10 @@ class CloudConfig:
             "CLOUD_OFFLOAD_GPU_TYPE": ("gpu_type", str),
             "CLOUD_OFFLOAD_MAX_HOURLY_RATE": ("max_hourly_rate", float),
             "CLOUD_OFFLOAD_MAX_TOTAL_JOB_COST": ("max_total_job_cost", float),
+            "CLOUD_OFFLOAD_MAX_JOB_RUNTIME_SECONDS": (
+                "max_job_runtime_seconds",
+                int,
+            ),
             "CLOUD_OFFLOAD_RECOMMENDATION_POLICY": ("recommendation_policy", str),
             "CLOUD_OFFLOAD_RENTAL_CONFIRMATION": ("rental_confirmation", str),
             "CLOUD_OFFLOAD_CONFIRMATION_COUNTDOWN": (
@@ -558,6 +574,7 @@ class CloudConfig:
             ),
             "CLOUD_OFFLOAD_KEEP_WARM_WARNING": ("keep_warm_warning_seconds", int),
             "CLOUD_OFFLOAD_POLL_INTERVAL": ("poll_interval_seconds", int),
+            "CLOUD_OFFLOAD_LEASE_TTL": ("lease_ttl_seconds", int),
             "CLOUD_OFFLOAD_WORKER_TOKEN": ("worker_token", str),
             "CLOUD_OFFLOAD_WORKER_WHEELHOUSE_URL": ("worker_wheelhouse_url", str),
             "CLOUD_OFFLOAD_WORKER_WHEELHOUSE_SHA256": ("worker_wheelhouse_sha256", str),
@@ -609,6 +626,7 @@ class CloudConfig:
             "gpu_type": self.gpu_type,
             "max_hourly_rate": self.max_hourly_rate,
             "max_total_job_cost": self.max_total_job_cost,
+            "max_job_runtime_seconds": self.max_job_runtime_seconds,
             "recommendation_policy": self.recommendation_policy,
             "rental_confirmation": self.rental_confirmation,
             "confirmation_countdown_seconds": self.confirmation_countdown_seconds,
@@ -619,6 +637,7 @@ class CloudConfig:
             "keep_warm": self.keep_warm,
             "keep_warm_warning_seconds": self.keep_warm_warning_seconds,
             "poll_interval_seconds": self.poll_interval_seconds,
+            "lease_ttl_seconds": self.lease_ttl_seconds,
             "worker_auth_configured": bool(self.worker_token),
             "worker_wheelhouse_configured": bool(self.worker_wheelhouse_url),
             "worker_profiles": self.worker_profiles,
