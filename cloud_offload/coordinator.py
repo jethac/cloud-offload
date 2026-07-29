@@ -162,6 +162,58 @@ class CoordinatorQueue:
             f"/api/workers/jobs/{job_id}/events", {"event": event}
         )
 
+    def sign_prepared_manifest(
+        self, proposal: dict[str, Any], *, job_id: str, volume_id: str
+    ) -> dict[str, Any]:
+        """Ask the coordinator authority to validate policy and sign a proposal."""
+        return self._post(
+            "/api/workers/cache/manifests/sign",
+            {
+                "manifest": proposal,
+                "job_id": job_id,
+                "volume_id": volume_id,
+                "worker_id": self.worker_id,
+            },
+        )
+
+    def verify_prepared_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Verify through the coordinator; the signing key stays control-plane-only."""
+        return self._post(
+            "/api/workers/cache/manifests/verify", {"manifest": manifest}
+        )
+
+    def record_cache_observation(
+        self, job_id: str, observation: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._post(
+            "/api/workers/cache/observations",
+            {
+                "job_id": job_id,
+                "worker_id": self.worker_id,
+                "observation": observation,
+            },
+        )
+
+    def announce_prepared_manifest(
+        self,
+        manifest: dict[str, Any],
+        *,
+        job_id: str,
+        volume_id: str,
+        generation: str,
+    ) -> dict[str, Any]:
+        """Project a just-published volume manifest into coordinator scheduling state."""
+        return self._post(
+            "/api/workers/cache/manifests/announce",
+            {
+                "manifest": manifest,
+                "job_id": job_id,
+                "volume_id": volume_id,
+                "generation": generation,
+                "worker_id": self.worker_id,
+            },
+        )
+
     def fail_job(self, job_id: str, error: str) -> Job:
         data = self._post(
             f"/api/workers/jobs/{job_id}/fail", {"error": error}

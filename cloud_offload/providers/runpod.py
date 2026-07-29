@@ -13,7 +13,14 @@ from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlencode
 
-from cloud_offload.providers.base import CloudConnector, Instance
+from cloud_offload.config import RUNPOD_NETWORK_VOLUME_MAX_GB
+from cloud_offload.providers.base import (
+    CloudConnector,
+    Instance,
+    PlacementConstraints,
+    PlacementError,
+    ProviderStorage,
+)
 
 GPU_TYPES_QUERY = """
 query CloudOffloadGpuTypes($secureCloud: Boolean) {
@@ -60,6 +67,19 @@ query CloudOffloadAccountBalance {
 """
 
 _USER_AGENT = "cloud-offload-connector/0.1"
+
+# RunPod publishes S3-compatible endpoints only for these datacenters. Keep
+# discovery explicit: fabricating an endpoint for another volume produces an
+# authentication-looking failure and hides that coordinator prepopulation is
+# unsupported there.
+RUNPOD_S3_ENDPOINTS = {
+    dc: f"https://s3api-{dc.lower()}.runpod.io/"
+    for dc in (
+        "EU-CZ-1", "EU-RO-1", "EUR-IS-1", "EUR-NO-1", "US-CA-2",
+        "US-GA-2", "US-IL-1", "US-KS-2", "US-MD-1", "US-MO-1",
+        "US-MO-2", "US-NC-1", "US-NC-2", "US-NE-1", "US-WA-1",
+    )
+}
 
 
 class RunPodConnector(CloudConnector):
@@ -150,8 +170,10 @@ class RunPodConnector(CloudConnector):
         gpu_type: str | None = None,
         min_gpu_ram: int | None = None,
         max_hourly_rate: float | None = None,
+        placement: PlacementConstraints | None = None,
     ) -> list[dict]:
         """List normalized GPU types with current on-demand prices."""
+        self._validate_cloud_placement(placement)
         # RunPod reports different on-demand prices for Secure and Community
         # Cloud.  Without this filter ``lowestPrice`` can quote the cheaper
         # tier even though launch() explicitly requests the other one.
@@ -179,8 +201,7 @@ class RunPodConnector(CloudConnector):
             if max_hourly_rate is not None and hourly_rate > max_hourly_rate:
                 continue
 
-            offers.append(
-                {
+            offer = {
                     "id": str(gpu["id"]),
                     "provider": self.name,
                     "gpu_type": gpu.get("displayName") or gpu["id"],
@@ -190,7 +211,10 @@ class RunPodConnector(CloudConnector):
                     "cloud_type": self.cloud_type,
                     "raw": gpu,
                 }
-            )
+            if placement is not None:
+                offer["datacenter_ids"] = list(placement.datacenter_ids)
+                offer["storage_compatible"] = bool(placement.storage_attachments)
+            offers.append(offer)
         return offers
 
     @staticmethod
@@ -212,6 +236,7 @@ class RunPodConnector(CloudConnector):
         env_vars: dict | None = None,
         startup_script: str | None = None,
         disk_gb: int | None = None,
+        placement: PlacementConstraints | None = None,
     ) -> Instance:
         """Launch a RunPod pod and wait until it reaches running state.
 
@@ -221,6 +246,30 @@ class RunPodConnector(CloudConnector):
         """
         self._ensure_image_pullable(docker_image)
         container_disk_gb = int(disk_gb) if disk_gb else self.container_disk_gb
+        self._validate_cloud_placement(placement)
+        attachment = (
+            placement.storage_attachments[0]
+            if placement and placement.storage_attachments
+            else None
+        )
+        if attachment:
+            volume = self.get_storage(attachment.provider_volume_id)
+            if volume is None:
+                raise PlacementError(
+                    f"RunPod network volume {attachment.provider_volume_id} was not found"
+                )
+            allowed = set(placement.datacenter_ids or ())
+            if allowed and volume.datacenter_id not in allowed:
+                raise PlacementError(
+                    f"RunPod network volume {volume.id} is in {volume.datacenter_id}, "
+                    f"outside requested datacenters {sorted(allowed)}"
+                )
+            if attachment.datacenter_id and volume.datacenter_id != attachment.datacenter_id:
+                raise PlacementError(
+                    f"RunPod network volume {volume.id} is in {volume.datacenter_id}, "
+                    f"not {attachment.datacenter_id}"
+                )
+
         pod_input: dict[str, Any] = {
             "cloudType": self.cloud_type,
             "containerDiskInGb": container_disk_gb,
@@ -240,9 +289,47 @@ class RunPodConnector(CloudConnector):
         if startup_script:
             encoded = base64.b64encode(startup_script.encode("utf-8")).decode("ascii")
             pod_input["dockerArgs"] = "bash -lc 'echo " + encoded + " | base64 -d | bash'"
-
-        data = self._graphql(CREATE_POD_MUTATION, {"input": pod_input})
-        pod = data.get("podFindAndDeployOnDemand")
+        if placement is None:
+            # Disabled/stateless behavior deliberately stays on the established
+            # GraphQL path. Storage-aware launches use the documented REST Pod
+            # contract below because it exposes hard datacenter constraints.
+            data = self._graphql(CREATE_POD_MUTATION, {"input": pod_input})
+            pod = data.get("podFindAndDeployOnDemand")
+        else:
+            rest_input: dict[str, Any] = {
+                "cloudType": self.cloud_type,
+                "computeType": "GPU",
+                "containerDiskInGb": container_disk_gb,
+                "env": {str(k): str(v) for k, v in (env_vars or {}).items()},
+                "gpuCount": 1,
+                "gpuTypeIds": [offer_id],
+                "gpuTypePriority": "custom",
+                "imageName": docker_image,
+                "interruptible": False,
+                "name": pod_input["name"],
+                "ports": ["22/tcp"],
+                "volumeInGb": self.volume_gb,
+                "volumeMountPath": attachment.mount_path if attachment else "/workspace",
+            }
+            if placement.datacenter_ids:
+                rest_input["dataCenterIds"] = list(placement.datacenter_ids)
+                rest_input["dataCenterPriority"] = "custom"
+            if attachment:
+                rest_input["networkVolumeId"] = attachment.provider_volume_id
+            if self.registry_auth_id:
+                rest_input["containerRegistryAuthId"] = self.registry_auth_id
+            if startup_script:
+                command = "echo " + encoded + " | base64 -d | bash"
+                rest_input["dockerEntrypoint"] = ["bash", "-lc"]
+                rest_input["dockerStartCmd"] = [command]
+            try:
+                pod = self._rest("POST", "pods", json=rest_input)
+            except Exception as exc:
+                message = str(exc)
+                raise PlacementError(
+                    "RunPod could not create a Pod in the storage-compatible "
+                    f"datacenter(s) {list(placement.datacenter_ids)}: {message}"
+                ) from exc
         if not pod or not pod.get("id"):
             raise RuntimeError("RunPod pod creation returned no pod ID")
         return self._wait_for_ready(str(pod["id"]))
@@ -312,6 +399,85 @@ class RunPodConnector(CloudConnector):
             for pod in pods
             if (instance := self._parse_instance(pod)).status in {"pending", "running"}
         ]
+
+    @staticmethod
+    def s3_endpoint(datacenter_id: str) -> str | None:
+        """Return a published RunPod S3 endpoint, never a guessed endpoint."""
+        return RUNPOD_S3_ENDPOINTS.get(str(datacenter_id).upper())
+
+    def list_storage(self) -> list[ProviderStorage]:
+        volumes = self._rest("GET", "networkvolumes") or []
+        return [self._parse_storage(item) for item in volumes]
+
+    def get_storage(self, storage_id: str) -> ProviderStorage | None:
+        try:
+            item = self._rest(
+                "GET", f"networkvolumes/{quote(str(storage_id), safe='')}"
+            )
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code == 404:
+                return None
+            raise
+        return self._parse_storage(item) if item else None
+
+    def create_storage(
+        self, *, name: str, size_gb: int, datacenter_id: str
+    ) -> ProviderStorage:
+        if self.cloud_type != "SECURE":
+            raise PlacementError("RunPod network volumes require Secure Cloud")
+        if not 1 <= int(size_gb) <= RUNPOD_NETWORK_VOLUME_MAX_GB:
+            raise ValueError(
+                f"RunPod storage size must be 1-{RUNPOD_NETWORK_VOLUME_MAX_GB} GB"
+            )
+        if not str(datacenter_id).strip():
+            raise ValueError("RunPod storage needs a datacenter")
+        item = self._rest(
+            "POST",
+            "networkvolumes",
+            json={
+                "name": str(name),
+                "size": int(size_gb),
+                "dataCenterId": str(datacenter_id),
+            },
+        )
+        if not item or not item.get("id"):
+            raise RuntimeError("RunPod network volume creation returned no ID")
+        return self._parse_storage(item)
+
+    def delete_storage(self, storage_id: str) -> bool:
+        try:
+            self._rest("DELETE", f"networkvolumes/{quote(str(storage_id), safe='')}")
+            return True
+        except Exception:
+            return False
+
+    def _parse_storage(self, item: dict) -> ProviderStorage:
+        datacenter_id = str(item.get("dataCenterId") or "")
+        return ProviderStorage(
+            id=str(item["id"]),
+            provider=self.name,
+            name=str(item.get("name") or item["id"]),
+            size_gb=int(item.get("size") or 0),
+            datacenter_id=datacenter_id,
+            s3_compatible=self.s3_endpoint(datacenter_id) is not None,
+            metadata={"s3_endpoint": self.s3_endpoint(datacenter_id)},
+        )
+
+    def _validate_cloud_placement(
+        self, placement: PlacementConstraints | None
+    ) -> None:
+        if not placement:
+            return
+        if any(item.read_only for item in placement.storage_attachments):
+            raise PlacementError(
+                "RunPod Pod network-volume attachments cannot enforce read-only mode"
+            )
+        if placement.storage_attachments and self.cloud_type != "SECURE":
+            raise PlacementError(
+                "RunPod network volumes are incompatible with Community Cloud; "
+                "select Secure Cloud before provisioning"
+            )
 
     def account_balance(self) -> dict:
         """Return RunPod account balance and current hourly spend."""

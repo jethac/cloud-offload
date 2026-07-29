@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2",
     "python-multipart>=0.0.9",
     "requests>=2.31",
+    "huggingface_hub>=0.23",
 ]
 
 [project.optional-dependencies]
@@ -23,9 +24,7 @@ dependencies = [
 cloud = [
     "aiohttp>=3.9",
     "safetensors>=0.4",
-    # Weight staging at first job; hf_transfer backs the
-    # HF_HUB_ENABLE_HF_TRANSFER=1 the runner image sets.
-    "huggingface_hub>=0.23",
+    # hf_transfer backs the HF_HUB_ENABLE_HF_TRANSFER=1 the runner image sets.
     "hf_transfer>=0.1",
 ]
 gcs = ["google-cloud-storage>=2.10"]

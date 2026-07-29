@@ -18,6 +18,13 @@ DEFAULT_WORKER_MANIFEST = "/opt/cloud-offload/runtime-profile.json"
 # only so existing keys can be migrated out of it; nothing writes it now. The
 # credentials module reads this attribute, so tests can redirect it.
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
+RUNPOD_NETWORK_VOLUME_MAX_GB = 4000
+
+
+def estimate_runpod_storage_monthly(size_gb: int | float) -> float:
+    """Published RunPod network-volume estimate: $0.07/GB then $0.05 over 1TB."""
+    size = float(size_gb)
+    return round(min(size, 1000) * 0.07 + max(0.0, size - 1000) * 0.05, 2)
 
 
 # Credential naming and storage live in cloud_offload.credentials, which keeps
@@ -73,6 +80,78 @@ def _normalized_on_prem_assets(entries) -> list:
         if pattern:
             normalized.append(pattern)
     return normalized
+
+
+def normalized_prepared_storage(value: Any) -> dict[str, Any]:
+    """Validate the durable prepared-state policy without accepting secrets."""
+    defaults: dict[str, Any] = {
+        "enabled": False,
+        "provider": "runpod",
+        "policy": "smart",
+        "region": "auto",
+        "cold_fallback": "allow",
+        "managed_size_gb": 250,
+        "existing_volume_id": None,
+        "max_monthly_storage_cost": None,
+        "confirmed": False,
+        "tenant": "default",
+        "cache_private_assets": False,
+        "shadow_admission": True,
+    }
+    if value is None:
+        return defaults
+    if not isinstance(value, dict):
+        raise ValueError("prepared_storage must be an object")
+    forbidden = {
+        key for key in value
+        if any(fragment in key.lower() for fragment in ("secret", "token", "api_key", "access_key"))
+    }
+    if forbidden:
+        raise ValueError(
+            "prepared_storage cannot contain credentials: " + ", ".join(sorted(forbidden))
+        )
+    unknown = set(value) - set(defaults)
+    if unknown:
+        raise ValueError("Unknown prepared_storage fields: " + ", ".join(sorted(unknown)))
+    result = {**defaults, **value}
+    result["enabled"] = bool(result["enabled"])
+    result["confirmed"] = bool(result["confirmed"])
+    result["cache_private_assets"] = bool(result["cache_private_assets"])
+    result["shadow_admission"] = bool(result["shadow_admission"])
+    result["provider"] = str(result["provider"]).strip().lower()
+    result["policy"] = str(result["policy"]).strip().lower()
+    result["region"] = str(result["region"]).strip()
+    result["cold_fallback"] = str(result["cold_fallback"]).strip().lower()
+    result["tenant"] = str(result["tenant"]).strip()
+    if result["provider"] != "runpod":
+        raise ValueError("prepared_storage.provider must currently be runpod")
+    if result["policy"] not in {"off", "smart", "strict", "pinned"}:
+        raise ValueError("prepared_storage.policy must be off, smart, strict, or pinned")
+    if result["cold_fallback"] not in {"allow", "ask", "deny"}:
+        raise ValueError("prepared_storage.cold_fallback must be allow, ask, or deny")
+    if result["policy"] == "pinned" and result["region"].lower() == "auto":
+        raise ValueError("prepared_storage.region is required for pinned policy")
+    if not result["tenant"]:
+        raise ValueError("prepared_storage.tenant cannot be empty")
+    result["managed_size_gb"] = int(result["managed_size_gb"])
+    if result["managed_size_gb"] < 1:
+        raise ValueError("prepared_storage.managed_size_gb must be at least 1")
+    if result["managed_size_gb"] > RUNPOD_NETWORK_VOLUME_MAX_GB:
+        raise ValueError(
+            f"prepared_storage.managed_size_gb cannot exceed {RUNPOD_NETWORK_VOLUME_MAX_GB}"
+        )
+    if result["existing_volume_id"] is not None:
+        result["existing_volume_id"] = str(result["existing_volume_id"]).strip() or None
+    budget = result["max_monthly_storage_cost"]
+    if budget is not None and float(budget) < 0:
+        raise ValueError("prepared_storage.max_monthly_storage_cost cannot be negative")
+    result["max_monthly_storage_cost"] = None if budget is None else float(budget)
+    # `off` is an explicit stateless policy even if an older UI left enabled true.
+    if result["policy"] == "off":
+        result["enabled"] = False
+    if result["enabled"] and not result["confirmed"]:
+        raise ValueError("prepared_storage must be confirmed before it is enabled")
+    return result
 
 
 @dataclass
@@ -159,6 +238,10 @@ class CloudConfig:
     # anything is provisioned. Values are ``{repo_id, revision, filename}`` or
     # ``{url}``.
     asset_sources: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    # Durable regional prepared state is opt-in. This object is intentionally
+    # limited to policy and provider identities; credentials resolve separately.
+    prepared_storage: dict[str, Any] = field(default_factory=dict)
 
     # Storage settings
     storage_type: Literal["local", "gcs", "s3"] = "local"
@@ -258,6 +341,7 @@ class CloudConfig:
                         str(profile_name), storage_field, profile.get(storage_field)
                     )
         self.asset_sources = normalized_asset_sources(self.asset_sources)
+        self.prepared_storage = normalized_prepared_storage(self.prepared_storage)
 
     @classmethod
     def from_file(cls, path: str | Path) -> "CloudConfig":
@@ -314,6 +398,9 @@ class CloudConfig:
                 if item.strip()
             ],
             asset_sources=json.loads(os.environ.get("CLOUD_OFFLOAD_ASSET_SOURCES_JSON", "{}")),
+            prepared_storage=json.loads(
+                os.environ.get("CLOUD_OFFLOAD_PREPARED_STORAGE_JSON", "{}")
+            ),
             storage_type=os.environ.get("CLOUD_OFFLOAD_STORAGE_TYPE", "local"),
             storage_path=os.environ.get("CLOUD_OFFLOAD_STORAGE_PATH", ""),
             vast_api_key=os.environ.get("VAST_API_KEY", ""),
@@ -377,6 +464,7 @@ class CloudConfig:
                 lambda value: [item.strip() for item in value.split(",") if item.strip()],
             ),
             "CLOUD_OFFLOAD_ASSET_SOURCES_JSON": ("asset_sources", json.loads),
+            "CLOUD_OFFLOAD_PREPARED_STORAGE_JSON": ("prepared_storage", json.loads),
             "CLOUD_OFFLOAD_STORAGE_TYPE": ("storage_type", str),
             "CLOUD_OFFLOAD_STORAGE_PATH": ("storage_path", str),
             "CLOUD_OFFLOAD_QUEUE_DB": ("queue_db_path", str),
@@ -423,6 +511,7 @@ class CloudConfig:
             "ingress": self.ingress,
             "on_prem_assets": self.on_prem_assets,
             "asset_sources": self.asset_sources,
+            "prepared_storage": self.prepared_storage,
             "storage_type": self.storage_type,
             "storage_path": self.storage_path,
             "queue_db_path": self.queue_db_path,

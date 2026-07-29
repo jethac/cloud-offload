@@ -13,10 +13,19 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from cloud_offload.config import CloudConfig
+from cloud_offload.config import CloudConfig, estimate_runpod_storage_monthly
+from cloud_offload.cache_registry import CacheRegistry
+from cloud_offload.cache_scheduler import (
+    PlacementCandidate,
+    PlacementDecision,
+    choose_placement,
+    resolve_prepared_requirements,
+    scheduler_runtime,
+)
 from cloud_offload.credentials import huggingface_token
 from cloud_offload.providers import create_connector
 from cloud_offload.providers.base import CloudConnector, CloudProvider, Instance
+from cloud_offload.providers.base import PlacementConstraints, StorageAttachment
 from cloud_offload.queue import JobQueue, JobStatus
 from cloud_offload.profiles import (
     configured_worker_profiles,
@@ -92,6 +101,7 @@ class Dispatcher:
     ):
         self.config = config
         self.queue = queue or JobQueue(config.queue_db_path)
+        self.cache_registry = CacheRegistry(config.queue_db_path)
 
         if provider is not None and connector is not None:
             raise ValueError("Pass connector or legacy provider, not both")
@@ -195,6 +205,7 @@ class Dispatcher:
             self.config.max_hourly_rate = persisted.max_hourly_rate
             self.config.worker_profiles = persisted.worker_profiles
             self.config.runpod_registry_auth_id = persisted.runpod_registry_auth_id
+            self.config.prepared_storage = persisted.prepared_storage
             runpod = self.connectors.get("runpod")
             if runpod is not None and hasattr(runpod, "registry_auth_id"):
                 runpod.registry_auth_id = persisted.runpod_registry_auth_id.strip()
@@ -316,14 +327,52 @@ class Dispatcher:
             if requested_gpu_types
             else worker_profile_gpu_type(profile, self.config.gpu_type)
         )
-        # Find cheapest available GPU, routing around recently failed hosts
+        # Find an offer, optionally treating regional prepared state as a
+        # schedulable resource. Disabled mode preserves the original call path.
         cooling = self._offers_on_cooldown(provider_name)
-        offer = connector.find_cheapest(
-            gpu_type=gpu_type,
-            min_gpu_ram=minimum_vram,
-            max_hourly_rate=self.config.max_hourly_rate,
-            exclude=cooling,
+        requirements = resolve_prepared_requirements(
+            profile_name, profile, queued_jobs or []
         )
+        placement_decision = None
+        if self.config.prepared_storage.get("enabled"):
+            placement_decision = self._choose_cache_placement(
+                connector=connector,
+                provider_name=provider_name,
+                gpu_type=gpu_type,
+                minimum_vram=minimum_vram,
+                cooling=cooling,
+                requirements=requirements,
+            )
+            self._publish_launch_event(
+                queued_jobs,
+                {
+                    "type": "cache_placement_considered",
+                    **placement_decision.explanation(),
+                },
+            )
+            if placement_decision.action != "launch" or not placement_decision.candidate:
+                detail = placement_decision.reason
+                self._record_launch_failure(
+                    provider_name, profile_name, queued_jobs, detail
+                )
+                return None
+            offer = placement_decision.candidate.offer
+            selected_type = (
+                "cache_cold_fallback"
+                if placement_decision.fallback
+                else "cache_placement_selected"
+            )
+            self._publish_launch_event(
+                queued_jobs,
+                {"type": selected_type, **placement_decision.explanation()},
+            )
+        else:
+            offer = connector.find_cheapest(
+                gpu_type=gpu_type,
+                min_gpu_ram=minimum_vram,
+                max_hourly_rate=self.config.max_hourly_rate,
+                exclude=cooling,
+            )
 
         if not offer:
             detail = "No available GPU matched the partition constraints"
@@ -406,43 +455,166 @@ class Dispatcher:
                 profile["custom_nodes"], separators=(",", ":")
             )
 
+        placement = placement_decision.placement() if placement_decision else None
+        if placement and placement_decision and placement_decision.candidate:
+            volume = placement_decision.candidate.volume
+            for queued_job in queued_jobs or []:
+                queued_job.params["prepared_requirement"] = requirements
+                queued_job.params["cache_volume_id"] = volume.id
+                queued_job.params["cache_provider_volume_id"] = volume.provider_volume_id
+                queued_job.params["cache_datacenter_id"] = volume.datacenter_id
+                self.queue.update(queued_job)
+            env_vars.update(
+                {
+                    "CLOUD_OFFLOAD_CACHE_ROOT": "/workspace/cloud-offload",
+                    "CLOUD_OFFLOAD_CACHE_VOLUME_ID": volume.id,
+                    "CLOUD_OFFLOAD_CACHE_EXPECTED_PROVIDER_VOLUME_ID": volume.provider_volume_id,
+                    "CLOUD_OFFLOAD_CACHE_MANIFEST": (
+                        placement_decision.candidate.manifest_ids[0]
+                        if placement_decision.candidate.manifest_ids
+                        else requirements["profile_fingerprint"]
+                    ),
+                    "CLOUD_OFFLOAD_CACHE_MODE": "restore-and-populate",
+                    "CLOUD_OFFLOAD_CACHE_POLICY": json.dumps(
+                        self.config.prepared_storage, separators=(",", ":")
+                    ),
+                    "CLOUD_OFFLOAD_CACHE_REQUIREMENTS": json.dumps(
+                        requirements, separators=(",", ":")
+                    ),
+                }
+            )
+
         disk_gb = self._planned_disk_gb(profile_name, queued_jobs)
 
         try:
-            instance = connector.launch(
+            launch_arguments = dict(
                 offer_id=offer["id"],
                 docker_image=profile["image"],
                 env_vars=env_vars,
                 startup_script=startup_script,
                 disk_gb=disk_gb,
             )
-
-            self.active_instances[instance.id] = instance
-            self.instance_providers[instance.id] = provider_name
-            self.instance_profiles[instance.id] = profile_name
-            launched_at = datetime.utcnow()
-            self.last_activity[instance.id] = launched_at
-            self.launched_at[instance.id] = launched_at
-
-            logger.info(f"Launched worker {instance.id}")
-            self.launch_failures.pop((provider_name, profile_name), None)
-            self.next_launch_at.pop((provider_name, profile_name), None)
+            if placement is not None:
+                launch_arguments["placement"] = placement
             self._publish_launch_event(
                 queued_jobs,
                 {
-                    "type": "runner_starting",
+                    "schema": "cloud-offload.phase-event.v1",
+                    "type": "provider_request_started",
+                    "phase": "provider_request",
+                    "monotonic_ms": round(time.monotonic() * 1000, 3),
                     "provider": provider_name,
-                    "runtime_profile": profile_name,
-                    "worker_instance_id": instance.id,
-                    "gpu_type": instance.gpu_type,
-                    "hourly_rate": instance.hourly_rate,
-                    "overall_progress": 2,
+                    "offer_id": offer["id"],
+                    "placement": "cached" if placement is not None else "cold",
                 },
             )
-            return instance
+            instance = connector.launch(**launch_arguments)
+            self._publish_launch_event(
+                queued_jobs,
+                {
+                    "schema": "cloud-offload.phase-event.v1",
+                    "type": "provider_request_completed",
+                    "phase": "provider_request",
+                    "monotonic_ms": round(time.monotonic() * 1000, 3),
+                    "provider": provider_name,
+                    "offer_id": offer["id"],
+                    "worker_instance_id": instance.id,
+                    "placement": "cached" if placement is not None else "cold",
+                },
+            )
+            return self._remember_launched_instance(
+                instance, provider_name, profile_name, queued_jobs
+            )
 
         except Exception as e:
+            self._publish_launch_event(
+                queued_jobs,
+                {
+                    "schema": "cloud-offload.phase-event.v1",
+                    "type": "provider_request_failed",
+                    "phase": "provider_request",
+                    "monotonic_ms": round(time.monotonic() * 1000, 3),
+                    "provider": provider_name,
+                    "offer_id": offer["id"],
+                    "failure": str(e),
+                    "placement": "cached" if placement is not None else "cold",
+                },
+            )
             logger.error(f"Failed to launch worker: {e}")
+            if (
+                placement is not None
+                and placement_decision is not None
+                and self.config.prepared_storage.get("policy") == "smart"
+                and self.config.prepared_storage.get("cold_fallback") == "allow"
+            ):
+                self._publish_launch_event(
+                    queued_jobs,
+                    {
+                        "type": "cache_cold_fallback",
+                        "reason": "cached_placement_launch_failed",
+                        "failure": str(e),
+                        **placement_decision.explanation(),
+                    },
+                )
+                cold_offer = connector.find_cheapest(
+                    gpu_type=gpu_type,
+                    min_gpu_ram=minimum_vram,
+                    max_hourly_rate=self.config.max_hourly_rate,
+                    exclude=cooling,
+                )
+                if cold_offer:
+                    cold_env = {
+                        key: value
+                        for key, value in env_vars.items()
+                        if not key.startswith("CLOUD_OFFLOAD_CACHE_")
+                    }
+                    for queued_job in queued_jobs or []:
+                        for key in (
+                            "prepared_requirement", "cache_volume_id",
+                            "cache_provider_volume_id", "cache_datacenter_id",
+                        ):
+                            queued_job.params.pop(key, None)
+                        self.queue.update(queued_job)
+                    try:
+                        self._publish_launch_event(
+                            queued_jobs,
+                            {
+                                "schema": "cloud-offload.phase-event.v1",
+                                "type": "provider_request_started",
+                                "phase": "provider_request",
+                                "monotonic_ms": round(time.monotonic() * 1000, 3),
+                                "provider": provider_name,
+                                "offer_id": cold_offer["id"],
+                                "placement": "cold_fallback",
+                            },
+                        )
+                        instance = connector.launch(
+                            offer_id=cold_offer["id"],
+                            docker_image=profile["image"],
+                            env_vars=cold_env,
+                            startup_script=startup_script,
+                            disk_gb=disk_gb,
+                        )
+                        self._publish_launch_event(
+                            queued_jobs,
+                            {
+                                "schema": "cloud-offload.phase-event.v1",
+                                "type": "provider_request_completed",
+                                "phase": "provider_request",
+                                "monotonic_ms": round(time.monotonic() * 1000, 3),
+                                "provider": provider_name,
+                                "offer_id": cold_offer["id"],
+                                "worker_instance_id": instance.id,
+                                "placement": "cold_fallback",
+                            },
+                        )
+                        return self._remember_launched_instance(
+                            instance, provider_name, profile_name, queued_jobs
+                        )
+                    except Exception as cold_exc:
+                        e = RuntimeError(
+                            f"cached placement failed ({e}); cold fallback failed ({cold_exc})"
+                        )
             self.offer_cooldowns[(provider_name, str(offer["id"]))] = (
                 time.monotonic() + OFFER_COOLDOWN_SECONDS
             )
@@ -455,6 +627,229 @@ class Dispatcher:
                 provider_name, profile_name, queued_jobs, str(e)
             )
             return None
+
+    def _remember_launched_instance(
+        self,
+        instance: Instance,
+        provider_name: str,
+        profile_name: str,
+        queued_jobs: list | None,
+    ) -> Instance:
+        self.active_instances[instance.id] = instance
+        self.instance_providers[instance.id] = provider_name
+        self.instance_profiles[instance.id] = profile_name
+        launched_at = datetime.utcnow()
+        self.last_activity[instance.id] = launched_at
+        self.launched_at[instance.id] = launched_at
+        logger.info("Launched worker %s", instance.id)
+        self.launch_failures.pop((provider_name, profile_name), None)
+        self.next_launch_at.pop((provider_name, profile_name), None)
+        self._publish_launch_event(
+            queued_jobs,
+            {
+                "type": "runner_starting",
+                "provider": provider_name,
+                "runtime_profile": profile_name,
+                "worker_instance_id": instance.id,
+                "gpu_type": instance.gpu_type,
+                "hourly_rate": instance.hourly_rate,
+                "overall_progress": 2,
+            },
+        )
+        return instance
+
+    def _choose_cache_placement(
+        self,
+        *,
+        connector: CloudConnector,
+        provider_name: str,
+        gpu_type: str,
+        minimum_vram: int,
+        cooling: set[str],
+        requirements: dict,
+    ):
+        policy = self.config.prepared_storage
+        existing = policy.get("existing_volume_id")
+
+        def storage_failure(reason: str) -> PlacementDecision:
+            if (
+                policy.get("policy") == "smart"
+                and policy.get("cold_fallback") == "allow"
+            ):
+                cold = [
+                    item
+                    for item in connector.list_available(
+                        gpu_type=gpu_type,
+                        min_gpu_ram=minimum_vram,
+                        max_hourly_rate=self.config.max_hourly_rate,
+                    )
+                    if str(item.get("id")) not in cooling
+                ]
+                if cold:
+                    offer = min(
+                        cold,
+                        key=lambda item: (
+                            float(item.get("hourly_rate", float("inf"))),
+                            str(item.get("id") or ""),
+                        ),
+                    )
+                    return PlacementDecision(
+                        "launch", PlacementCandidate(offer, None),
+                        f"{reason}_running_cold", (), fallback=True,
+                    )
+            return PlacementDecision("unavailable", None, reason, ())
+
+        try:
+            # Provider truth is rechecked before every cached placement. A
+            # deleted or moved adopted volume is removed from scheduling before
+            # Pod creation, not discovered after billing starts.
+            for registered in self.cache_registry.list_volumes():
+                if registered.provider != provider_name:
+                    continue
+                actual = connector.get_storage(registered.provider_volume_id)
+                if (
+                    actual is None
+                    or actual.datacenter_id != registered.datacenter_id
+                ):
+                    self.cache_registry.mark_volume(registered.id, "degraded")
+                    if registered.provider_volume_id == existing:
+                        return storage_failure(
+                            "configured_cache_volume_not_found"
+                            if actual is None
+                            else "configured_cache_volume_wrong_datacenter"
+                        )
+
+            if existing and not self.cache_registry.get_provider_volume(provider_name, existing):
+                provider_volume = connector.get_storage(existing)
+                if provider_volume is None:
+                    return storage_failure("configured_cache_volume_not_found")
+                if policy.get("region") not in {"auto", provider_volume.datacenter_id}:
+                    return storage_failure("configured_cache_volume_wrong_datacenter")
+                self.cache_registry.upsert_volume(
+                    provider=provider_name,
+                    provider_volume_id=provider_volume.id,
+                    datacenter_id=provider_volume.datacenter_id,
+                    ownership="adopted",
+                    capacity_bytes=provider_volume.size_gb * 1024**3,
+                    policy=policy,
+                    s3_compatible=provider_volume.s3_compatible,
+                )
+
+            ready = [
+                item for item in self.cache_registry.list_volumes(status="ready")
+                if item.provider == provider_name
+            ]
+            if not ready and not existing:
+                region = str(policy.get("region") or "auto")
+                if region == "auto":
+                    # RunPod's aggregate GPU-type API cannot prove a specific
+                    # datacenter has capacity. Region auto therefore becomes an
+                    # actionable one-time decision rather than silently creating
+                    # paid, stranded storage or running statelessly.
+                    return PlacementDecision(
+                        "ask", None, "managed_cache_region_selection_required", ()
+                    )
+                size_gb = int(policy.get("managed_size_gb") or 250)
+                monthly = estimate_runpod_storage_monthly(size_gb)
+                budget = policy.get("max_monthly_storage_cost")
+                if budget is not None and monthly > float(budget):
+                    return PlacementDecision(
+                        "unavailable", None, "managed_cache_exceeds_storage_budget", ()
+                    )
+                provider_volume = connector.create_storage(
+                    name=f"cloud-offload-{region.lower()}",
+                    size_gb=size_gb,
+                    datacenter_id=region,
+                )
+                self.cache_registry.upsert_volume(
+                    provider=provider_name,
+                    provider_volume_id=provider_volume.id,
+                    datacenter_id=provider_volume.datacenter_id,
+                    ownership="managed",
+                    capacity_bytes=provider_volume.size_gb * 1024**3,
+                    policy=policy,
+                    status="ready",
+                    s3_compatible=provider_volume.s3_compatible,
+                )
+        except Exception as exc:
+            logger.warning("Prepared storage lifecycle failed: %s", exc)
+            return storage_failure(f"prepared_storage_lifecycle_failed: {exc}")
+
+        runtime = scheduler_runtime(requirements)
+        coverages = {
+            item["volume"].id: item
+            for item in self.cache_registry.volume_coverage(
+                requirements["required"],
+                runtime=runtime,
+                tenant=str(policy.get("tenant") or "default"),
+                profile_fingerprint=str(requirements["profile_fingerprint"]),
+                allow_private=bool(policy.get("cache_private_assets")),
+                logical_required=requirements.get("logical_required") or [],
+            )
+            if item["volume"].provider == provider_name
+        }
+        cached: list[PlacementCandidate] = []
+        for volume in self.cache_registry.list_volumes(status="ready"):
+            if volume.provider != provider_name:
+                continue
+            if policy.get("policy") == "pinned" and volume.datacenter_id != policy.get("region"):
+                continue
+            constraints = PlacementConstraints(
+                datacenter_ids=(volume.datacenter_id,),
+                storage_attachments=(
+                    StorageAttachment(
+                        provider_volume_id=volume.provider_volume_id,
+                        mount_path="/workspace",
+                        datacenter_id=volume.datacenter_id,
+                    ),
+                ),
+            )
+            try:
+                offers = connector.list_available(
+                    gpu_type=gpu_type,
+                    min_gpu_ram=minimum_vram,
+                    max_hourly_rate=self.config.max_hourly_rate,
+                    placement=constraints,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Prepared placement %s/%s unavailable: %s",
+                    volume.datacenter_id,
+                    volume.id,
+                    exc,
+                )
+                continue
+            coverage = coverages.get(volume.id) or {
+                "cached_bytes": 0,
+                "required_bytes": sum(requirements["required"].values()),
+                "complete": not requirements["required"],
+                "manifest_ids": [],
+            }
+            for offer in offers:
+                if str(offer.get("id")) in cooling:
+                    continue
+                cached.append(
+                    PlacementCandidate(
+                        offer=offer,
+                        volume=volume,
+                        cached_bytes=int(coverage["cached_bytes"]),
+                        required_bytes=int(coverage["required_bytes"]),
+                        complete=bool(coverage["complete"]),
+                        manifest_ids=tuple(coverage["manifest_ids"]),
+                    )
+                )
+        cold = [
+            offer
+            for offer in connector.list_available(
+                gpu_type=gpu_type,
+                min_gpu_ram=minimum_vram,
+                max_hourly_rate=self.config.max_hourly_rate,
+            )
+            if str(offer.get("id")) not in cooling
+        ]
+        return choose_placement(
+            policy=policy, cached_candidates=cached, cold_offers=cold
+        )
 
     def _planned_disk_gb(self, profile_name: str, queued_jobs: list | None) -> int:
         """The container disk to rent: the configured floor, or a job's plan if larger.
