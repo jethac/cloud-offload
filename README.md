@@ -565,6 +565,10 @@ rental confirmation, preflight before paid work, persistent progress, provider-
 confirmed billing closure, and prepared-state acceleration. The storage subsystem
 is specified separately in **[Storage-aware Cloud Offload](docs/storage-aware-cloud-offload.md)**.
 
+The read-only **[partition preflight contract](docs/preflight.md)** checks
+deterministic requirements and returns safe current GPU choices before a job or
+paid provider resource is created.
+
 Two additional load balancers are designed and queued behind the current release:
 
 - **[Fleet provider](docs/fleet-provider.md)** — your own machines (a studio's
