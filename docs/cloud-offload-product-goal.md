@@ -626,6 +626,8 @@ This ledger records merged implementation evidence across both repositories.
 | [#12](https://github.com/jethac/cloud-offload/pull/12) | Made benchmark cache state authoritative: cold forces prepared storage off, hot requires an existing confirmed volume, full configuration is restored, and exact Pods are cleaned up. | Merged as `9675fdf`; 517 tests passed. |
 | [#13](https://github.com/jethac/cloud-offload/pull/13) | Added reversible storage, corruption, and coordinator-restart production canaries plus health PID identity. | Merged as `429d405`; 520 tests passed. |
 | [#14](https://github.com/jethac/cloud-offload/pull/14) | Added two-phase pre-submit failure hooks so reviewed corruption setup settles before job submission and Pod creation, with unconditional idempotent cleanup. | Merged as `4900aa6`; 522 tests passed. |
+| [#15](https://github.com/jethac/cloud-offload/pull/15) | Consolidated the complete program record and replaced the unsafe Windows signal-zero PID probe with native process-state inspection. | Merged as `79faa25`; 525 tests and real live/absent PID probes passed. |
+| [#16](https://github.com/jethac/cloud-offload/pull/16) | Made restart canaries prove journal replay and persist cancellation through the replacement coordinator instead of depending on unrelated image startup. | 526 tests passed; the production restart canary passed before merge. |
 
 ### ComfyUI extension repository
 
@@ -680,10 +682,22 @@ not blanket production-readiness claims:
   long worker startup and reached its $0.30 scenario ceiling before execution,
   so the restart hook never fired. Both exact Pods were removed. These outcomes
   are retained as failed evidence rather than rewritten as passes.
+- A restart-only retry that still waited for `execution_start` remained in
+  `runner_starting` for 1,012.250 seconds, reached its scenario timeout, and was
+  cancelled. The exact Pod was absent after 9.328 seconds, policy was restored,
+  provider inventory was empty, and the conservative cost was $0.418959. This
+  is startup-latency evidence, not restart evidence.
+- The corrected restart canary triggered immediately after provider creation,
+  stopped coordinator PID `38032`, brought replacement PID `49336` healthy,
+  proved job `05156c58-cff6-4164-915d-5273ec72519f` was replayable, and persisted
+  its cancellation through that replacement. Exact Pod `tpoita6ieh2bq5` was
+  provider-absent after one termination request. The case passed in 29.234
+  seconds with a conservative $0.012100 compute upper bound, restored policy,
+  empty final inventory, and no orphan or audit error.
 
-The accepted cold/hot scorecard and three accepted failure canaries prove a
-larger part of M0, but M0 is not complete until the corruption and restart
-canaries pass and a compact redacted evidence projection is committed.
+The accepted cold/hot scorecard and four accepted failure canaries prove a
+larger part of M0, but M0 is not complete until the corruption canary passes and
+a compact redacted evidence projection is committed.
 
 ## Current execution state and immediate next work
 
@@ -713,9 +727,12 @@ Status snapshot as of 2026-07-29:
   a Windows process-liveness probe raised while that process was exiting, so the
   replacement was not launched. Manual recovery restored a healthy coordinator
   with a new PID; prepared-storage policy remained `smart`.
-- The first unmet M0 work is therefore: fix the Windows restart probe; redesign
-  the corruption canary so it cannot alias a previously cached object; rerun
-  both cases to direct accepted evidence; generate one compact
+- The Windows restart probe and canary contract were corrected in PRs #15 and
+  #16. A focused production rerun now directly proves replacement health,
+  journal replay, replacement-owned cancellation, and exact provider cleanup.
+- The first unmet M0 work is therefore: redesign the corruption canary so it
+  cannot alias a previously cached object; rerun it to direct accepted evidence;
+  generate one compact
   redacted evidence projection for the accepted campaigns; merge that record;
   and audit every M0 exit before starting M1.
 
@@ -729,11 +746,10 @@ Status snapshot as of 2026-07-29:
    and conservative compute cost are separately represented in its scorecard.
 4. **Proved:** the full prepared-storage configuration was restored and verified
    after every completed scenario and campaign cleanup.
-5. **Partial:** cancellation, provider, and storage canaries passed. Corruption
-   and coordinator restart still require direct accepted evidence.
+5. **Partial:** cancellation, provider, storage, and coordinator-restart canaries
+   passed. Corruption still requires direct accepted evidence.
 6. **Proved for completed campaigns:** final provider inventory was empty and
-   attributable Pods had provider-absence receipts. The active rerun must meet
-   the same condition before its evidence can be used.
+   attributable Pods had provider-absence receipts.
 7. **Required:** commit a compact redacted scorecard projection or durable CI
    artifact reference that is comparable across runs and contains no prompts,
    raw workflow, asset paths, hook arguments/output, credentials, or secret
@@ -761,7 +777,7 @@ Status snapshot as of 2026-07-29:
 
 | Milestone | Status on 2026-07-29 | Gate |
 | --- | --- | --- |
-| M0 — measurement and scorecard | **In progress** | Cold/hot plus three failure classes accepted; corruption, restart, and durable redacted evidence remain. |
+| M0 — measurement and scorecard | **In progress** | Cold/hot plus four failure classes accepted; corruption and durable redacted evidence remain. |
 | M1 — preflight, recommendation, confirmation | **Not started** | Begins after M0 evidence is trustworthy. |
 | M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
