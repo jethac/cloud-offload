@@ -170,8 +170,8 @@ validate the product journey.
 | ID | Requirement | Primary milestone | Current state |
 | --- | --- | --- | --- |
 | `EXEC-1` | Rent and operate a compatible GPU without user-managed infrastructure. | M1 | Working baseline; recommendation and preflight remain. |
-| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | In progress; M0 is closed. |
-| `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | In progress; M0 is closed. |
+| `READY-1` | Prove deterministic requirements before provider mutation. | M1 | Read-only `PreflightReportV1` exists; submission binding and launch revalidation remain. |
+| `RECOMMEND-1` | Recommend provider/GPU/region using expected total time and cost, including prepared-state locality. | M1 | Initial explainable ranking exists; measured history and complete cost components remain. |
 | `CONFIRM-1` | Show recommendation, cost, rationale, and a default ten-second auto-start confirmation. | M1 | In progress; M0 is closed. |
 | `CONFIRM-2` | Provide Start now, Cancel, Choose another GPU, Don't show again, and equivalent persistent settings. | M1 | In progress; M0 is closed. |
 | `JOURNAL-1` | Persist an idempotent, replayable, lifecycle-authoritative `JobEventV2` journal. | M0 | Complete; tests and accepted production canaries prove replay and lifecycle authority. |
@@ -636,6 +636,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#22](https://github.com/jethac/cloud-offload/pull/22) | Persists the exact placement manifest on the assigned job, adds an active-job and volume-bound signed manifest fetch for stale mounted views, keeps exact placement authoritative in the worker, and removes fallback-created synthetic manifests during cleanup. It also records the unique-identity replay. | Merged as `3a60f7e`; 533 tests passed. Two bounded replays proved exact fetch, quarantine, fallback, and complete cleanup, then showed that the 105-second observation window is shorter than a worst-case prepared-asset verification pass. |
 | [#23](https://github.com/jethac/cloud-offload/pull/23) | Gives only corruption observation a 240-second event window inside a 270-second hook process limit and records both PR #22 production replays. | Merged as `c0114c5`; 534 tests passed. The bounded replay then produced accepted corruption evidence. |
 | [#24](https://github.com/jethac/cloud-offload/pull/24) | Commits the compact redacted seven-scenario production projection, checks its completeness and redaction contract, records the accepted corruption replay, and audits every M0 exit. | 535 tests passed; M0 is complete and M1 is active. |
+| [#25](https://github.com/jethac/cloud-offload/pull/25) | Adds the read-only `cloud-offload.preflight.v1` report and endpoint, deterministic blockers, safe volatile offer reads, storage-local candidate ranking, cost/time ranges, quote expiry, and explicit unknowns. | 541 tests passed. Provider-mutation guard tests pass; submission binding is the next M1 slice. |
 
 ### ComfyUI extension repository
 
@@ -1022,12 +1023,18 @@ canary. The accepted replay satisfied all of these conditions.
 
 ### Active engineering handoff
 
-M1 starts with the backend contract. Implement `PreflightReportV1` and
-`POST /api/preflight` before the confirmation UI. The report must separate
-deterministic proof from volatile observations, bind a canonical execution plan
-to `preflight_id` and `manifest_digest`, and make no provider mutation. The next
-slice is complete only when blocked work cannot create a Pod and a ready report
-contains enough safe data for a ranked GPU recommendation and cost range.
+PR #25 starts M1 with the backend contract. `PreflightReportV1` and
+`POST /api/preflight` separate deterministic proof from volatile observations,
+hash the canonical execution plan as `manifest_digest`, identify the report
+with `preflight_id`, and make no provider mutation. The report ranks safe GPU
+choices, includes prepared state locality, returns time and compute-cost ranges,
+and identifies missing history and cost components as unknowns.
+
+The active slice is submission binding and revalidation. Persist a safe
+preflight record, require a current `preflight_id` and matching
+`manifest_digest` for paid partition launch, re-read availability, price,
+region, and volume immediately before provider mutation, and return a revised
+report instead of silently substituting a materially changed recommendation.
 
 ### Operational safety rules
 
@@ -1052,7 +1059,7 @@ contains enough safe data for a ranked GPU recommendation and cost range.
 | Milestone | Status on 2026-07-29 | Gate |
 | --- | --- | --- |
 | M0 — measurement and scorecard | **Complete** | All exits passed; seven accepted scenarios and the redacted projection are durable. |
-| M1 — preflight, recommendation, confirmation | **In progress** | Implement the backend preflight contract first. |
+| M1 — preflight, recommendation, confirmation | **In progress** | Read-only report and initial ranking exist; bind submission and revalidate next. |
 | M2 — persistent visibility | **Partial foundation** | Journal and initial canvas feedback exist; Cloud Jobs drawer and telemetry remain. |
 | M3 — leases and billing closure | **Partial foundation** | Logical cancellation exists; persisted lease and provider receipt remain. |
 | M4 — fast trusted restore | **Partial foundation** | Durable prepared storage exists; trust receipts/scrubbing and performance target remain. |
