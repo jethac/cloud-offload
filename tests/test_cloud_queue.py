@@ -628,6 +628,28 @@ def test_fail_job_requeues_then_dead_letters(tmp_path):
     assert failed_twice.completed_at is not None
 
 
+def test_cancelled_job_is_not_resurrected_by_late_worker_callbacks(tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        params={"partition_cache_key": "cancelled-result"},
+        status=JobStatus.QUEUED,
+    )
+    claimed = queue.claim_jobs("worker-a", limit=1)[0]
+    cancelled = queue.update_status(
+        claimed.id, JobStatus.FAILED, error="Cancelled"
+    )
+
+    assert cancelled.status == JobStatus.FAILED
+    assert queue.update_status(claimed.id, JobStatus.RUNNING).status == JobStatus.FAILED
+    assert queue.set_progress(claimed.id, 99).progress == cancelled.progress
+    assert queue.fail_job(claimed.id, "late failure").status == JobStatus.FAILED
+    assert queue.complete_job(claimed.id, {"output": "late"}).status == JobStatus.FAILED
+    assert queue.get(claimed.id).error == "Cancelled"
+    assert queue.get_partition_cache("cancelled-result") is None
+
+
 def test_dispatcher_startup_script_uses_wheelhouse_only(tmp_path):
     config = CloudConfig(
         queue_db_path=str(tmp_path / "queue.db"),
@@ -1036,6 +1058,30 @@ def test_a_pod_that_never_registers_is_terminated(tmp_path, monkeypatch):
     events = queue.list_events(job.id)
     assert events[-1]["event"]["type"] == "provisioning_failed"
     assert events[-1]["event"]["error"] == "Runner did not register within 3600s"
+
+
+def test_a_paid_starting_pod_emits_elapsed_feedback_before_registration(tmp_path):
+    from datetime import datetime, timedelta
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    job = queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={"runtime_profile": "comfyui-partition-v1"},
+        status=JobStatus.QUEUED,
+    )
+    dispatcher = long_idle_dispatcher(config, queue)
+    dispatcher.launched_at["pod-1"] = datetime.utcnow() - timedelta(seconds=35)
+
+    dispatcher._check_unregistered_workers()
+
+    event = queue.list_events(job.id)[-1]["event"]
+    assert event["type"] == "runner_starting_progress"
+    assert 34 <= event["elapsed_seconds"] <= 36
+    assert "pulling the pinned image" in event["message"]
+    assert "pod-1" in dispatcher.active_instances
 
 
 def test_a_registered_starting_runner_is_not_terminated_by_the_boot_deadline(

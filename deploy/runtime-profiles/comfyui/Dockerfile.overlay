@@ -1,0 +1,14 @@
+# Fast source-only rebuild for an already pinned Cloud Offload ComfyUI runner.
+# The base remains immutable by digest; this layer replaces only Cloud Offload
+# itself, preserving the expensive CUDA, ComfyUI, and dependency layers.
+ARG BASE_IMAGE=ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:ee68a9ee81cb29991c7e47fa003c65838e57b83539b9ac72bf187b63e2d8198f
+FROM ${BASE_IMAGE}
+
+ARG CLOUD_OFFLOAD_SOURCE_REVISION=working-tree
+
+COPY . /opt/cloud-offload/source
+RUN python -m pip install --no-cache-dir --force-reinstall --no-deps \
+    "/opt/cloud-offload/source[cloud]" \
+    && python -c "from cloud_offload.worker import Worker; assert hasattr(Worker, '_initialize_prepared_cache')"
+
+LABEL org.opencontainers.image.revision="${CLOUD_OFFLOAD_SOURCE_REVISION}"

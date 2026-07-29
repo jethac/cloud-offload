@@ -578,10 +578,13 @@ class PreparedStateCAS:
         *,
         writer_id: str | None = None,
         bundle: bool = False,
+        source_verified: bool = False,
+        progress_callback: Callable[[int, int], None] | None = None,
+        commit_callback: Callable[[str], None] | None = None,
     ) -> Path:
         source = Path(source)
         digest = normalize_digest(expected_digest)
-        if sha256_file(source) != digest:
+        if not source_verified and sha256_file(source) != digest:
             raise CacheCorruptionError(f"Population source does not match sha256:{digest}")
         target = self._resolve(bundle_key(digest) if bundle else blob_key(digest))
         if target.is_file():
@@ -592,9 +595,34 @@ class PreparedStateCAS:
         staging = self._resolve(f"staging/{writer_id}/{target.name}.partial")
         staging.parent.mkdir(parents=True, exist_ok=False)
         try:
-            shutil.copyfile(source, staging)
-            self.verify_object(digest, target=staging)
+            total = source.stat().st_size
+            copied = 0
+            copied_digest = hashlib.sha256()
+            with source.open("rb") as reader, staging.open("xb") as writer:
+                for chunk in iter(lambda: reader.read(8 * 1024 * 1024), b""):
+                    writer.write(chunk)
+                    copied_digest.update(chunk)
+                    copied += len(chunk)
+                    if progress_callback:
+                        progress_callback(copied, total)
+                writer.flush()
+                if commit_callback:
+                    commit_callback("flushing")
+            # RunPod network volumes are object-backed FUSE mounts. fsync can
+            # hang for minutes or fail with EIO even though close+readback is
+            # healthy. Closing the writer above hands the object to the mount;
+            # a full digest readback below is the stronger portable durability
+            # check we actually need.
+            if copied != total or copied_digest.hexdigest() != digest:
+                raise CacheCorruptionError(
+                    f"Prepared cache copy does not match sha256:{digest}"
+                )
+            if commit_callback:
+                commit_callback("verifying")
+            self.verify_object(digest, target=staging, expected_size=total)
             target.parent.mkdir(parents=True, exist_ok=True)
+            if commit_callback:
+                commit_callback("publishing")
             try:
                 # Hard-link is an atomic create-if-absent. Another valid writer
                 # winning the race is harmless because the name is the digest.
@@ -608,12 +636,29 @@ class PreparedStateCAS:
                 raise RuntimeError(
                     "Prepared cache filesystem cannot atomically publish objects"
                 ) from exc
-            self.verify_object(digest, target=target)
+            # When our hard-link won, target and the already verified staging
+            # file are the same inode. Re-reading a 20 GB object here provides
+            # no additional integrity and doubles first-run publication time.
+            if not target.samefile(staging):
+                self.verify_object(digest, target=target)
+            if commit_callback:
+                commit_callback("committed")
             return target
         finally:
             shutil.rmtree(staging.parent, ignore_errors=True)
             if lease:
-                lease.unlink(missing_ok=True)
+                # A losing Windows test writer may still have the advisory
+                # lease open for its expiry check. Retry the owner cleanup;
+                # Linux volume workers do not need this, but the semantics are
+                # the same on both platforms.
+                for attempt in range(5):
+                    try:
+                        lease.unlink(missing_ok=True)
+                        break
+                    except PermissionError:
+                        if attempt == 4:
+                            raise
+                        time.sleep(0.01)
 
     def verify_object(
         self, digest: str, *, target: Path | None = None, expected_size: int | None = None
@@ -656,9 +701,19 @@ class PreparedStateCAS:
         (target.with_suffix(".reason")).write_text(str(reason), encoding="utf-8")
         return target
 
-    def publish_manifest(self, manifest: dict[str, Any]) -> Path:
+    def publish_manifest(
+        self,
+        manifest: dict[str, Any],
+        *,
+        verified_digests: set[str] | None = None,
+    ) -> Path:
         verified = self.signer.verify(manifest)
+        already_verified = {
+            normalize_digest(item) for item in (verified_digests or set())
+        }
         for artifact in verified["artifacts"]:
+            if normalize_digest(artifact["digest"]) in already_verified:
+                continue
             self.verify_object(
                 artifact["digest"],
                 target=self._resolve(artifact["storage_key"]),
@@ -996,7 +1051,23 @@ class RunPodS3PreparedStore:
 
     def probe(self) -> bool:
         self.client.head_bucket(Bucket=self.volume_id)
-        return True
+        # A bucket HEAD only proves that the credential can discover the
+        # volume.  Prepared-state verification needs the exact permissions it
+        # will use later, so exercise a tiny write/read/delete lifecycle under
+        # the staging namespace and always clean it up.
+        key = f"staging/probes/{uuid.uuid4().hex}"
+        payload = os.urandom(32)
+        try:
+            self.client.put_object(Bucket=self.volume_id, Key=key, Body=payload)
+            response = self.client.get_object(Bucket=self.volume_id, Key=key)
+            if response["Body"].read() != payload:
+                raise CacheCorruptionError("RunPod S3 probe returned different bytes")
+            head = self.client.head_object(Bucket=self.volume_id, Key=key)
+            if int(head.get("ContentLength") or -1) != len(payload):
+                raise CacheCorruptionError("RunPod S3 probe returned the wrong size")
+            return True
+        finally:
+            self.client.delete_object(Bucket=self.volume_id, Key=key)
 
     def exists(self, key: str, size: int | None = None) -> bool:
         try:
@@ -1110,8 +1181,14 @@ class RunPodS3PreparedStore:
                 raise ManifestError("RunPod S3 inventory schema is invalid")
             return index
         except Exception as exc:
-            status = getattr(exc, "response", {}).get("Error", {}).get("Code")
+            error = getattr(exc, "response", {}).get("Error", {})
+            status = error.get("Code")
+            message = str(error.get("Message") or exc).lower()
             if status in {"NoSuchKey", "404", "NotFound"}:
+                return {"schema": INDEX_SCHEMA, "generation": None, "manifests": []}
+            # RunPod's S3 gateway reports a missing object as
+            # InvalidArgument/"object not found" rather than NoSuchKey.
+            if status == "InvalidArgument" and "object not found" in message:
                 return {"schema": INDEX_SCHEMA, "generation": None, "manifests": []}
             # Injected fakes commonly use KeyError for a missing first pointer.
             if isinstance(exc, KeyError):

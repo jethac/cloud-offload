@@ -34,8 +34,17 @@ KEYCHAIN_SERVICE = "cloud-offload"
 #: workers use to download gated profile weights.
 HUGGINGFACE_CREDENTIAL = "huggingface"
 
+# RunPod's S3-compatible network-volume API uses a credential pair that is
+# deliberately separate from the ordinary RunPod control-plane token.  Keep
+# both halves as named keychain entries; neither is a connector and neither may
+# enter config.json.
+RUNPOD_S3_ACCESS_CREDENTIAL = "runpod-s3-access-key"
+RUNPOD_S3_SECRET_CREDENTIAL = "runpod-s3-secret-key"
+
 __all__ = [
     "HUGGINGFACE_CREDENTIAL",
+    "RUNPOD_S3_ACCESS_CREDENTIAL",
+    "RUNPOD_S3_SECRET_CREDENTIAL",
     "KEYCHAIN_SERVICE",
     "KeychainUnavailable",
     "delete_credential",

@@ -128,6 +128,7 @@ class Dispatcher:
         self.instance_profiles: dict[str, str] = {}
         self.last_activity: dict[str, datetime] = {}
         self.launched_at: dict[str, datetime] = {}
+        self.runner_feedback_at: dict[str, datetime] = {}
         self.launch_failures: dict[tuple[str, str], int] = {}
         self.next_launch_at: dict[tuple[str, str], float] = {}
         # (provider, offer_id) -> monotonic expiry. A host that refuses a launch
@@ -196,7 +197,8 @@ class Dispatcher:
         # a newly submitted job cannot launch with a stale image or GPU policy.
         # Provider credentials/connectors remain process-owned.
         try:
-            persisted = CloudConfig.load(resolve_secrets=False)
+            config_path = getattr(self.config, "_source_path", None)
+            persisted = CloudConfig.load(config_path, resolve_secrets=False)
             self.config.keep_warm = persisted.keep_warm
             self.config.keep_warm_warning_seconds = persisted.keep_warm_warning_seconds
             self.config.idle_shutdown_seconds = persisted.idle_shutdown_seconds
@@ -205,7 +207,11 @@ class Dispatcher:
             self.config.max_hourly_rate = persisted.max_hourly_rate
             self.config.worker_profiles = persisted.worker_profiles
             self.config.runpod_registry_auth_id = persisted.runpod_registry_auth_id
-            self.config.prepared_storage = persisted.prepared_storage
+            # Prepared storage can create paid durable resources. Only refresh
+            # it for file-backed services; a programmatically constructed
+            # config remains authoritative for this opt-in policy.
+            if config_path is not None:
+                self.config.prepared_storage = persisted.prepared_storage
             runpod = self.connectors.get("runpod")
             if runpod is not None and hasattr(runpod, "registry_auth_id"):
                 runpod.registry_auth_id = persisted.runpod_registry_auth_id.strip()
@@ -969,6 +975,7 @@ cloud-offload worker --poll 10
                 self.instance_profiles.pop(instance_id, None)
                 self.last_activity.pop(instance_id, None)
                 self.launched_at.pop(instance_id, None)
+                self.runner_feedback_at.pop(instance_id, None)
             else:
                 self.active_instances[instance_id] = instance
 
@@ -980,12 +987,60 @@ cloud-offload worker --poll 10
         for instance_id, launched_at in list(self.launched_at.items()):
             provider_name = self.instance_providers[instance_id]
             profile_name = self.instance_profiles[instance_id]
+
+            def registered_after_launch(worker: dict) -> bool:
+                if (
+                    worker.get("provider") != provider_name
+                    or worker.get("runtime_profile") != profile_name
+                ):
+                    return False
+                try:
+                    seen = datetime.fromisoformat(
+                        str(worker.get("last_seen") or "").replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except ValueError:
+                    return False
+                return seen >= launched_at
+
             registered = any(
-                worker.get("provider") == provider_name
-                and worker.get("runtime_profile") == profile_name
+                registered_after_launch(worker)
                 for worker in workers
             )
-            if registered or now - launched_at <= timedelta(
+            if registered:
+                self.runner_feedback_at.pop(instance_id, None)
+                continue
+
+            queued_jobs = [
+                job
+                for job in self.queue.list_by_status(
+                    JobStatus.QUEUED, provider=provider_name
+                )
+                if self._job_profile_name(job, profiles) == profile_name
+            ]
+            last_feedback = self.runner_feedback_at.get(instance_id)
+            if queued_jobs and (
+                last_feedback is None
+                or now - last_feedback >= timedelta(seconds=10)
+            ):
+                elapsed = round((now - launched_at).total_seconds(), 1)
+                self._publish_launch_event(
+                    queued_jobs,
+                    {
+                        "schema": "cloud-offload.phase-event.v1",
+                        "type": "runner_starting_progress",
+                        "phase": "runner_starting",
+                        "worker_instance_id": instance_id,
+                        "elapsed_seconds": elapsed,
+                        "overall_progress": 2,
+                        "message": (
+                            "RunPod is allocating the machine, pulling the pinned "
+                            "image, and starting ComfyUI"
+                        ),
+                    },
+                )
+                self.runner_feedback_at[instance_id] = now
+
+            if now - launched_at <= timedelta(
                 seconds=RUNNER_REGISTRATION_TIMEOUT_SECONDS
             ):
                 continue
@@ -995,13 +1050,6 @@ cloud-offload worker --poll 10
                 f"{RUNNER_REGISTRATION_TIMEOUT_SECONDS}s"
             )
             logger.error("Worker %s %s; terminating", instance_id, detail.lower())
-            queued_jobs = [
-                job
-                for job in self.queue.list_by_status(
-                    JobStatus.QUEUED, provider=provider_name
-                )
-                if self._job_profile_name(job, profiles) == profile_name
-            ]
             self._record_launch_failure(
                 provider_name, profile_name, queued_jobs, detail
             )

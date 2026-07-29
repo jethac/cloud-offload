@@ -795,8 +795,86 @@ async def get_providers():
 @app.get("/api/cache/status")
 async def cache_status():
     """Prepared-storage policy, regional volumes, health and measured benefit."""
+    from cloud_offload.credentials import (
+        RUNPOD_S3_ACCESS_CREDENTIAL,
+        RUNPOD_S3_SECRET_CREDENTIAL,
+        get_credential,
+    )
+
     config = _config(resolve_secrets=False)
-    return _cache_registry(config).status(config.prepared_storage)
+    status = _cache_registry(config).status(config.prepared_storage)
+    status["s3_credentials_configured"] = bool(
+        get_credential(RUNPOD_S3_ACCESS_CREDENTIAL)
+        and get_credential(RUNPOD_S3_SECRET_CREDENTIAL)
+    )
+    return status
+
+
+@app.post("/api/cache/s3-credentials")
+async def set_cache_s3_credentials(body: dict[str, Any] = Body(...)):
+    """Store the dedicated RunPod S3 credential pair in the OS keychain.
+
+    Both values are write-only and must arrive together.  The endpoint never
+    echoes either half and rolls back the first write if the second fails.
+    Environment-owned credentials remain authoritative and cannot be replaced
+    through the API.
+    """
+    from cloud_offload.credentials import (
+        RUNPOD_S3_ACCESS_CREDENTIAL,
+        RUNPOD_S3_SECRET_CREDENTIAL,
+        get_credential,
+        provider_env_var,
+        set_credential,
+    )
+
+    access_key = body.get("access_key")
+    secret_key = body.get("secret_key")
+    if not isinstance(access_key, str) or not isinstance(secret_key, str):
+        raise HTTPException(
+            status_code=400,
+            detail="access_key and secret_key must both be strings",
+        )
+    access_key = access_key.strip()
+    secret_key = secret_key.strip()
+    if not access_key or not secret_key:
+        raise HTTPException(
+            status_code=400,
+            detail="access_key and secret_key are both required",
+        )
+    for credential in (
+        RUNPOD_S3_ACCESS_CREDENTIAL,
+        RUNPOD_S3_SECRET_CREDENTIAL,
+    ):
+        env_name = provider_env_var(credential)
+        if os.environ.get(env_name, "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail=f"RunPod S3 credentials come from {env_name}",
+            )
+
+    previous_access = get_credential(RUNPOD_S3_ACCESS_CREDENTIAL)
+    previous_secret = get_credential(RUNPOD_S3_SECRET_CREDENTIAL)
+    try:
+        await asyncio.to_thread(
+            set_credential, RUNPOD_S3_ACCESS_CREDENTIAL, access_key
+        )
+        await asyncio.to_thread(
+            set_credential, RUNPOD_S3_SECRET_CREDENTIAL, secret_key
+        )
+    except Exception as exc:
+        # Best-effort compare-and-restore keeps a half-written pair from being
+        # mistaken for usable credentials by the status surface.
+        try:
+            await asyncio.to_thread(
+                set_credential, RUNPOD_S3_ACCESS_CREDENTIAL, previous_access
+            )
+            await asyncio.to_thread(
+                set_credential, RUNPOD_S3_SECRET_CREDENTIAL, previous_secret
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"provider": "runpod", "s3_credentials_configured": True}
 
 
 @app.post("/api/cache/volumes")
@@ -1065,7 +1143,7 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
     store = _runpod_s3_store(volume, connector)
     canonical = create_storage(config)
     manifest_artifacts = []
-    requirement_assets = []
+    seeded_requirement_assets = []
     token = huggingface_token() or None
     with tempfile.TemporaryDirectory(prefix="cloud-offload-prepopulate-") as directory:
         for item in artifacts:
@@ -1162,7 +1240,7 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
             kind = "profile-weight" if profile_source else "model-weight"
             category = str(item.get("category") or "")
             filename = str(item.get("filename") or source.name)
-            requirement_assets.append(
+            seeded_requirement_assets.append(
                 {
                     "sha256": digest,
                     "size": source.stat().st_size,
@@ -1192,6 +1270,62 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
                     }} if profile_source else {}),
                     "destination": {"category": category, "filename": filename},
                 }
+            )
+    # A caller may seed only the highest-value subset while still binding its
+    # signed manifest to the complete workflow requirement. Without this
+    # separate identity list, a one-model seed gets a different fingerprint
+    # from the six-model job and can never be selected by that job's worker.
+    requirement_assets = seeded_requirement_assets
+    declared_requirement = body.get("requirement_artifacts")
+    if declared_requirement is not None:
+        if not isinstance(declared_requirement, list) or not declared_requirement:
+            raise HTTPException(
+                status_code=400,
+                detail="requirement_artifacts must be a non-empty list",
+            )
+        requirement_assets = []
+        for item in declared_requirement:
+            if not isinstance(item, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="requirement_artifacts entries must be objects",
+                )
+            try:
+                digest = normalize_digest(str(item.get("sha256") or ""))
+                size = int(item.get("size") or 0)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="requirement_artifacts need valid sha256 and size fields",
+                ) from exc
+            if size < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="requirement_artifacts size cannot be negative",
+                )
+            requirement_assets.append(
+                {
+                    "sha256": digest,
+                    "size": size,
+                    "category": str(item.get("category") or ""),
+                    "filename": str(item.get("filename") or ""),
+                    "private": bool(item.get("private") or item.get("gated")),
+                    "cacheable": bool(item.get("cacheable", True)),
+                }
+            )
+        complete_digests = {item["sha256"] for item in requirement_assets}
+        missing = sorted(
+            item["sha256"]
+            for item in seeded_requirement_assets
+            if item["sha256"] not in complete_digests
+        )
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Every seeded artifact must appear in requirement_artifacts: "
+                    + ", ".join(missing)
+                ),
             )
     requirement = resolve_prepared_requirements(
         profile_name,
@@ -2269,7 +2403,11 @@ async def worker_progress(job_id: str, request: Request, payload: dict[str, Any]
 @app.post("/api/workers/jobs/{job_id}/events")
 async def worker_event(job_id: str, request: Request, payload: dict[str, Any] = Body(...)):
     """Accept an authenticated incremental event from a remote runner."""
+    from cloud_offload.queue import JobStatus
+
     queue, job = _authorize_worker_job(request, job_id)
+    if job.status in {JobStatus.FAILED, JobStatus.DEAD_LETTER}:
+        return {"job_id": job.id, "ignored": True, "status": job.status.value}
     event = payload.get("event")
     if not isinstance(event, dict):
         raise HTTPException(status_code=400, detail="event object is required")
