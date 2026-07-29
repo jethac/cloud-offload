@@ -2,6 +2,7 @@
 
 import json
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -346,12 +347,14 @@ def test_staging_emits_ordered_weights_staging_events(tmp_path, monkeypatch):
 
     worker._stage_profile_weights(job)
 
-    events = [
+    all_events = [
         item["event"]
         for item in worker.queue.list_events(job.id)
         if not item["type"].startswith("job_")
     ]
+    events = [event for event in all_events if event["type"] == "weights_staging"]
     assert [event["type"] for event in events] == ["weights_staging"] * 4
+    assert sum(event["type"] == "weight_download_progress" for event in all_events) == 3
     assert [(event["repo_id"], event["file"]) for event in events] == [
         ("org/checkpoints", "base.safetensors"),
         ("org/checkpoints", "refiner.safetensors"),
@@ -415,3 +418,35 @@ def test_worker_rejects_malformed_weights_env(monkeypatch):
 
     monkeypatch.delenv("CLOUD_OFFLOAD_WEIGHTS")
     assert Worker._load_weights_env() == []
+
+
+def test_blocking_download_feedback_reports_observed_bytes_and_completion(tmp_path):
+    worker = Worker.__new__(Worker)
+    events = []
+    worker._cache_event = lambda job, event_type, **fields: events.append(
+        {"type": event_type, **fields}
+    )
+    target = tmp_path / "large-model.part"
+
+    def download():
+        target.write_bytes(b"a" * 10)
+        time.sleep(0.04)
+        with target.open("ab") as handle:
+            handle.write(b"b" * 10)
+        return target
+
+    result = worker._run_with_feedback(
+        SimpleNamespace(id="job-1"),
+        "weight_download_progress",
+        download,
+        interval_seconds=0.01,
+        progress_reader=lambda: target.stat().st_size if target.exists() else 0,
+        bytes_total=20,
+    )
+
+    assert result == target
+    assert any(item.get("bytes_completed") == 10 for item in events[:-1])
+    assert events[-1]["bytes_completed"] == 20
+    assert events[-1]["bytes_total"] == 20
+    assert events[-1]["complete"] is True
+    assert events[-1]["indeterminate"] is False

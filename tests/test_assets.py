@@ -676,12 +676,19 @@ def test_staging_emits_one_event_per_asset(tmp_path, monkeypatch):
 
     worker._stage_profile_weights(job)
 
-    events = [
+    all_events = [
         item["event"]
         for item in worker.queue.list_events(job.id)
         if not item["type"].startswith("job_")
     ]
+    events = [event for event in all_events if event["type"] == "weights_staging"]
     assert [event["type"] for event in events] == ["weights_staging"] * 3
+    download_events = [
+        event for event in all_events if event["type"] == "weight_download_progress"
+    ]
+    assert len(download_events) == 2
+    assert download_events[-1]["bytes_completed"] == CHECKPOINT_ASSET["size"]
+    assert download_events[-1]["bytes_total"] == CHECKPOINT_ASSET["size"]
     assert [(event["file"], event["category"]) for event in events] == [
         ("base.safetensors", None),
         ("detail.safetensors", "loras"),

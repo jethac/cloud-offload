@@ -1969,6 +1969,15 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50):
     return [job.to_dict() for job in jobs]
 
 
+@app.get("/api/job-visibility")
+async def job_visibility(limit: int = 50, active_only: bool = False):
+    """Return a safe, reloadable view for the Cloud Jobs user interface."""
+    from cloud_offload.job_visibility import visibility_page
+
+    _, queue = _queue()
+    return visibility_page(queue, limit=limit, active_only=active_only)
+
+
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
     """Get job status (+ result when completed)."""
