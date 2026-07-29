@@ -232,6 +232,36 @@ def test_exact_manifest_id_falls_back_to_immutable_direct_object(tmp_path):
     )
 
 
+def test_exact_manifest_id_fetches_from_authority_when_mount_is_stale(tmp_path):
+    signer = ManifestSigner(b"f" * 32)
+    manifest = signed_manifest(signer, [portable_artifact(b"control-plane")])
+
+    class FetchAuthority:
+        def __init__(self):
+            self.fetches = []
+
+        def fetch(self, manifest_id):
+            self.fetches.append(manifest_id)
+            return manifest
+
+        def verify(self, document):
+            return signer.verify(document)
+
+    authority = FetchAuthority()
+    volume = PreparedStateCAS(tmp_path / "volume", authority)
+    volume.publish_index(
+        [manifest],
+        generation="stale-mounted-index",
+        manifest_keys={manifest["manifest_id"]: "manifests/missing.json"},
+    )
+
+    assert volume.load_index()["manifests"][0]["manifest_id"] == manifest["manifest_id"]
+    selected = volume.find_manifest(manifest_id=manifest["manifest_id"])
+
+    assert selected == manifest
+    assert authority.fetches == [manifest["manifest_id"]]
+
+
 def test_concurrent_writers_cannot_publish_partial_or_invalid_objects(tmp_path):
     signer = ManifestSigner(b"s" * 32)
     volume = PreparedStateCAS(tmp_path / "volume", signer)
@@ -1212,6 +1242,7 @@ class PlacementProvider(CloudConnector):
         self.fail_cached = fail_cached
         self.created = []
         self.launches = []
+        self.launch_environments = []
 
     @property
     def name(self):
@@ -1245,6 +1276,7 @@ class PlacementProvider(CloudConnector):
         placement=None,
     ):
         self.launches.append(placement)
+        self.launch_environments.append(dict(env_vars or {}))
         if placement and self.fail_cached:
             raise PlacementError("cached datacenter capacity disappeared")
         return Instance(
@@ -1406,6 +1438,7 @@ def test_smart_launch_capacity_race_immediately_retries_cold(tmp_path):
     assert instance and instance.id == "worker-cold"
     assert provider.launches[0] is not None
     assert provider.launches[1] is None
+    assert "cache_manifest_id" not in dispatcher.queue.get(job.id).params
     event_types = [
         item["event"]["type"] for item in dispatcher.queue.list_events(job.id)
     ]
@@ -1450,7 +1483,7 @@ def test_worker_manifest_announcement_drives_next_exact_cache_placement(
     requirements = resolve_prepared_requirements(
         "comfy", profile, [SimpleNamespace(request={"assets": [asset]})]
     )
-    job = queue.create(
+    queue.create(
         "comfyui-workflow",
         "inline://request",
         params={
@@ -1499,6 +1532,32 @@ def test_worker_manifest_announcement_drives_next_exact_cache_placement(
         },
     )
     assert response.status_code == 200, response.text
+
+    claimed.params["cache_manifest_id"] = manifest["manifest_id"]
+    queue.update(claimed)
+    fetched = TestClient(server.app).post(
+        "/api/workers/cache/manifests/fetch",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={
+            "job_id": claimed.id,
+            "worker_id": "worker-one",
+            "volume_id": cache_volume.id,
+            "manifest_id": manifest["manifest_id"],
+        },
+    )
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["manifest_id"] == manifest["manifest_id"]
+    refused = TestClient(server.app).post(
+        "/api/workers/cache/manifests/fetch",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={
+            "job_id": claimed.id,
+            "worker_id": "worker-one",
+            "volume_id": cache_volume.id,
+            "manifest_id": "sha256:" + "f" * 64,
+        },
+    )
+    assert refused.status_code == 403
 
     queue.complete_job(claimed.id, {"outputs": {}})
     other_requirements = {
@@ -1550,6 +1609,25 @@ def test_worker_manifest_announcement_drives_next_exact_cache_placement(
     assert decision.candidate.complete
     assert decision.candidate.manifest_ids == (manifest["manifest_id"],)
 
+    launch_job = dispatcher.queue.create(
+        "comfyui-workflow",
+        "inline://launch",
+        params={"runtime_profile": "comfy"},
+        request={"assets": [asset], "workflow": {}},
+        provider="runpod",
+    )
+    launched = dispatcher._launch_worker("runpod", "comfy", [launch_job])
+
+    assert launched and launched.id == "worker-cache"
+    assert (
+        dispatcher.queue.get(launch_job.id).params["cache_manifest_id"]
+        == manifest["manifest_id"]
+    )
+    assert (
+        provider.launch_environments[-1]["CLOUD_OFFLOAD_CACHE_MANIFEST"]
+        == manifest["manifest_id"]
+    )
+
 
 def test_result_available_phase_precedes_job_completion(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
@@ -1596,6 +1674,24 @@ def cache_worker(cas, profile_fingerprint, worker_id):
     worker.cache_receipt = None
     worker._active_cache_job = None
     return worker
+
+
+def test_exact_placement_manifest_precedes_same_profile_worker_publication(tmp_path):
+    signer = ManifestSigner(b"e" * 32)
+    cas = PreparedStateCAS(tmp_path / "volume", signer)
+    profile = fingerprint({"profile": "exact"})
+    selected = signed_manifest(signer, [portable_artifact(b"selected")], profile)
+    latest = signed_manifest(signer, [portable_artifact(b"later")], profile)
+    direct = cas.root / manifest_by_id_key(selected["manifest_id"])
+    direct.parent.mkdir(parents=True, exist_ok=True)
+    direct.write_bytes(canonical_json(selected))
+    worker = cache_worker(cas, profile, "worker-exact")
+    worker.cache_manifest_instruction = selected["manifest_id"]
+    worker._latest_prepared_manifest = latest
+
+    assert (
+        worker._selected_prepared_manifest()["manifest_id"] == selected["manifest_id"]
+    )
 
 
 def test_two_jobs_accumulate_manifest_and_second_fresh_worker_never_fetches_origin(

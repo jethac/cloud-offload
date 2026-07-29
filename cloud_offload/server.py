@@ -2420,6 +2420,46 @@ async def worker_verify_prepared_manifest(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/workers/cache/manifests/fetch")
+async def worker_fetch_prepared_manifest(
+    request: Request, payload: dict[str, Any] = Body(...)
+):
+    """Return only the exact signed manifest assigned to an active worker job."""
+
+    config, queue = _queue()
+    try:
+        queue.authorize_worker(_worker_token(request))
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    job = queue.get(str(payload.get("job_id") or ""))
+    worker_id = str(payload.get("worker_id") or "")
+    volume_id = str(payload.get("volume_id") or "")
+    manifest_id = str(payload.get("manifest_id") or "")
+    if not _is_active_worker_job(job, worker_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Prepared manifest fetch is not bound to this worker's active job",
+        )
+    if str(job.params.get("cache_volume_id") or "") != volume_id:
+        raise HTTPException(
+            status_code=403, detail="Fetch volume is outside launch plan"
+        )
+    if str(job.params.get("cache_manifest_id") or "") != manifest_id:
+        raise HTTPException(
+            status_code=403, detail="Manifest ID is outside the exact launch plan"
+        )
+    manifest = _cache_registry(config).get_manifest(volume_id, manifest_id)
+    if not manifest:
+        raise HTTPException(status_code=404, detail="Prepared manifest not found")
+    try:
+        verified = _prepared_manifest_signer(config).verify(manifest)
+        if str(verified.get("cache_volume_id") or "") != volume_id:
+            raise ValueError("Signed manifest volume claim does not match launch plan")
+        return verified
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/workers/cache/manifests/announce")
 async def worker_announce_prepared_manifest(
     request: Request, payload: dict[str, Any] = Body(...)

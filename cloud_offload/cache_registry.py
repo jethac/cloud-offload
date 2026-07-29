@@ -502,6 +502,17 @@ class CacheRegistry:
                 "artifacts_removed": removed_count,
             }
 
+    def get_manifest(self, volume_id: str, manifest_id: str) -> dict[str, Any] | None:
+        """Return one projected signed manifest for an exact volume and ID."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT manifest_json FROM cache_manifests "
+                "WHERE volume_id=? AND manifest_id=?",
+                (str(volume_id), str(manifest_id)),
+            ).fetchone()
+        return json.loads(row["manifest_json"]) if row else None
+
     def query_manifests(
         self,
         *,

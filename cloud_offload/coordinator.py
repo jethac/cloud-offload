@@ -66,9 +66,7 @@ class CoordinatorQueue:
 
     def worker_policy(self) -> dict[str, Any]:
         """Fetch the coordinator-owned worker lifetime policy."""
-        response = self.session.get(
-            f"{self.base_url}/api/workers/policy", timeout=30
-        )
+        response = self.session.get(f"{self.base_url}/api/workers/policy", timeout=30)
         response.raise_for_status()
         return response.json()
 
@@ -105,7 +103,9 @@ class CoordinatorQueue:
             response = self.session.post(
                 f"{self.base_url}/api/workers/artifacts",
                 data={"sha256": digest},
-                files={"file": (source.name, handle, "application/vnd.comfy.partition+zip")},
+                files={
+                    "file": (source.name, handle, "application/vnd.comfy.partition+zip")
+                },
                 timeout=600,
             )
         response.raise_for_status()
@@ -195,8 +195,21 @@ class CoordinatorQueue:
 
     def verify_prepared_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
         """Verify through the coordinator; the signing key stays control-plane-only."""
+        return self._post("/api/workers/cache/manifests/verify", {"manifest": manifest})
+
+    def fetch_prepared_manifest(
+        self, manifest_id: str, *, job_id: str, volume_id: str
+    ) -> dict[str, Any]:
+        """Fetch only the exact manifest assigned to this worker's active job."""
+
         return self._post(
-            "/api/workers/cache/manifests/verify", {"manifest": manifest}
+            "/api/workers/cache/manifests/fetch",
+            {
+                "manifest_id": manifest_id,
+                "job_id": job_id,
+                "volume_id": volume_id,
+                "worker_id": self.worker_id,
+            },
         )
 
     def record_cache_observation(
@@ -232,7 +245,5 @@ class CoordinatorQueue:
         )
 
     def fail_job(self, job_id: str, error: str) -> Job:
-        data = self._post(
-            f"/api/workers/jobs/{job_id}/fail", {"error": error}
-        )
+        data = self._post(f"/api/workers/jobs/{job_id}/fail", {"error": error})
         return Job.from_dict(data)
