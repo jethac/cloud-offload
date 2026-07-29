@@ -13,6 +13,7 @@ from cloud_offload.benchmark_faults import (
     inject_storage_unavailable,
     observe_corruption,
     prepare_corruption,
+    restart_coordinator,
 )
 
 
@@ -150,6 +151,32 @@ class FakeKernel32:
         return 1
 
 
+class FakeRestartClient:
+    def __init__(self, pid, status="queued"):
+        self.pid = pid
+        self.status = status
+        self.posts = []
+
+    def get(self, path):
+        assert path == "/api/health"
+        return {"pid": self.pid}
+
+    def job(self, job_id):
+        return {"id": job_id, "status": self.status}
+
+    def post(self, path, body):
+        self.posts.append((path, body))
+        return {"status": "failed"}
+
+
+class FakeReplacementProcess:
+    pid = 222
+
+    @staticmethod
+    def poll():
+        return None
+
+
 def test_fault_hook_refuses_direct_invocation(monkeypatch):
     monkeypatch.delenv("CLOUD_OFFLOAD_BENCHMARK_FAILURE_KIND", raising=False)
     monkeypatch.delenv("CLOUD_OFFLOAD_BENCHMARK_JOB_ID", raising=False)
@@ -184,6 +211,65 @@ def test_process_exists_uses_native_windows_probe(monkeypatch):
 
     assert _process_exists(123) is True
     assert _process_exists(456) is False
+
+
+def test_restart_replays_and_cancels_through_replacement_coordinator(
+    monkeypatch, tmp_path
+):
+    old = FakeRestartClient(111)
+    replacement = FakeRestartClient(222, status="running")
+    service_reads = iter(
+        [
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": 11435,
+                "pid": 111,
+            },
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": 11435,
+                "pid": 222,
+            },
+        ]
+    )
+    process_states = iter([True, False, False])
+    launches = []
+    monkeypatch.setattr(
+        benchmark_faults,
+        "read_service_info",
+        lambda require_healthy=True: next(service_reads),
+    )
+    monkeypatch.setattr(
+        benchmark_faults, "_process_exists", lambda pid: next(process_states)
+    )
+    monkeypatch.setattr(benchmark_faults.os, "kill", lambda pid, signal: None)
+    monkeypatch.setattr(benchmark_faults, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(
+        benchmark_faults,
+        "CoordinatorFaultClient",
+        lambda service: replacement,
+    )
+
+    def launch(*args, **kwargs):
+        launches.append((args, kwargs))
+        return FakeReplacementProcess()
+
+    monkeypatch.setattr(benchmark_faults.subprocess, "Popen", launch)
+
+    receipt = restart_coordinator(old, "job-restart")
+
+    assert receipt == {
+        "kind": "restart",
+        "old_process_stopped": True,
+        "replacement_healthy": True,
+        "job_replay_available": True,
+        "replayed_status": "running",
+        "cancellation_recorded": True,
+    }
+    assert replacement.posts == [("/api/jobs/job-restart/cancel", {})]
+    assert len(launches) == 1
 
 
 def test_storage_fault_is_observed_without_mutating_provider_storage():
