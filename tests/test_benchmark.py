@@ -435,6 +435,10 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
     )
     driver = FakeDriver({"corruption": successful_script("pod-corruption")})
 
+    assets = plan.scenarios[0].request["partition"]["assets"]
+    assert len(assets) == 1
+    assert assets[0]["filename"].startswith("cloud_offload_benchmark_canary_")
+
     scorecard = BenchmarkRunner(driver).run(plan)
     result = scorecard["results"][0]
 
@@ -447,6 +451,10 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
         "cleanup",
     ]
     assert driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == ""
+    assert (
+        assets[0]["sha256"]
+        in driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS"]
+    )
     assert driver.hooks[1][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == "job-1"
     assert result["failure_injection"]["preparation_hook"]["exit_code"] == 0
     assert result["failure_injection"]["hook"]["exit_code"] == 0

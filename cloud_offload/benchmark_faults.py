@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -21,8 +22,18 @@ from urllib.parse import urlparse
 
 import requests
 
+from cloud_offload.cache_registry import CacheRegistry
 from cloud_offload.config import CONFIG_DIR, CloudConfig
-from cloud_offload.prepared_state import RunPodS3PreparedStore, normalize_digest
+from cloud_offload.prepared_state import (
+    INDEX_SCHEMA,
+    RunPodS3PreparedStore,
+    blob_key,
+    build_manifest,
+    canonical_json,
+    load_or_create_manifest_signer,
+    normalize_digest,
+    utc_now,
+)
 from cloud_offload.providers import create_connector
 from cloud_offload.service_config import (
     ServiceConfigError,
@@ -30,6 +41,7 @@ from cloud_offload.service_config import (
     is_local_host,
     read_service_info,
 )
+from cloud_offload.storage import create_storage, partition_artifact_key
 
 
 FAULT_KINDS = {"storage", "corruption", "restart"}
@@ -181,11 +193,35 @@ def inject_storage_unavailable(
     }
 
 
+CORRUPTION_STATE_SCHEMA = "cloud-offload.benchmark-corruption-state.v1"
+
+
+def corruption_canary_asset(scenario: str) -> dict[str, Any]:
+    """Return the synthetic asset unique to one corruption scenario."""
+
+    scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
+    payload = f"cloud-offload-benchmark-valid-v1:{scenario_tag}".encode("utf-8")
+    return {
+        "category": "vae",
+        "filename": f"cloud_offload_benchmark_canary_{scenario_tag}.bin",
+        "format": "other",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+        "cacheable": True,
+        "private": False,
+    }
+
+
+def _corruption_valid_payload(scenario: str) -> bytes:
+    scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
+    return f"cloud-offload-benchmark-valid-v1:{scenario_tag}".encode("utf-8")
+
+
 def _corruption_target(
     client: CoordinatorFaultClient,
-    job_id: str | None = None,
+    scenario: str,
     *,
-    declared_digests: set[str] | None = None,
+    declared_digests: set[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     prepared = client.prepared_storage()
     provider_volume_id = str(prepared.get("existing_volume_id") or "")
@@ -203,36 +239,44 @@ def _corruption_target(
     if not volume or not volume.get("s3_compatible"):
         raise RuntimeError("Bound prepared volume has no S3 canary path")
 
-    declared = {
-        "sha256:" + normalize_digest(item) for item in (declared_digests or set())
-    }
-    if not declared and job_id:
-        job = client.job(job_id)
-        declared = {
-            "sha256:" + normalize_digest(str(item.get("sha256") or ""))
-            for item in ((job.get("request") or {}).get("partition") or {}).get(
-                "assets", []
-            )
-            if item.get("sha256")
-        }
-    if not declared:
-        raise RuntimeError("Benchmark job declares no digest-addressed assets")
+    declared = {"sha256:" + normalize_digest(item) for item in declared_digests}
+    canary_digest = "sha256:" + corruption_canary_asset(scenario)["sha256"]
+    if canary_digest not in declared:
+        raise RuntimeError("Benchmark request is missing its fresh corruption asset")
+    ordinary = declared - {canary_digest}
     manifests = list(client.get("/api/cache/manifests").get("manifests") or [])
-    candidates: dict[str, dict[str, Any]] = {}
-    for manifest in manifests:
-        if str(manifest.get("volume_id") or "") != str(volume.get("id") or ""):
-            continue
-        for artifact in manifest.get("artifacts") or []:
-            digest = str(artifact.get("digest") or "")
-            if digest in declared and artifact.get("kind") == "model-weight":
-                candidates[digest] = artifact
+    candidates = [
+        manifest
+        for manifest in manifests
+        if str(manifest.get("volume_id") or "") == str(volume.get("id") or "")
+        and canary_digest
+        not in {
+            str(artifact.get("digest") or "")
+            for artifact in manifest.get("artifacts") or []
+        }
+    ]
     if not candidates:
-        raise RuntimeError("No prepared model artifact matches the benchmark job")
-    artifact = min(
-        candidates.values(),
-        key=lambda item: (int(item.get("size") or 0), str(item.get("digest") or "")),
+        raise RuntimeError("Bound prepared volume has no base manifest for the canary")
+    manifest = max(
+        candidates,
+        key=lambda item: (
+            len(
+                ordinary
+                & {
+                    str(artifact.get("digest") or "")
+                    for artifact in item.get("artifacts") or []
+                }
+            ),
+            str(item.get("created_at") or ""),
+            str(item.get("manifest_id") or ""),
+        ),
     )
-    return volume, artifact
+    overlap = ordinary & {
+        str(item.get("digest") or "") for item in manifest.get("artifacts") or []
+    }
+    if not overlap:
+        raise RuntimeError("No prepared base artifact matches the benchmark request")
+    return volume, manifest
 
 
 def _prepared_store(volume: dict[str, Any]) -> RunPodS3PreparedStore:
@@ -247,19 +291,31 @@ def _prepared_store(volume: dict[str, Any]) -> RunPodS3PreparedStore:
     )
 
 
-def _corruption_canary(
-    client: CoordinatorFaultClient,
-    scenario: str,
-    declared_digests: set[str],
-    *,
-    store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore],
-) -> tuple[RunPodS3PreparedStore, dict[str, Any], str]:
-    volume, artifact = _corruption_target(client, declared_digests=declared_digests)
-    store = store_factory(volume)
-    digest = normalize_digest(str(artifact["digest"]))
+def _manifest_signer():
+    config = CloudConfig.load()
+    return load_or_create_manifest_signer(
+        Path(config.queue_db_path).with_name("prepared-manifest-key")
+    )
+
+
+def _cache_registry() -> CacheRegistry:
+    return CacheRegistry(CloudConfig.load(resolve_secrets=False).queue_db_path)
+
+
+def _coordinator_storage():
+    return create_storage(CloudConfig.load())
+
+
+def _corruption_keys(scenario: str) -> dict[str, str]:
+    digest = normalize_digest(str(corruption_canary_asset(scenario)["sha256"]))
     scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
-    backup = f"staging/benchmark-corruption/{scenario_tag}/{digest}.backup"
-    return store, artifact, backup
+    prefix = f"staging/benchmark-corruption/{scenario_tag}"
+    return {
+        "digest": digest,
+        "blob_key": blob_key(digest),
+        "state_key": f"{prefix}/state.json",
+        "quarantine_prefix": f"quarantine/{digest}/",
+    }
 
 
 def _object_size(store: RunPodS3PreparedStore, key: str) -> int | None:
@@ -270,63 +326,231 @@ def _object_size(store: RunPodS3PreparedStore, key: str) -> int | None:
     return int(head.get("ContentLength") or -1)
 
 
+def _object_bytes(store: RunPodS3PreparedStore, key: str) -> bytes | None:
+    try:
+        response = store.client.get_object(Bucket=store.volume_id, Key=key)
+    except Exception:
+        return None
+    return bytes(response["Body"].read())
+
+
+def _manifest_index_entry(
+    manifest: dict[str, Any], generation: str, storage_key: str
+) -> dict[str, Any]:
+    return {
+        "manifest_id": manifest["manifest_id"],
+        "storage_key": storage_key,
+        "profile_fingerprint": manifest["profile_fingerprint"],
+        "created_at": manifest["created_at"],
+        "generation": generation,
+        "artifacts": [
+            {
+                "digest": item["digest"],
+                "kind": item["kind"],
+                "size": item["size"],
+                "portability": item["portability"],
+                "requirements": item["requirements"],
+                "policy": item["policy"],
+            }
+            for item in manifest["artifacts"]
+        ],
+    }
+
+
+def _delete_quarantine_objects(store: RunPodS3PreparedStore, prefix: str) -> int:
+    deleted = 0
+    continuation = None
+    while True:
+        request: dict[str, Any] = {"Bucket": store.volume_id, "Prefix": prefix}
+        if continuation:
+            request["ContinuationToken"] = continuation
+        response = store.client.list_objects_v2(**request)
+        for item in response.get("Contents") or []:
+            key = str(item.get("Key") or "")
+            if key.startswith(prefix):
+                store.client.delete_object(Bucket=store.volume_id, Key=key)
+                deleted += 1
+        if not response.get("IsTruncated"):
+            break
+        continuation = response.get("NextContinuationToken")
+        if not continuation:
+            raise RuntimeError("Corruption quarantine listing has no cursor")
+    return deleted
+
+
 def prepare_corruption(
     client: CoordinatorFaultClient,
     scenario: str,
     declared_digests: set[str],
     *,
     store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
+    signer_factory: Callable[[], Any] = _manifest_signer,
+    registry_factory: Callable[[], CacheRegistry] = _cache_registry,
+    coordinator_storage_factory: Callable[[], Any] = _coordinator_storage,
     settle_seconds: float = 5,
 ) -> dict[str, Any]:
-    """Back up and corrupt a required object before a Pod can be submitted."""
+    """Publish then corrupt an object no prior mount could have cached."""
 
-    store, artifact, backup = _corruption_canary(
-        client, scenario, declared_digests, store_factory=store_factory
+    volume, base_manifest = _corruption_target(
+        client, scenario, declared_digests=declared_digests
     )
-    key = str(artifact["storage_key"])
-    expected_size = int(artifact["size"])
-    if _object_size(store, key) != expected_size:
-        raise RuntimeError("Corruption target is not valid before canary preparation")
-    if _object_size(store, backup) is not None:
-        raise RuntimeError("A stale corruption canary backup already exists")
-    copied = False
+    store = store_factory(volume)
+    keys = _corruption_keys(scenario)
+    if _object_size(store, keys["state_key"]) is not None:
+        raise RuntimeError("A stale fresh-object corruption canary is still active")
+    if _object_size(store, keys["blob_key"]) is not None:
+        raise RuntimeError("Fresh corruption canary digest already exists")
+    original_index = store.load_index()
+    original_generation = str(original_index.get("generation") or "")
+    if not original_generation:
+        raise RuntimeError("Prepared storage has no restorable inventory generation")
+    asset = corruption_canary_asset(scenario)
+    valid_payload = _corruption_valid_payload(scenario)
+    coordinator_storage = coordinator_storage_factory()
+    coordinator_artifact_key = partition_artifact_key(keys["digest"])
+    if coordinator_storage.exists(coordinator_artifact_key):
+        raise RuntimeError("Fresh corruption coordinator artifact already exists")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".part") as temporary:
+        temporary.write(valid_payload)
+        temporary_path = Path(temporary.name)
     try:
-        store.client.copy_object(
-            Bucket=store.volume_id,
-            CopySource={"Bucket": store.volume_id, "Key": key},
-            Key=backup,
-        )
-        if _object_size(store, backup) != expected_size:
-            raise RuntimeError("Corruption canary backup has the wrong size")
-        copied = True
+        coordinator_storage.upload(temporary_path, coordinator_artifact_key)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    if not coordinator_storage.exists(coordinator_artifact_key):
+        raise RuntimeError("Fresh corruption coordinator artifact was not published")
+    artifact = {
+        "digest": "sha256:" + keys["digest"],
+        "kind": "model-weight",
+        "size": len(valid_payload),
+        "storage_key": keys["blob_key"],
+        "portability": "portable",
+        "requirements": {},
+        "policy": {
+            "tenant": str(client.prepared_storage().get("tenant") or "default"),
+            "cacheable": True,
+            "private": False,
+        },
+        "destination": {
+            "category": asset["category"],
+            "filename": asset["filename"],
+        },
+    }
+    canary_manifest = build_manifest(
+        profile_fingerprint=str(base_manifest["profile_fingerprint"]),
+        producer=dict(base_manifest.get("producer") or {}),
+        artifacts=[
+            item
+            for item in base_manifest.get("artifacts") or []
+            if str(item.get("digest") or "") != artifact["digest"]
+        ]
+        + [artifact],
+        signer=signer_factory(),
+        claims={"cache_volume_id": str(volume["id"])},
+    )
+    scenario_tag = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:16]
+    generation = f"{time.time_ns()}-benchmark-{scenario_tag}"
+    profile = normalize_digest(str(canary_manifest["profile_fingerprint"]))
+    manifest_key = f"manifests/{profile}/{generation}.json"
+    index_key = f"indexes/{generation}.json"
+    state = {
+        "schema": CORRUPTION_STATE_SCHEMA,
+        "volume_id": str(volume["id"]),
+        "provider_volume_id": str(volume["provider_volume_id"]),
+        "original_generation": original_generation,
+        "canary_generation": generation,
+        "manifest_id": canary_manifest["manifest_id"],
+        "manifest_key": manifest_key,
+        "index_key": index_key,
+        "coordinator_artifact_key": coordinator_artifact_key,
+        "coordinator_artifact_created": True,
+        **keys,
+    }
+    try:
         store.client.put_object(
             Bucket=store.volume_id,
-            Key=key,
-            Body=b"cloud-offload-benchmark-corruption-canary",
+            Key=keys["state_key"],
+            Body=canonical_json(state),
         )
-        canary_size = _object_size(store, key)
-        if canary_size is None or canary_size == expected_size:
-            raise RuntimeError("Corruption canary did not replace the canonical object")
-        # Give the provider gateway a bounded propagation window before the Pod
-        # and its fresh volume mount are created.
-        time.sleep(max(0.0, settle_seconds))
-        if _object_size(store, key) != canary_size:
-            raise RuntimeError("Corruption canary was not stable before submission")
     except Exception:
-        if copied:
-            store.client.copy_object(
-                Bucket=store.volume_id,
-                CopySource={"Bucket": store.volume_id, "Key": backup},
-                Key=key,
+        coordinator_storage.delete(coordinator_artifact_key)
+        raise
+    try:
+        store.client.put_object(
+            Bucket=store.volume_id,
+            Key=keys["blob_key"],
+            Body=valid_payload,
+        )
+        if _object_bytes(store, keys["blob_key"]) != valid_payload:
+            raise RuntimeError("Fresh corruption canary valid object was not published")
+        manifest_payload = canonical_json(canary_manifest)
+        store.client.put_object(
+            Bucket=store.volume_id, Key=manifest_key, Body=manifest_payload
+        )
+        if _object_size(store, manifest_key) != len(manifest_payload):
+            raise RuntimeError("Fresh corruption manifest publication was incomplete")
+        entries = [
+            item
+            for item in original_index.get("manifests") or []
+            if str(item.get("manifest_id") or "") != canary_manifest["manifest_id"]
+        ]
+        entries.append(_manifest_index_entry(canary_manifest, generation, manifest_key))
+        canary_index = {
+            "schema": INDEX_SCHEMA,
+            "generation": generation,
+            "created_at": utc_now(),
+            "manifests": sorted(
+                entries,
+                key=lambda item: (
+                    str(item.get("created_at") or ""),
+                    str(item.get("manifest_id") or ""),
+                ),
+            ),
+        }
+        index_payload = canonical_json(canary_index)
+        store.client.put_object(
+            Bucket=store.volume_id, Key=index_key, Body=index_payload
+        )
+        if _object_size(store, index_key) != len(index_payload):
+            raise RuntimeError("Fresh corruption index publication was incomplete")
+        registry_factory().announce_manifest(
+            str(volume["id"]), generation, canary_manifest
+        )
+        store.client.put_object(
+            Bucket=store.volume_id,
+            Key="indexes/latest",
+            Body=generation.encode("utf-8"),
+        )
+        corrupt_payload = b"cloud-offload-benchmark-corrupt"
+        store.client.put_object(
+            Bucket=store.volume_id,
+            Key=keys["blob_key"],
+            Body=corrupt_payload,
+        )
+        if _object_bytes(store, keys["blob_key"]) != corrupt_payload:
+            raise RuntimeError("Fresh corruption object did not replace valid bytes")
+        time.sleep(max(0.0, settle_seconds))
+        if _object_bytes(store, keys["blob_key"]) != corrupt_payload:
+            raise RuntimeError(
+                "Fresh corruption object was not stable before submission"
             )
-            store.client.delete_object(Bucket=store.volume_id, Key=backup)
+    except Exception:
+        cleanup_corruption(
+            client,
+            scenario,
+            declared_digests,
+            store_factory=store_factory,
+            registry_factory=registry_factory,
+            coordinator_storage_factory=coordinator_storage_factory,
+        )
         raise
     return {
         "kind": "corruption",
         "stage": "prepare",
-        "backup_verified": True,
+        "fresh_object": True,
+        "canary_manifest_published": True,
         "canary_verified": True,
-        "artifact_size": expected_size,
+        "artifact_size": len(valid_payload),
     }
 
 
@@ -336,44 +560,75 @@ def cleanup_corruption(
     declared_digests: set[str],
     *,
     store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
+    registry_factory: Callable[[], CacheRegistry] = _cache_registry,
+    coordinator_storage_factory: Callable[[], Any] = _coordinator_storage,
 ) -> dict[str, Any]:
-    """Idempotently restore the canonical object and remove the canary backup."""
+    """Remove the synthetic generation without touching ordinary artifacts."""
 
-    store, artifact, backup = _corruption_canary(
-        client, scenario, declared_digests, store_factory=store_factory
-    )
-    key = str(artifact["storage_key"])
-    expected_size = int(artifact["size"])
-    backup_size = _object_size(store, backup)
-    changed = False
-    if backup_size is None:
-        if _object_size(store, key) != expected_size:
-            raise RuntimeError("Corruption backup is absent and canonical is invalid")
+    volume, _ = _corruption_target(client, scenario, declared_digests=declared_digests)
+    store = store_factory(volume)
+    keys = _corruption_keys(scenario)
+    state_payload = _object_bytes(store, keys["state_key"])
+    if state_payload is None:
+        if _object_size(store, keys["blob_key"]) is not None:
+            raise RuntimeError("Canary state is absent while its unique blob remains")
+        coordinator_key = partition_artifact_key(keys["digest"])
+        if coordinator_storage_factory().exists(coordinator_key):
+            raise RuntimeError(
+                "Canary state is absent while its coordinator artifact remains"
+            )
         return {
             "kind": "corruption",
             "stage": "cleanup",
-            "canonical_size_restored": True,
-            "backup_deleted": True,
+            "original_generation_restored": True,
+            "canary_deleted": True,
             "changed": False,
         }
-    if backup_size != expected_size:
-        raise RuntimeError("Corruption backup has the wrong size during cleanup")
-    if _object_size(store, key) != expected_size:
-        store.client.copy_object(
+    state = json.loads(state_payload)
+    if state.get("schema") != CORRUPTION_STATE_SCHEMA:
+        raise RuntimeError("Corruption cleanup state has an unknown schema")
+    current_generation = (
+        (_object_bytes(store, "indexes/latest") or b"").decode("utf-8").strip()
+    )
+    canary_generation = str(state["canary_generation"])
+    original_generation = str(state["original_generation"])
+    if current_generation == canary_generation:
+        store.client.put_object(
             Bucket=store.volume_id,
-            CopySource={"Bucket": store.volume_id, "Key": backup},
-            Key=key,
+            Key="indexes/latest",
+            Body=original_generation.encode("utf-8"),
         )
-        changed = True
-    if _object_size(store, key) != expected_size:
-        raise RuntimeError("Corruption cleanup did not restore canonical size")
-    store.client.delete_object(Bucket=store.volume_id, Key=backup)
+    elif current_generation != original_generation:
+        raise RuntimeError(
+            "Prepared inventory changed during corruption canary; refusing to overwrite it"
+        )
+    registry_factory().remove_manifest(
+        str(state["volume_id"]),
+        str(state["manifest_id"]),
+        inventory_generation=original_generation,
+    )
+    if state.get("coordinator_artifact_created"):
+        coordinator_storage_factory().delete(str(state["coordinator_artifact_key"]))
+    deleted_quarantine = _delete_quarantine_objects(
+        store, str(state["quarantine_prefix"])
+    )
+    for key in (
+        str(state["blob_key"]),
+        str(state["manifest_key"]),
+        str(state["index_key"]),
+    ):
+        store.client.delete_object(Bucket=store.volume_id, Key=key)
+    store.client.delete_object(Bucket=store.volume_id, Key=keys["state_key"])
+    restored = (_object_bytes(store, "indexes/latest") or b"").decode("utf-8").strip()
+    if restored != original_generation:
+        raise RuntimeError("Corruption cleanup did not restore the original generation")
     return {
         "kind": "corruption",
         "stage": "cleanup",
-        "canonical_size_restored": True,
-        "backup_deleted": True,
-        "changed": changed,
+        "original_generation_restored": True,
+        "canary_deleted": True,
+        "quarantine_objects_deleted": deleted_quarantine,
+        "changed": True,
     }
 
 
@@ -385,46 +640,39 @@ def observe_corruption(
     *,
     store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
 ) -> dict[str, Any]:
-    """Require worker quarantine, then recover the pre-submission canary.
+    """Require quarantine, then restore the tiny valid blob for a job retry."""
 
-    The cleanup path is unconditional, so a timeout, terminal job, or callback
-    error cannot strand either corrupted canonical bytes or the backup.
-    """
-
-    store, artifact, backup = _corruption_canary(
-        client, scenario, declared_digests, store_factory=store_factory
+    volume, _ = _corruption_target(client, scenario, declared_digests=declared_digests)
+    store = store_factory(volume)
+    keys = _corruption_keys(scenario)
+    state_payload = _object_bytes(store, keys["state_key"])
+    if state_payload is None:
+        raise RuntimeError("Fresh corruption canary state is absent")
+    state = json.loads(state_payload)
+    if state.get("schema") != CORRUPTION_STATE_SCHEMA:
+        raise RuntimeError("Fresh corruption canary state is invalid")
+    valid_payload = _corruption_valid_payload(scenario)
+    if _object_bytes(store, str(state["blob_key"])) == valid_payload:
+        raise RuntimeError("Fresh corruption canary is no longer corrupt")
+    observed = _wait_for_event(
+        client,
+        job_id,
+        {"cache_artifact_quarantined"},
+        timeout_seconds=105,
     )
-    key = str(artifact["storage_key"])
-    expected_size = int(artifact["size"])
-    quarantine_observed = False
-    if _object_size(store, backup) != expected_size:
-        raise RuntimeError("Prepared corruption backup is missing")
-    if _object_size(store, key) == expected_size:
-        raise RuntimeError("Prepared corruption canary is no longer present")
-    try:
-        observed = _wait_for_event(
-            client,
-            job_id,
-            {"cache_artifact_quarantined"},
-            timeout_seconds=105,
-        )
-        quarantine_observed = observed == "cache_artifact_quarantined"
-    finally:
-        cleanup = cleanup_corruption(
-            client,
-            scenario,
-            declared_digests,
-            store_factory=store_factory,
-        )
-    if not quarantine_observed or not cleanup.get("canonical_size_restored"):
-        raise RuntimeError("Corruption canary did not quarantine and recover cleanly")
+    store.client.put_object(
+        Bucket=store.volume_id,
+        Key=str(state["blob_key"]),
+        Body=valid_payload,
+    )
+    if _object_bytes(store, str(state["blob_key"])) != valid_payload:
+        raise RuntimeError("Could not restore valid retry bytes after quarantine")
     return {
         "kind": "corruption",
         "stage": "observe",
-        "quarantine_observed": True,
-        "canonical_size_restored": True,
-        "backup_deleted": True,
-        "artifact_size": expected_size,
+        "quarantine_observed": observed == "cache_artifact_quarantined",
+        "valid_retry_object_restored": True,
+        "artifact_size": len(valid_payload),
     }
 
 

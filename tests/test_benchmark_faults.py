@@ -1,6 +1,6 @@
 import ctypes
+import io
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -10,11 +10,13 @@ from cloud_offload.benchmark_faults import (
     _process_exists,
     _windows_process_exists,
     cleanup_corruption,
+    corruption_canary_asset,
     inject_storage_unavailable,
     observe_corruption,
     prepare_corruption,
     restart_coordinator,
 )
+from cloud_offload.prepared_state import ManifestSigner, blob_key
 
 
 class FakeFaultClient:
@@ -83,24 +85,36 @@ class FakeFaultClient:
                 "manifests": [
                     {
                         "volume_id": "registry-volume",
+                        "manifest_id": "sha256:" + "f" * 64,
+                        "profile_fingerprint": "sha256:" + "d" * 64,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "producer": {"image_digest": "sha256:" + "e" * 64},
                         "artifacts": [
                             {
                                 "digest": "sha256:" + "a" * 64,
                                 "kind": "model-weight",
                                 "size": 200,
-                                "storage_key": "blobs/a",
+                                "storage_key": blob_key("a" * 64),
+                                "portability": "portable",
+                                "requirements": {},
+                                "policy": {
+                                    "tenant": "default",
+                                    "cacheable": True,
+                                    "private": False,
+                                },
                             },
                             {
                                 "digest": "sha256:" + "b" * 64,
                                 "kind": "model-weight",
                                 "size": 100,
-                                "storage_key": "blobs/b",
-                            },
-                            {
-                                "digest": "sha256:" + "c" * 64,
-                                "kind": "model-weight",
-                                "size": 1,
-                                "storage_key": "blobs/unrelated",
+                                "storage_key": blob_key("b" * 64),
+                                "portability": "portable",
+                                "requirements": {},
+                                "policy": {
+                                    "tenant": "default",
+                                    "cacheable": True,
+                                    "private": False,
+                                },
                             },
                         ],
                     }
@@ -111,23 +125,77 @@ class FakeFaultClient:
 
 class FakeS3Client:
     def __init__(self):
-        self.objects = {"blobs/b": 100}
+        self.objects = {"indexes/latest": b"original-generation"}
         self.deleted = []
-
-    def copy_object(self, *, Bucket, CopySource, Key):
-        self.objects[Key] = self.objects[CopySource["Key"]]
 
     def head_object(self, *, Bucket, Key):
         if Key not in self.objects:
             raise KeyError(Key)
-        return {"ContentLength": self.objects[Key]}
+        return {"ContentLength": len(self.objects[Key])}
+
+    def get_object(self, *, Bucket, Key):
+        if Key not in self.objects:
+            raise KeyError(Key)
+        return {"Body": io.BytesIO(self.objects[Key])}
 
     def put_object(self, *, Bucket, Key, Body):
-        self.objects[Key] = len(Body)
+        self.objects[Key] = bytes(Body)
 
     def delete_object(self, *, Bucket, Key):
         self.deleted.append(Key)
         self.objects.pop(Key, None)
+
+    def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+        return {
+            "Contents": [
+                {"Key": key} for key in sorted(self.objects) if key.startswith(Prefix)
+            ],
+            "IsTruncated": False,
+        }
+
+
+class FakePreparedStore:
+    volume_id = "provider-volume"
+
+    def __init__(self, client):
+        self.client = client
+
+    def load_index(self):
+        return {
+            "schema": "cloud-offload.prepared-state.index.v1",
+            "generation": "original-generation",
+            "created_at": "2026-01-01T00:00:00Z",
+            "manifests": [],
+        }
+
+
+class FakeRegistry:
+    def __init__(self):
+        self.announced = []
+        self.removed = []
+
+    def announce_manifest(self, volume_id, generation, manifest):
+        self.announced.append((volume_id, generation, manifest["manifest_id"]))
+        return {"artifacts": len(manifest["artifacts"]), "drifted": 0}
+
+    def remove_manifest(self, volume_id, manifest_id, *, inventory_generation=None):
+        self.removed.append((volume_id, manifest_id, inventory_generation))
+        return {"manifests": 1, "artifacts_restored": 2, "artifacts_removed": 1}
+
+
+class FakeCoordinatorStorage:
+    def __init__(self):
+        self.objects = {}
+
+    def exists(self, key):
+        return key in self.objects
+
+    def upload(self, path, key):
+        self.objects[key] = path.read_bytes()
+        return key
+
+    def delete(self, key):
+        return self.objects.pop(key, None) is not None
 
 
 class FakeKernel32:
@@ -289,34 +357,45 @@ def test_storage_fault_is_observed_without_mutating_provider_storage():
     assert client.posts[-1] == original
 
 
-def test_corruption_fault_chooses_smallest_required_object_and_restores_backup():
+def test_corruption_fault_uses_fresh_object_and_restores_inventory():
     client = FakeFaultClient()
     client.prepared["policy"] = "smart"
     s3 = FakeS3Client()
-    store = SimpleNamespace(volume_id="provider-volume", client=s3)
+    store = FakePreparedStore(s3)
+    registry = FakeRegistry()
+    coordinator_storage = FakeCoordinatorStorage()
+    scenario = "corruption-scenario"
+    canary = corruption_canary_asset(scenario)
 
-    declared = {"a" * 64, "b" * 64}
+    declared = {"a" * 64, "b" * 64, canary["sha256"]}
     prepared = prepare_corruption(
         client,
-        "corruption-scenario",
+        scenario,
         declared,
         store_factory=lambda volume: store,
+        signer_factory=lambda: ManifestSigner(b"x" * 32),
+        registry_factory=lambda: registry,
+        coordinator_storage_factory=lambda: coordinator_storage,
         settle_seconds=0,
     )
 
     assert prepared == {
         "kind": "corruption",
         "stage": "prepare",
-        "backup_verified": True,
+        "fresh_object": True,
+        "canary_manifest_published": True,
         "canary_verified": True,
-        "artifact_size": 100,
+        "artifact_size": canary["size"],
     }
-    assert s3.objects["blobs/b"] != 100
+    canary_key = blob_key(canary["sha256"])
+    assert s3.objects[canary_key] == b"cloud-offload-benchmark-corrupt"
+    assert s3.objects["indexes/latest"] != b"original-generation"
+    assert len(registry.announced) == 1
 
     observed = observe_corruption(
         client,
         "job-corruption",
-        "corruption-scenario",
+        scenario,
         declared,
         store_factory=lambda volume: store,
     )
@@ -325,20 +404,35 @@ def test_corruption_fault_chooses_smallest_required_object_and_restores_backup()
         "kind": "corruption",
         "stage": "observe",
         "quarantine_observed": True,
-        "canonical_size_restored": True,
-        "backup_deleted": True,
-        "artifact_size": 100,
+        "valid_retry_object_restored": True,
+        "artifact_size": canary["size"],
     }
-    assert s3.objects["blobs/b"] == 100
-    assert len(s3.deleted) == 1
-    assert s3.deleted[0].startswith("staging/benchmark-corruption/")
+    assert len(s3.objects[canary_key]) == canary["size"]
+
+    cleaned = cleanup_corruption(
+        client,
+        scenario,
+        declared,
+        store_factory=lambda volume: store,
+        registry_factory=lambda: registry,
+        coordinator_storage_factory=lambda: coordinator_storage,
+    )
+    assert cleaned["changed"] is True
+    assert cleaned["original_generation_restored"] is True
+    assert cleaned["canary_deleted"] is True
+    assert s3.objects["indexes/latest"] == b"original-generation"
+    assert canary_key not in s3.objects
+    assert len(registry.removed) == 1
+    assert coordinator_storage.objects == {}
 
     assert (
         cleanup_corruption(
             client,
-            "corruption-scenario",
+            scenario,
             declared,
             store_factory=lambda volume: store,
+            registry_factory=lambda: registry,
+            coordinator_storage_factory=lambda: coordinator_storage,
         )["changed"]
         is False
     )

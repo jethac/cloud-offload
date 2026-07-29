@@ -188,9 +188,15 @@ class CacheRegistry:
                     s3_compatible=excluded.s3_compatible
                 """,
                 (
-                    volume_id, provider, provider_volume_id, datacenter_id,
-                    ownership, status, int(capacity_bytes),
-                    json.dumps(policy, sort_keys=True), int(s3_compatible),
+                    volume_id,
+                    provider,
+                    provider_volume_id,
+                    datacenter_id,
+                    ownership,
+                    status,
+                    int(capacity_bytes),
+                    json.dumps(policy, sort_keys=True),
+                    int(s3_compatible),
                 ),
             )
         return self.get_volume(volume_id)  # type: ignore[return-value]
@@ -202,7 +208,9 @@ class CacheRegistry:
             ).fetchone()
         return self._volume(row) if row else None
 
-    def get_provider_volume(self, provider: str, provider_volume_id: str) -> CacheVolume | None:
+    def get_provider_volume(
+        self, provider: str, provider_volume_id: str
+    ) -> CacheVolume | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM cache_volumes WHERE provider=? AND provider_volume_id=?",
@@ -224,10 +232,13 @@ class CacheRegistry:
     @staticmethod
     def _volume(row: sqlite3.Row) -> CacheVolume:
         return CacheVolume(
-            id=row["id"], provider=row["provider"],
+            id=row["id"],
+            provider=row["provider"],
             provider_volume_id=row["provider_volume_id"],
-            datacenter_id=row["datacenter_id"], ownership=row["ownership"],
-            status=row["status"], capacity_bytes=int(row["capacity_bytes"]),
+            datacenter_id=row["datacenter_id"],
+            ownership=row["ownership"],
+            status=row["status"],
+            capacity_bytes=int(row["capacity_bytes"]),
             inventory_generation=row["inventory_generation"],
             last_verified_at=row["last_verified_at"],
             policy=json.loads(row["policy_json"]),
@@ -246,7 +257,9 @@ class CacheRegistry:
 
     def delete_metadata(self, volume_id: str) -> bool:
         with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM cache_volumes WHERE id=?", (volume_id,))
+            cursor = connection.execute(
+                "DELETE FROM cache_volumes WHERE id=?", (volume_id,)
+            )
             return bool(cursor.rowcount)
 
     def reconcile_index(
@@ -282,8 +295,11 @@ class CacheRegistry:
                         manifest_json=excluded.manifest_json
                     """,
                     (
-                        manifest_id, volume_id, manifest["profile_fingerprint"],
-                        manifest["created_at"], json.dumps(document, sort_keys=True),
+                        manifest_id,
+                        volume_id,
+                        manifest["profile_fingerprint"],
+                        manifest["created_at"],
+                        json.dumps(document, sort_keys=True),
                     ),
                 )
                 for artifact in manifest.get("artifacts") or []:
@@ -316,9 +332,13 @@ class CacheRegistry:
                             eligibility=excluded.eligibility
                         """,
                         (
-                            volume_id, digest, str(artifact.get("kind") or "unknown"),
-                            int(artifact.get("size") or 0), compatibility_key,
-                            manifest_id, _now(),
+                            volume_id,
+                            digest,
+                            str(artifact.get("kind") or "unknown"),
+                            int(artifact.get("size") or 0),
+                            compatibility_key,
+                            manifest_id,
+                            _now(),
                             json.dumps(artifact.get("policy") or {}, sort_keys=True),
                             "invalidated" if invalidated else "eligible",
                         ),
@@ -369,9 +389,118 @@ class CacheRegistry:
                 for document in documents.values()
             ],
         }
-        return self.reconcile_index(
-            volume_id, index, manifest_documents=documents
-        )
+        return self.reconcile_index(volume_id, index, manifest_documents=documents)
+
+    def remove_manifest(
+        self,
+        volume_id: str,
+        manifest_id: str,
+        *,
+        inventory_generation: str | None = None,
+    ) -> dict[str, int]:
+        """Remove one manifest and rebuild projections for its artifact set.
+
+        Durable indexes are the source of truth. This operation is used after a
+        reversible benchmark generation is removed from that index; rebuilding
+        every digest mentioned by the removed manifest prevents its temporary
+        manifest ID or invalidation from poisoning later placement decisions.
+        Restore counters and timing observations on surviving artifacts remain
+        intact.
+        """
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT manifest_json FROM cache_manifests "
+                "WHERE volume_id=? AND manifest_id=?",
+                (volume_id, manifest_id),
+            ).fetchone()
+            if not row:
+                if inventory_generation is not None:
+                    connection.execute(
+                        "UPDATE cache_volumes SET inventory_generation=? WHERE id=?",
+                        (inventory_generation, volume_id),
+                    )
+                return {"manifests": 0, "artifacts_restored": 0, "artifacts_removed": 0}
+            removed = json.loads(row["manifest_json"])
+            connection.execute(
+                "DELETE FROM cache_manifests WHERE volume_id=? AND manifest_id=?",
+                (volume_id, manifest_id),
+            )
+            remaining_rows = connection.execute(
+                "SELECT manifest_id, manifest_json FROM cache_manifests "
+                "WHERE volume_id=? ORDER BY created_at DESC, manifest_id DESC",
+                (volume_id,),
+            ).fetchall()
+            latest_by_digest: dict[str, tuple[str, dict[str, Any]]] = {}
+            for remaining_row in remaining_rows:
+                document = json.loads(remaining_row["manifest_json"])
+                for artifact in document.get("artifacts") or []:
+                    latest_by_digest.setdefault(
+                        str(artifact.get("digest") or ""),
+                        (remaining_row["manifest_id"], artifact),
+                    )
+            restored = 0
+            removed_count = 0
+            for digest in {
+                str(item.get("digest") or "")
+                for item in removed.get("artifacts") or []
+                if item.get("digest")
+            }:
+                candidate = latest_by_digest.get(digest)
+                if candidate is None:
+                    connection.execute(
+                        "DELETE FROM cache_artifacts WHERE volume_id=? AND digest=?",
+                        (volume_id, digest),
+                    )
+                    connection.execute(
+                        "DELETE FROM cache_invalidations WHERE volume_id=? AND digest=?",
+                        (volume_id, digest),
+                    )
+                    removed_count += 1
+                    continue
+                surviving_manifest_id, artifact = candidate
+                compatibility_key = json.dumps(
+                    {
+                        "portability": artifact.get("portability"),
+                        "requirements": artifact.get("requirements") or {},
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                invalidated = connection.execute(
+                    "SELECT 1 FROM cache_invalidations WHERE volume_id=? AND digest=?",
+                    (volume_id, digest),
+                ).fetchone()
+                connection.execute(
+                    """
+                    UPDATE cache_artifacts SET
+                        kind=?, size_bytes=?, compatibility_key=?, manifest_id=?,
+                        policy_json=?, eligibility=?
+                    WHERE volume_id=? AND digest=?
+                    """,
+                    (
+                        str(artifact.get("kind") or "unknown"),
+                        int(artifact.get("size") or 0),
+                        compatibility_key,
+                        surviving_manifest_id,
+                        json.dumps(artifact.get("policy") or {}, sort_keys=True),
+                        "invalidated" if invalidated else "eligible",
+                        volume_id,
+                        digest,
+                    ),
+                )
+                restored += 1
+            if inventory_generation is not None:
+                connection.execute(
+                    "UPDATE cache_volumes SET inventory_generation=? WHERE id=?",
+                    (inventory_generation, volume_id),
+                )
+            return {
+                "manifests": 1,
+                "artifacts_restored": restored,
+                "artifacts_removed": removed_count,
+            }
 
     def query_manifests(
         self,
@@ -393,7 +522,9 @@ class CacheRegistry:
                 """
                 SELECT m.manifest_json, v.id AS volume_id, v.datacenter_id
                 FROM cache_manifests m JOIN cache_volumes v ON v.id=m.volume_id
-                """ + where + " ORDER BY m.created_at DESC",
+                """
+                + where
+                + " ORDER BY m.created_at DESC",
                 values,
             ).fetchall()
         return [
@@ -550,11 +681,7 @@ class CacheRegistry:
                     and len(required_hits) == len(required)
                     and set(logical_required).issubset(logical_hits),
                     "logical_hits": sorted(logical_hits),
-                    "manifest_ids": (
-                        [selected["manifest_id"]]
-                        if selected
-                        else []
-                    ),
+                    "manifest_ids": ([selected["manifest_id"]] if selected else []),
                     "coverage_manifest_ids": sorted(manifest_ids),
                 }
             )
@@ -581,13 +708,35 @@ class CacheRegistry:
             raise ValueError("Unsupported restore observation schema")
         observation_id = str(observation.get("id") or uuid.uuid4())
         fields = (
-            "volume_id", "manifest_id", "digest", "datacenter_id", "worker_class",
-            "image_digest", "strategy", "result", "bytes", "file_count", "lookup_ms",
-            "transfer_ms", "verification_ms", "extraction_ms", "import_ms", "total_ms",
+            "volume_id",
+            "manifest_id",
+            "digest",
+            "datacenter_id",
+            "worker_class",
+            "image_digest",
+            "strategy",
+            "result",
+            "bytes",
+            "file_count",
+            "lookup_ms",
+            "transfer_ms",
+            "verification_ms",
+            "extraction_ms",
+            "import_ms",
+            "total_ms",
             "fallback_ms",
         )
         values = [observation.get(field) for field in fields]
-        numeric = {"bytes", "file_count", "lookup_ms", "transfer_ms", "verification_ms", "extraction_ms", "import_ms", "total_ms"}
+        numeric = {
+            "bytes",
+            "file_count",
+            "lookup_ms",
+            "transfer_ms",
+            "verification_ms",
+            "extraction_ms",
+            "import_ms",
+            "total_ms",
+        }
         for index, field in enumerate(fields):
             if field in numeric and values[index] is None:
                 values[index] = 0
@@ -612,9 +761,15 @@ class CacheRegistry:
                     WHERE volume_id=? AND digest=?
                     """,
                     (
-                        _now(), float(observation.get("total_ms") or 0),
-                        max(0.0, float(observation.get("fallback_ms") or 0) - float(observation.get("total_ms") or 0)),
-                        observation["volume_id"], observation["digest"],
+                        _now(),
+                        float(observation.get("total_ms") or 0),
+                        max(
+                            0.0,
+                            float(observation.get("fallback_ms") or 0)
+                            - float(observation.get("total_ms") or 0),
+                        ),
+                        observation["volume_id"],
+                        observation["digest"],
                     ),
                 )
                 if observation.get("result") == "corruption":
@@ -656,7 +811,11 @@ class CacheRegistry:
         return dict(row)
 
     def create_replication(
-        self, source_volume_id: str, target_volume_id: str, digests: list[str], sizes: dict[str, int]
+        self,
+        source_volume_id: str,
+        target_volume_id: str,
+        digests: list[str],
+        sizes: dict[str, int],
     ) -> dict[str, Any]:
         source = self.get_volume(source_volume_id)
         target = self.get_volume(target_volume_id)
@@ -674,12 +833,22 @@ class CacheRegistry:
                     status, bytes, created_at
                 ) VALUES (?, ?, ?, ?, 'planned', ?, ?)
                 """,
-                (replication_id, source.id, target.id, json.dumps(sorted(set(digests))), total, _now()),
+                (
+                    replication_id,
+                    source.id,
+                    target.id,
+                    json.dumps(sorted(set(digests))),
+                    total,
+                    _now(),
+                ),
             )
         return {
-            "id": replication_id, "source_volume_id": source.id,
-            "target_volume_id": target.id, "digests": sorted(set(digests)),
-            "bytes": total, "status": "planned",
+            "id": replication_id,
+            "source_volume_id": source.id,
+            "target_volume_id": target.id,
+            "digests": sorted(set(digests)),
+            "bytes": total,
+            "status": "planned",
         }
 
     def complete_replication(
@@ -691,7 +860,11 @@ class CacheRegistry:
                 """
                 UPDATE cache_replications SET status=?, completed_at=? WHERE id=?
                 """,
-                (status if not failed_reason else f"failed:{failed_reason}"[:500], _now(), replication_id),
+                (
+                    status if not failed_reason else f"failed:{failed_reason}"[:500],
+                    _now(),
+                    replication_id,
+                ),
             )
             if not cursor.rowcount:
                 raise KeyError(replication_id)
@@ -701,7 +874,9 @@ class CacheRegistry:
         return {
             "policy": policy,
             "volumes": volumes,
-            "health": "degraded" if any(v["status"] == "degraded" for v in volumes) else "ready",
+            "health": "degraded"
+            if any(v["status"] == "degraded" for v in volumes)
+            else "ready",
             "capacity_bytes": sum(item["capacity_bytes"] for item in volumes),
             "recent_benefit": self.recent_benefit(),
         }
