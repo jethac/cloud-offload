@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -703,6 +704,41 @@ def test_expiry_route_unpublishes_target_and_keeps_source(tmp_path, monkeypatch)
     assert registry.get_manifest(source.id, source_manifest["manifest_id"])
     assert registry.get_manifest(target.id, target_manifest["manifest_id"]) is None
     assert registry.get_volume(target.id).status == "failed"
+
+
+def test_manual_replication_failure_keeps_private_endpoint_out_of_api(
+    tmp_path, monkeypatch
+):
+    config = SimpleNamespace(
+        queue_db_path=tmp_path / "queue.db",
+        prepared_storage=replication_policy(),
+    )
+    registry = CacheRegistry(config.queue_db_path)
+    source = add_volume(registry, "source-provider-volume", "A")
+    target = add_volume(registry, "target-provider-volume", "B")
+    manifest = add_manifest(registry, source, fingerprint({"profile": "manual"}))
+
+    async def fail_copy(*args, **kwargs):
+        raise RuntimeError("Read timeout on https://private-storage.example.invalid")
+
+    monkeypatch.setattr(server, "_config", lambda **kwargs: config)
+    monkeypatch.setattr(server, "_cache_registry", lambda *args: registry)
+    monkeypatch.setattr(server, "_copy_cache_manifest", fail_copy)
+
+    response = TestClient(server.app).post(
+        "/api/cache/replicate",
+        json={
+            "confirmed": True,
+            "source_volume_id": source.id,
+            "target_volume_id": target.id,
+            "manifest_id": manifest["manifest_id"],
+        },
+    )
+
+    assert response.status_code == 409
+    payload = json.dumps(response.json(), sort_keys=True)
+    assert "Replication failed: RuntimeError" in payload
+    assert "private-storage" not in payload
 
 
 def test_automatic_route_stays_locked_before_shadow_accuracy(tmp_path, monkeypatch):

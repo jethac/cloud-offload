@@ -1697,17 +1697,32 @@ class RunPodS3PreparedStore:
         if client_factory is None:
             try:
                 import boto3
+                from botocore.config import Config
             except ImportError as exc:
                 raise ImportError(
                     "boto3 is required for RunPod S3 prepopulation"
                 ) from exc
             client_factory = boto3.client
+            client_config = Config(
+                connect_timeout=30,
+                read_timeout=900,
+                tcp_keepalive=True,
+                max_pool_connections=32,
+                retries={"max_attempts": 10, "mode": "standard"},
+            )
+        else:
+            client_config = None
+        client_kwargs = {
+            "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret_key,
+            "region_name": str(datacenter_id),
+            "endpoint_url": str(endpoint_url),
+        }
+        if client_config is not None:
+            client_kwargs["config"] = client_config
         client = client_factory(
             "s3",
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            region_name=str(datacenter_id),
-            endpoint_url=str(endpoint_url),
+            **client_kwargs,
         )
         return cls(
             volume_id=volume_id,
