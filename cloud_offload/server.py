@@ -1810,19 +1810,28 @@ async def _copy_cache_manifest(config, registry, source, target, manifest_id: st
     )
     with tempfile.TemporaryDirectory(prefix="cloud-offload-replica-") as directory:
         for artifact in document["artifacts"]:
-            path = Path(directory) / normalize_cache_filename(artifact["digest"])
-            await asyncio.to_thread(
-                source_store.download_verified,
+            if await asyncio.to_thread(
+                target_store.exists,
                 artifact["storage_key"],
-                artifact["digest"],
-                path,
-            )
-            await asyncio.to_thread(
-                target_store.upload_verified,
-                path,
-                artifact["digest"],
-                storage_key=artifact["storage_key"],
-            )
+                int(artifact["size"]),
+            ):
+                continue
+            path = Path(directory) / normalize_cache_filename(artifact["digest"])
+            try:
+                await asyncio.to_thread(
+                    source_store.download_verified,
+                    artifact["storage_key"],
+                    artifact["digest"],
+                    path,
+                )
+                await asyncio.to_thread(
+                    target_store.upload_verified,
+                    path,
+                    artifact["digest"],
+                    storage_key=artifact["storage_key"],
+                )
+            finally:
+                path.unlink(missing_ok=True)
     proposal = {
         key: value
         for key, value in document.items()
