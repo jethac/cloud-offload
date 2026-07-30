@@ -1439,11 +1439,10 @@ class RunPodMissingObject(Exception):
 def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
     import boto3
 
-    created = {}
+    created = []
 
     def client(service, **kwargs):
-        created["service"] = service
-        created.update(kwargs)
+        created.append({"service": service, **kwargs})
         return SimpleNamespace()
 
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "access")
@@ -1456,14 +1455,24 @@ def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
         endpoint_url="https://s3.example.invalid",
     )
 
-    transfer = created["config"]
+    transfer = created[0]["config"]
+    range_transfer = created[1]["config"]
     assert store.client is not None
-    assert created["service"] == "s3"
+    assert store.range_client is not store.client
+    assert [item["service"] for item in created] == ["s3", "s3"]
     assert transfer.connect_timeout == 30
     assert transfer.read_timeout == 7200
     assert transfer.tcp_keepalive is True
     assert transfer.max_pool_connections == 32
     assert transfer.retries == {"max_attempts": 10, "mode": "standard"}
+    assert range_transfer.connect_timeout == 30
+    assert range_transfer.read_timeout == 60
+    assert range_transfer.tcp_keepalive is True
+    assert range_transfer.max_pool_connections == 32
+    assert range_transfer.retries == {
+        "total_max_attempts": 1,
+        "mode": "standard",
+    }
     assert store.transfer_config.multipart_threshold == 64 * 1024 * 1024
     assert store.transfer_config.multipart_chunksize == 8 * 1024 * 1024
     assert store.transfer_config.max_concurrency == 4
@@ -1717,6 +1726,31 @@ class MemoryS3:
                 "ContentRange": f"bytes {start}-{end}/{len(value)}",
             }
         return {"Body": io.BytesIO(value)}
+
+
+def test_s3_verified_download_uses_the_bounded_range_client(tmp_path):
+    class SlowPrimary(MemoryS3):
+        def get_object(self, **kwargs):
+            raise AssertionError("range download used the long-timeout client")
+
+    payload = b"bounded range response"
+    artifact = portable_artifact(payload)
+    bounded = MemoryS3()
+    bounded.objects[artifact["storage_key"]] = payload
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=SlowPrimary(),
+        range_client=bounded,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+    )
+    destination = tmp_path / "downloaded"
+
+    assert store.download_verified(
+        artifact["storage_key"], artifact["digest"], destination
+    ) == destination
+    assert destination.read_bytes() == payload
+    assert bounded.ranges == ["bytes=0-33554431"]
 
 
 def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp_path):
