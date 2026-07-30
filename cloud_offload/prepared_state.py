@@ -47,9 +47,7 @@ RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
 # use the resumable, independently retried multipart path.
 RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 64 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CHUNK_BYTES = 8 * 1024 * 1024
-# Upload parts are small, bounded requests. Give them more concurrency than
-# large source ranges without increasing source gateway pressure or memory.
-RUNPOD_S3_MULTIPART_CONCURRENCY = 8
+RUNPOD_S3_MULTIPART_CONCURRENCY = 4
 RUNPOD_S3_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024
 RUNPOD_S3_MULTIPART_MAX_PARTS = 10_000
 RUNPOD_S3_COMPLETION_POLL_SECONDS = 5
