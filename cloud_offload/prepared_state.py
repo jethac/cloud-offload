@@ -38,6 +38,7 @@ DEFAULT_TRUST_SAMPLE_BYTES = 1024 * 1024
 DEFAULT_TRUST_SAMPLE_COUNT = 5
 S3_VERIFICATION_RANGE_BYTES = 32 * 1024 * 1024
 S3_DOWNLOAD_CONCURRENCY = 10
+S3_RANGE_HEADER_TIMEOUT_SECONDS = 60
 S3_RANGE_SOCKET_TIMEOUT_SECONDS = 180
 S3_RANGE_READ_BYTES = 1024 * 1024
 RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -1666,6 +1667,7 @@ class RunPodS3PreparedStore:
         volume_id: str,
         datacenter_id: str,
         client: Any,
+        range_client: Any | None = None,
         endpoint_url: str,
         prefix: str = "",
         publication_lock: Any | None = None,
@@ -1674,6 +1676,7 @@ class RunPodS3PreparedStore:
         self.volume_id = str(volume_id)
         self.datacenter_id = str(datacenter_id).upper()
         self.client = client
+        self.range_client = range_client or client
         self.endpoint_url = str(endpoint_url)
         self.prefix = str(prefix).strip("/")
         self.transfer_config = transfer_config
@@ -1731,6 +1734,13 @@ class RunPodS3PreparedStore:
                 max_pool_connections=32,
                 retries={"max_attempts": 10, "mode": "standard"},
             )
+            range_client_config = Config(
+                connect_timeout=30,
+                read_timeout=S3_RANGE_HEADER_TIMEOUT_SECONDS,
+                tcp_keepalive=True,
+                max_pool_connections=32,
+                retries={"total_max_attempts": 1, "mode": "standard"},
+            )
             transfer_config = TransferConfig(
                 multipart_threshold=RUNPOD_S3_MULTIPART_THRESHOLD_BYTES,
                 multipart_chunksize=RUNPOD_S3_MULTIPART_CHUNK_BYTES,
@@ -1739,6 +1749,7 @@ class RunPodS3PreparedStore:
             )
         else:
             client_config = None
+            range_client_config = None
             transfer_config = None
         client_kwargs = {
             "aws_access_key_id": access_key,
@@ -1752,10 +1763,17 @@ class RunPodS3PreparedStore:
             "s3",
             **client_kwargs,
         )
+        range_client = client
+        if range_client_config is not None:
+            range_client = client_factory(
+                "s3",
+                **{**client_kwargs, "config": range_client_config},
+            )
         return cls(
             volume_id=volume_id,
             datacenter_id=datacenter_id,
             client=client,
+            range_client=range_client,
             endpoint_url=endpoint_url,
             prefix=prefix,
             transfer_config=transfer_config,
@@ -2243,7 +2261,7 @@ class RunPodS3PreparedStore:
         try:
             first_end = S3_VERIFICATION_RANGE_BYTES - 1
             def download_first_range() -> tuple[dict[str, Any], bytes | None]:
-                response = self.client.get_object(
+                response = self.range_client.get_object(
                     Bucket=self.volume_id,
                     Key=self._key(key),
                     Range=f"bytes=0-{first_end}",
@@ -2413,7 +2431,7 @@ class RunPodS3PreparedStore:
             request_start = next_start
             body = None
             try:
-                response = self.client.get_object(
+                response = self.range_client.get_object(
                     Bucket=self.volume_id,
                     Key=self._key(key),
                     Range=f"bytes={request_start}-{end}",
