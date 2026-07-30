@@ -415,6 +415,95 @@ def test_prepared_region_wins_balanced_recommendation(monkeypatch, tmp_path):
     assert connector.mutations == []
 
 
+def test_preflight_uses_two_compatible_replicas_and_keeps_cold_fallback(
+    tmp_path, monkeypatch
+):
+    config = config_for_preflight(tmp_path)
+    config.prepared_storage = {
+        "enabled": True,
+        "confirmed": True,
+        "provider": "runpod",
+        "policy": "smart",
+        "region": "auto",
+        "cold_fallback": "allow",
+        "managed_size_gb": 100,
+        "existing_volume_id": "provider-a",
+        "max_monthly_storage_cost": 30,
+        "tenant": "default",
+        "cache_private_assets": False,
+        "shadow_admission": True,
+    }
+    config.__post_init__()
+    volumes = [
+        CacheVolume(
+            id=f"volume-{region.lower()}",
+            provider="runpod",
+            provider_volume_id=f"provider-{region.lower()}",
+            datacenter_id=region,
+            ownership="managed",
+            status="ready",
+            capacity_bytes=100 * 1024**3,
+            inventory_generation="generation",
+            last_verified_at="2026-07-30T00:00:00Z",
+            policy=config.prepared_storage,
+            s3_compatible=True,
+        )
+        for region in ("A", "B")
+    ]
+
+    class Registry:
+        def list_volumes(self, status=None):
+            assert status == "ready"
+            return volumes
+
+        def volume_coverage(self, required, **kwargs):
+            return [
+                {
+                    "volume": volume,
+                    "cached_bytes": 0,
+                    "required_bytes": 0,
+                    "complete": True,
+                    "manifest_ids": ["sha256:" + region * 64],
+                }
+                for volume, region in zip(volumes, ("a", "b"), strict=True)
+            ]
+
+    connector = ReadOnlyConnector()
+    for volume in volumes:
+        connector.storage[volume.provider_volume_id] = ProviderStorage(
+            id=volume.provider_volume_id,
+            provider="runpod",
+            name=volume.provider_volume_id,
+            size_gb=100,
+            datacenter_id=volume.datacenter_id,
+            s3_compatible=True,
+        )
+    monkeypatch.setattr(preflight, "_storage_credentials_configured", lambda: True)
+
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        storage=LocalStorage(config.storage_path),
+        cache_registry=Registry(),
+        connector_factory=lambda provider, config: connector,
+    )
+
+    prepared = [
+        item for item in report["candidates"] if item["prepared_volume_id"]
+    ]
+    cold = [
+        item for item in report["candidates"] if not item["prepared_volume_id"]
+    ]
+    assert {item["region"] for item in prepared} == {"A", "B"}
+    assert all(item["preparation"]["complete"] for item in prepared)
+    assert cold
+    assert report["recommendation"]["candidate_id"] in {
+        item["candidate_id"] for item in prepared
+    }
+    assert connector.mutations == []
+
+
 def test_manual_policy_returns_ranked_choices_without_auto_selection(tmp_path):
     config = config_for_preflight(tmp_path)
 

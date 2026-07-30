@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import secrets
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -151,6 +152,8 @@ class Dispatcher:
         self.worker_token = _load_or_create_worker_token(self.config)
         self.queue.set_worker_token(self.worker_token)
         self._tunnel = None  # opened lazily when ingress == "cloudflared"
+        self._replication_thread: threading.Thread | None = None
+        self._next_replication_at = 0.0
 
     def _resolve_coordinator_url(self) -> str | None:
         """The URL a worker uses to reach the coordinator.
@@ -239,6 +242,7 @@ class Dispatcher:
         # Restore durable provider ownership before any decision can rent a
         # second resource. This also executes cancellation and hard limits.
         self._reconcile_leases()
+        self._tick_regional_replication()
 
         # Count queued jobs
         queued_count = self.queue.count_by_status(JobStatus.QUEUED)
@@ -325,6 +329,61 @@ class Dispatcher:
 
         # Check for idle workers to terminate
         self._check_idle_workers()
+
+    def _tick_regional_replication(self) -> None:
+        """Start one non-blocking automatic controller cycle when it is due."""
+
+        replication = (self.config.prepared_storage or {}).get("replication") or {}
+        if replication.get("mode") != "automatic":
+            return
+        if getattr(self.config, "_source_path", None) is None:
+            return
+        if self._replication_thread and self._replication_thread.is_alive():
+            return
+        now = time.monotonic()
+        if now < self._next_replication_at:
+            return
+        self._next_replication_at = now + int(
+            replication.get("controller_interval_seconds") or 300
+        )
+        self._replication_thread = threading.Thread(
+            target=self._run_replication_controller_tick,
+            name="cloud-offload-replication-controller",
+            daemon=True,
+        )
+        self._replication_thread.start()
+
+    def _run_replication_controller_tick(self) -> None:
+        """Ask the authenticated local coordinator to run one durable cycle."""
+
+        import requests
+
+        from cloud_offload.service_config import discover_service_info
+
+        try:
+            service = discover_service_info(require_healthy=True)
+            headers = (
+                {"Authorization": "Bearer " + service["token"]}
+                if service.get("token")
+                else {}
+            )
+            replication = (
+                (self.config.prepared_storage or {}).get("replication") or {}
+            )
+            response = requests.post(
+                str(service["url"]).rstrip("/")
+                + "/api/cache/replication/controller/tick",
+                headers=headers,
+                timeout=int(replication.get("copy_timeout_seconds") or 21600) + 300,
+            )
+            response.raise_for_status()
+            status = str((response.json() or {}).get("status") or "unknown")
+            logger.info("Regional replication controller tick: %s", status)
+        except Exception as exc:  # noqa: BLE001 - next interval retries safely
+            logger.warning(
+                "Regional replication controller tick failed: %s",
+                type(exc).__name__,
+            )
 
     def _launch_worker(
         self,

@@ -98,6 +98,8 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
         "shadow_required_recommendations": 10,
         "shadow_validation_hours": 24,
         "shadow_min_precision": 0.8,
+        "controller_interval_seconds": 300,
+        "copy_timeout_seconds": 21600,
     }
     defaults: dict[str, Any] = {
         "enabled": False,
@@ -227,6 +229,20 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
     if not 0.5 <= replication["shadow_min_precision"] <= 1:
         raise ValueError(
             "prepared_storage.replication.shadow_min_precision must be between 0.5 and 1"
+        )
+    replication["controller_interval_seconds"] = int(
+        replication["controller_interval_seconds"]
+    )
+    if not 30 <= replication["controller_interval_seconds"] <= 24 * 3600:
+        raise ValueError(
+            "prepared_storage.replication.controller_interval_seconds must be between 30 and 86400"
+        )
+    replication["copy_timeout_seconds"] = int(
+        replication["copy_timeout_seconds"]
+    )
+    if not 300 <= replication["copy_timeout_seconds"] <= 7 * 24 * 3600:
+        raise ValueError(
+            "prepared_storage.replication.copy_timeout_seconds must be between 300 and 604800"
         )
     if replication["mode"] == "automatic":
         if replication["monthly_budget_usd"] is None:

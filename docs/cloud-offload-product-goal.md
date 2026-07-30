@@ -1482,7 +1482,16 @@ recommendations reach the configured precision gate. Copy uses provider object
 APIs and no GPU. Repeated requests return the same action. Due replica manifests
 and unshared target objects can be removed without deleting source state.
 Automatic target-volume creation, scheduled controller runs, full replica-aware
-placement evidence, and regional-loss recovery remain before M6 can close.
+placement evidence, and regional-loss recovery are now implemented. Automatic
+target creation has a separate regional single-flight lock and checks both the
+replication budget and the complete storage budget. The dispatcher starts a
+non-blocking authenticated controller cycle. It recovers stale copy claims,
+checks provider truth, records the shadow report, expires replicas, removes an
+empty automatic target after provider confirmation, and starts at most one copy.
+Lost targets leave prepared placement, and preflight keeps cold fallback visible
+while it can use compatible replicas in multiple regions. Production shadow,
+copy, expiry, cleanup, placement, and loss-recovery evidence remain before M6 can
+close.
 
 Exit:
 

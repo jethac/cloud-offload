@@ -1894,10 +1894,224 @@ async def regional_replica_actions():
     return {
         "schema": "cloud-offload.regional-replica-actions.v1",
         "actions": registry.list_replica_actions(),
+        "targets": registry.list_replica_targets(),
         "shadow_accuracy": shadow_accuracy(
             registry, config.prepared_storage
         ),
     }
+
+
+def _registered_storage_monthly_cost(registry) -> float:
+    from cloud_offload.config import estimate_runpod_storage_monthly
+
+    return sum(
+        estimate_runpod_storage_monthly(volume.capacity_bytes / (1024**3))
+        for volume in registry.list_volumes()
+        if volume.status in {"creating", "ready", "deleting"}
+    )
+
+
+async def _ensure_automatic_replica_target(
+    config, registry, recommendation: dict[str, Any]
+):
+    """Create one approved target volume under both storage budgets."""
+
+    target_id = str(recommendation.get("target_volume_id") or "")
+    if target_id:
+        target = registry.get_volume(target_id)
+        if target:
+            return target
+    policy = config.prepared_storage
+    replication = policy.get("replication") or {}
+    region = str(recommendation.get("target_region") or "")
+    approved = {str(item) for item in replication.get("approved_regions") or []}
+    if not region or region not in approved:
+        raise RuntimeError("Replica target region is not approved")
+    budget = replication.get("monthly_budget_usd")
+    if budget is None:
+        raise RuntimeError("Automatic replica target needs a monthly budget")
+    size_gb = int(policy.get("managed_size_gb") or 0)
+    from cloud_offload.config import estimate_runpod_storage_monthly
+
+    monthly_cost = estimate_runpod_storage_monthly(size_gb)
+    total_budget = policy.get("max_monthly_storage_cost")
+    if total_budget is None:
+        raise RuntimeError("Automatic replica target needs a total storage budget")
+    if _registered_storage_monthly_cost(registry) + monthly_cost > float(total_budget):
+        raise RuntimeError("Replica target exceeds the total storage budget")
+    claim = registry.claim_replica_target(
+        provider=str(recommendation.get("provider") or ""),
+        datacenter_id=region,
+        size_gb=size_gb,
+        monthly_cost_usd=monthly_cost,
+        monthly_budget_usd=float(budget),
+    )
+    if claim["duplicate_suppressed"]:
+        if claim["status"] == "ready" and claim.get("cache_volume_id"):
+            target = registry.get_volume(claim["cache_volume_id"])
+            if target:
+                return target
+            registry.update_replica_target(
+                claim["id"], "lost", error="cache_volume_missing"
+            )
+        raise RuntimeError("Replica target creation is already in progress")
+    connector = _cache_connector(config, claim["provider"])
+    provider_volume = None
+    registered_target = None
+    try:
+        provider_volume = await asyncio.to_thread(
+            connector.create_storage,
+            name=f"cloud-offload-replica-{region.lower()}",
+            size_gb=size_gb,
+            datacenter_id=region,
+        )
+        registry.bind_replica_target_provider(
+            claim["id"], provider_volume_id=provider_volume.id
+        )
+        if not provider_volume.s3_compatible:
+            raise RuntimeError("Replica target does not support RunPod S3")
+        target = registry.upsert_volume(
+            provider=claim["provider"],
+            provider_volume_id=provider_volume.id,
+            datacenter_id=provider_volume.datacenter_id,
+            ownership="managed",
+            capacity_bytes=provider_volume.size_gb * 1024**3,
+            policy={**policy, "existing_volume_id": provider_volume.id},
+            status="ready",
+            s3_compatible=True,
+        )
+        registered_target = target
+        registry.complete_replica_target(
+            claim["id"],
+            provider_volume_id=provider_volume.id,
+            cache_volume_id=target.id,
+        )
+        return target
+    except Exception as exc:
+        if registered_target is not None:
+            registry.mark_volume(registered_target.id, "failed")
+        cleanup_confirmed = False
+        if provider_volume is not None:
+            try:
+                cleanup_confirmed = bool(
+                    await asyncio.to_thread(
+                        connector.delete_storage, provider_volume.id
+                    )
+                )
+            except Exception:  # noqa: BLE001 - exact failed target remains visible
+                logger.exception("Automatic replica target cleanup failed")
+        registry.update_replica_target(
+            claim["id"],
+            (
+                "deleted"
+                if cleanup_confirmed
+                else "deleting" if provider_volume is not None else "failed"
+            ),
+            error=type(exc).__name__,
+        )
+        raise
+
+
+async def _reconcile_automatic_replica_targets(config, registry) -> dict[str, Any]:
+    """Remove lost automatic targets from placement without assuming deletion."""
+
+    lost: list[str] = []
+    unknown: list[str] = []
+    cleaned: list[str] = []
+    for record in registry.list_replica_targets(status="deleting"):
+        provider_volume_id = str(record.get("provider_volume_id") or "")
+        if not provider_volume_id:
+            continue
+        try:
+            connector = _cache_connector(config, record["provider"])
+            provider_volume = await asyncio.to_thread(
+                connector.get_storage, provider_volume_id
+            )
+            removed = provider_volume is None or bool(
+                await asyncio.to_thread(
+                    connector.delete_storage, provider_volume_id
+                )
+            )
+        except Exception:  # noqa: BLE001 - later cycles retry exact ownership
+            unknown.append(record["id"])
+            continue
+        if removed:
+            cache_volume_id = str(record.get("cache_volume_id") or "")
+            if cache_volume_id and registry.get_volume(cache_volume_id):
+                registry.mark_volume(cache_volume_id, "failed")
+            registry.update_replica_target(record["id"], "deleted")
+            cleaned.append(record["id"])
+    for record in registry.list_replica_targets(status="ready"):
+        cache_volume_id = str(record.get("cache_volume_id") or "")
+        volume = registry.get_volume(cache_volume_id)
+        if not volume:
+            registry.update_replica_target(
+                record["id"], "lost", error="cache_volume_missing"
+            )
+            if cache_volume_id:
+                registry.lose_replica_actions_for_target(cache_volume_id)
+            lost.append(record["id"])
+            continue
+        try:
+            connector = _cache_connector(config, record["provider"])
+            provider_volume = await asyncio.to_thread(
+                connector.get_storage, record["provider_volume_id"]
+            )
+        except Exception:  # noqa: BLE001 - provider uncertainty is not loss
+            unknown.append(record["id"])
+            continue
+        if (
+            provider_volume is None
+            or provider_volume.datacenter_id != record["datacenter_id"]
+        ):
+            registry.update_replica_target(
+                record["id"], "lost", error="provider_volume_absent"
+            )
+            registry.mark_volume(volume.id, "failed")
+            registry.lose_replica_actions_for_target(volume.id)
+            lost.append(record["id"])
+    return {"lost": lost, "cleaned": cleaned, "unknown": unknown}
+
+
+async def _delete_empty_automatic_replica_targets(config, registry) -> list[dict[str, Any]]:
+    """Delete exact empty automatic volumes after their last replica expires."""
+
+    deleted: list[dict[str, Any]] = []
+    active_actions = registry.list_replica_actions()
+    for record in registry.list_replica_targets(status="ready"):
+        cache_volume_id = str(record.get("cache_volume_id") or "")
+        volume = registry.get_volume(cache_volume_id)
+        if not volume or volume.ownership != "managed":
+            continue
+        if any(
+            action.get("target_volume_id") == cache_volume_id
+            and action.get("status") in {"copying", "completed"}
+            for action in active_actions
+        ):
+            continue
+        if any(
+            item.get("volume_id") == cache_volume_id
+            for item in registry.query_manifests()
+        ):
+            continue
+        registry.update_replica_target(record["id"], "deleting")
+        registry.mark_volume(cache_volume_id, "deleting")
+        try:
+            connector = _cache_connector(config, record["provider"])
+            removed = await asyncio.to_thread(
+                connector.delete_storage, record["provider_volume_id"]
+            )
+            if not removed:
+                raise RuntimeError("Provider did not confirm target deletion")
+            registry.mark_volume(cache_volume_id, "failed")
+            state = registry.update_replica_target(record["id"], "deleted")
+            deleted.append(state)
+        except Exception as exc:
+            registry.mark_volume(cache_volume_id, "ready")
+            registry.update_replica_target(
+                record["id"], "ready", error=type(exc).__name__
+            )
+    return deleted
 
 
 @app.post("/api/cache/replication/execute")
@@ -1947,14 +2161,36 @@ async def execute_regional_replica(body: dict[str, Any] = Body(...)):
                     "accuracy": accuracy,
                 },
             )
-        if not recommendation.get("eligible_for_automatic"):
+        blockers = set(recommendation.get("automatic_blockers") or [])
+        if blockers - {"target_volume_missing"}:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "cloud_offload.replication_policy_blocked",
-                    "reasons": recommendation.get("automatic_blockers") or [],
+                    "reasons": sorted(blockers),
                 },
             )
+        if not recommendation.get("target_volume_id"):
+            try:
+                await _ensure_automatic_replica_target(
+                    config, registry, recommendation
+                )
+            except (ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            refreshed = build_shadow_report(registry, policy)
+            recommendation = next(
+                (
+                    item
+                    for item in refreshed.get("recommendations") or []
+                    if item.get("recommendation_id") == recommendation_id
+                ),
+                None,
+            )
+            if not recommendation or not recommendation.get("eligible_for_automatic"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Created replica target did not satisfy the current policy",
+                )
     source = registry.get_volume(str(recommendation.get("source_volume_id") or ""))
     target = registry.get_volume(str(recommendation.get("target_volume_id") or ""))
     if not source or not target:
@@ -2045,11 +2281,72 @@ async def expire_regional_replicas():
             failures.append(
                 {"action_id": action["id"], "reason": type(exc).__name__}
             )
+    deleted_targets = await _delete_empty_automatic_replica_targets(
+        config, registry
+    )
     return {
         "schema": "cloud-offload.regional-replica-expiry.v1",
         "expired": expired,
         "failures": failures,
+        "deleted_targets": deleted_targets,
         "source_state_deleted": False,
+        "provider_gpu_mutation": False,
+    }
+
+
+@app.post("/api/cache/replication/controller/tick")
+async def regional_replication_controller_tick():
+    """Run one scheduled reconcile, shadow, expiry, and optional copy cycle."""
+
+    from cloud_offload.regional_replication import (
+        build_shadow_report,
+        shadow_accuracy,
+    )
+
+    config = _config()
+    policy = config.prepared_storage
+    replication = policy.get("replication") or {}
+    if replication.get("mode") != "automatic":
+        return {
+            "schema": "cloud-offload.replication-controller-tick.v1",
+            "status": "idle",
+            "reason": "automatic_mode_off",
+            "provider_gpu_mutation": False,
+        }
+    registry = _cache_registry(config)
+    now = datetime.now(timezone.utc)
+    timeout = int(replication.get("copy_timeout_seconds") or 21600)
+    stale_before = (now - timedelta(seconds=timeout)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    recovered = registry.recover_stale_replica_actions(
+        stale_before=stale_before
+    )
+    target_recovery = await _reconcile_automatic_replica_targets(config, registry)
+    shadow = build_shadow_report(registry, policy, now=now)
+    registry.record_shadow_evaluation(shadow)
+    expiry = await expire_regional_replicas()
+    accuracy = shadow_accuracy(registry, policy, now=now)
+    action: dict[str, Any] | None = None
+    blocked: Any = None
+    if accuracy["automation_gate_passed"] and shadow["recommendations"]:
+        recommendation = shadow["recommendations"][0]
+        try:
+            action = await execute_regional_replica(
+                {"recommendation_id": recommendation["recommendation_id"]}
+            )
+        except HTTPException as exc:
+            blocked = exc.detail
+    return {
+        "schema": "cloud-offload.replication-controller-tick.v1",
+        "status": "copied" if action else "observed",
+        "recovered_stale_actions": recovered,
+        "target_recovery": target_recovery,
+        "shadow_evaluation_id": shadow["evaluation_id"],
+        "shadow_accuracy": accuracy,
+        "expiry": expiry,
+        "action": action,
+        "blocked": blocked,
         "provider_gpu_mutation": False,
     }
 
