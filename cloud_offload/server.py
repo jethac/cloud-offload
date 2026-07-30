@@ -170,6 +170,30 @@ def error_response(
     )
 
 
+def _bounded_error_token(value: object, *, fallback: str = "unknown") -> str:
+    token = "".join(
+        character
+        for character in str(value or "")
+        if character.isalnum() or character in {"_", "-"}
+    )[:40]
+    return token or fallback
+
+
+def _safe_replication_failure_reason(exc: Exception) -> str:
+    """Keep provider failure routing data without messages, keys, or endpoints."""
+
+    response = getattr(exc, "response", {})
+    error = response.get("Error", {}) if isinstance(response, dict) else {}
+    code = error.get("Code") if isinstance(error, dict) else None
+    return ":".join(
+        (
+            _bounded_error_token(type(exc).__name__),
+            _bounded_error_token(code),
+            _bounded_error_token(getattr(exc, "operation_name", None)),
+        )
+    )
+
+
 @app.exception_handler(HTTPException)
 async def handle_http_exception(request: Request, exc: HTTPException):
     global last_error
@@ -2027,12 +2051,13 @@ async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
             **result,
         }
     except Exception as exc:  # noqa: BLE001 - persisted as bounded action failure
+        failure_reason = _safe_replication_failure_reason(exc)
         registry.complete_replication(
-            plan["id"], failed_reason=type(exc).__name__
+            plan["id"], failed_reason=failure_reason
         )
         raise HTTPException(
             status_code=409,
-            detail=f"Replication failed: {type(exc).__name__}",
+            detail=f"Replication failed: {failure_reason}",
         )
 
 

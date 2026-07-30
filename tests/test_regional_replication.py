@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
 from cloud_offload import server
@@ -964,8 +965,26 @@ def test_manual_replication_failure_keeps_private_endpoint_out_of_api(
         stored_status = connection.execute(
             "SELECT status FROM cache_replications ORDER BY created_at DESC LIMIT 1"
         ).fetchone()[0]
-    assert stored_status == "failed:RuntimeError"
+    assert stored_status == "failed:RuntimeError:unknown:unknown"
     assert "private-storage" not in stored_status
+
+
+def test_replication_failure_reason_keeps_only_safe_provider_routing_data():
+    error = ClientError(
+        {
+            "Error": {
+                "Code": "502",
+                "Message": "failed at https://private-storage.example.invalid/secret-key",
+            }
+        },
+        "UploadPart",
+    )
+
+    reason = server._safe_replication_failure_reason(error)
+
+    assert reason == "ClientError:502:UploadPart"
+    assert "private-storage" not in reason
+    assert "secret-key" not in reason
 
 
 def test_automatic_route_stays_locked_before_shadow_accuracy(tmp_path, monkeypatch):
