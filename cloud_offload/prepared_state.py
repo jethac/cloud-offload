@@ -1855,9 +1855,18 @@ class RunPodS3PreparedStore:
             math.ceil(source_size / RUNPOD_S3_MULTIPART_MAX_PARTS),
         )
         part_count = math.ceil(source_size / part_size)
-        upload_id, completed = self._find_resumable_multipart(
-            object_key, source_size=source_size, part_size=part_size
-        )
+        try:
+            upload_id, completed = self._find_resumable_multipart(
+                object_key, source_size=source_size, part_size=part_size
+            )
+        except Exception as exc:
+            if not self._is_multipart_resume_listing_unavailable(exc):
+                raise
+            # Some RunPod gateways temporarily reject multipart listing while
+            # create, part upload, and completion remain available. Start a
+            # new bounded session after the normal retry budget is exhausted.
+            # An exact-key cleanup can remove the inaccessible old session.
+            upload_id, completed = None, {}
         if upload_id is None:
             response = self._call_with_gateway_retry(
                 lambda: self.client.create_multipart_upload(
@@ -2089,6 +2098,13 @@ class RunPodS3PreparedStore:
                 "ConnectTimeoutError",
                 "ResponseStreamingError",
             }
+        )
+
+    @classmethod
+    def _is_multipart_resume_listing_unavailable(cls, exc: Exception) -> bool:
+        operation = str(getattr(exc, "operation_name", "") or "")
+        return operation in {"ListMultipartUploads", "ListParts"} and (
+            cls._is_gateway_retryable(exc)
         )
 
     def publish_manifest(self, manifest: dict[str, Any], signer: ManifestSigner) -> str:
