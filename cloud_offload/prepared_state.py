@@ -1766,18 +1766,12 @@ class RunPodS3PreparedStore:
         # >5GB weights; duplicate digest writers are safe because their bytes
         # were verified locally and are identical by definition.
         self.client.upload_file(str(source), self.volume_id, self._key(key))
-        if not self.exists(key, source.stat().st_size):
-            raise CacheCorruptionError("RunPod S3 published object has the wrong size")
         self._download_verify(key, digest, source.stat().st_size)
         return key
 
     def publish_manifest(self, manifest: dict[str, Any], signer: ManifestSigner) -> str:
         signer.verify(manifest)
         for artifact in manifest["artifacts"]:
-            if not self.exists(artifact["storage_key"], int(artifact["size"])):
-                raise CacheCorruptionError(
-                    f"Cannot publish manifest; {artifact['digest']} is absent"
-                )
             self._download_verify(
                 artifact["storage_key"],
                 normalize_digest(artifact["digest"]),
@@ -1955,7 +1949,17 @@ class RunPodS3PreparedStore:
 
     def download_verified(self, key: str, digest: str, destination: str | Path) -> Path:
         destination = Path(destination)
-        self.client.download_file(self.volume_id, self._key(key), str(destination))
+        response = self.client.get_object(
+            Bucket=self.volume_id, Key=self._key(key)
+        )
+        body = response["Body"]
+        try:
+            with destination.open("wb") as handle:
+                shutil.copyfileobj(body, handle, length=8 * 1024 * 1024)
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
         if sha256_file(destination) != normalize_digest(digest):
             destination.unlink(missing_ok=True)
             raise CacheCorruptionError(f"RunPod S3 object {key} failed verification")
@@ -1966,10 +1970,9 @@ class RunPodS3PreparedStore:
         os.close(descriptor)
         temporary = Path(temporary_name)
         try:
-            self.client.download_file(self.volume_id, self._key(key), str(temporary))
+            self.download_verified(key, digest, temporary)
             if (
                 temporary.stat().st_size != int(size)
-                or sha256_file(temporary) != digest
             ):
                 raise CacheCorruptionError(
                     f"RunPod S3 object {key} failed digest verification"

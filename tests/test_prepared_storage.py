@@ -1442,6 +1442,7 @@ class MemoryS3:
         self.lock = threading.Lock()
         self.copy_calls = 0
         self.download_calls = 0
+        self.get_calls = 0
 
     def head_bucket(self, **kwargs):
         return {}
@@ -1477,6 +1478,7 @@ class MemoryS3:
             self.objects[Key] = value
 
     def get_object(self, Bucket, Key):
+        self.get_calls += 1
         with self.lock:
             if Key not in self.objects:
                 raise MissingObject()
@@ -1519,7 +1521,34 @@ def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp
         item[1]["manifest_id"] for item in manifests
     }
     assert client.copy_calls == 0
-    assert client.download_calls >= 2
+    assert client.get_calls >= 2
+
+
+def test_s3_verified_download_does_not_require_head_or_download_file(tmp_path):
+    class GetOnlyS3(MemoryS3):
+        def head_object(self, Bucket, Key):
+            raise PermissionError("HEAD is not available")
+
+        def download_file(self, bucket, key, filename):
+            raise AssertionError("download_file sends HEAD before GET")
+
+    client = GetOnlyS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=client,
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    payload = b"runtime bundle that supports GET only"
+    artifact = portable_artifact(payload)
+    client.objects[store._key(artifact["storage_key"])] = payload
+    destination = tmp_path / "runtime-bundle"
+
+    assert store.download_verified(
+        artifact["storage_key"], artifact["digest"], destination
+    ) == destination
+    assert destination.read_bytes() == payload
 
 
 def test_s3_replica_expiry_keeps_shared_objects_until_last_manifest(tmp_path):
