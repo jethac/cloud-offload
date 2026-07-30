@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from cloud_offload.config import CONFIG_DIR
 
@@ -61,7 +62,10 @@ def load_plugins(logger: logging.Logger | None = None) -> dict:
 
 
 def _build_parser() -> tuple[
-    argparse.ArgumentParser, argparse.ArgumentParser, argparse.ArgumentParser
+    argparse.ArgumentParser,
+    argparse.ArgumentParser,
+    argparse.ArgumentParser,
+    argparse.ArgumentParser,
 ]:
     parser = argparse.ArgumentParser(
         prog="cloud-offload", description="Provider-neutral cloud offload coordinator"
@@ -163,6 +167,42 @@ def _build_parser() -> tuple[
         help="Allow explicit storage/corruption/restart hook commands from the plan",
     )
 
+    release_parser = subparsers.add_parser(
+        "release", help="Validate or run the continuous M7 production gate"
+    )
+    release_sub = release_parser.add_subparsers(dest="release_command")
+    release_validate = release_sub.add_parser(
+        "validate", help="Validate a release plan without provider work"
+    )
+    release_validate.add_argument("--plan", required=True, help="Release plan JSON")
+    release_status = release_sub.add_parser(
+        "status", help="Show the safe release ledger"
+    )
+    release_status.add_argument("--plan", required=True, help="Release plan JSON")
+    release_status.add_argument("--ledger", required=True, help="Release ledger JSON")
+    release_run = release_sub.add_parser(
+        "run", help="Run release matrices and update the atomic ledger"
+    )
+    release_run.add_argument("--plan", required=True, help="Release plan JSON")
+    release_run.add_argument("--ledger", required=True, help="Release ledger JSON")
+    release_run.add_argument(
+        "--output-dir", required=True, help="Private scorecard and test-log directory"
+    )
+    release_run.add_argument("--config", help="Path to Cloud Offload config")
+    release_run.add_argument(
+        "--max-matrices", type=int, help="Stop after this many new matrices"
+    )
+    release_run.add_argument(
+        "--confirm-spend",
+        action="store_true",
+        help="Acknowledge the release plan's provider spend and runtime ceilings",
+    )
+    release_run.add_argument(
+        "--allow-hooks",
+        action="store_true",
+        help="Allow the reviewed storage, corruption, and restart canaries",
+    )
+
     benchmark_hook = subparsers.add_parser(
         "benchmark-hook",
         help="Run a reviewed fault canary inside an authorized benchmark",
@@ -179,11 +219,11 @@ def _build_parser() -> tuple[
     queue_clean.add_argument(
         "--days", type=int, default=7, help="Delete jobs older than N days"
     )
-    return parser, queue_parser, benchmark_parser
+    return parser, queue_parser, benchmark_parser, release_parser
 
 
 def main():
-    parser, queue_parser, benchmark_parser = _build_parser()
+    parser, queue_parser, benchmark_parser, release_parser = _build_parser()
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -389,6 +429,90 @@ def main():
             raise SystemExit(0 if scorecard["passed"] else 1)
         else:
             benchmark_parser.print_help()
+
+    elif args.command == "release":
+        from cloud_offload.release_gate import (
+            ReleaseExecutor,
+            ReleasePlan,
+            load_ledger,
+            update_ledger,
+        )
+
+        if not args.release_command:
+            release_parser.print_help()
+            raise SystemExit(2)
+        try:
+            plan = ReleasePlan.load(args.plan)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"Invalid release plan: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        if args.release_command == "validate":
+            print(json.dumps(plan.safe_summary(), indent=2, sort_keys=True))
+        elif args.release_command == "status":
+            try:
+                ledger = load_ledger(Path(args.ledger), plan)
+                update_ledger(ledger, plan)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                print(f"Invalid release ledger: {exc}", file=sys.stderr)
+                raise SystemExit(2) from exc
+            print(json.dumps(ledger, indent=2, sort_keys=True))
+        elif args.release_command == "run":
+            if not args.confirm_spend:
+                print(
+                    "Release run not started. Review the safe plan, then pass "
+                    "--confirm-spend to acknowledge ceilings of "
+                    f"${plan.limits.max_total_cost_usd:.2f} and "
+                    f"{plan.limits.max_total_seconds:.0f}s.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            if args.max_matrices is not None and args.max_matrices <= 0:
+                print("--max-matrices must be positive", file=sys.stderr)
+                raise SystemExit(2)
+            setup_logging("release")
+            load_plugins()
+            from cloud_offload.config import CloudConfig
+            from cloud_offload.service_config import discover_service_info
+
+            config = (
+                CloudConfig.from_file(args.config)
+                if args.config
+                else CloudConfig.load()
+            )
+            try:
+                service = discover_service_info(require_healthy=True)
+                ledger = ReleaseExecutor(
+                    plan,
+                    args.ledger,
+                    args.output_dir,
+                    config,
+                    service,
+                    allow_hooks=args.allow_hooks,
+                ).run(max_matrices=args.max_matrices)
+            except Exception as exc:  # noqa: BLE001 - keep paid cleanup visible
+                print(
+                    "Release matrix stopped safely: "
+                    f"{type(exc).__name__}. See the private output directory.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1) from exc
+            print(
+                f"Release {'passed' if ledger['passed'] else 'in progress'}: "
+                f"{ledger['consecutive_passes']}/"
+                f"{plan.required_consecutive_matrices} consecutive matrices, "
+                f"${ledger['total_estimated_compute_cost_upper_usd']:.4f} "
+                "estimated upper compute cost."
+            )
+            successful_stops = {
+                "release_already_passed",
+                "release_passed",
+                "requested_matrix_limit",
+            }
+            raise SystemExit(
+                0 if ledger.get("last_stop_reason") in successful_stops else 1
+            )
+        else:
+            release_parser.print_help()
 
     elif args.command == "queue":
         load_plugins()
