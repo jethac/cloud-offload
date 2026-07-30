@@ -88,8 +88,6 @@ def shadow_accuracy(
     validated = []
     for item in unique.values():
         first = _parse_time(item["first_recommended_at"])
-        if current < first + timedelta(hours=validation_hours):
-            continue
         expiry = _parse_time(str(item.get("expires_at") or _iso(current)))
         followup = any(
             demand.get("profile_fingerprint") == item.get("profile_fingerprint")
@@ -98,6 +96,8 @@ def shadow_accuracy(
             and first < _parse_time(str(demand.get("created_at"))) <= expiry
             for demand in observations
         )
+        if not followup and current < first + timedelta(hours=validation_hours):
+            continue
         matured.append(item)
         if followup:
             validated.append(item)

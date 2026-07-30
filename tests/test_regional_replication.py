@@ -507,6 +507,60 @@ def test_shadow_accuracy_requires_mature_repeated_demand(tmp_path):
     assert accuracy["automation_gate_passed"] is True
 
 
+def test_shadow_accuracy_accepts_real_followup_before_negative_window(tmp_path):
+    registry = CacheRegistry(tmp_path / "queue.db")
+    profile = "sha256:" + "3" * 64
+    registry.record_shadow_evaluation(
+        {
+            "schema": "cloud-offload.replication-shadow.v1",
+            "evaluation_id": "immediate-followup",
+            "created_at": "2026-07-30T00:00:00Z",
+            "recommendations": [
+                {
+                    "recommendation_id": "sha256:" + "2" * 64,
+                    "profile_fingerprint": profile,
+                    "provider": "runpod",
+                    "target_region": "B",
+                    "expires_at": "2026-08-30T00:00:00Z",
+                }
+            ],
+        }
+    )
+    registry.record_regional_demand(
+        job_id="real-followup",
+        profile_fingerprint=profile,
+        provider="runpod",
+        datacenter_id="B",
+        prepared_volume_id=None,
+        required_bytes=100,
+        cached_bytes=0,
+        missing_bytes=100,
+        preparation_seconds=30,
+        hourly_rate=1,
+    )
+    with registry._connect() as connection:
+        connection.execute(
+            "UPDATE regional_cache_demand SET created_at='2026-07-30T00:05:00Z'"
+        )
+    policy = replication_policy(
+        replication={
+            "shadow_required_recommendations": 3,
+            "shadow_validation_hours": 24,
+        }
+    )
+
+    accuracy = shadow_accuracy(
+        registry,
+        policy,
+        now=datetime(2026, 7, 30, 0, 10, tzinfo=timezone.utc),
+    )
+
+    assert accuracy["mature_recommendation_count"] == 1
+    assert accuracy["validated_recommendation_count"] == 1
+    assert accuracy["precision"] == 1
+    assert accuracy["automation_gate_passed"] is False
+
+
 def test_execute_route_copies_once_and_suppresses_duplicate(tmp_path, monkeypatch):
     config = SimpleNamespace(
         queue_db_path=tmp_path / "queue.db",
