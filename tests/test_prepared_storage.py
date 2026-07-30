@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import sys
 import tarfile
 import threading
 import time
@@ -1434,6 +1435,34 @@ class MissingObject(Exception):
 
 class RunPodMissingObject(Exception):
     response = {"Error": {"Code": "InvalidArgument", "Message": "object not found"}}
+
+
+def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
+    created = {}
+
+    def client(service, **kwargs):
+        created["service"] = service
+        created.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=client))
+
+    store = RunPodS3PreparedStore.from_environment(
+        volume_id="volume",
+        datacenter_id="EU-RO-1",
+        endpoint_url="https://s3.example.invalid",
+    )
+
+    transfer = created["config"]
+    assert store.client is not None
+    assert created["service"] == "s3"
+    assert transfer.connect_timeout == 30
+    assert transfer.read_timeout == 900
+    assert transfer.tcp_keepalive is True
+    assert transfer.max_pool_connections == 32
+    assert transfer.retries == {"max_attempts": 10, "mode": "standard"}
 
 
 class MemoryS3:
