@@ -12,6 +12,8 @@ from cloud_offload.benchmark import (
     BenchmarkRunner,
     CoordinatorBenchmarkDriver,
     InstanceObservation,
+    _preparation_seconds,
+    _seconds_from_event_to,
     write_scorecard,
 )
 from cloud_offload.config import CloudConfig
@@ -754,14 +756,31 @@ def test_coordinator_driver_preflights_partition_before_submission():
                     "manifest_digest": "sha256:" + "a" * 64,
                     "status": "ready",
                     "recommendation": {"candidate_id": "sha256:" + "b" * 64},
+                    "execution_plan": {
+                        "profile": "comfyui",
+                        "image_digest": "sha256:" + "c" * 64,
+                        "provider": "runpod",
+                        "region": "US-MD-1",
+                        "prepared_volume_id": None,
+                    },
+                    "preparation": {
+                        "complete": False,
+                        "coverage_percent": 0,
+                    },
+                    "candidates": [
+                        {
+                            "region": "US-MD-1",
+                            "prepared_volume_id": None,
+                        }
+                    ],
                 }
             )
         return FakeResponse({"job_id": "job-1"})
 
     driver._request = request
-    selected = BenchmarkPlan.from_dict(
-        plan_dict([scenario("cold", "cold")])
-    ).scenarios[0]
+    selected_value = scenario("cold", "cold")
+    selected_value["allowed_regions"] = ["US-MD-1"]
+    selected = BenchmarkPlan.from_dict(plan_dict([selected_value])).scenarios[0]
 
     assert driver.submit(selected) == "job-1"
     assert [item[1] for item in calls] == ["/api/preflight", "/api/partitions"]
@@ -770,6 +789,55 @@ def test_coordinator_driver_preflights_partition_before_submission():
     assert submitted["manifest_digest"] == "sha256:" + "a" * 64
     assert submitted["candidate_id"] == "sha256:" + "b" * 64
     assert submitted["private_prompt"] == "private-cold"
+    assert calls[0][2]["allowed_regions"] == ["US-MD-1"]
+    assert driver.submission_receipt("job-1") == {
+        "schema": "cloud-offload.benchmark-submission-receipt.v1",
+        "preflight_status": "ready",
+        "profile": "comfyui",
+        "image_digest": "sha256:" + "c" * 64,
+        "provider": "runpod",
+        "region": "US-MD-1",
+        "allowed_regions": ["US-MD-1"],
+        "prepared_volume_bound": False,
+        "preparation_complete": False,
+        "preparation_coverage_percent": 0.0,
+        "cold_fallback_available": True,
+    }
+
+
+def test_preparation_measurement_uses_staging_to_execution_transition():
+    events = [
+        event(1, "job_created", "readiness", 1),
+        event(2, "phase_timing", "staging_started", 10),
+        event(3, "weight_download_progress", "weight_download_progress", 25),
+        event(4, "job_status_changed", "execution", 40),
+        event(5, "execution_success", "result_transfer", 50),
+    ]
+
+    assert _preparation_seconds(events) == 30.0
+    assert _preparation_seconds(events[:3]) is None
+    assert (
+        _seconds_from_event_to(
+            [event(1, "cancellation_requested", "resource_closure", 10)],
+            "cancellation_requested",
+            "2026-07-29T00:00:50+00:00",
+        )
+        == 40.0
+    )
+
+
+def test_benchmark_regions_are_validated_and_safe_summary_keeps_them():
+    selected = scenario("cold", "cold")
+    selected["allowed_regions"] = ["EU-RO-1"]
+    plan = BenchmarkPlan.from_dict(plan_dict([selected]))
+
+    assert plan.scenarios[0].allowed_regions == ("EU-RO-1",)
+    assert plan.safe_summary()["scenarios"][0]["allowed_regions"] == ["EU-RO-1"]
+
+    duplicate = scenario("cold", "cold")
+    duplicate["allowed_regions"] = ["EU-RO-1", "EU-RO-1"]
+    with pytest.raises(ValueError, match="unique non-empty"):
+        BenchmarkPlan.from_dict(plan_dict([duplicate]))
 
 
 def test_cli_validation_redacts_request_and_run_requires_spend_confirmation(

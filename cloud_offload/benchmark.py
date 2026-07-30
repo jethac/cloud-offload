@@ -162,6 +162,7 @@ class BenchmarkScenario:
     expected_statuses: tuple[str, ...]
     fresh_instance: bool = True
     prepared_storage_policy: str | None = None
+    allowed_regions: tuple[str, ...] = ()
     failure: FailureInjection | None = None
 
     @classmethod
@@ -274,6 +275,16 @@ class BenchmarkScenario:
                 f"scenarios[{index}] hot runs require an enabled "
                 "prepared_storage_policy"
             )
+        raw_regions = value.get("allowed_regions") or []
+        if not isinstance(raw_regions, list):
+            raise ValueError(f"scenarios[{index}].allowed_regions must be a list")
+        allowed_regions = tuple(
+            dict.fromkeys(str(item).strip() for item in raw_regions if str(item).strip())
+        )
+        if len(allowed_regions) != len(raw_regions):
+            raise ValueError(
+                f"scenarios[{index}].allowed_regions must contain unique non-empty names"
+            )
         return cls(
             name=name,
             cache_state=cache_state,
@@ -285,6 +296,7 @@ class BenchmarkScenario:
             expected_statuses=normalized_statuses,
             fresh_instance=bool(value.get("fresh_instance", True)),
             prepared_storage_policy=storage_policy,
+            allowed_regions=allowed_regions,
             failure=failure_injection,
         )
 
@@ -368,6 +380,7 @@ class BenchmarkPlan:
                     "timeout_seconds": item.timeout_seconds,
                     "fresh_instance": item.fresh_instance,
                     "prepared_storage_policy": item.prepared_storage_policy,
+                    "allowed_regions": list(item.allowed_regions),
                     "failure_kind": item.failure.kind if item.failure else None,
                     "failure_before_submit": (
                         item.failure.before_submit if item.failure else False
@@ -487,6 +500,39 @@ def _phase_durations(events: list[dict[str, Any]]) -> dict[str, float]:
         ended = ordered[index + 1][1] if index + 1 < len(ordered) else final_time
         durations[phase] = round(max(0.0, (ended - started).total_seconds()), 6)
     return durations
+
+
+def _preparation_seconds(events: list[dict[str, Any]]) -> float | None:
+    """Measure worker staging until the durable execution transition."""
+
+    started: datetime | None = None
+    for item in events:
+        observed = _parse_timestamp(item.get("observed_at"))
+        if observed is None:
+            continue
+        phase = str(item.get("phase") or "")
+        if started is None:
+            if phase == "staging_started":
+                started = observed
+            continue
+        if phase in {"execution", "execution_started"}:
+            return round(max(0.0, (observed - started).total_seconds()), 6)
+    return None
+
+
+def _seconds_from_event_to(
+    events: list[dict[str, Any]], event_type: str, completed_at: str
+) -> float | None:
+    completed = _parse_timestamp(completed_at)
+    if completed is None:
+        return None
+    for item in events:
+        if str(item.get("type") or "") != event_type:
+            continue
+        observed = _parse_timestamp(item.get("observed_at"))
+        if observed is not None:
+            return round(max(0.0, (completed - observed).total_seconds()), 6)
+    return None
 
 
 class BenchmarkRunner:
@@ -634,6 +680,7 @@ class BenchmarkRunner:
         harness_error: str | None = None
         fatal_error: BaseException | None = None
         support_bundle: dict[str, Any] | None = None
+        submission_receipt: dict[str, Any] | None = None
         preparation: dict[str, Any] | None = None
         restoration: dict[str, Any] | None = None
         failure_preparation: dict[str, Any] | None = None
@@ -654,6 +701,9 @@ class BenchmarkRunner:
                 if failure_preparation.get("exit_code") != 0:
                     raise RuntimeError("Pre-submit failure hook did not succeed")
             job_id = self.driver.submit(scenario)
+            receipt_reader = getattr(self.driver, "submission_receipt", None)
+            if callable(receipt_reader):
+                submission_receipt = receipt_reader(job_id)
             while True:
                 now = self.driver.monotonic()
                 elapsed = now - started
@@ -825,15 +875,22 @@ class BenchmarkRunner:
         )
         if fatal_error is not None:
             raise fatal_error
+        completed_at = _utc_now()
         return {
             "schema": SCENARIO_SCHEMA,
             "name": scenario.name,
             "cache_state": scenario.cache_state,
             "request_digest": _canonical_digest(scenario.request),
             "started_at": started_at,
-            "completed_at": _utc_now(),
+            "completed_at": completed_at,
             "duration_seconds": round(max(0.0, completed - started), 6),
             "resource_closure_seconds": round(cleanup_duration, 6),
+            "cancellation_to_provider_absence_seconds": _seconds_from_event_to(
+                events, "cancellation_requested", completed_at
+            ),
+            "revocation_to_provider_absence_seconds": _seconds_from_event_to(
+                events, "lease_revoked", completed_at
+            ),
             "job_id": job_id,
             "status": status,
             "expected_statuses": list(scenario.expected_statuses),
@@ -845,6 +902,7 @@ class BenchmarkRunner:
             "event_count": len(events),
             "event_cursor": cursor,
             "phase_durations_seconds": _phase_durations(events),
+            "preparation_seconds": _preparation_seconds(events),
             "estimated_compute_cost_upper_usd": round(estimated_cost, 6),
             "resources": [
                 {
@@ -863,6 +921,7 @@ class BenchmarkRunner:
             "cleanup": cleanup,
             "orphaned_resources": orphaned_resources,
             "support_bundle": support_bundle,
+            "submission_receipt": submission_receipt,
         }
 
     @staticmethod
@@ -1141,6 +1200,7 @@ class CoordinatorBenchmarkDriver:
         }
         self.allow_hooks = allow_hooks
         self._prepared_storage_restore: dict[str, dict[str, dict[str, Any]]] = {}
+        self._submission_receipts: dict[str, dict[str, Any]] = {}
 
     def _request(
         self,
@@ -1323,6 +1383,7 @@ class CoordinatorBenchmarkDriver:
                     "input_artifacts": request_payload.get("input_artifacts") or {},
                     "provider": request_payload.get("provider") or "auto",
                     "recommendation_policy": "balanced",
+                    "allowed_regions": list(scenario.allowed_regions) or None,
                 },
                 timeout=120,
             )
@@ -1361,7 +1422,43 @@ class CoordinatorBenchmarkDriver:
         job_id = payload.get("job_id")
         if not job_id:
             raise RuntimeError("Coordinator submission returned no job_id")
-        return str(job_id)
+        job_id = str(job_id)
+        if scenario.endpoint == "/api/partitions":
+            execution = preflight.get("execution_plan") or {}
+            preparation = preflight.get("preparation") or {}
+            candidates = preflight.get("candidates") or []
+            selected_region = str(execution.get("region") or "") or None
+            self._submission_receipts[job_id] = {
+                "schema": "cloud-offload.benchmark-submission-receipt.v1",
+                "preflight_status": str(preflight.get("status") or ""),
+                "profile": str(execution.get("profile") or ""),
+                "image_digest": str(execution.get("image_digest") or ""),
+                "provider": str(execution.get("provider") or ""),
+                "region": selected_region,
+                "allowed_regions": list(scenario.allowed_regions),
+                "prepared_volume_bound": bool(execution.get("prepared_volume_id")),
+                "preparation_complete": bool(preparation.get("complete")),
+                "preparation_coverage_percent": float(
+                    preparation.get("coverage_percent") or 0
+                ),
+                "cold_fallback_available": any(
+                    str(item.get("region") or "") == selected_region
+                    and not item.get("prepared_volume_id")
+                    for item in candidates
+                ),
+            }
+        return job_id
+
+    def submission_receipt(self, job_id: str) -> dict[str, Any] | None:
+        receipt = self._submission_receipts.get(job_id)
+        return json.loads(json.dumps(receipt)) if receipt is not None else None
+
+    def cache_status(self) -> dict[str, Any]:
+        response = self._request(
+            "GET", "/api/cache/status", retry_safe=True, timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
 
     def snapshot(self, job_id: str) -> dict[str, Any]:
         response = self._request(

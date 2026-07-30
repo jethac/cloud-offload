@@ -1567,6 +1567,15 @@ Cloud Offload graduates from beta only after:
 - every failure can be explained from a redacted support bundle; and
 - GPU and storage spending remain within configured budgets.
 
+The M7 controller treats one full matrix as the complete cold, hot,
+cancellation, provider, storage, corruption, restart, stale-manifest, and
+regional-fallback canary set for one declared image-region case. Cases rotate in
+a stable order. The trailing 30-pass window must cover every declared public
+worker profile, pinned image, region, and profile-region case. A single failed
+matrix resets the consecutive count. Raw plans and detailed scorecards remain
+under `.runlogs/`; only the finite redacted ledger is eligible for durable
+release evidence.
+
 ## Success metrics and SLO candidates
 
 These are product targets to validate and tighten with baseline data:

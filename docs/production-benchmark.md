@@ -194,6 +194,82 @@ commands. A passing process exits zero. A failed scenario, untriggered injection
 budget circuit breaker, missing fresh Pod, or orphaned provider resource writes a
 failed scorecard and exits non-zero.
 
+## Milestone 7 release controller
+
+One benchmark campaign is not a production release claim. The M7 controller
+adds an atomic ledger and requires at least 30 trailing full matrices. A failed
+matrix resets the consecutive count to zero. The controller stops after the
+first failure so that it does not spend money on evidence that cannot extend the
+release window.
+
+A release plan uses `cloud-offload.release-plan.v1`. It declares:
+
+- the exact backend and ComfyUI extension Git revisions;
+- the public worker profiles and pinned image digests under release;
+- the supported release regions;
+- one case for every declared profile and region pair;
+- one private benchmark-plan path for each case; and
+- total, per-matrix, time, closure, reload, acceleration, GPU, and storage
+  limits.
+
+Each case is a full matrix. It must include fresh-Pod cold and hot runs plus
+cancellation, provider, storage, corruption, and coordinator-restart canaries.
+Every scenario must constrain preflight to the case region. The benchmark
+scorecard records a safe submission receipt with the selected profile, image
+digest, and region. The release controller rejects a different selection.
+
+Cases run in a stable round-robin order. The trailing 30-pass window must cover
+every declared case, profile, and region. Thus a release cannot collect all 30
+passes from only the easiest region.
+
+Before each paid case, fixed internal contract tests must pass for:
+
+- reload, cursor reconnect, and event order;
+- deterministic preflight blockers;
+- stale and corrupt cache recovery;
+- regional cold fallback;
+- support-bundle redaction; and
+- GPU and storage budget enforcement.
+
+The paid scorecard must also prove exact provider cleanup, cancellation through
+provider absence within its SLO, hot preparation at no more than 25% of cold,
+corrupt-object quarantine, cold fallback, safe support bundles, current-state
+reload within two seconds, resumable ordered events, and storage spend inside
+both configured and release budgets.
+
+Validate a release plan without reading credentials or starting a Pod:
+
+```bash
+cloud-offload release validate --plan .runlogs/m7-release-plan.json
+```
+
+Run a bounded number of matrices and keep all detailed material under
+`.runlogs/`:
+
+```bash
+cloud-offload release run \
+  --plan .runlogs/m7-release-plan.json \
+  --ledger .runlogs/m7-release-ledger.json \
+  --output-dir .runlogs/m7-matrices \
+  --max-matrices 1 \
+  --confirm-spend \
+  --allow-hooks
+```
+
+Resume with the same plan and ledger. A changed repository revision, worker
+image, benchmark plan, region set, limit, or test set changes the release-plan
+digest. The controller refuses to mix that work with the earlier ledger.
+
+```bash
+cloud-offload release status \
+  --plan .runlogs/m7-release-plan.json \
+  --ledger .runlogs/m7-release-ledger.json
+```
+
+Raw plans, workflows, full scorecards, hooks, and test output stay local. The
+ledger contains only digests, finite measurements, opaque release identity,
+cleanup and budget receipts, and explicit pass or failure codes.
+
 ## Scorecard
 
 `cloud-offload.benchmark-scorecard.v1` contains:
