@@ -1515,6 +1515,34 @@ def test_s3_upload_recovers_completed_merge_after_wrapped_524(monkeypatch, tmp_p
     assert sleeps == [5, 5]
 
 
+def test_s3_upload_recovers_delayed_invalid_part_after_exact_object_exists(tmp_path):
+    class InvalidPartError(Exception):
+        response = {
+            "ResponseMetadata": {"HTTPStatusCode": 400},
+            "Error": {"Code": "InvalidPart"},
+        }
+
+    class CompletedS3(MemoryS3):
+        def upload_file(self, filename, bucket, key, Config=None):
+            self.objects[key] = Path(filename).read_bytes()
+            raise InvalidPartError("completion retry arrived after the merge")
+
+    client = CompletedS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=client,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        transfer_config=object(),
+    )
+    source = tmp_path / "model"
+    source.write_bytes(b"verified object after multipart merge")
+    artifact = portable_artifact(source.read_bytes())
+
+    assert store.upload_verified(source, artifact["digest"]) == artifact["storage_key"]
+    assert client.objects[artifact["storage_key"]] == source.read_bytes()
+
+
 def test_s3_upload_does_not_hide_non_timeout_failure(tmp_path):
     class DeniedS3(MemoryS3):
         def upload_file(self, filename, bucket, key, Config=None):
