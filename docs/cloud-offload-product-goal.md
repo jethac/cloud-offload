@@ -657,6 +657,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#47](https://github.com/jethac/cloud-offload/pull/47) | Projects manifest-checked pre-ComfyUI boot restores into the claimed job event stream and restore receipt. | Merged as `d1e462e`; 623 tests passed. |
 | [#48](https://github.com/jethac/cloud-offload/pull/48) | Moves the boot-report setting after stable image layers so the evidence fix does not invalidate the large apt, ComfyUI, PyTorch, and CUDA cache layers. | Merged as `b197c91`; 30 focused image and shell checks passed. |
 | [#49](https://github.com/jethac/cloud-offload/pull/49) | Records the redacted paid M5 population and fresh-Pod restore proof, exact image identity, result transport, bounded incident, and provider closure. It marks M5 complete and makes M6 active. | 624 tests passed. Both runtime bundles restored before job claim with complete digest checks, no duplicate population, and zero final provider resources. |
+| [#50](https://github.com/jethac/cloud-offload/pull/50) | Adds safe paid-region demand observations, bounded replication policy, and read-only shadow recommendations with source, destination, bytes, expected benefit, cost, budget, expiry, and decision reasons. | 632 tests passed. Existing compatible targets suppress recommendations, duplicate paid observations collapse, and the shadow endpoints make no provider mutation. |
 
 ### ComfyUI extension repository
 
@@ -1465,6 +1466,16 @@ Exit:
 - Add budgets, TTLs, eviction, and single-flight copies.
 - Replicate through provider object APIs without a GPU.
 - Enable automation only after shadow accuracy is demonstrated.
+
+Implementation status: active. Confirmed paid placements now record safe demand
+by profile fingerprint, provider, and region. The read-only shadow advisor uses
+that demand and the signed manifest projection to report a source, target region,
+bytes, expected hits, expected saved GPU time and cost, copy cost, incremental
+monthly storage cost, expiry, budget effect, and decision reasons. It suppresses
+a recommendation when the target already has a compatible manifest. Reports keep
+cold fallback explicit and make no provider mutation. Automatic copies, durable
+single-flight admission, TTL eviction, replica-aware placement, and regional-loss
+recovery remain before M6 can close.
 
 Exit:
 

@@ -278,6 +278,45 @@ def _cache_registry(config=None):
     return CacheRegistry(config.queue_db_path)
 
 
+def _record_regional_demand(config, report, candidate, job_id: str) -> None:
+    """Record safe paid demand and refresh the local shadow recommendation."""
+
+    prepared = config.prepared_storage or {}
+    replication = prepared.get("replication") or {}
+    if not prepared.get("enabled") or replication.get("mode") == "off":
+        return
+    execution_plan = report.get("execution_plan") or {}
+    profile_fingerprint = str(execution_plan.get("profile_fingerprint") or "")
+    region = str(candidate.get("region") or "")
+    if not profile_fingerprint or not region:
+        return
+    preparation = candidate.get("preparation") or {}
+    preparation_range = (candidate.get("estimate") or {}).get(
+        "preparation_seconds"
+    )
+    if isinstance(preparation_range, list):
+        preparation_seconds = preparation_range[0] if preparation_range else 0
+    else:
+        preparation_seconds = preparation_range or 0
+    registry = _cache_registry(config)
+    registry.record_regional_demand(
+        job_id=job_id,
+        profile_fingerprint=profile_fingerprint,
+        provider=str(candidate.get("provider") or ""),
+        datacenter_id=region,
+        prepared_volume_id=candidate.get("prepared_volume_id"),
+        required_bytes=int(preparation.get("required_bytes") or 0),
+        cached_bytes=int(preparation.get("cached_bytes") or 0),
+        missing_bytes=int(preparation.get("missing_bytes") or 0),
+        preparation_seconds=float(preparation_seconds or 0),
+        hourly_rate=float(candidate.get("hourly_rate") or 0),
+    )
+    from cloud_offload.regional_replication import build_shadow_report
+
+    shadow = build_shadow_report(registry, prepared)
+    registry.record_shadow_evaluation(shadow)
+
+
 def _preflight_store(config=None):
     from cloud_offload.preflight_store import PreflightStore
 
@@ -1137,6 +1176,31 @@ async def cache_status():
         and get_credential(RUNPOD_S3_SECRET_CREDENTIAL)
     )
     return status
+
+
+@app.get("/api/cache/replication/shadow")
+async def replication_shadow_history(limit: int = 20):
+    """Return safe recorded recommendations without provider mutation."""
+
+    config = _config(resolve_secrets=False)
+    return {
+        "schema": "cloud-offload.replication-shadow-history.v1",
+        "evaluations": _cache_registry(config).list_shadow_evaluations(limit=limit),
+        "provider_mutation": False,
+    }
+
+
+@app.post("/api/cache/replication/shadow")
+async def evaluate_replication_shadow():
+    """Record one read-only regional replication recommendation report."""
+
+    from cloud_offload.regional_replication import build_shadow_report
+
+    config = _config(resolve_secrets=False)
+    registry = _cache_registry(config)
+    report = build_shadow_report(registry, config.prepared_storage)
+    registry.record_shadow_evaluation(report)
+    return report
 
 
 @app.post("/api/cache/s3-credentials")
@@ -2795,6 +2859,12 @@ async def submit_workflow(request: WorkflowSubmitRequest):
         provider=confirmed_candidate["provider"],
         status=JobStatus.QUEUED,
     )
+    try:
+        _record_regional_demand(
+            config, confirmed_report, confirmed_candidate, job.id
+        )
+    except Exception:  # noqa: BLE001 - telemetry cannot hide a queued paid job
+        logger.exception("Could not record regional demand for queued workflow")
     return {
         "job_id": job.id,
         "status": job.status.value,
@@ -3073,6 +3143,12 @@ async def submit_partition(request: PartitionSubmitRequest):
         provider=confirmed_candidate["provider"],
         status=JobStatus.QUEUED,
     )
+    try:
+        _record_regional_demand(
+            config, confirmed_report, confirmed_candidate, job.id
+        )
+    except Exception:  # noqa: BLE001 - telemetry cannot hide a queued paid job
+        logger.exception("Could not record regional demand for queued partition")
     return {
         "job_id": job.id,
         "status": job.status.value,

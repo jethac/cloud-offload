@@ -85,6 +85,17 @@ def _normalized_on_prem_assets(entries) -> list:
 
 def normalized_prepared_storage(value: Any) -> dict[str, Any]:
     """Validate the durable prepared-state policy without accepting secrets."""
+    replication_defaults: dict[str, Any] = {
+        "mode": "shadow",
+        "approved_regions": [],
+        "monthly_budget_usd": None,
+        "ttl_days": 30,
+        "demand_window_days": 30,
+        "min_hits": 3,
+        "min_avoided_gpu_seconds": 600.0,
+        "transfer_cost_per_gb_usd": None,
+        "max_inflight": 1,
+    }
     defaults: dict[str, Any] = {
         "enabled": False,
         "provider": "runpod",
@@ -98,6 +109,7 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
         "tenant": "default",
         "cache_private_assets": False,
         "shadow_admission": True,
+        "replication": replication_defaults,
     }
     if value is None:
         return defaults
@@ -114,7 +126,19 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
     unknown = set(value) - set(defaults)
     if unknown:
         raise ValueError("Unknown prepared_storage fields: " + ", ".join(sorted(unknown)))
-    result = {**defaults, **value}
+    replication_value = value.get("replication")
+    if replication_value is None:
+        replication_value = {}
+    if not isinstance(replication_value, dict):
+        raise ValueError("prepared_storage.replication must be an object")
+    replication_unknown = set(replication_value) - set(replication_defaults)
+    if replication_unknown:
+        raise ValueError(
+            "Unknown prepared_storage.replication fields: "
+            + ", ".join(sorted(replication_unknown))
+        )
+    replication = {**replication_defaults, **replication_value}
+    result = {**defaults, **value, "replication": replication}
     result["enabled"] = bool(result["enabled"])
     result["confirmed"] = bool(result["confirmed"])
     result["cache_private_assets"] = bool(result["cache_private_assets"])
@@ -124,6 +148,71 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
     result["region"] = str(result["region"]).strip()
     result["cold_fallback"] = str(result["cold_fallback"]).strip().lower()
     result["tenant"] = str(result["tenant"]).strip()
+    replication["mode"] = str(replication["mode"]).strip().lower()
+    if replication["mode"] not in {"off", "shadow", "automatic"}:
+        raise ValueError(
+            "prepared_storage.replication.mode must be off, shadow, or automatic"
+        )
+    approved_regions = replication["approved_regions"]
+    if not isinstance(approved_regions, list):
+        raise ValueError(
+            "prepared_storage.replication.approved_regions must be a list"
+        )
+    replication["approved_regions"] = list(
+        dict.fromkeys(
+            str(item).strip() for item in approved_regions if str(item).strip()
+        )
+    )
+    replication_budget = replication["monthly_budget_usd"]
+    if replication_budget is not None and float(replication_budget) < 0:
+        raise ValueError(
+            "prepared_storage.replication.monthly_budget_usd cannot be negative"
+        )
+    replication["monthly_budget_usd"] = (
+        None if replication_budget is None else float(replication_budget)
+    )
+    replication["ttl_days"] = int(replication["ttl_days"])
+    if not 1 <= replication["ttl_days"] <= 365:
+        raise ValueError(
+            "prepared_storage.replication.ttl_days must be between 1 and 365"
+        )
+    replication["demand_window_days"] = int(replication["demand_window_days"])
+    if not 1 <= replication["demand_window_days"] <= 365:
+        raise ValueError(
+            "prepared_storage.replication.demand_window_days must be between 1 and 365"
+        )
+    replication["min_hits"] = int(replication["min_hits"])
+    if replication["min_hits"] < 1:
+        raise ValueError("prepared_storage.replication.min_hits must be at least 1")
+    replication["min_avoided_gpu_seconds"] = float(
+        replication["min_avoided_gpu_seconds"]
+    )
+    if replication["min_avoided_gpu_seconds"] < 0:
+        raise ValueError(
+            "prepared_storage.replication.min_avoided_gpu_seconds cannot be negative"
+        )
+    transfer_cost = replication["transfer_cost_per_gb_usd"]
+    if transfer_cost is not None and float(transfer_cost) < 0:
+        raise ValueError(
+            "prepared_storage.replication.transfer_cost_per_gb_usd cannot be negative"
+        )
+    replication["transfer_cost_per_gb_usd"] = (
+        None if transfer_cost is None else float(transfer_cost)
+    )
+    replication["max_inflight"] = int(replication["max_inflight"])
+    if not 1 <= replication["max_inflight"] <= 16:
+        raise ValueError(
+            "prepared_storage.replication.max_inflight must be between 1 and 16"
+        )
+    if replication["mode"] == "automatic":
+        if replication["monthly_budget_usd"] is None:
+            raise ValueError(
+                "prepared_storage.replication.monthly_budget_usd is required for automatic mode"
+            )
+        if not replication["approved_regions"]:
+            raise ValueError(
+                "prepared_storage.replication.approved_regions is required for automatic mode"
+            )
     if result["provider"] != "runpod":
         raise ValueError("prepared_storage.provider must currently be runpod")
     if result["policy"] not in {"off", "smart", "strict", "pinned"}:
@@ -147,6 +236,15 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
     if budget is not None and float(budget) < 0:
         raise ValueError("prepared_storage.max_monthly_storage_cost cannot be negative")
     result["max_monthly_storage_cost"] = None if budget is None else float(budget)
+    if (
+        result["max_monthly_storage_cost"] is not None
+        and replication["monthly_budget_usd"] is not None
+        and replication["monthly_budget_usd"]
+        > result["max_monthly_storage_cost"]
+    ):
+        raise ValueError(
+            "prepared_storage.replication.monthly_budget_usd cannot exceed max_monthly_storage_cost"
+        )
     # `off` is an explicit stateless policy even if an older UI left enabled true.
     if result["policy"] == "off":
         result["enabled"] = False
