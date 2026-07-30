@@ -1888,7 +1888,9 @@ async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
             **result,
         }
     except Exception as exc:  # noqa: BLE001 - persisted as bounded action failure
-        registry.complete_replication(plan["id"], failed_reason=str(exc))
+        registry.complete_replication(
+            plan["id"], failed_reason=type(exc).__name__
+        )
         raise HTTPException(
             status_code=409,
             detail=f"Replication failed: {type(exc).__name__}",

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -833,6 +834,12 @@ def test_manual_replication_failure_keeps_private_endpoint_out_of_api(
     payload = json.dumps(response.json(), sort_keys=True)
     assert "Replication failed: RuntimeError" in payload
     assert "private-storage" not in payload
+    with sqlite3.connect(config.queue_db_path) as connection:
+        stored_status = connection.execute(
+            "SELECT status FROM cache_replications ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()[0]
+    assert stored_status == "failed:RuntimeError"
+    assert "private-storage" not in stored_status
 
 
 def test_automatic_route_stays_locked_before_shadow_accuracy(tmp_path, monkeypatch):
