@@ -1977,7 +1977,6 @@ class RunPodS3PreparedStore:
             upload_id = str(upload["UploadId"])
             parts: dict[int, str] = {}
             marker = 0
-            valid = True
             while True:
                 request = {
                     "Bucket": self.volume_id,
@@ -1998,25 +1997,26 @@ class RunPodS3PreparedStore:
                     )
                     etag = str(item.get("ETag") or "")
                     if int(item.get("Size") or -1) != expected_size or not etag:
-                        valid = False
-                        break
+                        # RunPod's POSIX compatibility layer can expose an
+                        # in-flight part with its current short size. Re-upload
+                        # that part number, but retain every exact-size part.
+                        continue
                     parts[number] = etag
-                if not valid or not response.get("IsTruncated"):
+                if not response.get("IsTruncated"):
                     break
                 marker = int(response.get("NextPartNumberMarker") or 0)
                 if marker <= 0:
                     raise CacheCorruptionError(
                         "RunPod S3 multipart part page has no marker"
                     )
-            if valid:
-                candidates.append(
-                    (
-                        len(parts),
-                        str(upload.get("Initiated") or ""),
-                        upload_id,
-                        parts,
-                    )
+            candidates.append(
+                (
+                    len(parts),
+                    str(upload.get("Initiated") or ""),
+                    upload_id,
+                    parts,
                 )
+            )
         if candidates:
             _, _, upload_id, parts = max(candidates, key=lambda item: item[:2])
             return upload_id, parts
