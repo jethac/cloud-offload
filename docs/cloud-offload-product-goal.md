@@ -2,7 +2,7 @@
 
 > Status: **canonical product goal**
 > Last updated: **2026-07-30**
-> Program status: **in progress — Milestone 5 is complete and Milestone 6 regional replication is the current gate**
+> Program status: **in progress — Milestone 6 is complete and Milestone 7 production release is the current gate**
 > Scope: the end-to-end Cloud Offload product across the coordinator, dispatcher,
 > workers, provider connectors, prepared storage, and ComfyUI extension.
 >
@@ -31,12 +31,11 @@ requests:
 4. **What happens next?** The current execution state and the first unmet exit
    criterion in milestone order.
 
-The active program gate is **M6 regional replication**. M0 through M5 are
-complete. M6 and M7 remain part of this same goal; they are not a backlog that
-can be silently deferred or a new goal that must be rediscovered later. M6 may
-close only after shadow recommendations prove that another prepared region has
-measured value, replication stays inside budget and TTL, and placement and
-cleanup remain safe.
+The active program gate is **M7 production release**. M0 through M6 are
+complete. M7 remains part of this same goal; it is not a backlog that can be
+silently deferred or a new goal that must be rediscovered later. M7 may close
+only after thirty consecutive full canary matrices pass across the supported
+images and regions with zero orphaned Pods and all release SLOs intact.
 
 Raw benchmark plans, workflows, hooks, support bundles, and service logs remain
 local under `.runlogs/`. The durable record committed to the repository contains
@@ -174,9 +173,9 @@ validate the product journey.
 | `VISIBLE-1` | Reconstruct a persistent job surface with phases, bytes, throughput, ETA confidence, spend, and identities. | M2 | Complete; the persistent Cloud Jobs surface reconstructs safe authoritative state after reload and exposes complete M2 telemetry. |
 | `CLOSE-1` | Revoke work and prove provider termination before claiming billing stopped. | M3 | Complete; backend PR #34 and extension PR #8 implement the contract, and the accepted paid RunPod cancellation and restart matrix proves exact provider-confirmed closure. |
 | `STORAGE-1` | Opt into or adopt RunPod storage before cached rental and attach it to compatible future Pods. | M4 foundation | Initial managed/adopted-volume MVP merged. |
-| `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Initial one-region placement merged; adaptive multi-region policy pending. |
+| `STORAGE-2` | Track prepared contents and location, and prefer offers near compatible state with explicit cold fallback. | M4/M6 | Complete; paid multi-region demand, a copied compatible replica, prepared-local ranking, visible cold fallback, TTL expiry, and regional-loss recovery have accepted production evidence. |
 | `ACCEL-1` | Make compatible repeat runs measurably faster with trusted restores and capsules. | M4/M5 | Complete; signed trusted restore, canonical workflow capsules, and fresh-Pod runtime-bundle restore have paid production proof. |
-| `REPLICA-1` | Replicate prepared state only for measured benefit, within budget and TTL. | M6 | Planned; shadow mode first. |
+| `REPLICA-1` | Replicate prepared state only for measured benefit, within budget and TTL. | M6 | Complete; three mature recommendations reached 100% precision, automatic S3 copy stayed within both budgets, repeat cycles did not copy twice, expiry kept the source, and loss removed the replica from placement. |
 | `EVIDENCE-1` | Produce redacted, comparable cold/hot/failure scorecards without orphaned resources. | M0 | Complete; all seven scenarios are accepted and the compact redacted projection is committed. |
 | `RELEASE-1` | Pass the continuous production matrix and budget gates. | M7 | Pending. |
 
@@ -661,6 +660,10 @@ This ledger records merged implementation evidence across both repositories.
 | [#51](https://github.com/jethac/cloud-offload/pull/51) | Adds durable single-flight regional replica actions, exact current-recommendation binding, monthly budget and concurrency enforcement, shadow precision gating, provider-object copy, safe status, and TTL expiry. | 639 tests passed. Repeated requests do not copy twice, automatic mode stays locked before the accuracy gate, expiry keeps source state, and the controller never rents a GPU. |
 | [#52](https://github.com/jethac/cloud-offload/pull/52) | Adds accuracy-gated automatic target creation, target budget reservation, exact provider ownership, scheduled controller cycles, stale-copy recovery, empty-target deletion, multi-region placement, and provider-confirmed regional-loss recovery. | 645 tests passed. Automatic targets stay within both storage budgets, failed creation keeps exact cleanup ownership, lost targets leave placement and release copy claims, cold fallback remains visible, and no replica operation rents a GPU. |
 | [#53](https://github.com/jethac/cloud-offload/pull/53) | Makes a real later paid demand validate its matching shadow recommendation immediately, while the validation window remains the conservative maturity rule for recommendations with no later demand. | 646 tests passed. Repeated real demand can open the accuracy gate without an arbitrary delay, but one recent untested recommendation cannot. |
+| [#54](https://github.com/jethac/cloud-offload/pull/54) | Sends the requested region allowlist to the provider as a hard cold-stock placement constraint. | 647 tests passed. Live free quotes returned current stock in EU-RO-1, EUR-IS-1, and US-GA-2 without provider mutation. |
+| [#55](https://github.com/jethac/cloud-offload/pull/55) | Includes measured bytes from complete compatible runtime-bundle manifests in cold preparation and regional demand. | 648 tests passed. Cold regional demand now records the exact 3,840,000 runtime bytes instead of zero bytes. |
+| [#56](https://github.com/jethac/cloud-offload/pull/56) | Streams verified RunPod S3 downloads through `GetObject` so a valid object does not depend on `HeadObject`, while retaining full digest and size checks. | 649 tests passed. The live 3,420,160-byte environment bundle returned HEAD 403 and GET success; the merged fix completed the regional copy. |
+| [#57](https://github.com/jethac/cloud-offload/pull/57) | Records the redacted paid M6 demand, shadow-accuracy, automatic-copy, repeat-cycle, placement, loss, TTL-expiry, source-preservation, and final-cleanup proof. It marks M6 complete and makes M7 active. | 650 tests pass, including a strict finite and redacted M6 evidence test. Final RunPod state has zero active GPUs and no automatic test volume. |
 
 ### ComfyUI extension repository
 
@@ -1291,7 +1294,46 @@ no job ID, provider resource ID, raw workflow, private path, endpoint, or secret
 6. **Closure:** all three attributed attempts left zero orphaned resources. The
    independent final provider inventory was empty. No manual cleanup was needed.
 
-All M5 exits pass. M5 is complete. M6 is the first unmet milestone.
+All M5 exits pass. M5 is complete. M6 was the next milestone at the time of this
+evidence.
+
+### M6 evidence and exit audit
+
+The safe evidence projection is
+[M6 regional replication evidence](evidence/m6-regional-replication-evidence-2026-07-30.json).
+It records free regional stock, bounded paid demand, shadow accuracy, automatic
+provider-object copy, repeat-cycle safety, prepared placement, regional loss,
+controlled TTL expiry, source preservation, and final cleanup. It contains no
+job ID, provider resource ID, raw workflow, private path, endpoint, or secret.
+
+1. **Measured demand:** six positive-byte paid observations covered EU-RO-1,
+   EUR-IS-1, and US-GA-2. Each observation measured 3,840,000 missing runtime
+   bytes. The complete paid campaign used a USD 0.12 per-scenario limit and a
+   USD 0.061635 estimated compute-cost upper bound.
+2. **Shadow accuracy:** three unique mature recommendations received a later
+   matching paid observation. Precision was 1.0 against a 0.8 gate, so automatic
+   mode opened only after the required three recommendations passed.
+3. **Budgeted copy:** the controller created a 50 GB EUR-IS-1 target with a USD
+   3.50 monthly estimate under a USD 4 replication limit and a USD 11 complete
+   storage limit. It copied and verified two artifacts and 3,840,000 bytes
+   through RunPod S3 without a GPU.
+4. **Repeat safety and placement:** a repeat controller cycle created no action
+   and left the completed-action count at one. Free preflight then returned
+   seven complete prepared choices and seven cold fallback choices in the same
+   region.
+5. **Regional loss:** deletion of the exact managed test target produced one
+   lost target and one lost action. A lower total budget blocked replacement.
+   Free preflight removed all prepared choices and retained seven cold choices.
+6. **TTL and cleanup:** a controlled clock-injection canary preserved the real
+   one-day TTL, moved only the exact completed action past expiry, and ran the
+   normal expiry path. One action expired, zero expiry failures occurred, one
+   empty provider target was deleted, and the two-artifact source manifest
+   remained ready in US-MD-1.
+7. **Closure:** the saved user configuration was restored to shadow mode.
+   ComfyUI, the coordinator, and the dispatcher were healthy. RunPod had zero
+   active GPUs, only the three original volumes, and no automatic test volume.
+
+All M6 exits pass. M6 is complete. M7 is the first unmet milestone.
 
 ### Operational safety rules
 
@@ -1321,8 +1363,8 @@ All M5 exits pass. M5 is complete. M6 is the first unmet milestone.
 | M3 — leases and billing closure | **Complete** | The automated five-phase matrix and the bounded paid RunPod cancellation/restart campaign pass with provider-confirmed closure and zero final resources. |
 | M4 — fast trusted restore | **Complete** | Signed trust receipts, complete first-seen verification, foreground and background corruption handling, safe fallback, and the paid 8.601% hot-to-cold preparation result are durable. |
 | M5 — workflow capsules | **Complete** | Canonical capsules, free blockers, signed runtime bundles, exact runtime identity, first-rent publication, paid fresh-Pod restore, result transport, and compact redacted evidence are durable. |
-| M6 — regional replication | **In progress** | Shadow recommendations precede automation. |
-| M7 — production release gate | **Not started** | Requires all prior exits and continuous canaries. |
+| M6 — regional replication | **Complete** | Six positive-byte paid observations, 3-of-3 shadow validation, budgeted automatic copy, repeat safety, prepared and cold placement, loss recovery, TTL expiry, and source-preserving cleanup have accepted evidence. |
+| M7 — production release gate | **In progress** | M0 through M6 are complete. Thirty consecutive full canary matrices are the active gate. |
 
 ### Milestone 0 — Measurement contract and production scorecard
 
@@ -1470,7 +1512,7 @@ Exit:
 - Replicate through provider object APIs without a GPU.
 - Enable automation only after shadow accuracy is demonstrated.
 
-Implementation status: active. Confirmed paid placements now record safe demand
+Implementation status: complete. Confirmed paid placements record safe demand
 by profile fingerprint, provider, and region. The read-only shadow advisor uses
 that demand and the signed manifest projection to report a source, target region,
 bytes, expected hits, expected saved GPU time and cost, copy cost, incremental
@@ -1491,9 +1533,12 @@ non-blocking authenticated controller cycle. It recovers stale copy claims,
 checks provider truth, records the shadow report, expires replicas, removes an
 empty automatic target after provider confirmation, and starts at most one copy.
 Lost targets leave prepared placement, and preflight keeps cold fallback visible
-while it can use compatible replicas in multiple regions. Production shadow,
-copy, expiry, cleanup, placement, and loss-recovery evidence remain before M6 can
-close.
+while it can use compatible replicas in multiple regions. The accepted M6
+evidence records six positive-byte paid observations across three regions,
+3-of-3 validated shadow recommendations at 100% precision, two complete S3
+copies, repeat-cycle suppression, prepared and cold choices together,
+provider-confirmed regional loss, controlled one-day TTL expiry, source
+preservation, restored configuration, zero active GPUs, and no test volume.
 
 Exit:
 
@@ -1502,6 +1547,9 @@ Exit:
 - duplicate copies are suppressed;
 - scheduling uses compatible replicas without hiding cold fallback; and
 - regional loss has a rehearsed recovery path.
+
+All exits pass. The compact redacted evidence is in
+`docs/evidence/m6-regional-replication-evidence-2026-07-30.json`.
 
 ### Milestone 7 — Production release gate
 

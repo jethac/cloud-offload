@@ -1,0 +1,233 @@
+{
+  "schema": "cloud-offload.m6-production-evidence.v1",
+  "milestone": "M6",
+  "accepted": true,
+  "captured_at": "2026-07-30T10:27:05+09:00",
+  "merged_stack": {
+    "backend_merge_commit": "b739b136b5bcd073df26f9b25cc538569855105c",
+    "worker_image": "ghcr.io/jethac/cloud-offload-worker-comfyui",
+    "worker_image_digest": "sha256:c4c85999c3d2824fcedcae6f0fb26c6903bfc66cdd174d650c9ccfaead210c16",
+    "worker_image_revision": "b197c91"
+  },
+  "automated_verification": {
+    "backend": {
+      "passed": 649,
+      "failed": 0
+    },
+    "regional_cold_stock_is_region_constrained": true,
+    "runtime_bundle_bytes_are_measured": true,
+    "shadow_recommendations_are_read_only": true,
+    "automatic_copy_is_accuracy_gated": true,
+    "replica_targets_are_single_flight": true,
+    "runpod_s3_get_is_digest_verified": true,
+    "regional_loss_removes_prepared_placement": true,
+    "expiry_keeps_source_state": true
+  },
+  "free_region_stock": {
+    "provider_mutation": false,
+    "regions": [
+      {
+        "region": "EU-RO-1",
+        "gpu_type": "RTX 2000 Ada",
+        "hourly_rate_usd": 0.24
+      },
+      {
+        "region": "EUR-IS-1",
+        "gpu_type": "RTX 2000 Ada",
+        "hourly_rate_usd": 0.24
+      },
+      {
+        "region": "US-GA-2",
+        "gpu_type": "L4",
+        "hourly_rate_usd": 0.39
+      }
+    ]
+  },
+  "paid_demand_campaign": {
+    "accepted": true,
+    "scenario_spend_limit_usd": 0.12,
+    "total_estimated_compute_cost_upper_usd": 0.061635,
+    "terminal_completed_run_count": 7,
+    "positive_byte_observation_count": 6,
+    "missing_bytes_per_accepted_observation": 3840000,
+    "final_active_gpu_count": 0,
+    "orphan_count": 0,
+    "regions": [
+      {
+        "region": "EU-RO-1",
+        "accepted_observations": 2,
+        "hourly_rate_usd": 0.24,
+        "measured_preparation_seconds_per_observation": 0.037,
+        "accepted_run_costs_usd": [
+          0.010538,
+          0.004288
+        ]
+      },
+      {
+        "region": "EUR-IS-1",
+        "accepted_observations": 2,
+        "hourly_rate_usd": 0.24,
+        "measured_preparation_seconds_per_observation": 0.037,
+        "accepted_run_costs_usd": [
+          0.004053,
+          0.004127
+        ]
+      },
+      {
+        "region": "US-GA-2",
+        "accepted_observations": 2,
+        "hourly_rate_usd": 0.39,
+        "measured_preparation_seconds_per_observation": 0.037,
+        "accepted_run_costs_usd": [
+          0.015211,
+          0.013704
+        ]
+      }
+    ],
+    "bounded_incidents": [
+      {
+        "kind": "preflight_runtime_bytes_were_zero",
+        "accepted_as_replication_observation": false,
+        "terminal_status": "completed",
+        "estimated_compute_cost_upper_usd": 0.009714,
+        "provider_absent": true,
+        "orphan_count": 0,
+        "fixed_by_merged_change": true
+      },
+      {
+        "kind": "revised_quote_conflict",
+        "paid_resource_created": false,
+        "estimated_compute_cost_upper_usd": 0.0,
+        "provider_absent": true,
+        "orphan_count": 0
+      },
+      {
+        "kind": "provider_inventory_read_timeout",
+        "terminal_status": "completed",
+        "estimated_compute_cost_upper_usd": 0.015211,
+        "provider_absent": true,
+        "orphan_count": 0
+      }
+    ]
+  },
+  "shadow_accuracy": {
+    "provider_mutation": false,
+    "unique_recommendations": 3,
+    "mature_recommendations": 3,
+    "validated_recommendations": 3,
+    "precision": 1.0,
+    "required_recommendations": 3,
+    "required_precision": 0.8,
+    "automation_gate_passed": true
+  },
+  "automatic_replication": {
+    "accepted": true,
+    "source_region": "US-MD-1",
+    "target_region": "EUR-IS-1",
+    "reason": "measured_later_paid_demand",
+    "target_size_gb": 50,
+    "incremental_monthly_storage_cost_usd": 3.5,
+    "replication_monthly_budget_usd": 4.0,
+    "total_storage_budget_usd": 11.0,
+    "peak_incremental_monthly_storage_cost_usd": 3.5,
+    "ttl_days": 1,
+    "estimated_copy_cost_usd": 0.0,
+    "completed_copy_count": 2,
+    "failed_copy_count_before_fix": 1,
+    "bytes_per_completed_copy": 3840000,
+    "artifact_count_per_completed_copy": 2,
+    "artifacts": [
+      {
+        "kind": "custom-node-bundle",
+        "bytes": 419840
+      },
+      {
+        "kind": "environment-bundle",
+        "bytes": 3420160
+      }
+    ],
+    "provider_gpu_mutation": false,
+    "one_gb_provider_failures": {
+      "failed_target_records": 4,
+      "provider_volumes_created": 0,
+      "provider_status": "internal_error"
+    },
+    "s3_compatibility_incident": {
+      "head_status": 403,
+      "get_succeeded": true,
+      "digest_verification_retained": true,
+      "fixed_by_merged_change": true
+    }
+  },
+  "repeat_cycle": {
+    "status": "observed",
+    "new_action_created": false,
+    "completed_actions_before": 1,
+    "completed_actions_after": 1,
+    "ready_targets_after": 1,
+    "provider_gpu_mutation": false
+  },
+  "prepared_placement_before_loss": {
+    "status": "ready",
+    "prepared_recommended": true,
+    "prepared_candidate_count": 7,
+    "complete_prepared_candidate_count": 7,
+    "cold_fallback_candidate_count": 7,
+    "provider_mutation": false
+  },
+  "regional_loss_recovery": {
+    "accepted": true,
+    "exact_managed_target_deleted": true,
+    "lost_target_count": 1,
+    "lost_action_count": 1,
+    "ready_target_count": 0,
+    "replacement_blocked_by_budget": true,
+    "source_state_deleted": false,
+    "post_loss_preflight_status": "ready_with_preparation",
+    "post_loss_prepared_candidate_count": 0,
+    "post_loss_cold_fallback_candidate_count": 7,
+    "provider_gpu_mutation": false
+  },
+  "ttl_expiry": {
+    "accepted": true,
+    "method": "controlled_clock_injection",
+    "original_ttl_days": 1,
+    "expired_action_count": 1,
+    "failure_count": 0,
+    "deleted_empty_target_count": 1,
+    "source_state_deleted": false,
+    "source_manifest_present": true,
+    "source_artifact_count": 2,
+    "source_bytes": 3840000,
+    "provider_gpu_mutation": false
+  },
+  "final_state": {
+    "saved_configuration_restored": true,
+    "replication_mode": "shadow",
+    "comfyui_running": true,
+    "coordinator_healthy": true,
+    "dispatcher_running": true,
+    "active_runpod_gpu_count": 0,
+    "runpod_volume_count": 3,
+    "automatic_test_volume_count": 0,
+    "orphan_count": 0
+  },
+  "m6_exit_audit": {
+    "every_replica_has_reason_budget_and_expiry": true,
+    "monthly_storage_spend_stayed_within_policy": true,
+    "duplicate_copy_was_suppressed": true,
+    "compatible_replica_was_used_for_placement": true,
+    "cold_fallback_remained_visible": true,
+    "regional_loss_recovery_passed": true,
+    "ttl_expiry_and_empty_target_cleanup_passed": true,
+    "all_exits_passed": true
+  },
+  "privacy": {
+    "raw_request_included": false,
+    "raw_workflow_included": false,
+    "raw_prompt_included": false,
+    "private_asset_location_included": false,
+    "credential_or_secret_endpoint_included": false,
+    "job_or_provider_resource_id_included": false
+  }
+}
