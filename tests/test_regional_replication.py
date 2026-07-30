@@ -12,7 +12,13 @@ from cloud_offload import server
 from cloud_offload.cache_registry import CacheRegistry
 from cloud_offload.config import CloudConfig
 from cloud_offload.dispatcher import Dispatcher
-from cloud_offload.prepared_state import ManifestSigner, blob_key, build_manifest, fingerprint
+from cloud_offload.prepared_state import (
+    ManifestSigner,
+    blob_key,
+    build_manifest,
+    bundle_key,
+    fingerprint,
+)
 from cloud_offload.providers.base import ProviderStorage
 from cloud_offload.regional_replication import build_shadow_report, shadow_accuracy
 
@@ -711,6 +717,126 @@ def test_manifest_copy_skips_complete_target_objects_and_releases_local_files(
     assert not target_store.upload_path.exists()
     assert target_store.published is not None
     assert result["artifact_count"] == 2
+
+
+def test_manifest_refresh_reuses_only_exact_models_for_current_profile(
+    tmp_path, monkeypatch
+):
+    signer = ManifestSigner(b"r" * 32)
+    payload = b"current model bytes"
+    model = artifact(payload)
+    model["destination"] = {"category": "checkpoints", "filename": "model.bin"}
+    old_runtime = {
+        **artifact(b"old runtime"),
+        "kind": "environment-bundle",
+        "materialization": "extract",
+        "portability": "runtime-bound",
+        "requirements": {
+            "image_digest": "sha256:" + "0" * 64,
+            "dependency_lock": "sha256:" + "0" * 64,
+            "platform": "linux-x86_64",
+            "python_abi": "cp311",
+        },
+        "source": {"dependency_lock": "sha256:" + "0" * 64},
+        "destination": {"dependency_lock": "sha256:" + "0" * 64},
+    }
+    old_runtime["storage_key"] = bundle_key(old_runtime["digest"])
+    config = CloudConfig(
+        queue_db_path=tmp_path / "queue.db",
+        prepared_storage=replication_policy(),
+        worker_profiles={
+            "comfyui": {
+                "image": "runner@sha256:" + "a" * 64,
+                "models": ["comfyui-workflow"],
+                "providers": ["runpod"],
+                "custom_nodes": [
+                    {
+                        "id": "current-pack",
+                        "git": "https://example.invalid/current-pack.git",
+                        "commit": "b" * 40,
+                    }
+                ],
+            }
+        },
+    )
+    registry = CacheRegistry(config.queue_db_path)
+    volume = add_volume(registry, "source-provider-volume", "A")
+    source_manifest = build_manifest(
+        profile_fingerprint=fingerprint({"profile": "old"}),
+        producer={
+            "image_digest": "sha256:" + "0" * 64,
+            "cloud_offload_version": "old",
+        },
+        artifacts=[model, old_runtime],
+        signer=signer,
+        claims={"cache_volume_id": volume.id},
+    )
+    registry.reconcile_index(
+        volume.id,
+        {
+            "schema": "cloud-offload.prepared-state.index.v1",
+            "generation": "old-generation",
+            "manifests": [source_manifest],
+        },
+        manifest_documents={source_manifest["manifest_id"]: source_manifest},
+    )
+
+    class RefreshStore:
+        published = None
+
+        def publish_manifest(self, manifest, manifest_signer):
+            manifest_signer.verify(manifest)
+            self.published = manifest
+
+        def load_index(self):
+            assert self.published is not None
+            return {
+                "schema": "cloud-offload.prepared-state.index.v1",
+                "generation": "refreshed-generation",
+                "manifests": [source_manifest, self.published],
+            }
+
+    store = RefreshStore()
+    monkeypatch.setattr(server, "_config", lambda **kwargs: config)
+    monkeypatch.setattr(server, "_cache_registry", lambda *args: registry)
+    monkeypatch.setattr(server, "_cache_connector", lambda *args: object())
+    monkeypatch.setattr(server, "_runpod_s3_store", lambda *args: store)
+    monkeypatch.setattr(server, "_prepared_manifest_signer", lambda *args: signer)
+    request = {
+        "confirmed": True,
+        "volume_id": volume.id,
+        "source_manifest_id": source_manifest["manifest_id"],
+        "profile": "comfyui",
+        "requirement_artifacts": [
+            {
+                "sha256": model["digest"].removeprefix("sha256:"),
+                "size": len(payload),
+                "category": "checkpoints",
+                "filename": "model.bin",
+                "format": "other",
+            }
+        ],
+    }
+    client = TestClient(server.app)
+
+    unconfirmed = client.post(
+        "/api/cache/manifests/refresh", json={**request, "confirmed": False}
+    )
+    response = client.post("/api/cache/manifests/refresh", json=request)
+
+    assert unconfirmed.status_code == 409
+    assert response.status_code == 200
+    body = response.json()
+    assert body["manifest_id"] != source_manifest["manifest_id"]
+    assert body["profile_fingerprint"] != source_manifest["profile_fingerprint"]
+    assert body["artifact_count"] == 1
+    assert body["cached_bytes"] == len(payload)
+    assert body["complete"] is False
+    assert body["runtime_requirements_pending"] is True
+    assert body["provider_gpu_mutation"] is False
+    assert [item["kind"] for item in store.published["artifacts"]] == [
+        "model-weight"
+    ]
 
 
 def test_expiry_route_unpublishes_target_and_keeps_source(tmp_path, monkeypatch):
