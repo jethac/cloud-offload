@@ -1475,7 +1475,7 @@ def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
     }
     assert store.transfer_config.multipart_threshold == 64 * 1024 * 1024
     assert store.transfer_config.multipart_chunksize == 8 * 1024 * 1024
-    assert store.transfer_config.max_concurrency == 4
+    assert store.transfer_config.max_concurrency == 8
     assert store.transfer_config.use_threads is True
 
 
