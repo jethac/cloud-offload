@@ -41,7 +41,10 @@ S3_DOWNLOAD_CONCURRENCY = 10
 S3_RANGE_SOCKET_TIMEOUT_SECONDS = 180
 S3_RANGE_READ_BYTES = 1024 * 1024
 RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
-RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 500 * 1024 * 1024
+# RunPod's S3 gateway can reject long single-request uploads well below the
+# S3 protocol limit. Keep only small objects on PutObject so model artifacts
+# use the resumable, independently retried multipart path.
+RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 64 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CHUNK_BYTES = 8 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CONCURRENCY = 4
 RUNPOD_S3_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024
