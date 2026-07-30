@@ -1866,6 +1866,57 @@ def test_s3_verified_download_retries_incomplete_range_stream(monkeypatch, tmp_p
     assert sleeps == [2, 2, 4]
 
 
+def test_s3_verified_download_resumes_after_partial_range_stream(monkeypatch, tmp_path):
+    class ResponseStreamingError(Exception):
+        pass
+
+    class PartialBody(io.BytesIO):
+        def __init__(self, value):
+            super().__init__(value)
+            self.read_count = 0
+
+        def read(self, size=-1):
+            self.read_count += 1
+            if self.read_count == 1:
+                return super().read(2)
+            raise ResponseStreamingError("partial range")
+
+    class PartialRangeS3(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.interrupted = False
+
+        def get_object(self, Bucket, Key, Range=None):
+            response = super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+            if Range == "bytes=5-9" and not self.interrupted:
+                self.interrupted = True
+                response["Body"] = PartialBody(response["Body"].read())
+            return response
+
+    sleeps = []
+    monkeypatch.setattr(prepared_state_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(prepared_state_module, "S3_VERIFICATION_RANGE_BYTES", 5)
+    monkeypatch.setattr(prepared_state_module, "S3_DOWNLOAD_CONCURRENCY", 1)
+    client = PartialRangeS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=client,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    payload = b"0123456789"
+    artifact = portable_artifact(payload)
+    client.objects[store._key(artifact["storage_key"])] = payload
+    destination = tmp_path / "resumed-range"
+
+    store.download_verified(artifact["storage_key"], artifact["digest"], destination)
+
+    assert destination.read_bytes() == payload
+    assert client.ranges == ["bytes=0-4", "bytes=5-9", "bytes=7-9"]
+    assert sleeps == [2]
+
+
 def test_s3_replica_expiry_keeps_shared_objects_until_last_manifest(tmp_path):
     client = MemoryS3()
     store = RunPodS3PreparedStore(
