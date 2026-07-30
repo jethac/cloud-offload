@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -8,7 +9,9 @@ from fastapi.testclient import TestClient
 from cloud_offload import server
 from cloud_offload.cache_registry import CacheRegistry
 from cloud_offload.config import CloudConfig
+from cloud_offload.dispatcher import Dispatcher
 from cloud_offload.prepared_state import ManifestSigner, blob_key, build_manifest, fingerprint
+from cloud_offload.providers.base import ProviderStorage
 from cloud_offload.regional_replication import build_shadow_report, shadow_accuracy
 
 
@@ -30,6 +33,8 @@ def replication_policy(**updates):
         "shadow_required_recommendations": 10,
         "shadow_validation_hours": 24,
         "shadow_min_precision": 0.8,
+        "controller_interval_seconds": 300,
+        "copy_timeout_seconds": 21600,
     }
     if isinstance(replication_updates, dict):
         replication.update(replication_updates)
@@ -569,6 +574,18 @@ def test_expiry_route_unpublishes_target_and_keeps_source(tmp_path, monkeypatch)
     profile = fingerprint({"profile": "expiry"})
     source_manifest = add_manifest(registry, source, profile, b"source")
     target_manifest = add_manifest(registry, target, profile, b"replica")
+    target_claim = registry.claim_replica_target(
+        provider="runpod",
+        datacenter_id="B",
+        size_gb=100,
+        monthly_cost_usd=7,
+        monthly_budget_usd=20,
+    )
+    registry.complete_replica_target(
+        target_claim["id"],
+        provider_volume_id=target.provider_volume_id,
+        cache_volume_id=target.id,
+    )
     action = registry.claim_replica_action(
         action_recommendation(source, target, source_manifest),
         monthly_budget_usd=20,
@@ -598,8 +615,18 @@ def test_expiry_route_unpublishes_target_and_keeps_source(tmp_path, monkeypatch)
             }
 
     store = ExpiryStore()
+
+    class Connector:
+        def __init__(self):
+            self.deleted = []
+
+        def delete_storage(self, storage_id):
+            self.deleted.append(storage_id)
+            return True
+
+    connector = Connector()
     monkeypatch.setattr(server, "_config", lambda **kwargs: config)
-    monkeypatch.setattr(server, "_cache_connector", lambda *args: object())
+    monkeypatch.setattr(server, "_cache_connector", lambda *args: connector)
     monkeypatch.setattr(server, "_runpod_s3_store", lambda *args: store)
     monkeypatch.setattr(
         server, "_prepared_manifest_signer", lambda config: ManifestSigner(b"x" * 32)
@@ -615,9 +642,13 @@ def test_expiry_route_unpublishes_target_and_keeps_source(tmp_path, monkeypatch)
     assert body["provider_gpu_mutation"] is False
     assert len(body["expired"]) == 1
     assert body["expired"][0]["status"] == "expired"
+    assert len(body["deleted_targets"]) == 1
+    assert body["deleted_targets"][0]["status"] == "deleted"
+    assert connector.deleted == [target.provider_volume_id]
     assert store.removed == [target_manifest["manifest_id"]]
     assert registry.get_manifest(source.id, source_manifest["manifest_id"])
     assert registry.get_manifest(target.id, target_manifest["manifest_id"]) is None
+    assert registry.get_volume(target.id).status == "failed"
 
 
 def test_automatic_route_stays_locked_before_shadow_accuracy(tmp_path, monkeypatch):
@@ -646,3 +677,261 @@ def test_automatic_route_stays_locked_before_shadow_accuracy(tmp_path, monkeypat
     assert detail["code"] == "cloud_offload.replication_shadow_gate"
     assert detail["accuracy"]["automation_gate_passed"] is False
     assert registry.list_replica_actions() == []
+
+
+def test_automatic_route_creates_approved_target_then_copies(
+    tmp_path, monkeypatch
+):
+    policy = replication_policy(replication={"mode": "automatic"})
+    config = SimpleNamespace(
+        queue_db_path=tmp_path / "queue.db",
+        prepared_storage=policy,
+    )
+    registry = CacheRegistry(config.queue_db_path)
+    source = add_volume(registry, "source-provider-volume", "A")
+    profile = fingerprint({"profile": "automatic-create"})
+    source_manifest = add_manifest(registry, source, profile)
+    record_demand(registry, profile)
+    recommendation = build_shadow_report(registry, policy)["recommendations"][0]
+
+    class Connector:
+        def __init__(self):
+            self.created = []
+            self.deleted = []
+
+        def create_storage(self, *, name, size_gb, datacenter_id):
+            self.created.append((name, size_gb, datacenter_id))
+            return ProviderStorage(
+                id="automatic-provider-volume",
+                provider="runpod",
+                name=name,
+                size_gb=size_gb,
+                datacenter_id=datacenter_id,
+                s3_compatible=True,
+            )
+
+        def delete_storage(self, storage_id):
+            self.deleted.append(storage_id)
+            return True
+
+    connector = Connector()
+    copies = []
+
+    async def copy(config, registry, source, target, manifest_id):
+        copies.append((source.id, target.id, manifest_id))
+        return {
+            "source_manifest_id": manifest_id,
+            "target_manifest_id": "sha256:" + "5" * 64,
+            "target_generation": "automatic-generation",
+            "bytes": recommendation["bytes"],
+            "artifact_count": 1,
+        }
+
+    monkeypatch.setattr(server, "_config", lambda **kwargs: config)
+    monkeypatch.setattr(server, "_cache_connector", lambda *args: connector)
+    monkeypatch.setattr(server, "_copy_cache_manifest", copy)
+    import cloud_offload.regional_replication as replication_module
+
+    monkeypatch.setattr(
+        replication_module,
+        "shadow_accuracy",
+        lambda *args, **kwargs: {"automation_gate_passed": True},
+    )
+    client = TestClient(server.app)
+
+    response = client.post(
+        "/api/cache/replication/execute",
+        json={"recommendation_id": recommendation["recommendation_id"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert connector.created == [("cloud-offload-replica-b", 100, "B")]
+    assert connector.deleted == []
+    targets = registry.list_replica_targets(status="ready")
+    assert len(targets) == 1
+    target = registry.get_volume(targets[0]["cache_volume_id"])
+    assert target.provider_volume_id == "automatic-provider-volume"
+    assert copies == [(source.id, target.id, source_manifest["manifest_id"])]
+    assert registry.list_replica_actions()[0]["target_volume_id"] == target.id
+
+
+def test_replica_target_claim_is_single_flight_and_budgeted(tmp_path):
+    registry = CacheRegistry(tmp_path / "queue.db")
+
+    first = registry.claim_replica_target(
+        provider="runpod",
+        datacenter_id="B",
+        size_gb=100,
+        monthly_cost_usd=7,
+        monthly_budget_usd=10,
+    )
+    duplicate = registry.claim_replica_target(
+        provider="runpod",
+        datacenter_id="B",
+        size_gb=100,
+        monthly_cost_usd=7,
+        monthly_budget_usd=10,
+    )
+
+    assert first["duplicate_suppressed"] is False
+    assert duplicate["id"] == first["id"]
+    assert duplicate["duplicate_suppressed"] is True
+    with pytest.raises(RuntimeError, match="budget"):
+        registry.claim_replica_target(
+            provider="runpod",
+            datacenter_id="C",
+            size_gb=100,
+            monthly_cost_usd=7,
+            monthly_budget_usd=10,
+        )
+
+
+def test_failed_target_creation_keeps_exact_provider_cleanup_ownership(
+    tmp_path, monkeypatch
+):
+    policy = replication_policy(replication={"mode": "automatic"})
+    config = SimpleNamespace(
+        queue_db_path=tmp_path / "queue.db",
+        prepared_storage=policy,
+    )
+    registry = CacheRegistry(config.queue_db_path)
+    source = add_volume(registry, "source-provider-volume", "A")
+    profile = fingerprint({"profile": "target-cleanup"})
+    add_manifest(registry, source, profile)
+    record_demand(registry, profile)
+    recommendation = build_shadow_report(registry, policy)["recommendations"][0]
+
+    class Connector:
+        def __init__(self):
+            self.cleanup_ready = False
+
+        def create_storage(self, *, name, size_gb, datacenter_id):
+            return ProviderStorage(
+                id="cleanup-provider-volume",
+                provider="runpod",
+                name=name,
+                size_gb=size_gb,
+                datacenter_id=datacenter_id,
+                s3_compatible=False,
+            )
+
+        def get_storage(self, storage_id):
+            return ProviderStorage(
+                id=storage_id,
+                provider="runpod",
+                name="cleanup",
+                size_gb=100,
+                datacenter_id="B",
+            )
+
+        def delete_storage(self, storage_id):
+            return self.cleanup_ready
+
+    connector = Connector()
+    monkeypatch.setattr(server, "_cache_connector", lambda *args: connector)
+
+    with pytest.raises(RuntimeError, match="does not support"):
+        asyncio.run(
+            server._ensure_automatic_replica_target(
+                config, registry, recommendation
+            )
+        )
+
+    pending = registry.list_replica_targets()[0]
+    assert pending["status"] == "deleting"
+    assert pending["provider_volume_id"] == "cleanup-provider-volume"
+
+    connector.cleanup_ready = True
+    recovery = asyncio.run(
+        server._reconcile_automatic_replica_targets(config, registry)
+    )
+
+    assert recovery["cleaned"] == [pending["id"]]
+    assert registry.list_replica_targets()[0]["status"] == "deleted"
+
+
+def test_controller_marks_lost_target_out_of_placement(tmp_path, monkeypatch):
+    policy = replication_policy(replication={"mode": "automatic"})
+    config = SimpleNamespace(
+        queue_db_path=tmp_path / "queue.db",
+        prepared_storage=policy,
+    )
+    registry = CacheRegistry(config.queue_db_path)
+    source_volume = add_volume(registry, "source-provider-volume", "A")
+    target_volume = add_volume(registry, "lost-provider-volume", "B")
+    manifest = add_manifest(
+        registry, source_volume, fingerprint({"profile": "loss-recovery"})
+    )
+    claim = registry.claim_replica_target(
+        provider="runpod",
+        datacenter_id="B",
+        size_gb=100,
+        monthly_cost_usd=7,
+        monthly_budget_usd=20,
+    )
+    registry.complete_replica_target(
+        claim["id"],
+        provider_volume_id=target_volume.provider_volume_id,
+        cache_volume_id=target_volume.id,
+    )
+    recommendation = action_recommendation(source_volume, target_volume, manifest)
+    action = registry.claim_replica_action(
+        recommendation, monthly_budget_usd=20, max_inflight=1
+    )
+    registry.complete_replica_action(
+        action["id"], target_manifest_id="sha256:" + "4" * 64
+    )
+
+    class MissingConnector:
+        def get_storage(self, storage_id):
+            return None
+
+    monkeypatch.setattr(server, "_config", lambda **kwargs: config)
+    monkeypatch.setattr(server, "_cache_connector", lambda *args: MissingConnector())
+    client = TestClient(server.app)
+
+    response = client.post("/api/cache/replication/controller/tick")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["target_recovery"]["lost"] == [claim["id"]]
+    assert registry.list_replica_targets()[0]["status"] == "lost"
+    assert registry.get_volume(target_volume.id).status == "failed"
+    assert registry.list_replica_actions()[0]["status"] == "lost"
+    assert body["provider_gpu_mutation"] is False
+
+    replacement = add_volume(registry, "replacement-provider-volume", "B")
+    retried = registry.claim_replica_action(
+        {
+            **recommendation,
+            "target_volume_id": replacement.id,
+        },
+        monthly_budget_usd=20,
+        max_inflight=1,
+    )
+    assert retried["status"] == "copying"
+    assert retried["duplicate_suppressed"] is False
+
+
+def test_dispatcher_starts_one_nonblocking_controller_thread(tmp_path, monkeypatch):
+    policy = replication_policy(replication={"mode": "automatic"})
+    config = CloudConfig(
+        queue_db_path=tmp_path / "queue.db",
+        worker_token="w" * 32,
+        prepared_storage=policy,
+    )
+    config._source_path = tmp_path / "config.json"
+    dispatcher = Dispatcher(config, connector=object())
+    calls = []
+    monkeypatch.setattr(
+        dispatcher,
+        "_run_replication_controller_tick",
+        lambda: calls.append("tick"),
+    )
+
+    dispatcher._tick_regional_replication()
+    dispatcher._replication_thread.join(timeout=2)
+    dispatcher._tick_regional_replication()
+
+    assert calls == ["tick"]

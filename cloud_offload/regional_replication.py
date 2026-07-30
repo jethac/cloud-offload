@@ -269,7 +269,6 @@ def build_shadow_report(
             "source_volume_id": source_volume.id if source_volume else None,
             "source_manifest_id": source.get("manifest_id") if source else None,
             "target_region": target_region,
-            "target_volume_id": target_volume.id if target_volume else None,
         }
         automatic_blockers = [
             code
@@ -292,6 +291,7 @@ def build_shadow_report(
             {
                 "recommendation_id": _identity(recommendation_key),
                 **recommendation_key,
+                "target_volume_id": target_volume.id if target_volume else None,
                 "source_region": source_volume.datacenter_id if source_volume else None,
                 "bytes": artifact_bytes,
                 "expected_hits": expected_hits,

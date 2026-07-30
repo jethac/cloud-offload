@@ -659,6 +659,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#49](https://github.com/jethac/cloud-offload/pull/49) | Records the redacted paid M5 population and fresh-Pod restore proof, exact image identity, result transport, bounded incident, and provider closure. It marks M5 complete and makes M6 active. | 624 tests passed. Both runtime bundles restored before job claim with complete digest checks, no duplicate population, and zero final provider resources. |
 | [#50](https://github.com/jethac/cloud-offload/pull/50) | Adds safe paid-region demand observations, bounded replication policy, and read-only shadow recommendations with source, destination, bytes, expected benefit, cost, budget, expiry, and decision reasons. | 632 tests passed. Existing compatible targets suppress recommendations, duplicate paid observations collapse, and the shadow endpoints make no provider mutation. |
 | [#51](https://github.com/jethac/cloud-offload/pull/51) | Adds durable single-flight regional replica actions, exact current-recommendation binding, monthly budget and concurrency enforcement, shadow precision gating, provider-object copy, safe status, and TTL expiry. | 639 tests passed. Repeated requests do not copy twice, automatic mode stays locked before the accuracy gate, expiry keeps source state, and the controller never rents a GPU. |
+| [#52](https://github.com/jethac/cloud-offload/pull/52) | Adds accuracy-gated automatic target creation, target budget reservation, exact provider ownership, scheduled controller cycles, stale-copy recovery, empty-target deletion, multi-region placement, and provider-confirmed regional-loss recovery. | 645 tests passed. Automatic targets stay within both storage budgets, failed creation keeps exact cleanup ownership, lost targets leave placement and release copy claims, cold fallback remains visible, and no replica operation rents a GPU. |
 
 ### ComfyUI extension repository
 
@@ -1482,7 +1483,16 @@ recommendations reach the configured precision gate. Copy uses provider object
 APIs and no GPU. Repeated requests return the same action. Due replica manifests
 and unshared target objects can be removed without deleting source state.
 Automatic target-volume creation, scheduled controller runs, full replica-aware
-placement evidence, and regional-loss recovery remain before M6 can close.
+placement evidence, and regional-loss recovery are now implemented. Automatic
+target creation has a separate regional single-flight lock and checks both the
+replication budget and the complete storage budget. The dispatcher starts a
+non-blocking authenticated controller cycle. It recovers stale copy claims,
+checks provider truth, records the shadow report, expires replicas, removes an
+empty automatic target after provider confirmation, and starts at most one copy.
+Lost targets leave prepared placement, and preflight keeps cold fallback visible
+while it can use compatible replicas in multiple regions. Production shadow,
+copy, expiry, cleanup, placement, and loss-recovery evidence remain before M6 can
+close.
 
 Exit:
 

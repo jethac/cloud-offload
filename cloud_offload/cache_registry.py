@@ -193,6 +193,22 @@ class CacheRegistry:
                     WHERE status IN ('copying','completed');
                 CREATE INDEX IF NOT EXISTS idx_regional_replica_expiry
                     ON regional_replica_actions(status, expires_at);
+                CREATE TABLE IF NOT EXISTS regional_replica_targets (
+                    id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    datacenter_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    provider_volume_id TEXT,
+                    cache_volume_id TEXT,
+                    size_gb INTEGER NOT NULL,
+                    monthly_cost_usd REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    ready_at TEXT,
+                    error TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_regional_replica_target_active
+                    ON regional_replica_targets(provider, datacenter_id)
+                    WHERE status IN ('creating','ready','deleting');
                 """
             )
 
@@ -1241,6 +1257,184 @@ class CacheRegistry:
                 "SELECT * FROM regional_replica_actions WHERE id=?", (str(action_id),)
             ).fetchone()
         return self._replica_action(row)
+
+    def recover_stale_replica_actions(self, *, stale_before: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE regional_replica_actions
+                SET status='failed', completed_at=?, error='copy_timeout_recovered'
+                WHERE status='copying' AND created_at<=?
+                """,
+                (_now(), str(stale_before)),
+            )
+            return int(cursor.rowcount)
+
+    def lose_replica_actions_for_target(self, cache_volume_id: str) -> int:
+        """Release single-flight claims after provider-confirmed regional loss."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE regional_replica_actions
+                SET status='lost', completed_at=?, error='regional_target_lost'
+                WHERE target_volume_id=? AND status IN ('copying','completed')
+                """,
+                (_now(), str(cache_volume_id)),
+            )
+            return int(cursor.rowcount)
+
+    @staticmethod
+    def _replica_target(row: sqlite3.Row) -> dict[str, Any]:
+        return {key: row[key] for key in row.keys()}
+
+    def claim_replica_target(
+        self,
+        *,
+        provider: str,
+        datacenter_id: str,
+        size_gb: int,
+        monthly_cost_usd: float,
+        monthly_budget_usd: float,
+    ) -> dict[str, Any]:
+        provider_name = str(provider).strip().lower()
+        region = str(datacenter_id).strip()
+        size = int(size_gb)
+        monthly_cost = float(monthly_cost_usd)
+        budget = float(monthly_budget_usd)
+        if not provider_name or not region or size < 1:
+            raise ValueError("Replica target needs provider, region, and size")
+        if not all(
+            math.isfinite(item) and item >= 0 for item in (monthly_cost, budget)
+        ):
+            raise ValueError("Replica target cost and budget must be finite")
+        target_id = str(uuid.uuid4())
+        created_at = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM regional_replica_targets
+                WHERE provider=? AND datacenter_id=?
+                  AND status IN ('creating','ready','deleting')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (provider_name, region),
+            ).fetchone()
+            if existing:
+                return {
+                    **self._replica_target(existing),
+                    "duplicate_suppressed": True,
+                }
+            reserved = connection.execute(
+                """
+                SELECT COALESCE(SUM(monthly_cost_usd),0) AS cost
+                FROM regional_replica_targets
+                WHERE status IN ('creating','ready','deleting')
+                """
+            ).fetchone()["cost"]
+            if float(reserved) + monthly_cost > budget:
+                raise RuntimeError("Regional replica target budget exceeded")
+            connection.execute(
+                """
+                INSERT INTO regional_replica_targets (
+                    id, provider, datacenter_id, status, provider_volume_id,
+                    cache_volume_id, size_gb, monthly_cost_usd, created_at,
+                    ready_at, error
+                ) VALUES (?, ?, ?, 'creating', NULL, NULL, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    target_id,
+                    provider_name,
+                    region,
+                    size,
+                    monthly_cost,
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM regional_replica_targets WHERE id=?", (target_id,)
+            ).fetchone()
+        return {**self._replica_target(row), "duplicate_suppressed": False}
+
+    def complete_replica_target(
+        self,
+        target_id: str,
+        *,
+        provider_volume_id: str,
+        cache_volume_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE regional_replica_targets
+                SET status='ready', provider_volume_id=?, cache_volume_id=?,
+                    ready_at=?, error=NULL
+                WHERE id=? AND status='creating'
+                """,
+                (
+                    str(provider_volume_id),
+                    str(cache_volume_id),
+                    _now(),
+                    str(target_id),
+                ),
+            )
+            if not cursor.rowcount:
+                raise KeyError(target_id)
+            row = connection.execute(
+                "SELECT * FROM regional_replica_targets WHERE id=?", (str(target_id),)
+            ).fetchone()
+        return self._replica_target(row)
+
+    def bind_replica_target_provider(
+        self, target_id: str, *, provider_volume_id: str
+    ) -> dict[str, Any]:
+        """Persist provider ownership immediately after paid storage creation."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE regional_replica_targets SET provider_volume_id=?
+                WHERE id=? AND status='creating'
+                """,
+                (str(provider_volume_id), str(target_id)),
+            )
+            if not cursor.rowcount:
+                raise KeyError(target_id)
+            row = connection.execute(
+                "SELECT * FROM regional_replica_targets WHERE id=?", (str(target_id),)
+            ).fetchone()
+        return self._replica_target(row)
+
+    def update_replica_target(
+        self, target_id: str, status: str, *, error: str | None = None
+    ) -> dict[str, Any]:
+        if status not in {"ready", "failed", "deleting", "deleted", "lost"}:
+            raise ValueError("Unsupported replica target status")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE regional_replica_targets SET status=?, error=? WHERE id=?
+                """,
+                (status, str(error)[:500] if error else None, str(target_id)),
+            )
+            if not cursor.rowcount:
+                raise KeyError(target_id)
+            row = connection.execute(
+                "SELECT * FROM regional_replica_targets WHERE id=?", (str(target_id),)
+            ).fetchone()
+        return self._replica_target(row)
+
+    def list_replica_targets(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM regional_replica_targets"
+        values: tuple[Any, ...] = ()
+        if status:
+            query += " WHERE status=?"
+            values = (str(status),)
+        query += " ORDER BY created_at DESC, id DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [self._replica_target(row) for row in rows]
 
     def create_replication(
         self,

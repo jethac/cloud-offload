@@ -158,7 +158,9 @@ Persisted configuration:
       "max_inflight": 1,
       "shadow_required_recommendations": 10,
       "shadow_validation_hours": 24,
-      "shadow_min_precision": 0.8
+      "shadow_min_precision": 0.8,
+      "controller_interval_seconds": 300,
+      "copy_timeout_seconds": 21600
     }
   }
 }
@@ -613,9 +615,22 @@ request returns the same action and does not copy again. It never rents a GPU.
 `POST /api/cache/replication/expire` unpublishes due target manifests and deletes
 objects that no remaining target manifest uses. It does not delete source state
 or rent a GPU. `GET /api/cache/replication/actions` returns the safe action and
-shadow-accuracy state. Automatic target-volume creation, scheduled controller
-runs, full replica-aware placement evidence, and regional-loss recovery remain
-gated by later M6 evidence.
+shadow-accuracy state.
+
+After the accuracy gate passes, automatic mode can create one approved managed
+target volume. Creation has its own durable region single-flight lock and checks
+the replication budget and complete prepared-storage budget before provider
+mutation. A failed creation deletes its exact new provider volume. The primary
+prepared-volume binding does not change.
+
+The dispatcher starts a non-blocking authenticated controller cycle at the
+configured interval. A cycle recovers stale copy claims, checks provider truth
+for automatic targets, records a shadow evaluation, expires replicas, deletes an
+empty automatic target after provider confirmation, and starts at most one new
+copy. A lost target becomes ineligible for placement. Current preflight can use
+compatible replicas in more than one region and still shows the cold fallback.
+Production shadow-accuracy, automatic-copy, expiry, and regional-loss evidence
+remain before M6 can close.
 
 ### Retention
 
