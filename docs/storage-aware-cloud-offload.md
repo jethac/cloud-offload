@@ -125,10 +125,11 @@ most users to understand provider datacenter IDs.
 
 The default region mode is `auto`. A raw datacenter selector appears under
 advanced settings and becomes required only for `pinned`. The first implementation
-supports one managed region. Later releases may create replicas in additional
-regions after showing their cost and expected benefit.
+supports one managed region. The M6 shadow controller now records safe paid
+placement demand and shows the cost and expected benefit of additional regions
+before it can copy data.
 
-Proposed persisted configuration:
+Persisted configuration:
 
 ```json
 {
@@ -144,7 +145,18 @@ Proposed persisted configuration:
     "confirmed": true,
     "tenant": "default",
     "cache_private_assets": false,
-    "shadow_admission": true
+    "shadow_admission": true,
+    "replication": {
+      "mode": "shadow",
+      "approved_regions": [],
+      "monthly_budget_usd": null,
+      "ttl_days": 30,
+      "demand_window_days": 30,
+      "min_hits": 3,
+      "min_avoided_gpu_seconds": 600,
+      "transfer_cost_per_gb_usd": null,
+      "max_inflight": 1
+    }
   }
 }
 ```
@@ -157,6 +169,9 @@ provider quote.
 
 Provider credentials and S3-compatible credentials remain in the environment or
 OS keychain and must never be serialized into this object or returned by an API.
+Automatic mode is rejected unless it has a finite monthly budget and at least
+one approved region. Its budget cannot exceed the complete prepared-storage
+monthly limit.
 
 ### First-run disclosure
 
@@ -570,6 +585,21 @@ A later replica controller may:
 3. publish a target-region manifest only after verification;
 4. stop replication at the user's storage budget;
 5. delete a replica without deleting the canonical object tier.
+
+The M6 shadow controller is the first part of this controller. Each confirmed
+paid placement records only a profile fingerprint, provider, region, prepared
+coverage, conservative preparation estimate, hourly rate, and byte counts. It
+does not store the workflow, prompt, input path, or job identity in its safe
+output.
+
+`POST /api/cache/replication/shadow` records a new local evaluation.
+`GET /api/cache/replication/shadow` returns the safe evaluation history. A report
+contains the source manifest and volume, target region and optional existing
+target volume, bytes, expected hits, expected saved GPU time and cost, copy cost,
+incremental monthly storage cost, expiry, budget, decision reasons, and explicit
+cold-fallback visibility. Both endpoints make no provider mutation. Copy,
+automatic admission, TTL eviction, and loss recovery remain gated by later M6
+evidence.
 
 ### Retention
 

@@ -1270,6 +1270,7 @@ def build_partition_preflight(
         },
         "execution_plan": {
             "profile": profile.get("name") or profile_name,
+            "profile_fingerprint": requirements["profile_fingerprint"],
             "image_digest": image_digest,
             "gpu_requirement": {
                 "requested_type": gpu_type or "any",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from dataclasses import asdict, dataclass
@@ -142,6 +143,32 @@ class CacheRegistry:
                     FOREIGN KEY(source_volume_id) REFERENCES cache_volumes(id),
                     FOREIGN KEY(target_volume_id) REFERENCES cache_volumes(id)
                 );
+                CREATE TABLE IF NOT EXISTS regional_cache_demand (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL UNIQUE,
+                    profile_fingerprint TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    datacenter_id TEXT NOT NULL,
+                    prepared_volume_id TEXT,
+                    required_bytes INTEGER NOT NULL,
+                    cached_bytes INTEGER NOT NULL,
+                    missing_bytes INTEGER NOT NULL,
+                    preparation_seconds REAL NOT NULL,
+                    hourly_rate REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_regional_cache_demand_scope
+                    ON regional_cache_demand(
+                        profile_fingerprint, provider, datacenter_id, created_at
+                    );
+                CREATE TABLE IF NOT EXISTS replication_shadow_evaluations (
+                    id TEXT PRIMARY KEY,
+                    schema TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    report_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_replication_shadow_created
+                    ON replication_shadow_evaluations(created_at DESC);
                 """
             )
 
@@ -895,6 +922,124 @@ class CacheRegistry:
             ).fetchone()
         return dict(row)
 
+    def record_regional_demand(
+        self,
+        *,
+        job_id: str,
+        profile_fingerprint: str,
+        provider: str,
+        datacenter_id: str,
+        prepared_volume_id: str | None,
+        required_bytes: int,
+        cached_bytes: int,
+        missing_bytes: int,
+        preparation_seconds: float,
+        hourly_rate: float,
+    ) -> dict[str, Any]:
+        """Record one paid placement without storing workflow or user data."""
+
+        identity = str(job_id).strip()
+        profile = str(profile_fingerprint).strip()
+        provider_name = str(provider).strip().lower()
+        region = str(datacenter_id).strip()
+        if not identity or not profile or not provider_name or not region:
+            raise ValueError(
+                "Regional demand requires job, profile, provider, and region identities"
+            )
+        required = int(required_bytes)
+        cached = int(cached_bytes)
+        missing = int(missing_bytes)
+        preparation = float(preparation_seconds)
+        rate = float(hourly_rate)
+        if min(required, cached, missing) < 0:
+            raise ValueError("Regional demand byte counts cannot be negative")
+        if not math.isfinite(preparation) or preparation < 0:
+            raise ValueError("Regional demand preparation time must be finite")
+        if not math.isfinite(rate) or rate < 0:
+            raise ValueError("Regional demand hourly rate must be finite")
+        observation_id = str(uuid.uuid4())
+        created_at = _now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO regional_cache_demand (
+                    id, job_id, profile_fingerprint, provider, datacenter_id,
+                    prepared_volume_id, required_bytes, cached_bytes, missing_bytes,
+                    preparation_seconds, hourly_rate, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO NOTHING
+                """,
+                (
+                    observation_id,
+                    identity,
+                    profile,
+                    provider_name,
+                    region,
+                    str(prepared_volume_id).strip() if prepared_volume_id else None,
+                    required,
+                    cached,
+                    missing,
+                    preparation,
+                    rate,
+                    created_at,
+                ),
+            )
+            created = bool(cursor.rowcount)
+            row = connection.execute(
+                "SELECT * FROM regional_cache_demand WHERE job_id=?", (identity,)
+            ).fetchone()
+        return {
+            key: row[key]
+            for key in row.keys()
+            if key != "job_id"
+        } | {"created": created}
+
+    def list_regional_demand(self, *, since: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM regional_cache_demand"
+        values: tuple[Any, ...] = ()
+        if since:
+            query += " WHERE created_at>=?"
+            values = (str(since),)
+        query += " ORDER BY created_at DESC, id DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [
+            {key: row[key] for key in row.keys() if key != "job_id"} for row in rows
+        ]
+
+    def record_shadow_evaluation(self, report: dict[str, Any]) -> str:
+        if report.get("schema") != "cloud-offload.replication-shadow.v1":
+            raise ValueError("Unsupported replication shadow report schema")
+        evaluation_id = str(report.get("evaluation_id") or uuid.uuid4())
+        created_at = str(report.get("created_at") or _now())
+        document = {**report, "evaluation_id": evaluation_id, "created_at": created_at}
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO replication_shadow_evaluations (
+                    id, schema, created_at, report_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    evaluation_id,
+                    "cloud-offload.replication-shadow.v1",
+                    created_at,
+                    json.dumps(document, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+        return evaluation_id
+
+    def list_shadow_evaluations(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT report_json FROM replication_shadow_evaluations
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (max(1, min(1000, int(limit))),),
+            ).fetchall()
+        return [json.loads(row["report_json"]) for row in rows]
+
     def create_replication(
         self,
         source_volume_id: str,
@@ -956,6 +1101,7 @@ class CacheRegistry:
 
     def status(self, policy: dict[str, Any]) -> dict[str, Any]:
         volumes = [asdict(item) for item in self.list_volumes()]
+        shadow = self.list_shadow_evaluations(limit=1)
         return {
             "policy": policy,
             "volumes": volumes,
@@ -964,4 +1110,16 @@ class CacheRegistry:
             else "ready",
             "capacity_bytes": sum(item["capacity_bytes"] for item in volumes),
             "recent_benefit": self.recent_benefit(),
+            "regional_demand_count": len(self.list_regional_demand()),
+            "replication_shadow": (
+                {
+                    "evaluation_id": shadow[0].get("evaluation_id"),
+                    "created_at": shadow[0].get("created_at"),
+                    "recommendation_count": len(
+                        shadow[0].get("recommendations") or []
+                    ),
+                }
+                if shadow
+                else None
+            ),
         }

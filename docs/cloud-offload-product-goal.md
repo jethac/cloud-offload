@@ -1466,6 +1466,16 @@ Exit:
 - Replicate through provider object APIs without a GPU.
 - Enable automation only after shadow accuracy is demonstrated.
 
+Implementation status: active. Confirmed paid placements now record safe demand
+by profile fingerprint, provider, and region. The read-only shadow advisor uses
+that demand and the signed manifest projection to report a source, target region,
+bytes, expected hits, expected saved GPU time and cost, copy cost, incremental
+monthly storage cost, expiry, budget effect, and decision reasons. It suppresses
+a recommendation when the target already has a compatible manifest. Reports keep
+cold fallback explicit and make no provider mutation. Automatic copies, durable
+single-flight admission, TTL eviction, replica-aware placement, and regional-loss
+recovery remain before M6 can close.
+
 Exit:
 
 - every automatic replica has a reason, budget, and expiry;
