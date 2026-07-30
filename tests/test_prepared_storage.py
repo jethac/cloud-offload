@@ -1778,11 +1778,14 @@ def test_s3_verified_download_limits_each_range_body_timeout(monkeypatch, tmp_pa
     assert client.body_timeouts == [7, 7, 7, 7]
 
 
-def test_s3_verified_download_retries_runpod_524(monkeypatch, tmp_path):
+@pytest.mark.parametrize("gateway_code", [520, 524])
+def test_s3_verified_download_retries_runpod_gateway_5xx(
+    monkeypatch, tmp_path, gateway_code
+):
     class GatewayTimeout(Exception):
         response = {
-            "ResponseMetadata": {"HTTPStatusCode": 524},
-            "Error": {"Code": "524"},
+            "ResponseMetadata": {"HTTPStatusCode": gateway_code},
+            "Error": {"Code": str(gateway_code)},
         }
 
     class ColdObjectS3(MemoryS3):
