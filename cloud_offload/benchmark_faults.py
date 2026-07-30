@@ -250,20 +250,40 @@ def _corruption_target(
     *,
     declared_digests: set[str],
     canary_nonce: str | None = None,
+    allowed_regions: set[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     prepared = client.prepared_storage()
     provider_volume_id = str(prepared.get("existing_volume_id") or "")
-    if not prepared.get("enabled") or not provider_volume_id:
-        raise RuntimeError("Corruption canary requires enabled, bound prepared storage")
+    if not prepared.get("enabled"):
+        raise RuntimeError("Corruption canary requires enabled prepared storage")
     volumes = list(client.get("/api/cache/status").get("volumes") or [])
-    volume = next(
-        (
+    normalized_regions = {
+        str(item).strip() for item in (allowed_regions or set()) if str(item).strip()
+    }
+    if normalized_regions:
+        region_volumes = [
             item
             for item in volumes
-            if str(item.get("provider_volume_id") or "") == provider_volume_id
-        ),
-        None,
-    )
+            if str(item.get("datacenter_id") or "") in normalized_regions
+            and str(item.get("status") or "ready") == "ready"
+            and item.get("s3_compatible")
+        ]
+        if len(region_volumes) != 1:
+            raise RuntimeError(
+                "Corruption canary requires one ready S3 volume in the allowed region"
+            )
+        volume = region_volumes[0]
+    else:
+        if not provider_volume_id:
+            raise RuntimeError("Corruption canary requires bound prepared storage")
+        volume = next(
+            (
+                item
+                for item in volumes
+                if str(item.get("provider_volume_id") or "") == provider_volume_id
+            ),
+            None,
+        )
     if not volume or not volume.get("s3_compatible"):
         raise RuntimeError("Bound prepared volume has no S3 canary path")
 
@@ -500,6 +520,7 @@ def prepare_corruption(
     coordinator_storage_factory: Callable[[], Any] = _coordinator_storage,
     profile_fingerprint: str | None = None,
     canary_nonce: str | None = None,
+    allowed_regions: set[str] | None = None,
     settle_seconds: float = 5,
 ) -> dict[str, Any]:
     """Publish then corrupt an object no prior mount could have cached."""
@@ -509,6 +530,7 @@ def prepare_corruption(
         scenario,
         declared_digests=declared_digests,
         canary_nonce=canary_nonce,
+        allowed_regions=allowed_regions,
     )
     store = store_factory(volume)
     keys = _corruption_keys(scenario, canary_nonce=canary_nonce)
@@ -653,6 +675,7 @@ def prepare_corruption(
             registry_factory=registry_factory,
             coordinator_storage_factory=coordinator_storage_factory,
             canary_nonce=canary_nonce,
+            allowed_regions=allowed_regions,
         )
         raise
     return {
@@ -674,6 +697,7 @@ def cleanup_corruption(
     registry_factory: Callable[[], CacheRegistry] = _cache_registry,
     coordinator_storage_factory: Callable[[], Any] = _coordinator_storage,
     canary_nonce: str | None = None,
+    allowed_regions: set[str] | None = None,
 ) -> dict[str, Any]:
     """Remove the synthetic generation without touching ordinary artifacts."""
 
@@ -682,6 +706,7 @@ def cleanup_corruption(
         scenario,
         declared_digests=declared_digests,
         canary_nonce=canary_nonce,
+        allowed_regions=allowed_regions,
     )
     store = store_factory(volume)
     keys = _corruption_keys(scenario, canary_nonce=canary_nonce)
@@ -807,6 +832,7 @@ def observe_corruption(
     *,
     store_factory: Callable[[dict[str, Any]], RunPodS3PreparedStore] = _prepared_store,
     canary_nonce: str | None = None,
+    allowed_regions: set[str] | None = None,
 ) -> dict[str, Any]:
     """Require quarantine, then restore the tiny valid blob for a job retry."""
 
@@ -815,6 +841,7 @@ def observe_corruption(
         scenario,
         declared_digests=declared_digests,
         canary_nonce=canary_nonce,
+        allowed_regions=allowed_regions,
     )
     store = store_factory(volume)
     keys = _corruption_keys(scenario, canary_nonce=canary_nonce)
@@ -1007,6 +1034,13 @@ def run_fault(kind: str) -> dict[str, Any]:
         )
         if not canary_nonce:
             raise RuntimeError("Corruption canary received no campaign nonce")
+        allowed_regions = {
+            item.strip()
+            for item in os.environ.get(
+                "CLOUD_OFFLOAD_BENCHMARK_ALLOWED_REGIONS", ""
+            ).split(",")
+            if item.strip()
+        }
         if stage == "prepare":
             profile_name = (
                 os.environ.get("CLOUD_OFFLOAD_BENCHMARK_PROFILE", "").strip()
@@ -1021,10 +1055,15 @@ def run_fault(kind: str) -> dict[str, Any]:
                 declared,
                 profile_fingerprint=profile_fingerprint,
                 canary_nonce=canary_nonce,
+                allowed_regions=allowed_regions,
             )
         if stage == "cleanup":
             return cleanup_corruption(
-                client, scenario, declared, canary_nonce=canary_nonce
+                client,
+                scenario,
+                declared,
+                canary_nonce=canary_nonce,
+                allowed_regions=allowed_regions,
             )
         return observe_corruption(
             client,
@@ -1032,6 +1071,7 @@ def run_fault(kind: str) -> dict[str, Any]:
             scenario,
             declared,
             canary_nonce=canary_nonce,
+            allowed_regions=allowed_regions,
         )
     if stage != "observe":
         raise RuntimeError("Restart canary supports only the observe stage")

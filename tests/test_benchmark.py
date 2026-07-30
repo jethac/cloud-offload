@@ -423,20 +423,18 @@ def test_cancellation_and_hook_failures_are_injected_at_the_requested_phase():
 
 
 def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
+    selected = scenario(
+        "corruption",
+        "failure",
+        failure={
+            "kind": "corruption",
+            "before_submit": True,
+            "hook_argv": ["cloud-offload", "benchmark-hook", "corruption"],
+        },
+    )
+    selected["allowed_regions"] = ["EU-RO-1"]
     plan = BenchmarkPlan.from_dict(
-        plan_dict(
-            [
-                scenario(
-                    "corruption",
-                    "failure",
-                    failure={
-                        "kind": "corruption",
-                        "before_submit": True,
-                        "hook_argv": ["cloud-offload", "benchmark-hook", "corruption"],
-                    },
-                )
-            ]
-        )
+        plan_dict([selected])
     )
     script = successful_script("pod-corruption")
     script.steps[0]["events"].append(
@@ -472,6 +470,10 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
     assert driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == ""
     assert (
         driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_PROFILE"] == "comfyui-partition-v1"
+    )
+    assert (
+        driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_ALLOWED_REGIONS"]
+        == "EU-RO-1"
     )
     assert (
         assets[0]["sha256"]
