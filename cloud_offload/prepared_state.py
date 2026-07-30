@@ -1878,9 +1878,15 @@ class RunPodS3PreparedStore:
         response = getattr(exc, "response", {}) or {}
         metadata = response.get("ResponseMetadata", {}) or {}
         error_data = response.get("Error", {}) or {}
+        status = metadata.get("HTTPStatusCode")
+        code = str(error_data.get("Code") or "")
+        try:
+            numeric_code = int(code)
+        except ValueError:
+            numeric_code = 0
         return (
-            metadata.get("HTTPStatusCode") == 524
-            or str(error_data.get("Code") or "") == "524"
+            (isinstance(status, int) and 500 <= status <= 599)
+            or 500 <= numeric_code <= 599
             or type(exc).__name__
             in {
                 "ReadTimeoutError",
