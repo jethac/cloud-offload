@@ -1884,7 +1884,10 @@ class RunPodS3PreparedStore:
             if len(payload) != expected_size:
                 raise CacheCorruptionError("Multipart source read was incomplete")
             response = self._call_with_gateway_retry(
-                lambda: self.client.upload_part(
+                # Parts are small and independently retryable. Use the bounded
+                # client so a stalled response header cannot hold a worker for
+                # the long multipart-completion timeout.
+                lambda: self.range_client.upload_part(
                     Bucket=self.volume_id,
                     Key=object_key,
                     UploadId=upload_id,
