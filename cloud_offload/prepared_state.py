@@ -46,7 +46,9 @@ RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
 # S3 protocol limit. Keep only small objects on PutObject so model artifacts
 # use the resumable, independently retried multipart path.
 RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 64 * 1024 * 1024
-RUNPOD_S3_MULTIPART_CHUNK_BYTES = 8 * 1024 * 1024
+# Match RunPod's large-file helper. Larger parts reduce control metadata on
+# POSIX-backed network volumes while staying far below the 500 MB part limit.
+RUNPOD_S3_MULTIPART_CHUNK_BYTES = 50 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CONCURRENCY = 4
 RUNPOD_S3_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024
 RUNPOD_S3_MULTIPART_MAX_PARTS = 10_000
