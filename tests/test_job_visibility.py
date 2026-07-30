@@ -316,6 +316,148 @@ def test_visibility_endpoint_returns_the_safe_page(monkeypatch, tmp_path):
     assert "private prompt text" not in response.text
 
 
+def test_individual_visibility_endpoint_returns_no_raw_job_data(monkeypatch, tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = _visible_job(queue)
+    monkeypatch.setattr(server, "_queue", lambda: (None, queue))
+
+    response = TestClient(server.app).get(f"/api/jobs/{job.id}/visibility")
+
+    assert response.status_code == 200
+    assert response.json()["schema"] == "cloud-offload.job-visibility.v1"
+    assert response.json()["job_id"] == job.id
+    for private_value in (
+        "private prompt text",
+        "private://input/path",
+        "https://private.invalid/token",
+        "do-not-return",
+    ):
+        assert private_value not in response.text
+
+
+def test_result_manifest_endpoint_returns_only_safe_artifact_data(monkeypatch, tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = _visible_job(queue)
+    queue.complete_job(
+        job.id,
+        {
+            "schema": "comfy.workflow.result.v1",
+            "prompt_id": "private-prompt-id",
+            "outputs": {"private-node": {"path": "B:/private/output.glb"}},
+            "artifacts": [
+                {
+                    "artifact_id": "a" * 64,
+                    "sha256": "b" * 64,
+                    "size": 42,
+                    "node_id": "14",
+                    "filename": "B:\\private\\mesh.glb",
+                    "subfolder": "private/folder",
+                    "mime_type": "model/gltf-binary",
+                    "output_kind": "3d",
+                    "role": "mesh",
+                    "object_id": "hero",
+                    "part_id": None,
+                    "material_id": "paint",
+                    "revision_id": "revision-1",
+                    "units": "meter",
+                    "coordinate_system": "right-handed-y-up",
+                    "collection": "main",
+                    "producer": "workflow-stage-1",
+                    "private_metadata": {"token": "secret"},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(server, "_queue", lambda: (None, queue))
+
+    response = TestClient(server.app).get(f"/api/jobs/{job.id}/result-manifest")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "schema": "cloud-offload.result-manifest.v1",
+        "job_id": job.id,
+        "status": "completed",
+        "result": {
+            "schema": "comfy.workflow.result.v1",
+            "artifacts": [
+                {
+                    "artifact_id": "a" * 64,
+                    "sha256": "b" * 64,
+                    "size": 42,
+                    "node_id": "14",
+                    "filename": "mesh.glb",
+                    "mime_type": "model/gltf-binary",
+                    "output_kind": "3d",
+                    "role": "mesh",
+                    "object_id": "hero",
+                    "part_id": None,
+                    "material_id": "paint",
+                    "revision_id": "revision-1",
+                    "units": "meter",
+                    "coordinate_system": "right-handed-y-up",
+                    "collection": "main",
+                    "producer": "workflow-stage-1",
+                }
+            ],
+        },
+    }
+    for private_value in (
+        "private-prompt-id",
+        "private-node",
+        "B:/private/output.glb",
+        "private/folder",
+        "secret",
+    ):
+        assert private_value not in response.text
+
+
+def test_result_manifest_rejects_nested_or_unbounded_allowed_fields(monkeypatch, tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = _visible_job(queue)
+    queue.complete_job(
+        job.id,
+        {
+            "schema": {"private": "schema-secret"},
+            "artifacts": [
+                {
+                    "artifact_id": "d" * 64,
+                    "filename": {"private": "filename-secret"},
+                    "size": {"private": "size-secret"},
+                    "role": ["role-secret"],
+                    "producer": {"token": "producer-secret"},
+                    "coordinate_system": "x" * 513,
+                    "part_id": None,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(server, "_queue", lambda: (None, queue))
+
+    response = TestClient(server.app).get(f"/api/jobs/{job.id}/result-manifest")
+
+    assert response.status_code == 200
+    assert response.json()["result"] == {
+        "schema": "",
+        "artifacts": [
+            {
+                "artifact_id": "d" * 64,
+                "filename": "artifact.bin",
+                "part_id": None,
+            }
+        ],
+    }
+    for private_value in (
+        "schema-secret",
+        "filename-secret",
+        "size-secret",
+        "role-secret",
+        "producer-secret",
+        "x" * 513,
+    ):
+        assert private_value not in response.text
+
+
 def test_visibility_uses_the_newest_event_window_and_reports_full_event_bounds(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
     job = queue.create("test", "private://input", status=JobStatus.QUEUED)

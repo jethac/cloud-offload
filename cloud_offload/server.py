@@ -2910,6 +2910,111 @@ async def job_visibility(limit: int = 50, active_only: bool = False):
     return visibility_page(queue, limit=limit, active_only=active_only)
 
 
+@app.get("/api/jobs/{job_id}/visibility")
+async def get_job_visibility(job_id: str):
+    """Return one safe job projection without its raw request or result."""
+    from cloud_offload.job_visibility import project_job_visibility
+
+    _, queue = _queue()
+    job = queue.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    event_reader = getattr(queue, "list_recent_events", None)
+    if not callable(event_reader):
+        event_reader = queue.list_events
+    view = project_job_visibility(job, event_reader(job.id, limit=1000))
+    bounds_reader = getattr(queue, "event_bounds", None)
+    if callable(bounds_reader):
+        view["event_count"], view["event_cursor"] = bounds_reader(job.id)
+    return view
+
+
+_SAFE_RESULT_TEXT_FIELDS = {
+    "artifact_id",
+    "sha256",
+    "node_id",
+    "mime_type",
+    "output_kind",
+    "role",
+    "object_id",
+    "part_id",
+    "material_id",
+    "revision_id",
+    "units",
+    "coordinate_system",
+    "collection",
+    "producer",
+}
+_SAFE_RESULT_NULLABLE_TEXT_FIELDS = {"part_id", "material_id"}
+_MAX_SAFE_RESULT_TEXT_CHARS = 512
+
+
+def _safe_result_text(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > _MAX_SAFE_RESULT_TEXT_CHARS:
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    return value
+
+
+def _safe_result_manifest(job) -> dict[str, Any]:
+    raw = job.result if isinstance(job.result, dict) else {}
+    artifacts = raw.get("artifacts") if isinstance(raw.get("artifacts"), list) else []
+    safe_artifacts = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        safe = {}
+        for key in _SAFE_RESULT_TEXT_FIELDS:
+            value = item.get(key)
+            if (
+                value is None
+                and key in item
+                and key in _SAFE_RESULT_NULLABLE_TEXT_FIELDS
+            ):
+                safe[key] = None
+                continue
+            text = _safe_result_text(value)
+            if text is not None:
+                safe[key] = text
+        size = item.get("size")
+        if isinstance(size, int) and not isinstance(size, bool) and 0 <= size < 2**63:
+            safe["size"] = size
+        filename_value = item.get("filename")
+        filename = (
+            filename_value.replace("\\", "/")
+            if isinstance(filename_value, str)
+            else "artifact.bin"
+        )
+        basename = PurePosixPath(filename).name
+        safe["filename"] = (
+            basename
+            if _safe_result_text(basename) is not None and len(basename) <= 255
+            else "artifact.bin"
+        )
+        safe_artifacts.append(safe)
+    result_schema = _safe_result_text(raw.get("schema")) or ""
+    return {
+        "schema": "cloud-offload.result-manifest.v1",
+        "job_id": job.id,
+        "status": job.status.value,
+        "result": {
+            "schema": result_schema,
+            "artifacts": safe_artifacts,
+        },
+    }
+
+
+@app.get("/api/jobs/{job_id}/result-manifest")
+async def get_job_result_manifest(job_id: str):
+    """Return declared result artifacts without the raw worker result."""
+    _, queue = _queue()
+    job = queue.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _safe_result_manifest(job)
+
+
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
     """Get job status (+ result when completed)."""
