@@ -41,6 +41,8 @@ RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 500 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CHUNK_BYTES = 50 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CONCURRENCY = 4
 RUNPOD_S3_COMPLETION_POLL_SECONDS = 5
+RUNPOD_S3_GATEWAY_ATTEMPTS = 5
+RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS = 30
 PORTABILITY_TIERS = {
     "portable",
     "runtime-bound",
@@ -1850,6 +1852,29 @@ class RunPodS3PreparedStore:
                 time.sleep(RUNPOD_S3_COMPLETION_POLL_SECONDS)
         return False
 
+    def _call_with_gateway_retry(self, operation: Callable[[], Any]) -> Any:
+        """Retry RunPod gateway timeouts that Botocore does not classify."""
+
+        for attempt in range(1, RUNPOD_S3_GATEWAY_ATTEMPTS + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                response = getattr(exc, "response", {}) or {}
+                metadata = response.get("ResponseMetadata", {}) or {}
+                error_data = response.get("Error", {}) or {}
+                retryable = (
+                    metadata.get("HTTPStatusCode") == 524
+                    or str(error_data.get("Code") or "") == "524"
+                    or type(exc).__name__
+                    in {"ReadTimeoutError", "ConnectTimeoutError"}
+                )
+                if not retryable or attempt == RUNPOD_S3_GATEWAY_ATTEMPTS:
+                    raise
+                time.sleep(
+                    min(2**attempt, RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS)
+                )
+        raise AssertionError("RunPod S3 retry loop ended without a result")
+
     def publish_manifest(self, manifest: dict[str, Any], signer: ManifestSigner) -> str:
         signer.verify(manifest)
         for artifact in manifest["artifacts"]:
@@ -2035,13 +2060,15 @@ class RunPodS3PreparedStore:
                 offset = 0
                 total_size: int | None = None
                 while total_size is None or offset < total_size:
-                    response = self.client.get_object(
-                        Bucket=self.volume_id,
-                        Key=self._key(key),
-                        Range=(
-                            f"bytes={offset}-"
-                            f"{offset + S3_VERIFICATION_RANGE_BYTES - 1}"
-                        ),
+                    response = self._call_with_gateway_retry(
+                        lambda: self.client.get_object(
+                            Bucket=self.volume_id,
+                            Key=self._key(key),
+                            Range=(
+                                f"bytes={offset}-"
+                                f"{offset + S3_VERIFICATION_RANGE_BYTES - 1}"
+                            ),
+                        )
                     )
                     body = response["Body"]
                     received = 0
