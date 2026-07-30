@@ -920,9 +920,22 @@ def build_partition_preflight(
             logical_required=requirements.get("logical_required") or [],
         )
     }
-    required_data_bytes = int(storage_plan.get("assets") or 0) + int(
+    declared_data_bytes = int(storage_plan.get("assets") or 0) + int(
         storage_plan.get("weights") or 0
     )
+    measured_complete_bytes = max(
+        (
+            int(item.get("cached_bytes") or 0)
+            for item in coverage_by_volume.values()
+            if item.get("complete")
+        ),
+        default=0,
+    )
+    # Runtime bundles use logical requirement keys because the coordinator does
+    # not know their content digest before the first worker builds them. Once a
+    # complete compatible manifest exists, its measured bytes are the best
+    # available size for cold-region cost, demand, and replication decisions.
+    required_data_bytes = max(declared_data_bytes, measured_complete_bytes)
     candidates: list[dict[str, Any]] = []
 
     if not blockers:
