@@ -1958,8 +1958,8 @@ class RunPodS3PreparedStore:
             if not key_marker:
                 raise CacheCorruptionError("RunPod S3 multipart page has no marker")
 
-        uploads.sort(key=lambda item: str(item.get("Initiated") or ""), reverse=True)
         part_count = math.ceil(source_size / part_size)
+        candidates: list[tuple[int, str, str, dict[int, str]]] = []
         for upload in uploads:
             upload_id = str(upload["UploadId"])
             parts: dict[int, str] = {}
@@ -1996,7 +1996,17 @@ class RunPodS3PreparedStore:
                         "RunPod S3 multipart part page has no marker"
                     )
             if valid:
-                return upload_id, parts
+                candidates.append(
+                    (
+                        len(parts),
+                        str(upload.get("Initiated") or ""),
+                        upload_id,
+                        parts,
+                    )
+                )
+        if candidates:
+            _, _, upload_id, parts = max(candidates, key=lambda item: item[:2])
+            return upload_id, parts
         return None, {}
 
     def _recover_completed_multipart(
