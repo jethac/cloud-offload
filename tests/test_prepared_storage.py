@@ -1720,6 +1720,73 @@ def test_s3_resume_prefers_the_valid_upload_with_the_most_completed_parts():
     assert parts == {1: '"part-1"', 2: '"part-2"'}
 
 
+def test_s3_large_upload_starts_new_session_when_resume_listing_is_unavailable(
+    monkeypatch, tmp_path
+):
+    class ListingUnavailable(Exception):
+        operation_name = "ListMultipartUploads"
+        response = {
+            "ResponseMetadata": {"HTTPStatusCode": 530},
+            "Error": {"Code": "530"},
+        }
+
+    class ReplacementS3:
+        def __init__(self):
+            self.list_calls = 0
+            self.created = 0
+            self.parts = {}
+            self.completed = False
+
+        def list_multipart_uploads(self, **kwargs):
+            self.list_calls += 1
+            raise ListingUnavailable()
+
+        def create_multipart_upload(self, **kwargs):
+            self.created += 1
+            return {"UploadId": "replacement"}
+
+        def upload_part(self, PartNumber, Body, **kwargs):
+            self.parts[PartNumber] = bytes(Body)
+            return {"ETag": f'"part-{PartNumber}"'}
+
+        def complete_multipart_upload(self, MultipartUpload, **kwargs):
+            assert [item["PartNumber"] for item in MultipartUpload["Parts"]] == [
+                1,
+                2,
+                3,
+            ]
+            self.completed = True
+            return {"ETag": '"complete"'}
+
+    monkeypatch.setattr(prepared_state_module, "RUNPOD_S3_MULTIPART_CHUNK_BYTES", 8)
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_MIN_PART_BYTES", 5
+    )
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_CONCURRENCY", 2
+    )
+    monkeypatch.setattr(prepared_state_module.time, "sleep", lambda _seconds: None)
+    client = ReplacementS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=client,
+        range_client=client,
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+    )
+    source = tmp_path / "large-model"
+    source.write_bytes(b"0123456789abcdefghijklmn")
+
+    store._upload_resumable_multipart(source, "blobs/model", source.stat().st_size)
+
+    assert client.list_calls == prepared_state_module.RUNPOD_S3_GATEWAY_ATTEMPTS
+    assert client.created == 1
+    assert b"".join(client.parts[number] for number in sorted(client.parts)) == (
+        source.read_bytes()
+    )
+    assert client.completed is True
+
+
 class MemoryS3:
     def __init__(self):
         self.objects = {}
