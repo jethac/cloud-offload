@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import platform as platform_module
 import shutil
@@ -35,6 +36,11 @@ DEFAULT_FULL_AUDIT_INTERVAL_SECONDS = 24 * 3600
 DEFAULT_TRUST_SAMPLE_BYTES = 1024 * 1024
 DEFAULT_TRUST_SAMPLE_COUNT = 5
 S3_VERIFICATION_RANGE_BYTES = 64 * 1024 * 1024
+RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
+RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 500 * 1024 * 1024
+RUNPOD_S3_MULTIPART_CHUNK_BYTES = 50 * 1024 * 1024
+RUNPOD_S3_MULTIPART_CONCURRENCY = 4
+RUNPOD_S3_COMPLETION_POLL_SECONDS = 5
 PORTABILITY_TIERS = {
     "portable",
     "runtime-bound",
@@ -1652,12 +1658,14 @@ class RunPodS3PreparedStore:
         endpoint_url: str,
         prefix: str = "",
         publication_lock: Any | None = None,
+        transfer_config: Any | None = None,
     ):
         self.volume_id = str(volume_id)
         self.datacenter_id = str(datacenter_id).upper()
         self.client = client
         self.endpoint_url = str(endpoint_url)
         self.prefix = str(prefix).strip("/")
+        self.transfer_config = transfer_config
         if any(part in {".", ".."} for part in self.prefix.split("/") if part):
             raise ValueError("RunPod S3 prefix cannot contain relative path segments")
         lock_namespace = (
@@ -1698,6 +1706,7 @@ class RunPodS3PreparedStore:
         if client_factory is None:
             try:
                 import boto3
+                from boto3.s3.transfer import TransferConfig
                 from botocore.config import Config
             except ImportError as exc:
                 raise ImportError(
@@ -1706,13 +1715,20 @@ class RunPodS3PreparedStore:
             client_factory = boto3.client
             client_config = Config(
                 connect_timeout=30,
-                read_timeout=900,
+                read_timeout=RUNPOD_S3_READ_TIMEOUT_SECONDS,
                 tcp_keepalive=True,
                 max_pool_connections=32,
                 retries={"max_attempts": 10, "mode": "standard"},
             )
+            transfer_config = TransferConfig(
+                multipart_threshold=RUNPOD_S3_MULTIPART_THRESHOLD_BYTES,
+                multipart_chunksize=RUNPOD_S3_MULTIPART_CHUNK_BYTES,
+                max_concurrency=RUNPOD_S3_MULTIPART_CONCURRENCY,
+                use_threads=True,
+            )
         else:
             client_config = None
+            transfer_config = None
         client_kwargs = {
             "aws_access_key_id": access_key,
             "aws_secret_access_key": secret_key,
@@ -1731,6 +1747,7 @@ class RunPodS3PreparedStore:
             client=client,
             endpoint_url=endpoint_url,
             prefix=prefix,
+            transfer_config=transfer_config,
         )
 
     def probe(self) -> bool:
@@ -1781,9 +1798,57 @@ class RunPodS3PreparedStore:
         # canonical key. A single CopyObject promotion would fail for common
         # >5GB weights; duplicate digest writers are safe because their bytes
         # were verified locally and are identical by definition.
-        self.client.upload_file(str(source), self.volume_id, self._key(key))
+        upload_kwargs = {}
+        if self.transfer_config is not None:
+            upload_kwargs["Config"] = self.transfer_config
+        try:
+            self.client.upload_file(
+                str(source), self.volume_id, self._key(key), **upload_kwargs
+            )
+        except Exception as exc:
+            if not self._recover_completed_multipart(key, source.stat().st_size, exc):
+                raise
         self._download_verify(key, digest, source.stat().st_size)
         return key
+
+    def _recover_completed_multipart(
+        self, key: str, expected_size: int, error: Exception
+    ) -> bool:
+        """Accept a timed-out multipart merge only after exact size proof."""
+
+        response = getattr(error, "response", {}) or {}
+        metadata = response.get("ResponseMetadata", {}) or {}
+        error_data = response.get("Error", {}) or {}
+        status = metadata.get("HTTPStatusCode")
+        code = str(error_data.get("Code") or "")
+        error_name = type(error).__name__
+        wrapped_text = str(error) if error_name == "S3UploadFailedError" else ""
+        recoverable = (
+            status == 524
+            or code in {"524", "NoSuchUpload"}
+            or error_name in {"ReadTimeoutError", "ConnectTimeoutError"}
+            or (
+                error_name == "S3UploadFailedError"
+                and ("(524)" in wrapped_text or "NoSuchUpload" in wrapped_text)
+            )
+        )
+        if not recoverable:
+            return False
+
+        size_gib = max(1, math.ceil(int(expected_size) / 1024**3))
+        attempts = max(12, size_gib)
+        for attempt in range(attempts):
+            try:
+                head = self.client.head_object(
+                    Bucket=self.volume_id, Key=self._key(key)
+                )
+                if int(head.get("ContentLength") or -1) == int(expected_size):
+                    return True
+            except Exception:
+                pass
+            if attempt + 1 < attempts:
+                time.sleep(RUNPOD_S3_COMPLETION_POLL_SECONDS)
+        return False
 
     def publish_manifest(self, manifest: dict[str, Any], signer: ManifestSigner) -> str:
         signer.verify(manifest)
