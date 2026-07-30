@@ -1634,6 +1634,18 @@ def test_s3_large_upload_resumes_completed_parts_after_gateway_failure(
             )
             return {"ETag": '"complete"'}
 
+    class BoundedPartClient:
+        def __init__(self, delegate):
+            self.delegate = delegate
+            self.part_calls = []
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+        def upload_part(self, **kwargs):
+            self.part_calls.append(kwargs["PartNumber"])
+            return self.delegate.upload_part(**kwargs)
+
     monkeypatch.setattr(
         prepared_state_module, "RUNPOD_S3_MULTIPART_THRESHOLD_BYTES", 1
     )
@@ -1646,10 +1658,12 @@ def test_s3_large_upload_resumes_completed_parts_after_gateway_failure(
     )
     monkeypatch.setattr(prepared_state_module.time, "sleep", lambda _seconds: None)
     client = ResumableS3()
+    bounded = BoundedPartClient(client)
     store = RunPodS3PreparedStore(
         volume_id="vol",
         datacenter_id="EU-RO-1",
         client=client,
+        range_client=bounded,
         endpoint_url="https://s3api-eu-ro-1.runpod.io/",
     )
     source = tmp_path / "large-model"
@@ -1665,6 +1679,7 @@ def test_s3_large_upload_resumes_completed_parts_after_gateway_failure(
     client.fail_part_two = False
     assert store.upload_verified(source, artifact["digest"]) == artifact["storage_key"]
     assert all(client.upload_attempts.count(part) == 1 for part in completed_before_retry)
+    assert bounded.part_calls == client.upload_attempts
     assert client.objects[artifact["storage_key"]] == source.read_bytes()
 
 
