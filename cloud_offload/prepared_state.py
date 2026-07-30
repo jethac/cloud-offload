@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -35,7 +36,8 @@ DEFAULT_TRUST_RECEIPT_TTL_SECONDS = 7 * 24 * 3600
 DEFAULT_FULL_AUDIT_INTERVAL_SECONDS = 24 * 3600
 DEFAULT_TRUST_SAMPLE_BYTES = 1024 * 1024
 DEFAULT_TRUST_SAMPLE_COUNT = 5
-S3_VERIFICATION_RANGE_BYTES = 64 * 1024 * 1024
+S3_VERIFICATION_RANGE_BYTES = 32 * 1024 * 1024
+S3_DOWNLOAD_CONCURRENCY = 10
 RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
 RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 500 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CHUNK_BYTES = 50 * 1024 * 1024
@@ -2056,67 +2058,76 @@ class RunPodS3PreparedStore:
     def download_verified(self, key: str, digest: str, destination: str | Path) -> Path:
         destination = Path(destination)
         try:
-            with destination.open("wb") as handle:
-                offset = 0
-                total_size: int | None = None
-                while total_size is None or offset < total_size:
-                    response = self._call_with_gateway_retry(
-                        lambda: self.client.get_object(
-                            Bucket=self.volume_id,
-                            Key=self._key(key),
-                            Range=(
-                                f"bytes={offset}-"
-                                f"{offset + S3_VERIFICATION_RANGE_BYTES - 1}"
-                            ),
-                        )
-                    )
-                    body = response["Body"]
-                    received = 0
-                    try:
-                        while chunk := body.read(8 * 1024 * 1024):
-                            handle.write(chunk)
-                            received += len(chunk)
-                    finally:
-                        close = getattr(body, "close", None)
-                        if callable(close):
-                            close()
+            first_end = S3_VERIFICATION_RANGE_BYTES - 1
+            response = self._call_with_gateway_retry(
+                lambda: self.client.get_object(
+                    Bucket=self.volume_id,
+                    Key=self._key(key),
+                    Range=f"bytes=0-{first_end}",
+                )
+            )
+            content_range = str(response.get("ContentRange") or "").strip()
+            if not content_range:
+                with destination.open("wb") as handle:
+                    self._copy_s3_body(response["Body"], handle)
+            else:
+                first_payload = self._read_s3_body(response["Body"])
+                first_start, returned_end, total_size = self._validate_s3_range(
+                    content_range,
+                    requested_start=0,
+                    requested_end=first_end,
+                    received=len(first_payload),
+                )
+                with destination.open("wb") as handle:
+                    handle.truncate(total_size)
+                    handle.seek(first_start)
+                    handle.write(first_payload)
 
-                    content_range = str(response.get("ContentRange") or "").strip()
-                    if not content_range:
-                        if offset:
-                            raise CacheCorruptionError(
-                                "RunPod S3 range response has no content range"
+                ranges = [
+                    (start, min(start + S3_VERIFICATION_RANGE_BYTES - 1, total_size - 1))
+                    for start in range(
+                        returned_end + 1,
+                        total_size,
+                        S3_VERIFICATION_RANGE_BYTES,
+                    )
+                ]
+                with ThreadPoolExecutor(
+                    max_workers=S3_DOWNLOAD_CONCURRENCY,
+                    thread_name_prefix="cloud-offload-s3-range",
+                ) as executor:
+                    with destination.open("r+b") as handle:
+                        pending = set()
+                        range_iterator = iter(ranges)
+
+                        def submit_next() -> bool:
+                            try:
+                                start, end = next(range_iterator)
+                            except StopIteration:
+                                return False
+                            pending.add(
+                                executor.submit(
+                                    self._download_s3_range,
+                                    key,
+                                    start,
+                                    end,
+                                    total_size,
+                                )
                             )
-                        # Small injected stores can return the complete object
-                        # without range metadata. The digest below still proves
-                        # that the complete immutable object was received.
-                        break
-                    try:
-                        unit, bounds = content_range.split(" ", 1)
-                        span, total = bounds.split("/", 1)
-                        start, end = (int(value) for value in span.split("-", 1))
-                        reported_total = int(total)
-                    except (TypeError, ValueError) as exc:
-                        raise CacheCorruptionError(
-                            "RunPod S3 range response is invalid"
-                        ) from exc
-                    if (
-                        unit.lower() != "bytes"
-                        or start != offset
-                        or end < start
-                        or end - start + 1 != received
-                        or reported_total < end + 1
-                        or (total_size is not None and total_size != reported_total)
-                    ):
-                        raise CacheCorruptionError(
-                            "RunPod S3 range response does not match the request"
-                        )
-                    total_size = reported_total
-                    offset += received
-                    if not received and offset < total_size:
-                        raise CacheCorruptionError(
-                            "RunPod S3 range response made no progress"
-                        )
+                            return True
+
+                        for _ in range(S3_DOWNLOAD_CONCURRENCY):
+                            if not submit_next():
+                                break
+                        while pending:
+                            completed, _ = wait(
+                                pending, return_when=FIRST_COMPLETED
+                            )
+                            for future in completed:
+                                pending.remove(future)
+                                start, payload = future.result()
+                                handle.seek(start)
+                                handle.write(payload)
+                                submit_next()
 
             if sha256_file(destination) != normalize_digest(digest):
                 raise CacheCorruptionError(
@@ -2126,6 +2137,83 @@ class RunPodS3PreparedStore:
             destination.unlink(missing_ok=True)
             raise
         return destination
+
+    @staticmethod
+    def _copy_s3_body(body: Any, handle: Any) -> int:
+        received = 0
+        try:
+            while chunk := body.read(8 * 1024 * 1024):
+                handle.write(chunk)
+                received += len(chunk)
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+        return received
+
+    @classmethod
+    def _read_s3_body(cls, body: Any) -> bytes:
+        with tempfile.SpooledTemporaryFile(max_size=S3_VERIFICATION_RANGE_BYTES) as spool:
+            cls._copy_s3_body(body, spool)
+            spool.seek(0)
+            return spool.read()
+
+    @staticmethod
+    def _validate_s3_range(
+        content_range: str,
+        *,
+        requested_start: int,
+        requested_end: int,
+        received: int,
+        expected_total: int | None = None,
+    ) -> tuple[int, int, int]:
+        try:
+            unit, bounds = content_range.split(" ", 1)
+            span, total = bounds.split("/", 1)
+            start, end = (int(value) for value in span.split("-", 1))
+            reported_total = int(total)
+        except (TypeError, ValueError) as exc:
+            raise CacheCorruptionError("RunPod S3 range response is invalid") from exc
+        expected_end = min(requested_end, reported_total - 1)
+        if (
+            unit.lower() != "bytes"
+            or start != requested_start
+            or end != expected_end
+            or end < start
+            or end - start + 1 != received
+            or reported_total < end + 1
+            or (expected_total is not None and expected_total != reported_total)
+        ):
+            raise CacheCorruptionError(
+                "RunPod S3 range response does not match the request"
+            )
+        return start, end, reported_total
+
+    def _download_s3_range(
+        self, key: str, start: int, end: int, total_size: int
+    ) -> tuple[int, bytes]:
+        def operation() -> tuple[int, bytes]:
+            response = self.client.get_object(
+                Bucket=self.volume_id,
+                Key=self._key(key),
+                Range=f"bytes={start}-{end}",
+            )
+            payload = self._read_s3_body(response["Body"])
+            content_range = str(response.get("ContentRange") or "").strip()
+            if not content_range:
+                raise CacheCorruptionError(
+                    "RunPod S3 range response has no content range"
+                )
+            self._validate_s3_range(
+                content_range,
+                requested_start=start,
+                requested_end=end,
+                received=len(payload),
+                expected_total=total_size,
+            )
+            return start, payload
+
+        return self._call_with_gateway_retry(operation)
 
     def _download_verify(self, key: str, digest: str, size: int) -> None:
         descriptor, temporary_name = tempfile.mkstemp(prefix="cloud-offload-s3-verify-")
