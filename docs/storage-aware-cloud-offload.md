@@ -629,8 +629,11 @@ for automatic targets, records a shadow evaluation, expires replicas, deletes an
 empty automatic target after provider confirmation, and starts at most one new
 copy. A lost target becomes ineligible for placement. Current preflight can use
 compatible replicas in more than one region and still shows the cold fallback.
-Production shadow-accuracy, automatic-copy, expiry, and regional-loss evidence
-remain before M6 can close.
+Production shadow accuracy, automatic copy, repeat-cycle safety, prepared and
+cold placement, regional loss, controlled TTL expiry, source preservation, and
+provider cleanup passed on 2026-07-30. The redacted evidence is in
+`docs/evidence/m6-regional-replication-evidence-2026-07-30.json`. M6 is complete;
+the continuous M7 production release matrix is now active.
 
 ### Retention
 
