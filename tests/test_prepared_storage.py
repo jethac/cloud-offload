@@ -3,7 +3,6 @@
 import io
 import json
 import os
-import sys
 import tarfile
 import threading
 import time
@@ -1438,6 +1437,8 @@ class RunPodMissingObject(Exception):
 
 
 def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
+    import boto3
+
     created = {}
 
     def client(service, **kwargs):
@@ -1447,7 +1448,7 @@ def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
 
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "access")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
-    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=client))
+    monkeypatch.setattr(boto3, "client", client)
 
     store = RunPodS3PreparedStore.from_environment(
         volume_id="volume",
@@ -1459,10 +1460,78 @@ def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
     assert store.client is not None
     assert created["service"] == "s3"
     assert transfer.connect_timeout == 30
-    assert transfer.read_timeout == 900
+    assert transfer.read_timeout == 7200
     assert transfer.tcp_keepalive is True
     assert transfer.max_pool_connections == 32
     assert transfer.retries == {"max_attempts": 10, "mode": "standard"}
+    assert store.transfer_config.multipart_threshold == 500 * 1024 * 1024
+    assert store.transfer_config.multipart_chunksize == 50 * 1024 * 1024
+    assert store.transfer_config.max_concurrency == 4
+    assert store.transfer_config.use_threads is True
+
+
+def test_s3_upload_recovers_completed_merge_after_wrapped_524(monkeypatch, tmp_path):
+    class S3UploadFailedError(Exception):
+        pass
+
+    class CompletingS3(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.pending = None
+            self.pending_head_calls = 0
+            self.upload_config = None
+
+        def upload_file(self, filename, bucket, key, Config=None):
+            self.pending = (key, Path(filename).read_bytes())
+            self.upload_config = Config
+            raise S3UploadFailedError("upload failed after (524) completion timeout")
+
+        def head_object(self, Bucket, Key):
+            if self.pending and Key == self.pending[0]:
+                self.pending_head_calls += 1
+                if self.pending_head_calls == 3:
+                    self.objects[Key] = self.pending[1]
+            return super().head_object(Bucket=Bucket, Key=Key)
+
+    sleeps = []
+    monkeypatch.setattr(prepared_state_module.time, "sleep", sleeps.append)
+    transfer_config = object()
+    client = CompletingS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=client,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        prefix="cloud-offload",
+        transfer_config=transfer_config,
+    )
+    source = tmp_path / "large-model"
+    source.write_bytes(b"verified model bytes")
+    artifact = portable_artifact(source.read_bytes())
+
+    assert store.upload_verified(source, artifact["digest"]) == artifact["storage_key"]
+    assert client.upload_config is transfer_config
+    assert client.pending_head_calls == 3
+    assert sleeps == [5, 5]
+
+
+def test_s3_upload_does_not_hide_non_timeout_failure(tmp_path):
+    class DeniedS3(MemoryS3):
+        def upload_file(self, filename, bucket, key, Config=None):
+            raise PermissionError("upload denied")
+
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=DeniedS3(),
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        transfer_config=object(),
+    )
+    source = tmp_path / "model"
+    source.write_bytes(b"model")
+
+    with pytest.raises(PermissionError, match="upload denied"):
+        store.upload_verified(source, portable_artifact(b"model")["digest"])
 
 
 class MemoryS3:
