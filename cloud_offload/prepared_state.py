@@ -38,6 +38,7 @@ DEFAULT_TRUST_SAMPLE_BYTES = 1024 * 1024
 DEFAULT_TRUST_SAMPLE_COUNT = 5
 S3_VERIFICATION_RANGE_BYTES = 32 * 1024 * 1024
 S3_DOWNLOAD_CONCURRENCY = 10
+S3_RANGE_SOCKET_TIMEOUT_SECONDS = 180
 RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
 RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 500 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CHUNK_BYTES = 50 * 1024 * 1024
@@ -2153,6 +2154,9 @@ class RunPodS3PreparedStore:
 
     @classmethod
     def _read_s3_body(cls, body: Any) -> bytes:
+        set_socket_timeout = getattr(body, "set_socket_timeout", None)
+        if callable(set_socket_timeout):
+            set_socket_timeout(S3_RANGE_SOCKET_TIMEOUT_SECONDS)
         with tempfile.SpooledTemporaryFile(max_size=S3_VERIFICATION_RANGE_BYTES) as spool:
             cls._copy_s3_body(body, spool)
             spool.seek(0)

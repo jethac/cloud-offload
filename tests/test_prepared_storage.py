@@ -1735,6 +1735,49 @@ def test_s3_verified_download_reads_ranges_concurrently(monkeypatch, tmp_path):
     assert client.maximum_active == 3
 
 
+def test_s3_verified_download_limits_each_range_body_timeout(monkeypatch, tmp_path):
+    monkeypatch.setattr(prepared_state_module, "S3_VERIFICATION_RANGE_BYTES", 5)
+    monkeypatch.setattr(prepared_state_module, "S3_RANGE_SOCKET_TIMEOUT_SECONDS", 7)
+
+    class TimedBody(io.BytesIO):
+        def __init__(self, value, observed):
+            super().__init__(value)
+            self.observed = observed
+
+        def set_socket_timeout(self, seconds):
+            self.observed.append(seconds)
+
+    class TimedRangeS3(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.body_timeouts = []
+
+        def get_object(self, Bucket, Key, Range=None):
+            response = super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+            response["Body"] = TimedBody(
+                response["Body"].read(), self.body_timeouts
+            )
+            return response
+
+    client = TimedRangeS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=client,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    payload = b"0123456789abcdef"
+    artifact = portable_artifact(payload)
+    client.objects[store._key(artifact["storage_key"])] = payload
+
+    store.download_verified(
+        artifact["storage_key"], artifact["digest"], tmp_path / "timed-bundle"
+    )
+
+    assert client.body_timeouts == [7, 7, 7, 7]
+
+
 def test_s3_verified_download_retries_runpod_524(monkeypatch, tmp_path):
     class GatewayTimeout(Exception):
         response = {
