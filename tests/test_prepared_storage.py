@@ -1720,6 +1720,47 @@ def test_s3_resume_prefers_the_valid_upload_with_the_most_completed_parts():
     assert parts == {1: '"part-1"', 2: '"part-2"'}
 
 
+def test_s3_resume_reuses_exact_parts_and_ignores_partial_part_records():
+    class PartialCandidateS3:
+        def list_multipart_uploads(self, **kwargs):
+            return {
+                "Uploads": [
+                    {
+                        "Key": "cloud-offload/blobs/model",
+                        "UploadId": "partial",
+                        "Initiated": "1",
+                    }
+                ],
+                "IsTruncated": False,
+            }
+
+        def list_parts(self, **kwargs):
+            return {
+                "Parts": [
+                    {"PartNumber": 1, "ETag": '"part-1"', "Size": 8},
+                    {"PartNumber": 2, "ETag": '"partial-2"', "Size": 3},
+                    {"PartNumber": 3, "ETag": "", "Size": 8},
+                    {"PartNumber": 4, "ETag": '"outside"', "Size": 8},
+                ],
+                "IsTruncated": False,
+            }
+
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=PartialCandidateS3(),
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+
+    upload_id, parts = store._find_resumable_multipart(
+        "cloud-offload/blobs/model", source_size=24, part_size=8
+    )
+
+    assert upload_id == "partial"
+    assert parts == {1: '"part-1"'}
+
+
 def test_s3_large_upload_starts_new_session_when_resume_listing_is_unavailable(
     monkeypatch, tmp_path
 ):
