@@ -705,6 +705,94 @@ def test_request_region_limit_queries_cold_stock_in_that_region(tmp_path):
     assert connector.mutations == []
 
 
+def test_cold_region_counts_measured_runtime_bundle_bytes(tmp_path, monkeypatch):
+    config = config_for_preflight(tmp_path)
+    config.prepared_storage = {
+        "enabled": True,
+        "confirmed": True,
+        "provider": "runpod",
+        "policy": "smart",
+        "region": "US-MD-1",
+        "cold_fallback": "allow",
+        "managed_size_gb": 100,
+        "existing_volume_id": "provider-primary",
+        "max_monthly_storage_cost": 10,
+        "tenant": "default",
+        "cache_private_assets": False,
+        "shadow_admission": True,
+    }
+    config.__post_init__()
+    volume = CacheVolume(
+        id="volume-primary",
+        provider="runpod",
+        provider_volume_id="provider-primary",
+        datacenter_id="US-MD-1",
+        ownership="adopted",
+        status="ready",
+        capacity_bytes=100 * 1024**3,
+        inventory_generation="generation",
+        last_verified_at="2026-07-30T00:00:00Z",
+        policy=config.prepared_storage,
+        s3_compatible=True,
+    )
+    runtime_bytes = 3_840_000
+
+    class Registry:
+        def list_volumes(self, status=None):
+            assert status == "ready"
+            return [volume]
+
+        def volume_coverage(self, required, **kwargs):
+            return [
+                {
+                    "volume": volume,
+                    "cached_bytes": runtime_bytes,
+                    "required_bytes": 0,
+                    "complete": True,
+                    "manifest_ids": ["sha256:" + "d" * 64],
+                }
+            ]
+
+    class RegionalConnector(ReadOnlyConnector):
+        def list_available(
+            self,
+            gpu_type=None,
+            min_gpu_ram=None,
+            max_hourly_rate=None,
+            placement=None,
+        ):
+            offers = super().list_available(
+                gpu_type=gpu_type,
+                min_gpu_ram=min_gpu_ram,
+                max_hourly_rate=max_hourly_rate,
+                placement=placement,
+            )
+            return [
+                {**offer, "datacenter_ids": list(placement.datacenter_ids)}
+                for offer in offers
+            ]
+
+    monkeypatch.setattr(preflight, "_storage_credentials_configured", lambda: True)
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        allowed_regions=["EU-RO-1"],
+        storage=LocalStorage(config.storage_path),
+        cache_registry=Registry(),
+        connector_factory=lambda *args: RegionalConnector(),
+    )
+
+    assert report["status"] == "ready_with_preparation"
+    assert report["preparation"] == {
+        "required_bytes": runtime_bytes,
+        "cached_bytes": 0,
+        "missing_bytes": runtime_bytes,
+        "coverage_percent": 0.0,
+        "complete": False,
+    }
+
+
 def test_paid_partition_waits_for_confirmation_without_creating_a_job(
     monkeypatch, tmp_path
 ):
