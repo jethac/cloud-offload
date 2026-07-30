@@ -51,7 +51,9 @@ RUNPOD_S3_MULTIPART_CONCURRENCY = 4
 RUNPOD_S3_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024
 RUNPOD_S3_MULTIPART_MAX_PARTS = 10_000
 RUNPOD_S3_COMPLETION_POLL_SECONDS = 5
-RUNPOD_S3_GATEWAY_ATTEMPTS = 5
+# RunPod recommends at least ten attempts for intermittent S3 gateway errors.
+# Keep concurrency bounded and extend only the retry budget.
+RUNPOD_S3_GATEWAY_ATTEMPTS = 10
 RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS = 30
 PORTABILITY_TIERS = {
     "portable",
