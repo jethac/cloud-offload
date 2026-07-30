@@ -34,6 +34,7 @@ DEFAULT_TRUST_RECEIPT_TTL_SECONDS = 7 * 24 * 3600
 DEFAULT_FULL_AUDIT_INTERVAL_SECONDS = 24 * 3600
 DEFAULT_TRUST_SAMPLE_BYTES = 1024 * 1024
 DEFAULT_TRUST_SAMPLE_COUNT = 5
+S3_VERIFICATION_RANGE_BYTES = 64 * 1024 * 1024
 PORTABILITY_TIERS = {
     "portable",
     "runtime-bound",
@@ -1964,20 +1965,74 @@ class RunPodS3PreparedStore:
 
     def download_verified(self, key: str, digest: str, destination: str | Path) -> Path:
         destination = Path(destination)
-        response = self.client.get_object(
-            Bucket=self.volume_id, Key=self._key(key)
-        )
-        body = response["Body"]
         try:
             with destination.open("wb") as handle:
-                shutil.copyfileobj(body, handle, length=8 * 1024 * 1024)
-        finally:
-            close = getattr(body, "close", None)
-            if callable(close):
-                close()
-        if sha256_file(destination) != normalize_digest(digest):
+                offset = 0
+                total_size: int | None = None
+                while total_size is None or offset < total_size:
+                    response = self.client.get_object(
+                        Bucket=self.volume_id,
+                        Key=self._key(key),
+                        Range=(
+                            f"bytes={offset}-"
+                            f"{offset + S3_VERIFICATION_RANGE_BYTES - 1}"
+                        ),
+                    )
+                    body = response["Body"]
+                    received = 0
+                    try:
+                        while chunk := body.read(8 * 1024 * 1024):
+                            handle.write(chunk)
+                            received += len(chunk)
+                    finally:
+                        close = getattr(body, "close", None)
+                        if callable(close):
+                            close()
+
+                    content_range = str(response.get("ContentRange") or "").strip()
+                    if not content_range:
+                        if offset:
+                            raise CacheCorruptionError(
+                                "RunPod S3 range response has no content range"
+                            )
+                        # Small injected stores can return the complete object
+                        # without range metadata. The digest below still proves
+                        # that the complete immutable object was received.
+                        break
+                    try:
+                        unit, bounds = content_range.split(" ", 1)
+                        span, total = bounds.split("/", 1)
+                        start, end = (int(value) for value in span.split("-", 1))
+                        reported_total = int(total)
+                    except (TypeError, ValueError) as exc:
+                        raise CacheCorruptionError(
+                            "RunPod S3 range response is invalid"
+                        ) from exc
+                    if (
+                        unit.lower() != "bytes"
+                        or start != offset
+                        or end < start
+                        or end - start + 1 != received
+                        or reported_total < end + 1
+                        or (total_size is not None and total_size != reported_total)
+                    ):
+                        raise CacheCorruptionError(
+                            "RunPod S3 range response does not match the request"
+                        )
+                    total_size = reported_total
+                    offset += received
+                    if not received and offset < total_size:
+                        raise CacheCorruptionError(
+                            "RunPod S3 range response made no progress"
+                        )
+
+            if sha256_file(destination) != normalize_digest(digest):
+                raise CacheCorruptionError(
+                    f"RunPod S3 object {key} failed verification"
+                )
+        except Exception:
             destination.unlink(missing_ok=True)
-            raise CacheCorruptionError(f"RunPod S3 object {key} failed verification")
+            raise
         return destination
 
     def _download_verify(self, key: str, digest: str, size: int) -> None:

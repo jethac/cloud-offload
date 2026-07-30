@@ -1472,6 +1472,7 @@ class MemoryS3:
         self.copy_calls = 0
         self.download_calls = 0
         self.get_calls = 0
+        self.ranges = []
 
     def head_bucket(self, **kwargs):
         return {}
@@ -1506,12 +1507,21 @@ class MemoryS3:
         with self.lock:
             self.objects[Key] = value
 
-    def get_object(self, Bucket, Key):
+    def get_object(self, Bucket, Key, Range=None):
         self.get_calls += 1
+        self.ranges.append(Range)
         with self.lock:
             if Key not in self.objects:
                 raise MissingObject()
             value = self.objects[Key]
+        if Range:
+            start_text, end_text = Range.removeprefix("bytes=").split("-", 1)
+            start = int(start_text)
+            end = min(int(end_text), len(value) - 1)
+            return {
+                "Body": io.BytesIO(value[start : end + 1]),
+                "ContentRange": f"bytes {start}-{end}/{len(value)}",
+            }
         return {"Body": io.BytesIO(value)}
 
 
@@ -1578,6 +1588,32 @@ def test_s3_verified_download_does_not_require_head_or_download_file(tmp_path):
         artifact["storage_key"], artifact["digest"], destination
     ) == destination
     assert destination.read_bytes() == payload
+
+
+def test_s3_verified_download_uses_bounded_ranges(monkeypatch, tmp_path):
+    monkeypatch.setattr(prepared_state_module, "S3_VERIFICATION_RANGE_BYTES", 5)
+    client = MemoryS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=client,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    payload = b"0123456789abcdef"
+    artifact = portable_artifact(payload)
+    client.objects[store._key(artifact["storage_key"])] = payload
+    destination = tmp_path / "ranged-bundle"
+
+    store.download_verified(artifact["storage_key"], artifact["digest"], destination)
+
+    assert destination.read_bytes() == payload
+    assert client.ranges == [
+        "bytes=0-4",
+        "bytes=5-9",
+        "bytes=10-14",
+        "bytes=15-19",
+    ]
 
 
 def test_s3_replica_expiry_keeps_shared_objects_until_last_manifest(tmp_path):
