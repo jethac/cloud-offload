@@ -1683,6 +1683,43 @@ def test_s3_large_upload_resumes_completed_parts_after_gateway_failure(
     assert client.objects[artifact["storage_key"]] == source.read_bytes()
 
 
+def test_s3_resume_prefers_the_valid_upload_with_the_most_completed_parts():
+    class CandidateS3:
+        def list_multipart_uploads(self, **kwargs):
+            return {
+                "Uploads": [
+                    {"Key": "cloud-offload/blobs/model", "UploadId": "older", "Initiated": "1"},
+                    {"Key": "cloud-offload/blobs/model", "UploadId": "newer", "Initiated": "2"},
+                ],
+                "IsTruncated": False,
+            }
+
+        def list_parts(self, UploadId, **kwargs):
+            count = 2 if UploadId == "older" else 1
+            return {
+                "Parts": [
+                    {"PartNumber": number, "ETag": f'"part-{number}"', "Size": 8}
+                    for number in range(1, count + 1)
+                ],
+                "IsTruncated": False,
+            }
+
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=CandidateS3(),
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+
+    upload_id, parts = store._find_resumable_multipart(
+        "cloud-offload/blobs/model", source_size=24, part_size=8
+    )
+
+    assert upload_id == "older"
+    assert parts == {1: '"part-1"', 2: '"part-2"'}
+
+
 class MemoryS3:
     def __init__(self):
         self.objects = {}
