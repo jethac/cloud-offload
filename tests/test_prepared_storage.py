@@ -1465,7 +1465,7 @@ def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
     assert transfer.max_pool_connections == 32
     assert transfer.retries == {"max_attempts": 10, "mode": "standard"}
     assert store.transfer_config.multipart_threshold == 500 * 1024 * 1024
-    assert store.transfer_config.multipart_chunksize == 50 * 1024 * 1024
+    assert store.transfer_config.multipart_chunksize == 8 * 1024 * 1024
     assert store.transfer_config.max_concurrency == 4
     assert store.transfer_config.use_threads is True
 
@@ -1532,6 +1532,103 @@ def test_s3_upload_does_not_hide_non_timeout_failure(tmp_path):
 
     with pytest.raises(PermissionError, match="upload denied"):
         store.upload_verified(source, portable_artifact(b"model")["digest"])
+
+
+def test_s3_large_upload_resumes_completed_parts_after_gateway_failure(
+    monkeypatch, tmp_path
+):
+    class GatewayError(Exception):
+        response = {
+            "ResponseMetadata": {"HTTPStatusCode": 524},
+            "Error": {"Code": "524"},
+        }
+
+    class ResumableS3(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.uploads = {}
+            self.upload_attempts = []
+            self.fail_part_two = True
+
+        def list_multipart_uploads(self, Bucket, Prefix, **kwargs):
+            return {
+                "Uploads": [
+                    {"Key": key, "UploadId": upload_id, "Initiated": upload_id}
+                    for upload_id, (key, _parts) in self.uploads.items()
+                    if key.startswith(Prefix)
+                ],
+                "IsTruncated": False,
+            }
+
+        def create_multipart_upload(self, Bucket, Key):
+            upload_id = f"upload-{len(self.uploads) + 1}"
+            self.uploads[upload_id] = (Key, {})
+            return {"UploadId": upload_id}
+
+        def list_parts(self, Bucket, Key, UploadId, **kwargs):
+            upload_key, parts = self.uploads[UploadId]
+            assert upload_key == Key
+            return {
+                "Parts": [
+                    {"PartNumber": number, "ETag": etag, "Size": len(payload)}
+                    for number, (etag, payload) in sorted(parts.items())
+                ],
+                "IsTruncated": False,
+            }
+
+        def upload_part(self, Bucket, Key, UploadId, PartNumber, Body):
+            self.upload_attempts.append(PartNumber)
+            if PartNumber == 2 and self.fail_part_two:
+                raise GatewayError()
+            etag = f'"part-{PartNumber}"'
+            self.uploads[UploadId][1][PartNumber] = (etag, bytes(Body))
+            return {"ETag": etag}
+
+        def complete_multipart_upload(
+            self, Bucket, Key, UploadId, MultipartUpload
+        ):
+            upload_key, parts = self.uploads.pop(UploadId)
+            assert upload_key == Key
+            assert [item["PartNumber"] for item in MultipartUpload["Parts"]] == list(
+                range(1, len(parts) + 1)
+            )
+            self.objects[Key] = b"".join(
+                payload for _etag, payload in dict(sorted(parts.items())).values()
+            )
+            return {"ETag": '"complete"'}
+
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_THRESHOLD_BYTES", 1
+    )
+    monkeypatch.setattr(prepared_state_module, "RUNPOD_S3_MULTIPART_CHUNK_BYTES", 8)
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_MIN_PART_BYTES", 5
+    )
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_CONCURRENCY", 2
+    )
+    monkeypatch.setattr(prepared_state_module.time, "sleep", lambda _seconds: None)
+    client = ResumableS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=client,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+    )
+    source = tmp_path / "large-model"
+    source.write_bytes(b"0123456789abcdefghijklmn")
+    artifact = portable_artifact(source.read_bytes())
+
+    with pytest.raises(GatewayError):
+        store.upload_verified(source, artifact["digest"])
+    completed_before_retry = set(client.uploads["upload-1"][1])
+    assert completed_before_retry
+    assert 2 not in completed_before_retry
+
+    client.fail_part_two = False
+    assert store.upload_verified(source, artifact["digest"]) == artifact["storage_key"]
+    assert all(client.upload_attempts.count(part) == 1 for part in completed_before_retry)
+    assert client.objects[artifact["storage_key"]] == source.read_bytes()
 
 
 class MemoryS3:

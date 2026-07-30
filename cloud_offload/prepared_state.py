@@ -42,8 +42,10 @@ S3_RANGE_SOCKET_TIMEOUT_SECONDS = 180
 S3_RANGE_READ_BYTES = 1024 * 1024
 RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
 RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 500 * 1024 * 1024
-RUNPOD_S3_MULTIPART_CHUNK_BYTES = 50 * 1024 * 1024
+RUNPOD_S3_MULTIPART_CHUNK_BYTES = 8 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CONCURRENCY = 4
+RUNPOD_S3_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024
+RUNPOD_S3_MULTIPART_MAX_PARTS = 10_000
 RUNPOD_S3_COMPLETION_POLL_SECONDS = 5
 RUNPOD_S3_GATEWAY_ATTEMPTS = 5
 RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS = 30
@@ -1798,24 +1800,180 @@ class RunPodS3PreparedStore:
                 f"Prepopulation source does not match sha256:{digest}"
             )
         key = str(storage_key or blob_key(digest))
-        if self.exists(key, source.stat().st_size):
+        source_size = source.stat().st_size
+        if self.exists(key, source_size):
             return key
-        # boto's upload_file performs multipart upload directly to the
-        # canonical key. A single CopyObject promotion would fail for common
-        # >5GB weights; duplicate digest writers are safe because their bytes
-        # were verified locally and are identical by definition.
-        upload_kwargs = {}
-        if self.transfer_config is not None:
-            upload_kwargs["Config"] = self.transfer_config
+        # Upload directly to the canonical content-addressed key. A single
+        # CopyObject promotion would fail for common >5GB weights; duplicate
+        # digest writers are safe because their source bytes were verified.
+        if source_size >= RUNPOD_S3_MULTIPART_THRESHOLD_BYTES:
+            self._upload_resumable_multipart(source, key, source_size)
+        else:
+            upload_kwargs = {}
+            if self.transfer_config is not None:
+                upload_kwargs["Config"] = self.transfer_config
+            try:
+                self.client.upload_file(
+                    str(source), self.volume_id, self._key(key), **upload_kwargs
+                )
+            except Exception as exc:
+                if not self._recover_completed_multipart(key, source_size, exc):
+                    raise
+        self._download_verify(key, digest, source_size)
+        return key
+
+    def _upload_resumable_multipart(
+        self, source: Path, key: str, source_size: int
+    ) -> None:
+        """Upload a large object in retryable parts and reuse verified-size parts."""
+
+        object_key = self._key(key)
+        part_size = max(
+            RUNPOD_S3_MULTIPART_MIN_PART_BYTES,
+            RUNPOD_S3_MULTIPART_CHUNK_BYTES,
+            math.ceil(source_size / RUNPOD_S3_MULTIPART_MAX_PARTS),
+        )
+        part_count = math.ceil(source_size / part_size)
+        upload_id, completed = self._find_resumable_multipart(
+            object_key, source_size=source_size, part_size=part_size
+        )
+        if upload_id is None:
+            response = self._call_with_gateway_retry(
+                lambda: self.client.create_multipart_upload(
+                    Bucket=self.volume_id, Key=object_key
+                )
+            )
+            upload_id = str(response.get("UploadId") or "")
+            if not upload_id:
+                raise CacheCorruptionError("RunPod S3 did not return a multipart ID")
+            completed = {}
+
+        pending = [
+            part_number
+            for part_number in range(1, part_count + 1)
+            if part_number not in completed
+        ]
+
+        def upload_part(part_number: int) -> tuple[int, str]:
+            offset = (part_number - 1) * part_size
+            expected_size = min(part_size, source_size - offset)
+            with source.open("rb") as stream:
+                stream.seek(offset)
+                payload = stream.read(expected_size)
+            if len(payload) != expected_size:
+                raise CacheCorruptionError("Multipart source read was incomplete")
+            response = self._call_with_gateway_retry(
+                lambda: self.client.upload_part(
+                    Bucket=self.volume_id,
+                    Key=object_key,
+                    UploadId=upload_id,
+                    PartNumber=part_number,
+                    Body=payload,
+                )
+            )
+            etag = str(response.get("ETag") or "")
+            if not etag:
+                raise CacheCorruptionError("RunPod S3 multipart part has no ETag")
+            return part_number, etag
+
+        with ThreadPoolExecutor(
+            max_workers=RUNPOD_S3_MULTIPART_CONCURRENCY
+        ) as executor:
+            for part_number, etag in executor.map(upload_part, pending):
+                completed[part_number] = etag
+
+        parts = [
+            {"PartNumber": part_number, "ETag": completed[part_number]}
+            for part_number in range(1, part_count + 1)
+        ]
         try:
-            self.client.upload_file(
-                str(source), self.volume_id, self._key(key), **upload_kwargs
+            self._call_with_gateway_retry(
+                lambda: self.client.complete_multipart_upload(
+                    Bucket=self.volume_id,
+                    Key=object_key,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                )
             )
         except Exception as exc:
-            if not self._recover_completed_multipart(key, source.stat().st_size, exc):
+            if not self._recover_completed_multipart(key, source_size, exc):
                 raise
-        self._download_verify(key, digest, source.stat().st_size)
-        return key
+
+    def _find_resumable_multipart(
+        self, object_key: str, *, source_size: int, part_size: int
+    ) -> tuple[str | None, dict[int, str]]:
+        """Return the newest exact-key upload whose completed part sizes match."""
+
+        uploads: list[dict[str, Any]] = []
+        key_marker: str | None = None
+        upload_marker: str | None = None
+        while True:
+            request: dict[str, Any] = {
+                "Bucket": self.volume_id,
+                "Prefix": object_key,
+            }
+            if key_marker:
+                request["KeyMarker"] = key_marker
+            if upload_marker:
+                request["UploadIdMarker"] = upload_marker
+            response = self._call_with_gateway_retry(
+                lambda request=request: self.client.list_multipart_uploads(**request)
+            )
+            uploads.extend(
+                item
+                for item in response.get("Uploads") or []
+                if str(item.get("Key") or "") == object_key
+                and item.get("UploadId")
+            )
+            if not response.get("IsTruncated"):
+                break
+            key_marker = str(response.get("NextKeyMarker") or "") or None
+            upload_marker = (
+                str(response.get("NextUploadIdMarker") or "") or None
+            )
+            if not key_marker:
+                raise CacheCorruptionError("RunPod S3 multipart page has no marker")
+
+        uploads.sort(key=lambda item: str(item.get("Initiated") or ""), reverse=True)
+        part_count = math.ceil(source_size / part_size)
+        for upload in uploads:
+            upload_id = str(upload["UploadId"])
+            parts: dict[int, str] = {}
+            marker = 0
+            valid = True
+            while True:
+                request = {
+                    "Bucket": self.volume_id,
+                    "Key": object_key,
+                    "UploadId": upload_id,
+                }
+                if marker:
+                    request["PartNumberMarker"] = marker
+                response = self._call_with_gateway_retry(
+                    lambda request=request: self.client.list_parts(**request)
+                )
+                for item in response.get("Parts") or []:
+                    number = int(item.get("PartNumber") or 0)
+                    expected_size = (
+                        min(part_size, source_size - ((number - 1) * part_size))
+                        if 1 <= number <= part_count
+                        else -1
+                    )
+                    etag = str(item.get("ETag") or "")
+                    if int(item.get("Size") or -1) != expected_size or not etag:
+                        valid = False
+                        break
+                    parts[number] = etag
+                if not valid or not response.get("IsTruncated"):
+                    break
+                marker = int(response.get("NextPartNumberMarker") or 0)
+                if marker <= 0:
+                    raise CacheCorruptionError(
+                        "RunPod S3 multipart part page has no marker"
+                    )
+            if valid:
+                return upload_id, parts
+        return None, {}
 
     def _recover_completed_multipart(
         self, key: str, expected_size: int, error: Exception
