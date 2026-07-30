@@ -1869,7 +1869,11 @@ class RunPodS3PreparedStore:
                     metadata.get("HTTPStatusCode") == 524
                     or str(error_data.get("Code") or "") == "524"
                     or type(exc).__name__
-                    in {"ReadTimeoutError", "ConnectTimeoutError"}
+                    in {
+                        "ReadTimeoutError",
+                        "ConnectTimeoutError",
+                        "ResponseStreamingError",
+                    }
                 )
                 if not retryable or attempt == RUNPOD_S3_GATEWAY_ATTEMPTS:
                     raise
@@ -2060,19 +2064,29 @@ class RunPodS3PreparedStore:
         destination = Path(destination)
         try:
             first_end = S3_VERIFICATION_RANGE_BYTES - 1
-            response = self._call_with_gateway_retry(
-                lambda: self.client.get_object(
+            def download_first_range() -> tuple[dict[str, Any], bytes | None]:
+                response = self.client.get_object(
                     Bucket=self.volume_id,
                     Key=self._key(key),
                     Range=f"bytes=0-{first_end}",
                 )
+                content_range = str(response.get("ContentRange") or "").strip()
+                payload = (
+                    self._read_s3_body(response["Body"])
+                    if content_range
+                    else None
+                )
+                return response, payload
+
+            response, first_payload = self._call_with_gateway_retry(
+                download_first_range
             )
             content_range = str(response.get("ContentRange") or "").strip()
             if not content_range:
                 with destination.open("wb") as handle:
                     self._copy_s3_body(response["Body"], handle)
             else:
-                first_payload = self._read_s3_body(response["Body"])
+                assert first_payload is not None
                 first_start, returned_end, total_size = self._validate_s3_range(
                     content_range,
                     requested_start=0,
