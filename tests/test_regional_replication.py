@@ -618,6 +618,100 @@ def test_execute_route_copies_once_and_suppresses_duplicate(tmp_path, monkeypatc
     assert calls == [recommendation["source_manifest_id"]]
 
 
+def test_manifest_copy_skips_complete_target_objects_and_releases_local_files(
+    tmp_path, monkeypatch
+):
+    signer = ManifestSigner(b"r" * 32)
+    first = artifact(b"already copied")
+    second = artifact(b"copy this artifact")
+    document = build_manifest(
+        profile_fingerprint=fingerprint({"profile": "resume"}),
+        producer={
+            "image_digest": "sha256:" + "1" * 64,
+            "cloud_offload_version": "test",
+            "python_abi": "test",
+            "platform": "portable",
+            "torch": "",
+            "cuda": "",
+        },
+        artifacts=[first, second],
+        signer=signer,
+    )
+    source = SimpleNamespace(id="source", provider="runpod")
+    target = SimpleNamespace(id="target", provider="runpod")
+
+    class SourceStore:
+        def __init__(self):
+            self.downloads = []
+
+        def load_index(self):
+            return {
+                "manifests": [
+                    {
+                        "manifest_id": document["manifest_id"],
+                        "storage_key": "source-manifest.json",
+                    }
+                ]
+            }
+
+        def read_json(self, key):
+            assert key == "source-manifest.json"
+            return document
+
+        def download_verified(self, key, digest, path):
+            self.downloads.append(key)
+            path.write_bytes(b"copy this artifact")
+
+    class TargetStore:
+        def __init__(self):
+            self.exists_calls = []
+            self.uploads = []
+            self.upload_path = None
+            self.published = None
+
+        def exists(self, key, size):
+            self.exists_calls.append((key, size))
+            return key == first["storage_key"]
+
+        def upload_verified(self, path, digest, *, storage_key):
+            self.upload_path = path
+            assert path.read_bytes() == b"copy this artifact"
+            self.uploads.append(storage_key)
+
+        def publish_manifest(self, manifest, manifest_signer):
+            manifest_signer.verify(manifest)
+            self.published = manifest
+
+        def load_index(self):
+            return {"generation": "target-generation", "manifests": []}
+
+    source_store = SourceStore()
+    target_store = TargetStore()
+    registry = SimpleNamespace(reconcile_index=lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_cache_connector", lambda *args: object())
+    monkeypatch.setattr(
+        server,
+        "_runpod_s3_store",
+        lambda volume, connector: (
+            source_store if volume.id == source.id else target_store
+        ),
+    )
+    monkeypatch.setattr(server, "_prepared_manifest_signer", lambda config: signer)
+
+    result = asyncio.run(
+        server._copy_cache_manifest(
+            SimpleNamespace(), registry, source, target, document["manifest_id"]
+        )
+    )
+
+    assert source_store.downloads == [second["storage_key"]]
+    assert target_store.uploads == [second["storage_key"]]
+    assert target_store.upload_path is not None
+    assert not target_store.upload_path.exists()
+    assert target_store.published is not None
+    assert result["artifact_count"] == 2
+
+
 def test_expiry_route_unpublishes_target_and_keeps_source(tmp_path, monkeypatch):
     config = SimpleNamespace(
         queue_db_path=tmp_path / "queue.db",
