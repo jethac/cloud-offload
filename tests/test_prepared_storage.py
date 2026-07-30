@@ -1817,6 +1817,55 @@ def test_s3_verified_download_retries_runpod_524(monkeypatch, tmp_path):
     assert sleeps == [2, 4]
 
 
+def test_s3_verified_download_retries_incomplete_range_stream(monkeypatch, tmp_path):
+    class ResponseStreamingError(Exception):
+        pass
+
+    class BrokenBody:
+        def read(self, size=-1):
+            raise ResponseStreamingError("incomplete range")
+
+        def close(self):
+            return None
+
+    class InterruptedRangeS3(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.remaining_first_interruptions = 1
+            self.remaining_later_interruptions = 2
+
+        def get_object(self, Bucket, Key, Range=None):
+            response = super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+            if Range == "bytes=0-4" and self.remaining_first_interruptions:
+                self.remaining_first_interruptions -= 1
+                response["Body"] = BrokenBody()
+            elif Range != "bytes=0-4" and self.remaining_later_interruptions:
+                self.remaining_later_interruptions -= 1
+                response["Body"] = BrokenBody()
+            return response
+
+    sleeps = []
+    monkeypatch.setattr(prepared_state_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(prepared_state_module, "S3_VERIFICATION_RANGE_BYTES", 5)
+    client = InterruptedRangeS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=client,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    payload = b"range stream recovers after interruption"
+    artifact = portable_artifact(payload)
+    client.objects[store._key(artifact["storage_key"])] = payload
+    destination = tmp_path / "recovered-range"
+
+    store.download_verified(artifact["storage_key"], artifact["digest"], destination)
+
+    assert destination.read_bytes() == payload
+    assert sleeps == [2, 2, 4]
+
+
 def test_s3_replica_expiry_keeps_shared_objects_until_last_manifest(tmp_path):
     client = MemoryS3()
     store = RunPodS3PreparedStore(
