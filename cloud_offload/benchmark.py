@@ -1050,6 +1050,9 @@ class BenchmarkRunner:
                 )
                 or "comfyui-partition-v1"
             ),
+            "CLOUD_OFFLOAD_BENCHMARK_ALLOWED_REGIONS": ",".join(
+                scenario.allowed_regions
+            ),
             "CLOUD_OFFLOAD_BENCHMARK_INSTANCE_IDS": ",".join(
                 meter.id for meter in resources.values()
             ),

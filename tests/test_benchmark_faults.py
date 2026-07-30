@@ -8,6 +8,7 @@ import cloud_offload.benchmark_faults as benchmark_faults
 from cloud_offload.benchmark_faults import (
     CORRUPTION_OBSERVE_TIMEOUT_SECONDS,
     _benchmark_context,
+    _corruption_target,
     _corruption_profile_fingerprint,
     _process_exists,
     _windows_process_exists,
@@ -496,6 +497,9 @@ def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
     monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE", "prepare")
     monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_ASSET_DIGESTS", ",".join(declared))
     monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_PROFILE", "profile-v2")
+    monkeypatch.setenv(
+        "CLOUD_OFFLOAD_BENCHMARK_ALLOWED_REGIONS", "EU-RO-1,EUR-IS-1"
+    )
     monkeypatch.setenv("CLOUD_OFFLOAD_BENCHMARK_CANARY_NONCE", "run-123")
     monkeypatch.setattr(benchmark_faults, "CoordinatorFaultClient", lambda: client)
 
@@ -510,6 +514,7 @@ def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
         *,
         profile_fingerprint=None,
         canary_nonce=None,
+        allowed_regions=None,
     ):
         calls["prepare"] = (
             received_client,
@@ -517,6 +522,7 @@ def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
             digests,
             profile_fingerprint,
             canary_nonce,
+            allowed_regions,
         )
         return {"stage": "prepare"}
 
@@ -533,7 +539,42 @@ def test_corruption_prepare_uses_injected_requirement_profile(monkeypatch):
         declared,
         "sha256:" + "c" * 64,
         "run-123",
+        {"EU-RO-1", "EUR-IS-1"},
     )
+
+
+def test_corruption_target_uses_exact_allowed_region_instead_of_global_binding():
+    class RegionalClient(FakeFaultClient):
+        def get(self, path):
+            value = super().get(path)
+            if path == "/api/cache/status":
+                value["volumes"].append(
+                    {
+                        "id": "registry-volume-is",
+                        "provider_volume_id": "provider-volume-is",
+                        "datacenter_id": "EUR-IS-1",
+                        "status": "ready",
+                        "s3_compatible": True,
+                    }
+                )
+            if path == "/api/cache/manifests":
+                replica = json.loads(json.dumps(value["manifests"][0]))
+                replica["volume_id"] = "registry-volume-is"
+                replica["manifest_id"] = "sha256:" + "e" * 64
+                value["manifests"].append(replica)
+            return value
+
+    scenario = "regional-canary"
+    canary = corruption_canary_asset(scenario)
+    volume, manifest = _corruption_target(
+        RegionalClient(),
+        scenario,
+        declared_digests={"a" * 64, "b" * 64, canary["sha256"]},
+        allowed_regions={"EUR-IS-1"},
+    )
+
+    assert volume["id"] == "registry-volume-is"
+    assert manifest["volume_id"] == "registry-volume-is"
 
 
 def test_corruption_profile_uses_dispatcher_launch_profile_name(monkeypatch):
