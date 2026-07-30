@@ -6,6 +6,7 @@ boundary artifacts, and relays resumable execution events.
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -1507,6 +1508,144 @@ async def get_cache_manifests(
             profile_fingerprint=profile_fingerprint,
             datacenter_id=datacenter_id,
         )
+    }
+
+
+@app.post("/api/cache/manifests/refresh")
+async def refresh_cache_manifest_profile(body: dict[str, Any] = Body(...)):
+    """Bind verified model objects to the current exact runner profile."""
+
+    if body.get("confirmed") is not True:
+        raise HTTPException(status_code=409, detail="Manifest refresh requires confirmation")
+    from types import SimpleNamespace
+
+    from cloud_offload.assets import normalized_partition_assets
+    from cloud_offload.cache_scheduler import (
+        resolve_prepared_requirements,
+        scheduler_runtime,
+    )
+    from cloud_offload.profiles import configured_worker_profiles
+
+    config = _config()
+    registry = _cache_registry(config)
+    volume = registry.get_volume(str(body.get("volume_id") or ""))
+    if not volume:
+        raise HTTPException(status_code=404, detail="Cache volume not found")
+    if volume.status != "ready" or not volume.s3_compatible:
+        raise HTTPException(
+            status_code=409,
+            detail="Manifest refresh requires a ready S3-compatible volume",
+        )
+    source_manifest_id = str(body.get("source_manifest_id") or "")
+    source_manifest = registry.get_manifest(volume.id, source_manifest_id)
+    if not source_manifest:
+        raise HTTPException(status_code=404, detail="Source manifest not found")
+    profile_name = str(body.get("profile") or "")
+    profile = configured_worker_profiles(config).get(profile_name)
+    if not profile:
+        raise HTTPException(status_code=400, detail="A configured profile is required")
+    try:
+        requirement_assets = normalized_partition_assets(
+            body.get("requirement_artifacts")
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not requirement_assets:
+        raise HTTPException(
+            status_code=400,
+            detail="A non-empty requirement_artifacts list is required",
+        )
+    requirement = resolve_prepared_requirements(
+        profile_name,
+        profile,
+        [SimpleNamespace(request={"assets": requirement_assets})],
+    )
+    required = requirement["required"]
+    source_models = {
+        str(item.get("digest") or ""): item
+        for item in source_manifest.get("artifacts") or []
+        if item.get("kind") == "model-weight"
+    }
+    refreshed_artifacts = []
+    for digest, size in required.items():
+        artifact = source_models.get(digest)
+        if artifact is None or int(artifact.get("size") or -1) != int(size):
+            raise HTTPException(
+                status_code=409,
+                detail="Source manifest does not cover the exact current model set",
+            )
+        if bool((artifact.get("policy") or {}).get("private")):
+            raise HTTPException(
+                status_code=409,
+                detail="Private model objects require a new authorized prepopulation",
+            )
+        refreshed_artifacts.append(copy.deepcopy(artifact))
+    proposal = {
+        "schema": "cloud-offload.prepared-state.v1",
+        "profile_fingerprint": requirement["profile_fingerprint"],
+        "created_at": source_manifest.get("created_at"),
+        "producer": {},
+        "artifacts": refreshed_artifacts,
+    }
+    job = SimpleNamespace(
+        params={
+            "prepared_requirement": requirement,
+            "cache_volume_id": volume.id,
+            "cache_provider_volume_id": volume.provider_volume_id,
+            "runtime_profile": profile_name,
+        }
+    )
+    try:
+        signer = _prepared_manifest_signer(config)
+        signer.verify(source_manifest)
+        _validate_manifest_proposal(
+            config, proposal, job=job, volume_id=volume.id
+        )
+        manifest = signer.sign(proposal)
+        connector = _cache_connector(config, volume.provider)
+        store = _runpod_s3_store(volume, connector)
+        await asyncio.to_thread(store.publish_manifest, manifest, signer)
+        index = await asyncio.to_thread(store.load_index)
+        registry.reconcile_index(
+            volume.id,
+            index,
+            manifest_documents={manifest["manifest_id"]: manifest},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Prepared manifest profile refresh failed")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Manifest refresh failed: {type(exc).__name__}",
+        ) from exc
+    coverage = next(
+        (
+            item
+            for item in registry.volume_coverage(
+                required,
+                runtime=scheduler_runtime(requirement),
+                tenant=str(config.prepared_storage.get("tenant") or "default"),
+                profile_fingerprint=requirement["profile_fingerprint"],
+                allow_private=bool(
+                    config.prepared_storage.get("cache_private_assets")
+                ),
+                logical_required=requirement.get("logical_required") or [],
+            )
+            if item["volume"].id == volume.id
+        ),
+        {},
+    )
+    return {
+        "volume_id": volume.id,
+        "source_manifest_id": source_manifest_id,
+        "manifest_id": manifest["manifest_id"],
+        "profile_fingerprint": requirement["profile_fingerprint"],
+        "artifact_count": len(refreshed_artifacts),
+        "cached_bytes": int(coverage.get("cached_bytes") or 0),
+        "complete": bool(coverage.get("complete")),
+        "runtime_requirements_pending": not bool(coverage.get("complete")),
+        "provider_gpu_mutation": False,
     }
 
 
