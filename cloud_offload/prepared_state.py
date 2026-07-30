@@ -1989,11 +1989,15 @@ class RunPodS3PreparedStore:
         wrapped_text = str(error) if error_name == "S3UploadFailedError" else ""
         recoverable = (
             status == 524
-            or code in {"524", "NoSuchUpload"}
+            or code in {"524", "NoSuchUpload", "InvalidPart"}
             or error_name in {"ReadTimeoutError", "ConnectTimeoutError"}
             or (
                 error_name == "S3UploadFailedError"
-                and ("(524)" in wrapped_text or "NoSuchUpload" in wrapped_text)
+                and (
+                    "(524)" in wrapped_text
+                    or "NoSuchUpload" in wrapped_text
+                    or "InvalidPart" in wrapped_text
+                )
             )
         )
         if not recoverable:
