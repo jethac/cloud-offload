@@ -50,6 +50,73 @@ def _volume_by_id(registry: CacheRegistry) -> dict[str, CacheVolume]:
     return {item.id: item for item in registry.list_volumes()}
 
 
+def _parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(
+        timezone.utc
+    )
+
+
+def shadow_accuracy(
+    registry: CacheRegistry,
+    prepared_storage_policy: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Score unique mature recommendations against later paid demand."""
+
+    current = (now or _utc_now()).astimezone(timezone.utc)
+    replication = dict(prepared_storage_policy.get("replication") or {})
+    validation_hours = max(
+        1, int(replication.get("shadow_validation_hours") or 24)
+    )
+    required = max(
+        3, int(replication.get("shadow_required_recommendations") or 10)
+    )
+    minimum_precision = float(replication.get("shadow_min_precision") or 0.8)
+    unique: dict[str, dict[str, Any]] = {}
+    for report in reversed(registry.list_shadow_evaluations(limit=1000)):
+        created_at = str(report.get("created_at") or "")
+        for item in report.get("recommendations") or []:
+            recommendation_id = str(item.get("recommendation_id") or "")
+            if recommendation_id and created_at:
+                unique.setdefault(
+                    recommendation_id,
+                    {**item, "first_recommended_at": created_at},
+                )
+    observations = registry.list_regional_demand()
+    matured = []
+    validated = []
+    for item in unique.values():
+        first = _parse_time(item["first_recommended_at"])
+        if current < first + timedelta(hours=validation_hours):
+            continue
+        expiry = _parse_time(str(item.get("expires_at") or _iso(current)))
+        followup = any(
+            demand.get("profile_fingerprint") == item.get("profile_fingerprint")
+            and demand.get("provider") == item.get("provider")
+            and demand.get("datacenter_id") == item.get("target_region")
+            and first < _parse_time(str(demand.get("created_at"))) <= expiry
+            for demand in observations
+        )
+        matured.append(item)
+        if followup:
+            validated.append(item)
+    precision = len(validated) / len(matured) if matured else 0.0
+    return {
+        "schema": "cloud-offload.replication-shadow-accuracy.v1",
+        "created_at": _iso(current),
+        "unique_recommendation_count": len(unique),
+        "mature_recommendation_count": len(matured),
+        "validated_recommendation_count": len(validated),
+        "precision": round(precision, 6),
+        "required_recommendations": required,
+        "required_precision": minimum_precision,
+        "validation_hours": validation_hours,
+        "automation_gate_passed": len(matured) >= required
+        and precision >= minimum_precision,
+    }
+
+
 def build_shadow_report(
     registry: CacheRegistry,
     prepared_storage_policy: dict[str, Any],

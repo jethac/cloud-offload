@@ -1522,6 +1522,55 @@ def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp
     assert client.download_calls >= 2
 
 
+def test_s3_replica_expiry_keeps_shared_objects_until_last_manifest(tmp_path):
+    client = MemoryS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="US-KS-2",
+        client=client,
+        endpoint_url="https://s3api-us-ks-2.runpod.io/",
+    )
+    signer = ManifestSigner(b"e" * 32)
+    artifacts = {
+        name: portable_artifact(name.encode())
+        for name in ("shared", "first", "second")
+    }
+    for name, artifact in artifacts.items():
+        source = tmp_path / name
+        source.write_bytes(name.encode())
+        store.upload_verified(source, artifact["digest"])
+    first = signed_manifest(
+        signer,
+        [artifacts["shared"], artifacts["first"]],
+        fingerprint({"profile": "first"}),
+    )
+    second = signed_manifest(
+        signer,
+        [artifacts["shared"], artifacts["second"]],
+        fingerprint({"profile": "second"}),
+    )
+    first_key = store.publish_manifest(first, signer)
+    store.publish_manifest(second, signer)
+
+    removed = store.remove_manifest(first["manifest_id"], signer, manifest=first)
+
+    assert removed == {"manifests": 1, "objects": 1}
+    assert first_key not in client.objects
+    assert not store.exists(artifacts["first"]["storage_key"])
+    assert store.exists(artifacts["shared"]["storage_key"])
+    assert store.exists(artifacts["second"]["storage_key"])
+    assert [item["manifest_id"] for item in store.load_index()["manifests"]] == [
+        second["manifest_id"]
+    ]
+
+    removed = store.remove_manifest(second["manifest_id"], signer, manifest=second)
+
+    assert removed == {"manifests": 1, "objects": 2}
+    assert store.load_index()["manifests"] == []
+    assert not store.exists(artifacts["shared"]["storage_key"])
+    assert not store.exists(artifacts["second"]["storage_key"])
+
+
 def test_s3_probe_exercises_write_read_and_delete():
     client = MemoryS3()
     store = RunPodS3PreparedStore(

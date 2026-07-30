@@ -155,7 +155,10 @@ Persisted configuration:
       "min_hits": 3,
       "min_avoided_gpu_seconds": 600,
       "transfer_cost_per_gb_usd": null,
-      "max_inflight": 1
+      "max_inflight": 1,
+      "shadow_required_recommendations": 10,
+      "shadow_validation_hours": 24,
+      "shadow_min_precision": 0.8
     }
   }
 }
@@ -597,9 +600,22 @@ output.
 contains the source manifest and volume, target region and optional existing
 target volume, bytes, expected hits, expected saved GPU time and cost, copy cost,
 incremental monthly storage cost, expiry, budget, decision reasons, and explicit
-cold-fallback visibility. Both endpoints make no provider mutation. Copy,
-automatic admission, TTL eviction, and loss recovery remain gated by later M6
-evidence.
+cold-fallback visibility. Both endpoints make no provider mutation.
+
+`POST /api/cache/replication/execute` copies one current recommendation through
+the source and target provider object APIs. Shadow mode requires explicit user
+confirmation. Automatic mode also requires enough mature unique recommendations
+and the configured minimum observed precision. The copy claim is durable and
+single-flight. It rechecks the finite monthly budget, copy cost, exact source,
+exact target, approved region, and expiry before it transfers data. A repeated
+request returns the same action and does not copy again. It never rents a GPU.
+
+`POST /api/cache/replication/expire` unpublishes due target manifests and deletes
+objects that no remaining target manifest uses. It does not delete source state
+or rent a GPU. `GET /api/cache/replication/actions` returns the safe action and
+shadow-accuracy state. Automatic target-volume creation, scheduled controller
+runs, full replica-aware placement evidence, and regional-loss recovery remain
+gated by later M6 evidence.
 
 ### Retention
 

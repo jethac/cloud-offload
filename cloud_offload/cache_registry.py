@@ -169,6 +169,30 @@ class CacheRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS idx_replication_shadow_created
                     ON replication_shadow_evaluations(created_at DESC);
+                CREATE TABLE IF NOT EXISTS regional_replica_actions (
+                    id TEXT PRIMARY KEY,
+                    recommendation_id TEXT NOT NULL,
+                    source_volume_id TEXT NOT NULL,
+                    target_volume_id TEXT NOT NULL,
+                    source_manifest_id TEXT NOT NULL,
+                    target_manifest_id TEXT,
+                    status TEXT NOT NULL,
+                    bytes INTEGER NOT NULL,
+                    incremental_monthly_cost_usd REAL NOT NULL,
+                    estimated_copy_cost_usd REAL NOT NULL,
+                    reason_json TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    error TEXT,
+                    FOREIGN KEY(source_volume_id) REFERENCES cache_volumes(id),
+                    FOREIGN KEY(target_volume_id) REFERENCES cache_volumes(id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_regional_replica_active
+                    ON regional_replica_actions(recommendation_id)
+                    WHERE status IN ('copying','completed');
+                CREATE INDEX IF NOT EXISTS idx_regional_replica_expiry
+                    ON regional_replica_actions(status, expires_at);
                 """
             )
 
@@ -1039,6 +1063,184 @@ class CacheRegistry:
                 (max(1, min(1000, int(limit))),),
             ).fetchall()
         return [json.loads(row["report_json"]) for row in rows]
+
+    @staticmethod
+    def _replica_action(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            key: row[key]
+            for key in row.keys()
+            if key != "reason_json"
+        } | {"reason_codes": json.loads(row["reason_json"])}
+
+    def claim_replica_action(
+        self,
+        recommendation: dict[str, Any],
+        *,
+        monthly_budget_usd: float,
+        max_inflight: int,
+    ) -> dict[str, Any]:
+        """Reserve one exact copy with single-flight and budget enforcement."""
+
+        recommendation_id = str(recommendation.get("recommendation_id") or "")
+        source_volume_id = str(recommendation.get("source_volume_id") or "")
+        target_volume_id = str(recommendation.get("target_volume_id") or "")
+        source_manifest_id = str(recommendation.get("source_manifest_id") or "")
+        expires_at = str(recommendation.get("expires_at") or "")
+        if not all(
+            (
+                recommendation_id,
+                source_volume_id,
+                target_volume_id,
+                source_manifest_id,
+                expires_at,
+            )
+        ):
+            raise ValueError("Replica action requires exact recommendation identities")
+        byte_count = max(0, int(recommendation.get("bytes") or 0))
+        monthly_cost = float(
+            recommendation.get("incremental_monthly_storage_cost_usd") or 0
+        )
+        copy_cost = recommendation.get("estimated_copy_cost_usd")
+        if copy_cost is None:
+            raise ValueError("Replica action requires a known copy cost")
+        copy_cost = float(copy_cost)
+        budget = float(monthly_budget_usd)
+        if not all(math.isfinite(item) and item >= 0 for item in (monthly_cost, copy_cost, budget)):
+            raise ValueError("Replica costs and budget must be finite and non-negative")
+        action_id = str(uuid.uuid4())
+        created_at = _now()
+        if expires_at <= created_at:
+            raise ValueError("Replica action recommendation has expired")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM regional_replica_actions
+                WHERE recommendation_id=? AND status IN ('copying','completed')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (recommendation_id,),
+            ).fetchone()
+            if existing:
+                return {**self._replica_action(existing), "duplicate_suppressed": True}
+            inflight = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM regional_replica_actions
+                WHERE status='copying'
+                """
+            ).fetchone()["count"]
+            if int(inflight) >= max(1, int(max_inflight)):
+                raise RuntimeError("Regional replication concurrency limit reached")
+            reserved = connection.execute(
+                """
+                SELECT COALESCE(SUM(incremental_monthly_cost_usd),0) AS cost
+                FROM regional_replica_actions
+                WHERE status IN ('copying','completed') AND expires_at>?
+                """,
+                (created_at,),
+            ).fetchone()["cost"]
+            if float(reserved) + monthly_cost > budget:
+                raise RuntimeError("Regional replication monthly budget exceeded")
+            connection.execute(
+                """
+                INSERT INTO regional_replica_actions (
+                    id, recommendation_id, source_volume_id, target_volume_id,
+                    source_manifest_id, target_manifest_id, status, bytes,
+                    incremental_monthly_cost_usd, estimated_copy_cost_usd,
+                    reason_json, expires_at, created_at, completed_at, error
+                ) VALUES (?, ?, ?, ?, ?, NULL, 'copying', ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    action_id,
+                    recommendation_id,
+                    source_volume_id,
+                    target_volume_id,
+                    source_manifest_id,
+                    byte_count,
+                    monthly_cost,
+                    copy_cost,
+                    json.dumps(
+                        list(recommendation.get("reason_codes") or []),
+                        sort_keys=True,
+                    ),
+                    expires_at,
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM regional_replica_actions WHERE id=?", (action_id,)
+            ).fetchone()
+        return {**self._replica_action(row), "duplicate_suppressed": False}
+
+    def complete_replica_action(
+        self, action_id: str, *, target_manifest_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE regional_replica_actions
+                SET status='completed', target_manifest_id=?, completed_at=?, error=NULL
+                WHERE id=? AND status='copying'
+                """,
+                (str(target_manifest_id), _now(), str(action_id)),
+            )
+            if not cursor.rowcount:
+                raise KeyError(action_id)
+            row = connection.execute(
+                "SELECT * FROM regional_replica_actions WHERE id=?", (str(action_id),)
+            ).fetchone()
+        return self._replica_action(row)
+
+    def fail_replica_action(self, action_id: str, error: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE regional_replica_actions
+                SET status='failed', completed_at=?, error=?
+                WHERE id=? AND status='copying'
+                """,
+                (_now(), str(error)[:500], str(action_id)),
+            )
+            if not cursor.rowcount:
+                raise KeyError(action_id)
+
+    def list_replica_actions(
+        self, *, status: str | None = None, due_before: str | None = None
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if status:
+            clauses.append("status=?")
+            values.append(str(status))
+        if due_before:
+            clauses.append("expires_at<=?")
+            values.append(str(due_before))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM regional_replica_actions"
+                + where
+                + " ORDER BY created_at DESC, id DESC",
+                values,
+            ).fetchall()
+        return [self._replica_action(row) for row in rows]
+
+    def expire_replica_action(self, action_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE regional_replica_actions
+                SET status='expired', completed_at=?
+                WHERE id=? AND status='completed'
+                """,
+                (_now(), str(action_id)),
+            )
+            if not cursor.rowcount:
+                raise KeyError(action_id)
+            row = connection.execute(
+                "SELECT * FROM regional_replica_actions WHERE id=?", (str(action_id),)
+            ).fetchone()
+        return self._replica_action(row)
 
     def create_replication(
         self,

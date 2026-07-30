@@ -95,6 +95,9 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
         "min_avoided_gpu_seconds": 600.0,
         "transfer_cost_per_gb_usd": None,
         "max_inflight": 1,
+        "shadow_required_recommendations": 10,
+        "shadow_validation_hours": 24,
+        "shadow_min_precision": 0.8,
     }
     defaults: dict[str, Any] = {
         "enabled": False,
@@ -203,6 +206,27 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
     if not 1 <= replication["max_inflight"] <= 16:
         raise ValueError(
             "prepared_storage.replication.max_inflight must be between 1 and 16"
+        )
+    replication["shadow_required_recommendations"] = int(
+        replication["shadow_required_recommendations"]
+    )
+    if replication["shadow_required_recommendations"] < 3:
+        raise ValueError(
+            "prepared_storage.replication.shadow_required_recommendations must be at least 3"
+        )
+    replication["shadow_validation_hours"] = int(
+        replication["shadow_validation_hours"]
+    )
+    if not 1 <= replication["shadow_validation_hours"] <= 24 * 90:
+        raise ValueError(
+            "prepared_storage.replication.shadow_validation_hours must be between 1 and 2160"
+        )
+    replication["shadow_min_precision"] = float(
+        replication["shadow_min_precision"]
+    )
+    if not 0.5 <= replication["shadow_min_precision"] <= 1:
+        raise ValueError(
+            "prepared_storage.replication.shadow_min_precision must be between 0.5 and 1"
         )
     if replication["mode"] == "automatic":
         if replication["monthly_budget_usd"] is None:

@@ -1473,9 +1473,15 @@ that demand and the signed manifest projection to report a source, target region
 bytes, expected hits, expected saved GPU time and cost, copy cost, incremental
 monthly storage cost, expiry, budget effect, and decision reasons. It suppresses
 a recommendation when the target already has a compatible manifest. Reports keep
-cold fallback explicit and make no provider mutation. Automatic copies, durable
-single-flight admission, TTL eviction, replica-aware placement, and regional-loss
-recovery remain before M6 can close.
+cold fallback explicit and make no provider mutation. A durable copy controller
+now checks the exact current recommendation, approved source and target, known
+copy cost, finite monthly budget, concurrency limit, and expiry. Shadow mode
+requires confirmation. Automatic mode stays locked until mature unique shadow
+recommendations reach the configured precision gate. Copy uses provider object
+APIs and no GPU. Repeated requests return the same action. Due replica manifests
+and unshared target objects can be removed without deleting source state.
+Automatic target-volume creation, scheduled controller runs, full replica-aware
+placement evidence, and regional-loss recovery remain before M6 can close.
 
 Exit:
 
