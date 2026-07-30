@@ -39,6 +39,7 @@ DEFAULT_TRUST_SAMPLE_COUNT = 5
 S3_VERIFICATION_RANGE_BYTES = 32 * 1024 * 1024
 S3_DOWNLOAD_CONCURRENCY = 10
 S3_RANGE_SOCKET_TIMEOUT_SECONDS = 180
+S3_RANGE_READ_BYTES = 1024 * 1024
 RUNPOD_S3_READ_TIMEOUT_SECONDS = 2 * 60 * 60
 RUNPOD_S3_MULTIPART_THRESHOLD_BYTES = 500 * 1024 * 1024
 RUNPOD_S3_MULTIPART_CHUNK_BYTES = 50 * 1024 * 1024
@@ -1862,25 +1863,31 @@ class RunPodS3PreparedStore:
             try:
                 return operation()
             except Exception as exc:
-                response = getattr(exc, "response", {}) or {}
-                metadata = response.get("ResponseMetadata", {}) or {}
-                error_data = response.get("Error", {}) or {}
-                retryable = (
-                    metadata.get("HTTPStatusCode") == 524
-                    or str(error_data.get("Code") or "") == "524"
-                    or type(exc).__name__
-                    in {
-                        "ReadTimeoutError",
-                        "ConnectTimeoutError",
-                        "ResponseStreamingError",
-                    }
-                )
-                if not retryable or attempt == RUNPOD_S3_GATEWAY_ATTEMPTS:
+                if (
+                    not self._is_gateway_retryable(exc)
+                    or attempt == RUNPOD_S3_GATEWAY_ATTEMPTS
+                ):
                     raise
                 time.sleep(
                     min(2**attempt, RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS)
                 )
         raise AssertionError("RunPod S3 retry loop ended without a result")
+
+    @staticmethod
+    def _is_gateway_retryable(exc: Exception) -> bool:
+        response = getattr(exc, "response", {}) or {}
+        metadata = response.get("ResponseMetadata", {}) or {}
+        error_data = response.get("Error", {}) or {}
+        return (
+            metadata.get("HTTPStatusCode") == 524
+            or str(error_data.get("Code") or "") == "524"
+            or type(exc).__name__
+            in {
+                "ReadTimeoutError",
+                "ConnectTimeoutError",
+                "ResponseStreamingError",
+            }
+        )
 
     def publish_manifest(self, manifest: dict[str, Any], signer: ManifestSigner) -> str:
         signer.verify(manifest)
@@ -2185,6 +2192,26 @@ class RunPodS3PreparedStore:
         received: int,
         expected_total: int | None = None,
     ) -> tuple[int, int, int]:
+        start, end, reported_total = RunPodS3PreparedStore._parse_s3_range(
+            content_range,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            expected_total=expected_total,
+        )
+        if end - start + 1 != received:
+            raise CacheCorruptionError(
+                "RunPod S3 range response does not match the request"
+            )
+        return start, end, reported_total
+
+    @staticmethod
+    def _parse_s3_range(
+        content_range: str,
+        *,
+        requested_start: int,
+        requested_end: int,
+        expected_total: int | None = None,
+    ) -> tuple[int, int, int]:
         try:
             unit, bounds = content_range.split(" ", 1)
             span, total = bounds.split("/", 1)
@@ -2198,7 +2225,6 @@ class RunPodS3PreparedStore:
             or start != requested_start
             or end != expected_end
             or end < start
-            or end - start + 1 != received
             or reported_total < end + 1
             or (expected_total is not None and expected_total != reported_total)
         ):
@@ -2210,28 +2236,60 @@ class RunPodS3PreparedStore:
     def _download_s3_range(
         self, key: str, start: int, end: int, total_size: int
     ) -> tuple[int, bytes]:
-        def operation() -> tuple[int, bytes]:
-            response = self.client.get_object(
-                Bucket=self.volume_id,
-                Key=self._key(key),
-                Range=f"bytes={start}-{end}",
-            )
-            payload = self._read_s3_body(response["Body"])
-            content_range = str(response.get("ContentRange") or "").strip()
-            if not content_range:
-                raise CacheCorruptionError(
-                    "RunPod S3 range response has no content range"
+        payload = bytearray()
+        next_start = start
+        for attempt in range(1, RUNPOD_S3_GATEWAY_ATTEMPTS + 1):
+            request_start = next_start
+            body = None
+            try:
+                response = self.client.get_object(
+                    Bucket=self.volume_id,
+                    Key=self._key(key),
+                    Range=f"bytes={request_start}-{end}",
                 )
-            self._validate_s3_range(
-                content_range,
-                requested_start=start,
-                requested_end=end,
-                received=len(payload),
-                expected_total=total_size,
-            )
-            return start, payload
+                body = response["Body"]
+                content_range = str(response.get("ContentRange") or "").strip()
+                if not content_range:
+                    raise CacheCorruptionError(
+                        "RunPod S3 range response has no content range"
+                    )
+                self._parse_s3_range(
+                    content_range,
+                    requested_start=request_start,
+                    requested_end=end,
+                    expected_total=total_size,
+                )
+                set_socket_timeout = getattr(body, "set_socket_timeout", None)
+                if callable(set_socket_timeout):
+                    set_socket_timeout(S3_RANGE_SOCKET_TIMEOUT_SECONDS)
+                while chunk := body.read(S3_RANGE_READ_BYTES):
+                    payload.extend(chunk)
+                    next_start += len(chunk)
+                    if next_start > end + 1:
+                        raise CacheCorruptionError(
+                            "RunPod S3 range response exceeded the request"
+                        )
+                if next_start == end + 1:
+                    return start, bytes(payload)
+            except Exception as exc:
+                if next_start == end + 1:
+                    return start, bytes(payload)
+                if (
+                    not self._is_gateway_retryable(exc)
+                    or attempt == RUNPOD_S3_GATEWAY_ATTEMPTS
+                ):
+                    raise
+            finally:
+                close = getattr(body, "close", None)
+                if callable(close):
+                    close()
+            if attempt == RUNPOD_S3_GATEWAY_ATTEMPTS:
+                raise CacheCorruptionError(
+                    "RunPod S3 range response made no progress"
+                )
+            time.sleep(min(2**attempt, RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS))
 
-        return self._call_with_gateway_retry(operation)
+        raise AssertionError("RunPod S3 range retry loop ended without a result")
 
     def _download_verify(self, key: str, digest: str, size: int) -> None:
         descriptor, temporary_name = tempfile.mkstemp(prefix="cloud-offload-s3-verify-")
