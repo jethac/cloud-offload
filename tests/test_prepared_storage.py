@@ -1466,7 +1466,7 @@ def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
     assert transfer.max_pool_connections == 32
     assert transfer.retries == {"max_attempts": 10, "mode": "standard"}
     assert range_transfer.connect_timeout == 30
-    assert range_transfer.read_timeout == 60
+    assert range_transfer.read_timeout == 90
     assert range_transfer.tcp_keepalive is True
     assert range_transfer.max_pool_connections == 32
     assert range_transfer.retries == {
@@ -1802,7 +1802,7 @@ def test_s3_verified_download_uses_the_bounded_range_client(tmp_path):
         artifact["storage_key"], artifact["digest"], destination
     ) == destination
     assert destination.read_bytes() == payload
-    assert bounded.ranges == ["bytes=0-33554431"]
+    assert bounded.ranges == ["bytes=0-67108863"]
 
 
 def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp_path):
