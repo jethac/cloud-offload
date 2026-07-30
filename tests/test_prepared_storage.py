@@ -1685,6 +1685,45 @@ def test_s3_verified_download_uses_bounded_ranges(monkeypatch, tmp_path):
     ]
 
 
+def test_s3_verified_download_retries_runpod_524(monkeypatch, tmp_path):
+    class GatewayTimeout(Exception):
+        response = {
+            "ResponseMetadata": {"HTTPStatusCode": 524},
+            "Error": {"Code": "524"},
+        }
+
+    class ColdObjectS3(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.remaining_timeouts = 2
+
+        def get_object(self, Bucket, Key, Range=None):
+            if self.remaining_timeouts:
+                self.remaining_timeouts -= 1
+                raise GatewayTimeout()
+            return super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+
+    sleeps = []
+    monkeypatch.setattr(prepared_state_module.time, "sleep", sleeps.append)
+    client = ColdObjectS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="US-MD-1",
+        client=client,
+        endpoint_url="https://s3api-us-md-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    payload = b"cold mounted object"
+    artifact = portable_artifact(payload)
+    client.objects[store._key(artifact["storage_key"])] = payload
+    destination = tmp_path / "cold-object"
+
+    store.download_verified(artifact["storage_key"], artifact["digest"], destination)
+
+    assert destination.read_bytes() == payload
+    assert sleeps == [2, 4]
+
+
 def test_s3_replica_expiry_keeps_shared_objects_until_last_manifest(tmp_path):
     client = MemoryS3()
     store = RunPodS3PreparedStore(
