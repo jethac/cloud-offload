@@ -1786,6 +1786,67 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
     }
 
 
+async def _copy_cache_manifest(config, registry, source, target, manifest_id: str):
+    """Copy one exact signed manifest through provider object APIs."""
+
+    source_connector = _cache_connector(config, source.provider)
+    target_connector = _cache_connector(config, target.provider)
+    source_store = _runpod_s3_store(source, source_connector)
+    target_store = _runpod_s3_store(target, target_connector)
+    source_index = await asyncio.to_thread(source_store.load_index)
+    entry = next(
+        (
+            item
+            for item in source_index.get("manifests") or []
+            if item.get("manifest_id") == manifest_id
+        ),
+        None,
+    )
+    if not entry:
+        raise KeyError("Source manifest not found")
+    signer = _prepared_manifest_signer(config)
+    document = signer.verify(
+        await asyncio.to_thread(source_store.read_json, entry["storage_key"])
+    )
+    with tempfile.TemporaryDirectory(prefix="cloud-offload-replica-") as directory:
+        for artifact in document["artifacts"]:
+            path = Path(directory) / normalize_cache_filename(artifact["digest"])
+            await asyncio.to_thread(
+                source_store.download_verified,
+                artifact["storage_key"],
+                artifact["digest"],
+                path,
+            )
+            await asyncio.to_thread(
+                target_store.upload_verified,
+                path,
+                artifact["digest"],
+                storage_key=artifact["storage_key"],
+            )
+    proposal = {
+        key: value
+        for key, value in document.items()
+        if key not in {"manifest_id", "signature", "cache_volume_id"}
+    }
+    proposal["cache_volume_id"] = target.id
+    replica_manifest = signer.sign(proposal)
+    signer.verify(replica_manifest)
+    await asyncio.to_thread(target_store.publish_manifest, replica_manifest, signer)
+    target_index = await asyncio.to_thread(target_store.load_index)
+    registry.reconcile_index(
+        target.id,
+        target_index,
+        manifest_documents={replica_manifest["manifest_id"]: replica_manifest},
+    )
+    return {
+        "source_manifest_id": document["manifest_id"],
+        "target_manifest_id": replica_manifest["manifest_id"],
+        "target_generation": target_index["generation"],
+        "bytes": sum(int(item["size"]) for item in document["artifacts"]),
+        "artifact_count": len(document["artifacts"]),
+    }
+
+
 @app.post("/api/cache/replicate")
 async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
     """Manually copy one verified immutable manifest to an approved replica."""
@@ -1801,69 +1862,196 @@ async def replicate_cache_manifest(body: dict[str, Any] = Body(...)):
         raise HTTPException(
             status_code=409, detail="Both replica volumes need RunPod S3"
         )
-    source_connector = _cache_connector(config, source.provider)
-    target_connector = _cache_connector(config, target.provider)
-    source_store = _runpod_s3_store(source, source_connector)
-    target_store = _runpod_s3_store(target, target_connector)
-    source_index = await asyncio.to_thread(source_store.load_index)
     manifest_id = str(body.get("manifest_id") or "")
-    entry = next(
-        (
-            item
-            for item in source_index.get("manifests") or []
-            if item.get("manifest_id") == manifest_id
-        ),
-        None,
-    )
-    if not entry:
+    document = registry.get_manifest(source.id, manifest_id)
+    if not document:
         raise HTTPException(status_code=404, detail="Source manifest not found")
-    signer = _prepared_manifest_signer(config)
-    document = signer.verify(
-        await asyncio.to_thread(source_store.read_json, entry["storage_key"])
-    )
     sizes = {item["digest"]: int(item["size"]) for item in document["artifacts"]}
     plan = registry.create_replication(source.id, target.id, list(sizes), sizes)
     try:
-        with tempfile.TemporaryDirectory(prefix="cloud-offload-replica-") as directory:
-            for artifact in document["artifacts"]:
-                path = Path(directory) / normalize_cache_filename(artifact["digest"])
-                await asyncio.to_thread(
-                    source_store.download_verified,
-                    artifact["storage_key"],
-                    artifact["digest"],
-                    path,
-                )
-                await asyncio.to_thread(
-                    target_store.upload_verified,
-                    path,
-                    artifact["digest"],
-                    storage_key=artifact["storage_key"],
-                )
-        proposal = {
-            key: value
-            for key, value in document.items()
-            if key not in {"manifest_id", "signature", "cache_volume_id"}
-        }
-        proposal["cache_volume_id"] = target.id
-        replica_manifest = signer.sign(proposal)
-        signer.verify(replica_manifest)
-        await asyncio.to_thread(target_store.publish_manifest, replica_manifest, signer)
-        target_index = await asyncio.to_thread(target_store.load_index)
-        registry.reconcile_index(
-            target.id,
-            target_index,
-            manifest_documents={replica_manifest["manifest_id"]: replica_manifest},
+        result = await _copy_cache_manifest(
+            config, registry, source, target, manifest_id
         )
         registry.complete_replication(plan["id"])
         return {
             **plan,
             "status": "completed",
-            "target_manifest_id": replica_manifest["manifest_id"],
-            "target_generation": target_index["generation"],
+            **result,
         }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - persisted as bounded action failure
         registry.complete_replication(plan["id"], failed_reason=str(exc))
         raise HTTPException(status_code=409, detail=f"Replication failed: {exc}")
+
+
+@app.get("/api/cache/replication/actions")
+async def regional_replica_actions():
+    """Return safe durable copy, completion, failure, and expiry state."""
+
+    config = _config(resolve_secrets=False)
+    registry = _cache_registry(config)
+    from cloud_offload.regional_replication import shadow_accuracy
+
+    return {
+        "schema": "cloud-offload.regional-replica-actions.v1",
+        "actions": registry.list_replica_actions(),
+        "shadow_accuracy": shadow_accuracy(
+            registry, config.prepared_storage
+        ),
+    }
+
+
+@app.post("/api/cache/replication/execute")
+async def execute_regional_replica(body: dict[str, Any] = Body(...)):
+    """Execute one current recommendation without renting a GPU."""
+
+    from cloud_offload.regional_replication import (
+        build_shadow_report,
+        shadow_accuracy,
+    )
+
+    config = _config()
+    policy = config.prepared_storage
+    replication = policy.get("replication") or {}
+    mode = str(replication.get("mode") or "shadow")
+    if mode == "off":
+        raise HTTPException(status_code=409, detail="Regional replication is off")
+    if mode == "shadow" and body.get("confirmed") is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="Shadow-mode replication requires explicit confirmation",
+        )
+    registry = _cache_registry(config)
+    report = build_shadow_report(registry, policy)
+    recommendation_id = str(body.get("recommendation_id") or "")
+    recommendation = next(
+        (
+            item
+            for item in report.get("recommendations") or []
+            if item.get("recommendation_id") == recommendation_id
+        ),
+        None,
+    )
+    if not recommendation:
+        raise HTTPException(
+            status_code=409,
+            detail="Replication recommendation is absent, stale, or no longer useful",
+        )
+    if mode == "automatic":
+        accuracy = shadow_accuracy(registry, policy)
+        if not accuracy["automation_gate_passed"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cloud_offload.replication_shadow_gate",
+                    "message": "Shadow accuracy has not reached the automatic-copy gate.",
+                    "accuracy": accuracy,
+                },
+            )
+        if not recommendation.get("eligible_for_automatic"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cloud_offload.replication_policy_blocked",
+                    "reasons": recommendation.get("automatic_blockers") or [],
+                },
+            )
+    source = registry.get_volume(str(recommendation.get("source_volume_id") or ""))
+    target = registry.get_volume(str(recommendation.get("target_volume_id") or ""))
+    if not source or not target:
+        raise HTTPException(
+            status_code=409,
+            detail="The approved source and target volumes must exist before copy",
+        )
+    if not source.s3_compatible or not target.s3_compatible:
+        raise HTTPException(status_code=409, detail="Replica volumes need RunPod S3")
+    budget = replication.get("monthly_budget_usd")
+    if budget is None:
+        if mode == "automatic":
+            raise HTTPException(
+                status_code=409, detail="Automatic replication needs a monthly budget"
+            )
+        budget = 0.0
+    try:
+        action = registry.claim_replica_action(
+            recommendation,
+            monthly_budget_usd=float(budget),
+            max_inflight=int(replication.get("max_inflight") or 1),
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if action["duplicate_suppressed"]:
+        return action
+    try:
+        result = await _copy_cache_manifest(
+            config,
+            registry,
+            source,
+            target,
+            str(recommendation["source_manifest_id"]),
+        )
+        completed = registry.complete_replica_action(
+            action["id"], target_manifest_id=result["target_manifest_id"]
+        )
+        return {**completed, "duplicate_suppressed": False, **result}
+    except Exception as exc:  # noqa: BLE001 - exact action remains auditable
+        registry.fail_replica_action(action["id"], type(exc).__name__)
+        logger.exception("Regional replica action failed")
+        raise HTTPException(
+            status_code=409,
+            detail="Regional replication failed; inspect the safe action status",
+        ) from exc
+
+
+@app.post("/api/cache/replication/expire")
+async def expire_regional_replicas():
+    """Unpublish expired replicas without deleting their source state."""
+
+    config = _config()
+    registry = _cache_registry(config)
+    signer = _prepared_manifest_signer(config)
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    due = registry.list_replica_actions(status="completed", due_before=now)
+    expired: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for action in due:
+        target = registry.get_volume(action["target_volume_id"])
+        manifest = registry.get_manifest(
+            action["target_volume_id"], action["target_manifest_id"]
+        )
+        if not target or not manifest:
+            failures.append(
+                {"action_id": action["id"], "reason": "replica_projection_missing"}
+            )
+            continue
+        try:
+            connector = _cache_connector(config, target.provider)
+            store = _runpod_s3_store(target, connector)
+            removed = await asyncio.to_thread(
+                store.remove_manifest,
+                action["target_manifest_id"],
+                signer,
+                manifest=manifest,
+            )
+            index = await asyncio.to_thread(store.load_index)
+            registry.remove_manifest(
+                target.id,
+                action["target_manifest_id"],
+                inventory_generation=index.get("generation"),
+            )
+            state = registry.expire_replica_action(action["id"])
+            expired.append({**state, "removed": removed})
+        except Exception as exc:  # noqa: BLE001 - retry keeps the action active
+            logger.exception("Regional replica expiry failed")
+            failures.append(
+                {"action_id": action["id"], "reason": type(exc).__name__}
+            )
+    return {
+        "schema": "cloud-offload.regional-replica-expiry.v1",
+        "expired": expired,
+        "failures": failures,
+        "source_state_deleted": False,
+        "provider_gpu_mutation": False,
+    }
 
 
 def normalize_cache_filename(digest: str) -> str:

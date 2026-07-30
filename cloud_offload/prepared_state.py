@@ -1847,6 +1847,76 @@ class RunPodS3PreparedStore:
             )
             return key
 
+    def remove_manifest(
+        self,
+        manifest_id: str,
+        signer: ManifestSigner,
+        *,
+        manifest: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """Unpublish one replica and delete objects no remaining manifest uses."""
+
+        expected_id = digest_id(manifest_id)
+        supplied = signer.verify(manifest) if manifest is not None else None
+        if supplied is not None and supplied["manifest_id"] != expected_id:
+            raise ManifestError("Replica expiry manifest identity changed")
+        with self.publication_lock:
+            entries = self._load_latest_index_entries()
+            removed = next(
+                (item for item in entries if item.get("manifest_id") == expected_id),
+                None,
+            )
+            remaining = [
+                item for item in entries if item.get("manifest_id") != expected_id
+            ]
+            if removed is None and supplied is None:
+                return {"manifests": 0, "objects": 0}
+            generation = f"{time.time_ns()}-{uuid.uuid4().hex}"
+            index = {
+                "schema": INDEX_SCHEMA,
+                "generation": generation,
+                "created_at": utc_now(),
+                "manifests": remaining,
+            }
+            payload = canonical_json(index)
+            index_key = f"indexes/{generation}.json"
+            self.client.put_object(
+                Bucket=self.volume_id, Key=self._key(index_key), Body=payload
+            )
+            if not self.exists(index_key, len(payload)):
+                raise CacheCorruptionError(
+                    "RunPod S3 replica expiry inventory was incomplete"
+                )
+            self.client.put_object(
+                Bucket=self.volume_id,
+                Key=self._key("indexes/latest"),
+                Body=generation.encode("utf-8"),
+            )
+
+            referenced = {
+                normalize_digest(str(artifact.get("digest") or ""))
+                for entry in remaining
+                for artifact in entry.get("artifacts") or []
+                if artifact.get("digest")
+            }
+            document = supplied
+            if document is None and removed and removed.get("storage_key"):
+                document = signer.verify(self.read_json(removed["storage_key"]))
+            objects = 0
+            for artifact in (document or {}).get("artifacts") or []:
+                storage_key = str(artifact.get("storage_key") or "")
+                digest = normalize_digest(str(artifact.get("digest") or ""))
+                if storage_key and digest not in referenced:
+                    self.client.delete_object(
+                        Bucket=self.volume_id, Key=self._key(storage_key)
+                    )
+                    objects += 1
+            if removed and removed.get("storage_key"):
+                self.client.delete_object(
+                    Bucket=self.volume_id, Key=self._key(removed["storage_key"])
+                )
+            return {"manifests": int(removed is not None), "objects": objects}
+
     def _load_latest_index_entries(self) -> list[dict[str, Any]]:
         return list(self.load_index().get("manifests") or [])
 

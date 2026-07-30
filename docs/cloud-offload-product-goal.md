@@ -658,6 +658,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#48](https://github.com/jethac/cloud-offload/pull/48) | Moves the boot-report setting after stable image layers so the evidence fix does not invalidate the large apt, ComfyUI, PyTorch, and CUDA cache layers. | Merged as `b197c91`; 30 focused image and shell checks passed. |
 | [#49](https://github.com/jethac/cloud-offload/pull/49) | Records the redacted paid M5 population and fresh-Pod restore proof, exact image identity, result transport, bounded incident, and provider closure. It marks M5 complete and makes M6 active. | 624 tests passed. Both runtime bundles restored before job claim with complete digest checks, no duplicate population, and zero final provider resources. |
 | [#50](https://github.com/jethac/cloud-offload/pull/50) | Adds safe paid-region demand observations, bounded replication policy, and read-only shadow recommendations with source, destination, bytes, expected benefit, cost, budget, expiry, and decision reasons. | 632 tests passed. Existing compatible targets suppress recommendations, duplicate paid observations collapse, and the shadow endpoints make no provider mutation. |
+| [#51](https://github.com/jethac/cloud-offload/pull/51) | Adds durable single-flight regional replica actions, exact current-recommendation binding, monthly budget and concurrency enforcement, shadow precision gating, provider-object copy, safe status, and TTL expiry. | 639 tests passed. Repeated requests do not copy twice, automatic mode stays locked before the accuracy gate, expiry keeps source state, and the controller never rents a GPU. |
 
 ### ComfyUI extension repository
 
@@ -1473,9 +1474,15 @@ that demand and the signed manifest projection to report a source, target region
 bytes, expected hits, expected saved GPU time and cost, copy cost, incremental
 monthly storage cost, expiry, budget effect, and decision reasons. It suppresses
 a recommendation when the target already has a compatible manifest. Reports keep
-cold fallback explicit and make no provider mutation. Automatic copies, durable
-single-flight admission, TTL eviction, replica-aware placement, and regional-loss
-recovery remain before M6 can close.
+cold fallback explicit and make no provider mutation. A durable copy controller
+now checks the exact current recommendation, approved source and target, known
+copy cost, finite monthly budget, concurrency limit, and expiry. Shadow mode
+requires confirmation. Automatic mode stays locked until mature unique shadow
+recommendations reach the configured precision gate. Copy uses provider object
+APIs and no GPU. Repeated requests return the same action. Due replica manifests
+and unshared target objects can be removed without deleting source state.
+Automatic target-volume creation, scheduled controller runs, full replica-aware
+placement evidence, and regional-loss recovery remain before M6 can close.
 
 Exit:
 

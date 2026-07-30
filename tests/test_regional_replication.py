@@ -1,5 +1,5 @@
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +9,7 @@ from cloud_offload import server
 from cloud_offload.cache_registry import CacheRegistry
 from cloud_offload.config import CloudConfig
 from cloud_offload.prepared_state import ManifestSigner, blob_key, build_manifest, fingerprint
-from cloud_offload.regional_replication import build_shadow_report
+from cloud_offload.regional_replication import build_shadow_report, shadow_accuracy
 
 
 GIB = 1024**3
@@ -27,6 +27,9 @@ def replication_policy(**updates):
         "min_avoided_gpu_seconds": 600,
         "transfer_cost_per_gb_usd": 0,
         "max_inflight": 1,
+        "shadow_required_recommendations": 10,
+        "shadow_validation_hours": 24,
+        "shadow_min_precision": 0.8,
     }
     if isinstance(replication_updates, dict):
         replication.update(replication_updates)
@@ -345,3 +348,301 @@ def test_shadow_routes_record_and_return_safe_history(tmp_path, monkeypatch):
     assert body["provider_mutation"] is False
     assert len(body["evaluations"]) == 1
     assert "job_id" not in history.text
+
+
+def action_recommendation(source, target, manifest, **updates):
+    return {
+        "recommendation_id": "sha256:" + "9" * 64,
+        "source_volume_id": source.id,
+        "target_volume_id": target.id,
+        "source_manifest_id": manifest["manifest_id"],
+        "bytes": sum(item["size"] for item in manifest["artifacts"]),
+        "incremental_monthly_storage_cost_usd": 0,
+        "estimated_copy_cost_usd": 0,
+        "reason_codes": ["measured_value"],
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=14))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        **updates,
+    }
+
+
+def test_replica_action_is_single_flight_budgeted_and_expirable(tmp_path):
+    registry = CacheRegistry(tmp_path / "queue.db")
+    source = add_volume(registry, "source-provider-volume", "A")
+    target = add_volume(registry, "target-provider-volume", "B")
+    manifest = add_manifest(registry, source, fingerprint({"profile": "action"}))
+    recommendation = action_recommendation(source, target, manifest)
+
+    claimed = registry.claim_replica_action(
+        recommendation, monthly_budget_usd=20, max_inflight=1
+    )
+    duplicate = registry.claim_replica_action(
+        recommendation, monthly_budget_usd=20, max_inflight=1
+    )
+
+    assert claimed["status"] == "copying"
+    assert claimed["duplicate_suppressed"] is False
+    assert duplicate["id"] == claimed["id"]
+    assert duplicate["duplicate_suppressed"] is True
+
+    with pytest.raises(RuntimeError, match="concurrency"):
+        registry.claim_replica_action(
+            action_recommendation(
+                source,
+                target,
+                manifest,
+                recommendation_id="sha256:" + "8" * 64,
+            ),
+            monthly_budget_usd=20,
+            max_inflight=1,
+        )
+
+    completed = registry.complete_replica_action(
+        claimed["id"], target_manifest_id="sha256:" + "7" * 64
+    )
+    assert completed["status"] == "completed"
+    assert registry.claim_replica_action(
+        recommendation, monthly_budget_usd=20, max_inflight=1
+    )["duplicate_suppressed"] is True
+    assert registry.expire_replica_action(claimed["id"])["status"] == "expired"
+
+
+def test_replica_action_rejects_unknown_cost_budget_and_expiry(tmp_path):
+    registry = CacheRegistry(tmp_path / "queue.db")
+    source = add_volume(registry, "source-provider-volume", "A")
+    target = add_volume(registry, "target-provider-volume", "B")
+    manifest = add_manifest(registry, source, fingerprint({"profile": "bounds"}))
+
+    with pytest.raises(ValueError, match="known copy cost"):
+        registry.claim_replica_action(
+            action_recommendation(
+                source, target, manifest, estimated_copy_cost_usd=None
+            ),
+            monthly_budget_usd=20,
+            max_inflight=1,
+        )
+    with pytest.raises(RuntimeError, match="budget"):
+        registry.claim_replica_action(
+            action_recommendation(
+                source, target, manifest, incremental_monthly_storage_cost_usd=5
+            ),
+            monthly_budget_usd=4,
+            max_inflight=1,
+        )
+    with pytest.raises(ValueError, match="expired"):
+        registry.claim_replica_action(
+            action_recommendation(
+                source,
+                target,
+                manifest,
+                expires_at="2020-01-01T00:00:00Z",
+            ),
+            monthly_budget_usd=20,
+            max_inflight=1,
+        )
+
+
+def test_shadow_accuracy_requires_mature_repeated_demand(tmp_path):
+    registry = CacheRegistry(tmp_path / "queue.db")
+    created = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    recommendations = []
+    for index in range(3):
+        recommendations.append(
+            {
+                "recommendation_id": "sha256:" + str(index + 1) * 64,
+                "profile_fingerprint": "sha256:" + str(index + 4) * 64,
+                "provider": "runpod",
+                "target_region": "B",
+                "expires_at": "2026-07-15T00:00:00Z",
+            }
+        )
+    registry.record_shadow_evaluation(
+        {
+            "schema": "cloud-offload.replication-shadow.v1",
+            "evaluation_id": "evaluation",
+            "created_at": created.isoformat().replace("+00:00", "Z"),
+            "recommendations": recommendations,
+        }
+    )
+    for index, recommendation in enumerate(recommendations):
+        registry.record_regional_demand(
+            job_id=f"followup-{index}",
+            profile_fingerprint=recommendation["profile_fingerprint"],
+            provider="runpod",
+            datacenter_id="B",
+            prepared_volume_id=None,
+            required_bytes=100,
+            cached_bytes=0,
+            missing_bytes=100,
+            preparation_seconds=30,
+            hourly_rate=1,
+        )
+    with registry._connect() as connection:
+        connection.execute(
+            "UPDATE regional_cache_demand SET created_at='2026-07-02T00:00:00Z'"
+        )
+    policy = replication_policy(
+        replication={
+            "shadow_required_recommendations": 3,
+            "shadow_validation_hours": 24,
+            "shadow_min_precision": 0.8,
+        }
+    )
+
+    accuracy = shadow_accuracy(
+        registry,
+        policy,
+        now=datetime(2026, 7, 3, tzinfo=timezone.utc),
+    )
+
+    assert accuracy["mature_recommendation_count"] == 3
+    assert accuracy["validated_recommendation_count"] == 3
+    assert accuracy["precision"] == 1
+    assert accuracy["automation_gate_passed"] is True
+
+
+def test_execute_route_copies_once_and_suppresses_duplicate(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        queue_db_path=tmp_path / "queue.db",
+        prepared_storage=replication_policy(),
+    )
+    registry = CacheRegistry(config.queue_db_path)
+    source = add_volume(registry, "source-provider-volume", "A")
+    add_volume(registry, "target-provider-volume", "B")
+    profile = fingerprint({"profile": "route"})
+    add_manifest(registry, source, profile)
+    record_demand(registry, profile)
+    report = build_shadow_report(registry, config.prepared_storage)
+    recommendation = report["recommendations"][0]
+    calls = []
+
+    async def copy(config, registry, source, target, manifest_id):
+        calls.append(manifest_id)
+        return {
+            "source_manifest_id": manifest_id,
+            "target_manifest_id": "sha256:" + "6" * 64,
+            "target_generation": "generation",
+            "bytes": recommendation["bytes"],
+            "artifact_count": 1,
+        }
+
+    monkeypatch.setattr(server, "_config", lambda **kwargs: config)
+    monkeypatch.setattr(server, "_copy_cache_manifest", copy)
+    client = TestClient(server.app)
+
+    unconfirmed = client.post(
+        "/api/cache/replication/execute",
+        json={"recommendation_id": recommendation["recommendation_id"]},
+    )
+    first = client.post(
+        "/api/cache/replication/execute",
+        json={
+            "recommendation_id": recommendation["recommendation_id"],
+            "confirmed": True,
+        },
+    )
+    duplicate = client.post(
+        "/api/cache/replication/execute",
+        json={
+            "recommendation_id": recommendation["recommendation_id"],
+            "confirmed": True,
+        },
+    )
+
+    assert unconfirmed.status_code == 409
+    assert first.status_code == 200
+    assert first.json()["status"] == "completed"
+    assert duplicate.status_code == 200
+    assert duplicate.json()["duplicate_suppressed"] is True
+    assert calls == [recommendation["source_manifest_id"]]
+
+
+def test_expiry_route_unpublishes_target_and_keeps_source(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        queue_db_path=tmp_path / "queue.db",
+        prepared_storage=replication_policy(),
+    )
+    registry = CacheRegistry(config.queue_db_path)
+    source = add_volume(registry, "source-provider-volume", "A")
+    target = add_volume(registry, "target-provider-volume", "B")
+    profile = fingerprint({"profile": "expiry"})
+    source_manifest = add_manifest(registry, source, profile, b"source")
+    target_manifest = add_manifest(registry, target, profile, b"replica")
+    action = registry.claim_replica_action(
+        action_recommendation(source, target, source_manifest),
+        monthly_budget_usd=20,
+        max_inflight=1,
+    )
+    registry.complete_replica_action(
+        action["id"], target_manifest_id=target_manifest["manifest_id"]
+    )
+    with registry._connect() as connection:
+        connection.execute(
+            "UPDATE regional_replica_actions SET expires_at='2020-01-01T00:00:00Z'"
+        )
+
+    class ExpiryStore:
+        def __init__(self):
+            self.removed = []
+
+        def remove_manifest(self, manifest_id, signer, *, manifest):
+            self.removed.append(manifest_id)
+            return {"manifests": 1, "objects": 1}
+
+        def load_index(self):
+            return {
+                "schema": "cloud-offload.prepared-state.index.v1",
+                "generation": "after-expiry",
+                "manifests": [],
+            }
+
+    store = ExpiryStore()
+    monkeypatch.setattr(server, "_config", lambda **kwargs: config)
+    monkeypatch.setattr(server, "_cache_connector", lambda *args: object())
+    monkeypatch.setattr(server, "_runpod_s3_store", lambda *args: store)
+    monkeypatch.setattr(
+        server, "_prepared_manifest_signer", lambda config: ManifestSigner(b"x" * 32)
+    )
+    client = TestClient(server.app)
+
+    response = client.post("/api/cache/replication/expire")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["failures"] == []
+    assert body["source_state_deleted"] is False
+    assert body["provider_gpu_mutation"] is False
+    assert len(body["expired"]) == 1
+    assert body["expired"][0]["status"] == "expired"
+    assert store.removed == [target_manifest["manifest_id"]]
+    assert registry.get_manifest(source.id, source_manifest["manifest_id"])
+    assert registry.get_manifest(target.id, target_manifest["manifest_id"]) is None
+
+
+def test_automatic_route_stays_locked_before_shadow_accuracy(tmp_path, monkeypatch):
+    policy = replication_policy(replication={"mode": "automatic"})
+    config = SimpleNamespace(
+        queue_db_path=tmp_path / "queue.db",
+        prepared_storage=policy,
+    )
+    registry = CacheRegistry(config.queue_db_path)
+    source = add_volume(registry, "source-provider-volume", "A")
+    add_volume(registry, "target-provider-volume", "B")
+    profile = fingerprint({"profile": "automatic-gate"})
+    add_manifest(registry, source, profile)
+    record_demand(registry, profile)
+    recommendation = build_shadow_report(registry, policy)["recommendations"][0]
+    monkeypatch.setattr(server, "_config", lambda **kwargs: config)
+    client = TestClient(server.app)
+
+    response = client.post(
+        "/api/cache/replication/execute",
+        json={"recommendation_id": recommendation["recommendation_id"]},
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["error"]["details"]["detail"]
+    assert detail["code"] == "cloud_offload.replication_shadow_gate"
+    assert detail["accuracy"]["automation_gate_passed"] is False
+    assert registry.list_replica_actions() == []
