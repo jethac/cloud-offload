@@ -658,6 +658,53 @@ def test_request_cannot_loosen_configured_cost_or_region_limits(tmp_path):
     assert connector.offer_reads == 0
 
 
+def test_request_region_limit_queries_cold_stock_in_that_region(tmp_path):
+    config = config_for_preflight(tmp_path)
+
+    class RegionalConnector(ReadOnlyConnector):
+        def __init__(self):
+            super().__init__()
+            self.placements = []
+
+        def list_available(
+            self,
+            gpu_type=None,
+            min_gpu_ram=None,
+            max_hourly_rate=None,
+            placement=None,
+        ):
+            self.placements.append(placement)
+            offers = super().list_available(
+                gpu_type=gpu_type,
+                min_gpu_ram=min_gpu_ram,
+                max_hourly_rate=max_hourly_rate,
+                placement=placement,
+            )
+            return [
+                {**offer, "datacenter_ids": list(placement.datacenter_ids)}
+                for offer in offers
+            ]
+
+    connector = RegionalConnector()
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        allowed_regions=["EU-RO-1"],
+        storage=LocalStorage(config.storage_path),
+        cache_registry=CacheRegistry(config.queue_db_path),
+        connector_factory=lambda *args: connector,
+    )
+
+    assert report["status"] == "ready"
+    assert report["candidates"][0]["region"] == "EU-RO-1"
+    assert report["recommendation"]["candidate_id"] == report["candidates"][0][
+        "candidate_id"
+    ]
+    assert connector.placements[0].datacenter_ids == ("EU-RO-1",)
+    assert connector.mutations == []
+
+
 def test_paid_partition_waits_for_confirmation_without_creating_a_job(
     monkeypatch, tmp_path
 ):

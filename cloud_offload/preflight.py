@@ -943,10 +943,16 @@ def build_partition_preflight(
                 tuple[dict[str, Any], CacheVolume | None, int, bool]
             ] = []
             try:
+                cold_constraints = (
+                    PlacementConstraints(datacenter_ids=tuple(region_allowlist))
+                    if region_allowlist
+                    else None
+                )
                 for offer in connector.list_available(
                     gpu_type=gpu_type,
                     min_gpu_ram=minimum_vram,
                     max_hourly_rate=rate_limit,
+                    placement=cold_constraints,
                 ):
                     provider_candidates.append((offer, None, 0, False))
             except Exception as exc:  # noqa: BLE001
