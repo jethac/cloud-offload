@@ -1677,12 +1677,62 @@ def test_s3_verified_download_uses_bounded_ranges(monkeypatch, tmp_path):
     store.download_verified(artifact["storage_key"], artifact["digest"], destination)
 
     assert destination.read_bytes() == payload
-    assert client.ranges == [
-        "bytes=0-4",
-        "bytes=5-9",
-        "bytes=10-14",
-        "bytes=15-19",
-    ]
+    assert client.ranges[0] == "bytes=0-4"
+    assert sorted(client.ranges[1:]) == sorted(
+        [
+            "bytes=5-9",
+            "bytes=10-14",
+            "bytes=15-15",
+        ]
+    )
+
+
+def test_s3_verified_download_reads_ranges_concurrently(monkeypatch, tmp_path):
+    monkeypatch.setattr(prepared_state_module, "S3_VERIFICATION_RANGE_BYTES", 5)
+    monkeypatch.setattr(prepared_state_module, "S3_DOWNLOAD_CONCURRENCY", 3)
+
+    class ConcurrentRangeS3(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.active = 0
+            self.maximum_active = 0
+            self.concurrent_entries = 0
+            self.active_lock = threading.Lock()
+            self.first_batch = threading.Barrier(3, timeout=2)
+
+        def get_object(self, Bucket, Key, Range=None):
+            if Range == "bytes=0-4" or Range is None:
+                return super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+            with self.active_lock:
+                self.active += 1
+                self.maximum_active = max(self.maximum_active, self.active)
+                self.concurrent_entries += 1
+                entry = self.concurrent_entries
+            try:
+                if entry <= 3:
+                    self.first_batch.wait()
+                return super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+            finally:
+                with self.active_lock:
+                    self.active -= 1
+
+    client = ConcurrentRangeS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=client,
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    payload = b"0123456789abcdefghijklmnop"
+    artifact = portable_artifact(payload)
+    client.objects[store._key(artifact["storage_key"])] = payload
+    destination = tmp_path / "parallel-bundle"
+
+    store.download_verified(artifact["storage_key"], artifact["digest"], destination)
+
+    assert destination.read_bytes() == payload
+    assert client.maximum_active == 3
 
 
 def test_s3_verified_download_retries_runpod_524(monkeypatch, tmp_path):
