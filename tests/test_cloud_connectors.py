@@ -470,6 +470,20 @@ def test_connectors_normalize_account_balances():
     assert runpod["current_spend_per_hour"] == 0.4
 
 
+def test_runpod_balance_is_unavailable_once_graphql_is_retired():
+    http = FakeHttp(
+        FakeResponse(
+            {"title": "Gone", "detail": "The GraphQL API has been retired"},
+            status_code=410,
+        )
+    )
+
+    balance = RunPodConnector(api_key="secret", http_client=http).account_balance()
+
+    assert balance["available"] is False
+    assert "retired" in balance["error"]
+
+
 def test_cloud_config_loads_runpod_without_exposing_secret(monkeypatch):
     monkeypatch.setenv("CLOUD_OFFLOAD_PROVIDER", "runpod")
     monkeypatch.setenv("RUNPOD_API_KEY", "runpod-secret")

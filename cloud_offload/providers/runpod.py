@@ -134,6 +134,13 @@ class RunPodConnector(CloudConnector):
             json={"query": query, "variables": variables or {}},
             timeout=30,
         )
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        # RunPod retires GraphQL in early 2027 with a 410 whose body names the
+        # replacement; surface that verbatim instead of a bare HTTP error.
+        if status_code == 410:
+            raise RunPodApiError(
+                self._problem_message(response, status_code), status_code=410
+            )
         response.raise_for_status()
         payload = response.json()
         errors = payload.get("errors") or []
@@ -548,8 +555,24 @@ class RunPodConnector(CloudConnector):
             )
 
     def account_balance(self) -> dict:
-        """Return RunPod account balance and current hourly spend."""
-        account = self._graphql(ACCOUNT_QUERY).get("myself") or {}
+        """Return RunPod account balance and current hourly spend.
+
+        REST v2 publishes spend (``/v2/billing``) but no credit balance, so this
+        is the connector's last GraphQL call. Once GraphQL is retired the
+        balance is reported as unavailable rather than failing the whole
+        credentials probe, which otherwise only needs REST.
+        """
+        try:
+            data = self._graphql(ACCOUNT_QUERY)
+        except RunPodApiError as exc:
+            if exc.status_code != 410:
+                raise
+            return {
+                "available": False,
+                "currency": "USD",
+                "error": str(exc),
+            }
+        account = data.get("myself") or {}
         return {
             "available": True,
             "currency": "USD",

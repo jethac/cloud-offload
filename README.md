@@ -131,7 +131,10 @@ Provisioning, GPU/datacenter discovery, and network volumes use RunPod's
 [REST API v2](https://docs.runpod.io/api-reference-v2/migrate-from-v1)
 (`RUNPOD_REST_URL`, default `https://api.runpod.io/v2`); only the account
 balance still comes from GraphQL (`RUNPOD_GRAPHQL_URL`), which v2 does not
-expose. Network volumes are 10 GB at minimum, per the v2 schema.
+expose: `/v2/billing` reports spend, not remaining credit. RunPod retires
+GraphQL in early 2027, after which the balance reads as unavailable and the
+rest of the connector keeps working. Network volumes are 10 GB at minimum, per
+the v2 schema.
 
 ### Vast.ai (the "add a provider" example)
 
