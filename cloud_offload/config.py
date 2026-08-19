@@ -20,6 +20,8 @@ DEFAULT_WORKER_MANIFEST = "/opt/cloud-offload/runtime-profile.json"
 # credentials module reads this attribute, so tests can redirect it.
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 RUNPOD_NETWORK_VOLUME_MAX_GB = 4000
+# RunPod's REST v2 network-volume schema rejects anything smaller.
+RUNPOD_NETWORK_VOLUME_MIN_GB = 10
 
 
 def estimate_runpod_storage_monthly(size_gb: int | float) -> float:
@@ -264,8 +266,11 @@ def normalized_prepared_storage(value: Any) -> dict[str, Any]:
     if not result["tenant"]:
         raise ValueError("prepared_storage.tenant cannot be empty")
     result["managed_size_gb"] = int(result["managed_size_gb"])
-    if result["managed_size_gb"] < 1:
-        raise ValueError("prepared_storage.managed_size_gb must be at least 1")
+    if result["managed_size_gb"] < RUNPOD_NETWORK_VOLUME_MIN_GB:
+        raise ValueError(
+            "prepared_storage.managed_size_gb must be at least "
+            f"{RUNPOD_NETWORK_VOLUME_MIN_GB}"
+        )
     if result["managed_size_gb"] > RUNPOD_NETWORK_VOLUME_MAX_GB:
         raise ValueError(
             f"prepared_storage.managed_size_gb cannot exceed {RUNPOD_NETWORK_VOLUME_MAX_GB}"
@@ -415,7 +420,9 @@ class CloudConfig:
         )
     )
     runpod_rest_url: str = field(
-        default_factory=lambda: os.environ.get("RUNPOD_REST_URL", "https://rest.runpod.io/v1")
+        default_factory=lambda: os.environ.get(
+            "RUNPOD_REST_URL", "https://api.runpod.io/v2"
+        )
     )
     runpod_cloud_type: Literal["SECURE", "COMMUNITY"] = "SECURE"
     runpod_container_disk_gb: int = 20
@@ -662,7 +669,9 @@ class CloudConfig:
             runpod_graphql_url=os.environ.get(
                 "RUNPOD_GRAPHQL_URL", "https://api.runpod.io/graphql"
             ),
-            runpod_rest_url=os.environ.get("RUNPOD_REST_URL", "https://rest.runpod.io/v1"),
+            runpod_rest_url=os.environ.get(
+                "RUNPOD_REST_URL", "https://api.runpod.io/v2"
+            ),
             runpod_cloud_type=os.environ.get("RUNPOD_CLOUD_TYPE", "SECURE").upper(),
             runpod_container_disk_gb=int(os.environ.get("RUNPOD_CONTAINER_DISK_GB", "20")),
             runpod_volume_gb=int(os.environ.get("RUNPOD_VOLUME_GB", "0")),

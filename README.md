@@ -127,6 +127,12 @@ export RUNPOD_CLOUD_TYPE=SECURE       # or COMMUNITY
 export RUNPOD_REGISTRY_AUTH_ID=...    # required to pull a private GHCR runner image
 ```
 
+Provisioning, GPU/datacenter discovery, and network volumes use RunPod's
+[REST API v2](https://docs.runpod.io/api-reference-v2/migrate-from-v1)
+(`RUNPOD_REST_URL`, default `https://api.runpod.io/v2`); only the account
+balance still comes from GraphQL (`RUNPOD_GRAPHQL_URL`), which v2 does not
+expose. Network volumes are 10 GB at minimum, per the v2 schema.
+
 ### Vast.ai (the "add a provider" example)
 
 Vast.ai is the worked example of adding an alternative provider. Set its key and

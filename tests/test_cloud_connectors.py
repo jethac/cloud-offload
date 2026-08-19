@@ -14,6 +14,7 @@ from cloud_offload.providers.base import (
     PlacementConstraints,
     PlacementError,
 )
+from cloud_offload.providers.runpod import RunPodApiError
 from cloud_offload.providers.runpod import RunPodConnector
 
 
@@ -100,32 +101,24 @@ def test_runpod_gpu_discovery_normalizes_and_filters_offers():
     http = FakeHttp(
         FakeResponse(
             {
-                "data": {
-                    "gpuTypes": [
-                        {
-                            "id": "NVIDIA GeForce RTX 4090",
-                            "displayName": "RTX 4090",
-                            "memoryInGb": 24,
-                            "secureCloud": True,
-                            "communityCloud": True,
-                            "lowestPrice": {
-                                "minimumBidPrice": 0.30,
-                                "uninterruptablePrice": 0.44,
-                            },
-                        },
-                        {
-                            "id": "NVIDIA A100 80GB PCIe",
-                            "displayName": "A100 PCIe",
-                            "memoryInGb": 80,
-                            "secureCloud": True,
-                            "communityCloud": True,
-                            "lowestPrice": {
-                                "minimumBidPrice": 1.19,
-                                "uninterruptablePrice": 1.19,
-                            },
-                        },
-                    ]
-                }
+                "gpus": [
+                    {
+                        "id": "NVIDIA GeForce RTX 4090",
+                        "name": "RTX 4090",
+                        "memory": 24,
+                        "secure": True,
+                        "community": True,
+                        "price": {"secure": 0.44, "community": 0.31},
+                    },
+                    {
+                        "id": "NVIDIA A100 80GB PCIe",
+                        "name": "A100 PCIe",
+                        "memory": 80,
+                        "secure": True,
+                        "community": True,
+                        "price": {"secure": 1.19, "community": 1.19},
+                    },
+                ]
             }
         )
     )
@@ -144,80 +137,105 @@ def test_runpod_gpu_discovery_normalizes_and_filters_offers():
             "cloud_type": "SECURE",
             "raw": {
                 "id": "NVIDIA GeForce RTX 4090",
-                "displayName": "RTX 4090",
-                "memoryInGb": 24,
-                "secureCloud": True,
-                "communityCloud": True,
-                "lowestPrice": {
-                    "minimumBidPrice": 0.30,
-                    "uninterruptablePrice": 0.44,
-                },
+                "name": "RTX 4090",
+                "memory": 24,
+                "secure": True,
+                "community": True,
+                "price": {"secure": 0.44, "community": 0.31},
             },
         }
     ]
-    assert http.requests[0][2]["json"]["variables"] == {"secureCloud": True}
+    method, url, kwargs = http.requests[0]
+    assert (method, url) == ("GET", "https://api.runpod.io/v2/catalog/gpus")
+    assert kwargs["params"] == {
+        "include": "AVAILABILITY",
+        "product": "POD",
+        "cloud": "SECURE",
+        "count": 1,
+    }
 
 
 def test_runpod_community_gpu_discovery_requests_community_price():
-    http = FakeHttp(FakeResponse({"data": {"gpuTypes": []}}))
+    http = FakeHttp(
+        FakeResponse(
+            {
+                "gpus": [
+                    {
+                        "id": "NVIDIA GeForce RTX 4090",
+                        "name": "RTX 4090",
+                        "memory": 24,
+                        "secure": True,
+                        "community": True,
+                        "price": {"secure": 0.44, "community": 0.31},
+                    }
+                ]
+            }
+        )
+    )
+    connector = RunPodConnector(
+        api_key="secret", cloud_type="COMMUNITY", http_client=http
+    )
+
+    offers = connector.list_available()
+
+    assert [offer["hourly_rate"] for offer in offers] == [0.31]
+    assert http.requests[0][2]["params"]["cloud"] == "COMMUNITY"
+
+
+def test_runpod_community_discovery_skips_secure_only_gpus():
+    http = FakeHttp(
+        FakeResponse(
+            {
+                "gpus": [
+                    {
+                        "id": "NVIDIA H100 80GB HBM3",
+                        "name": "H100 SXM",
+                        "memory": 80,
+                        "secure": True,
+                        "community": False,
+                        "price": {"secure": 2.69},
+                    }
+                ]
+            }
+        )
+    )
     connector = RunPodConnector(
         api_key="secret", cloud_type="COMMUNITY", http_client=http
     )
 
     assert connector.list_available() == []
-    assert http.requests[0][2]["json"]["variables"] == {"secureCloud": False}
 
 
 def test_runpod_storage_placement_only_returns_stock_in_requested_datacenter():
-    gpu_types = {
-        "data": {
-            "gpuTypes": [
-                {
-                    "id": "NVIDIA RTX 2000 Ada Generation",
-                    "displayName": "RTX 2000 Ada",
-                    "memoryInGb": 16,
-                    "secureCloud": True,
-                    "communityCloud": False,
-                    "lowestPrice": {"uninterruptablePrice": 0.24},
-                },
-                {
-                    "id": "NVIDIA A100-SXM4-80GB",
-                    "displayName": "A100 SXM",
-                    "memoryInGb": 80,
-                    "secureCloud": True,
-                    "communityCloud": False,
-                    "lowestPrice": {"uninterruptablePrice": 1.49},
-                },
-            ]
-        }
-    }
     data_centers = {
-        "data": {
-            "dataCenters": [
-                {
-                    "id": "US-MD-1",
-                    "gpuAvailability": [
-                        {
-                            "gpuTypeId": "NVIDIA RTX 2000 Ada Generation",
-                            "stockStatus": None,
-                        },
-                        {
-                            "gpuTypeId": "NVIDIA A100-SXM4-80GB",
-                            "stockStatus": "Low",
-                        },
-                    ],
-                },
-                {
-                    "id": "US-GA-2",
-                    "gpuAvailability": [
-                        {
-                            "gpuTypeId": "NVIDIA RTX 2000 Ada Generation",
-                            "stockStatus": "High",
-                        }
-                    ],
-                },
-            ]
-        }
+        "dataCenters": [{"id": "US-MD-1"}, {"id": "US-GA-2"}]
+    }
+    gpu_types = {
+        "gpus": [
+            {
+                "id": "NVIDIA RTX 2000 Ada Generation",
+                "name": "RTX 2000 Ada",
+                "memory": 16,
+                "secure": True,
+                "community": False,
+                "price": {"secure": 0.24},
+                "availability": "HIGH",
+                "dataCenters": [
+                    {"id": "US-MD-1", "availability": "NONE"},
+                    {"id": "US-GA-2", "availability": "HIGH"},
+                ],
+            },
+            {
+                "id": "NVIDIA A100-SXM4-80GB",
+                "name": "A100 SXM",
+                "memory": 80,
+                "secure": True,
+                "community": False,
+                "price": {"secure": 1.49},
+                "availability": "LOW",
+                "dataCenters": [{"id": "US-MD-1", "availability": "LOW"}],
+            },
+        ]
     }
     http = FakeHttp(FakeResponse(data_centers), FakeResponse(gpu_types))
     connector = RunPodConnector(api_key="secret", http_client=http)
@@ -228,15 +246,19 @@ def test_runpod_storage_placement_only_returns_stock_in_requested_datacenter():
 
     assert [offer["id"] for offer in offers] == ["NVIDIA A100-SXM4-80GB"]
     assert offers[0]["datacenter_stock"] == [
-        {"datacenter_id": "US-MD-1", "stock_status": "Low"}
+        {"datacenter_id": "US-MD-1", "stock_status": "LOW"}
     ]
+    assert http.requests[0][0:2] == (
+        "GET",
+        "https://api.runpod.io/v2/catalog/datacenters",
+    )
 
 
-def test_runpod_storage_placement_rejects_unknown_datacenter_stock():
-    http = FakeHttp(FakeResponse({"data": {"dataCenters": []}}))
+def test_runpod_storage_placement_rejects_unknown_datacenter():
+    http = FakeHttp(FakeResponse({"dataCenters": [{"id": "US-KS-2"}]}))
     connector = RunPodConnector(api_key="secret", http_client=http)
 
-    with pytest.raises(PlacementError, match="did not report current GPU stock"):
+    with pytest.raises(PlacementError, match="does not offer datacenter"):
         connector.list_available(
             placement=PlacementConstraints(datacenter_ids=("US-OLD-1",))
         )
@@ -244,33 +266,22 @@ def test_runpod_storage_placement_rejects_unknown_datacenter_stock():
 
 def test_runpod_launch_passes_worker_environment_and_startup_script():
     http = FakeHttp(
-        FakeResponse(
-            {
-                "data": {
-                    "podFindAndDeployOnDemand": {
-                        "id": "pod-1",
-                        "desiredStatus": "CREATED",
-                    }
-                }
-            }
-        ),
+        FakeResponse({"id": "pod-1", "status": "PROVISIONING"}),
         FakeResponse(
             {
                 "id": "pod-1",
                 "name": "cloud-offload-worker-test",
-                "desiredStatus": "RUNNING",
-                "gpuTypeId": "NVIDIA GeForce RTX 4090",
-                "gpuCount": 1,
-                "costPerHr": 0.44,
-                "runtime": {
-                    "ports": [
-                        {
-                            "ip": "203.0.113.10",
-                            "isIpPublic": True,
-                            "privatePort": 22,
-                            "publicPort": 22022,
-                        }
-                    ]
+                "status": "RUNNING",
+                "image": "pytorch/image:latest",
+                "gpu": {"id": "NVIDIA GeForce RTX 4090", "count": 1},
+                "cost": 0.44,
+                "dataCenterId": "US-KS-2",
+                "ssh": {
+                    "direct": {
+                        "host": "203.0.113.10",
+                        "port": 22022,
+                        "username": "root",
+                    }
                 },
             }
         ),
@@ -290,16 +301,71 @@ def test_runpod_launch_passes_worker_environment_and_startup_script():
         startup_script="cloud-offload worker --poll 10\n",
     )
 
-    create_body = http.requests[0][2]["json"]
-    pod_input = create_body["variables"]["input"]
-    encoded_script = pod_input["dockerArgs"].split("echo ", 1)[1].split(" ", 1)[0]
+    assert http.requests[0][0:2] == ("POST", "https://api.runpod.io/v2/pods")
+    pod_input = http.requests[0][2]["json"]
+    encoded_script = pod_input["args"].split("echo ", 1)[1].split(" ", 1)[0]
     assert base64.b64decode(encoded_script).decode() == "cloud-offload worker --poll 10\n"
-    assert pod_input["env"] == [{"key": "CLOUD_OFFLOAD_WORKER_MODE", "value": "true"}]
-    assert pod_input["gpuTypeId"] == "NVIDIA GeForce RTX 4090"
-    assert pod_input["containerRegistryAuthId"] == "registry-auth-1"
+    assert pod_input["env"] == {"CLOUD_OFFLOAD_WORKER_MODE": "true"}
+    assert pod_input["gpu"] == {"id": "NVIDIA GeForce RTX 4090", "count": 1}
+    assert pod_input["image"] == "pytorch/image:latest"
+    assert pod_input["cloud"] == "SECURE"
+    assert pod_input["disk"] == 20
+    assert pod_input["ports"] == ["22/tcp"]
+    assert pod_input["startSsh"] is True
+    assert pod_input["registry"] == "registry-auth-1"
+    assert "mounts" not in pod_input
     assert instance.status == "running"
+    assert instance.gpu_type == "NVIDIA GeForce RTX 4090"
+    assert instance.hourly_rate == 0.44
     assert instance.ip_address == "203.0.113.10"
     assert instance.ssh_port == 22022
+    assert instance.metadata["location"] == "US-KS-2"
+
+
+def test_runpod_launch_reads_ssh_endpoint_from_runtime_ports():
+    http = FakeHttp(
+        FakeResponse({"id": "pod-2", "status": "STARTING"}),
+        FakeResponse(
+            {
+                "id": "pod-2",
+                "status": "RUNNING",
+                "gpu": {"id": "NVIDIA A40", "count": 1},
+                "runtime": {
+                    "ports": [
+                        {
+                            "private": 22,
+                            "public": 34446,
+                            "type": "tcp",
+                            "ip": "203.0.113.20",
+                        }
+                    ]
+                },
+            }
+        ),
+    )
+    connector = RunPodConnector(
+        api_key="secret", http_client=http, launch_timeout=1, poll_interval=0
+    )
+
+    instance = connector.launch("NVIDIA A40", "pytorch/image:latest")
+
+    assert (instance.ip_address, instance.ssh_port) == ("203.0.113.20", 34446)
+
+
+def test_runpod_launch_reports_v2_problem_details():
+    http = FakeHttp(
+        FakeResponse(
+            {
+                "title": "Unprocessable Entity",
+                "detail": "gpu.id is not available",
+            },
+            status_code=422,
+        )
+    )
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    with pytest.raises(RunPodApiError, match="422: Unprocessable Entity: gpu.id"):
+        connector.launch("NVIDIA A40", "pytorch/image:latest")
 
 
 def test_runpod_refuses_private_ghcr_image_before_renting_pod():
@@ -320,15 +386,22 @@ def test_runpod_refuses_private_ghcr_image_before_renting_pod():
 def test_runpod_lifecycle_uses_rest_api():
     http = FakeHttp(
         FakeResponse(
-            [
-                {
-                    "id": "pod-running",
-                    "desiredStatus": "RUNNING",
-                    "gpuTypeId": "NVIDIA A40",
-                    "gpuCount": 1,
-                },
-                {"id": "pod-exited", "desiredStatus": "EXITED"},
-            ]
+            {
+                "pods": [
+                    {
+                        "id": "pod-running",
+                        "status": "RUNNING",
+                        "gpu": {"id": "NVIDIA A40", "count": 1},
+                    },
+                    {"id": "pod-exited", "status": "EXITED", "gpu": {"id": "NVIDIA A40"}},
+                    {
+                        "id": "pod-error",
+                        "status": "ERROR",
+                        "gpu": {"id": "NVIDIA A40"},
+                    },
+                    {"id": "pod-cpu", "status": "RUNNING", "cpu": {"id": "cpu3c-2-4"}},
+                ]
+            }
         ),
         FakeResponse(None, status_code=204),
     )
@@ -341,12 +414,40 @@ def test_runpod_lifecycle_uses_rest_api():
     assert terminated is True
     assert http.requests[0][0:2] == (
         "GET",
-        "https://rest.runpod.io/v1/pods",
+        "https://api.runpod.io/v2/pods",
     )
     assert http.requests[1][0:2] == (
         "DELETE",
-        "https://rest.runpod.io/v1/pods/pod-running",
+        "https://api.runpod.io/v2/pods/pod-running",
     )
+
+
+@pytest.mark.parametrize(
+    ("pod_status", "expected"),
+    [
+        ("PROVISIONING", "pending"),
+        ("STARTING", "pending"),
+        ("RUNNING", "running"),
+        ("EXITED", "stopped"),
+        ("ERROR", "stopped"),
+        ("TERMINATED", "terminated"),
+        ("SOMETHING_NEW", "unknown"),
+    ],
+)
+def test_runpod_maps_v2_pod_statuses(pod_status, expected):
+    http = FakeHttp(FakeResponse({"id": "pod-1", "status": pod_status}))
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    assert connector.get_instance("pod-1").status == expected
+
+
+def test_runpod_get_instance_returns_none_for_missing_pod():
+    http = FakeHttp(
+        FakeResponse({"title": "Not Found", "detail": "pod not found"}, status_code=404)
+    )
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    assert connector.get_instance("pod-gone") is None
 
 
 def test_connectors_normalize_account_balances():

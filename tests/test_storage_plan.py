@@ -568,7 +568,7 @@ def test_runpod_uses_the_planned_disk_for_its_pod():
     with pytest.raises(RuntimeError, match="stop before"):
         connector.launch(offer_id="gpu", docker_image="example/runner", disk_gb=140)
 
-    assert captured["variables"]["input"]["containerDiskInGb"] == 140
+    assert captured["disk"] == 140
 
 
 def test_runpod_falls_back_to_its_configured_disk():
@@ -586,7 +586,7 @@ def test_runpod_falls_back_to_its_configured_disk():
     with pytest.raises(RuntimeError, match="stop before"):
         connector.launch(offer_id="gpu", docker_image="example/runner")
 
-    assert captured["variables"]["input"]["containerDiskInGb"] == 20
+    assert captured["disk"] == 20
 
 
 # ---------------------------------------------------------------------------
