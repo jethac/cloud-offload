@@ -725,18 +725,17 @@ class Http:
 
 
 def test_runpod_storage_crud_and_storage_aware_rest_launch():
-    volume = {"id": "vol-1", "name": "cache", "size": 250, "dataCenterId": "US-KS-2"}
+    volume = {"id": "vol-1", "name": "cache", "size": 250, "dataCenter": "US-KS-2"}
     http = Http(
         Response(volume),
-        Response({"id": "pod-1", "desiredStatus": "CREATED"}, status=201),
+        Response({"id": "pod-1", "status": "PROVISIONING"}, status=201),
         Response(
             {
                 "id": "pod-1",
-                "desiredStatus": "RUNNING",
-                "gpuTypeId": "gpu",
-                "gpuCount": 1,
-                "costPerHr": 0.5,
-                "machine": {"dataCenterId": "US-KS-2"},
+                "status": "RUNNING",
+                "gpu": {"id": "gpu", "count": 1},
+                "cost": 0.5,
+                "dataCenterId": "US-KS-2",
             }
         ),
     )
@@ -750,16 +749,53 @@ def test_runpod_storage_crud_and_storage_aware_rest_launch():
     instance = connector.launch(
         "gpu", "example/runner", env_vars={"X": "1"}, placement=placement
     )
+    assert http.calls[0][:2] == (
+        "GET",
+        "https://api.runpod.io/v2/network-volumes/vol-1",
+    )
     create = http.calls[1]
-    assert create[:2] == ("POST", "https://rest.runpod.io/v1/pods")
-    assert create[2]["json"]["networkVolumeId"] == "vol-1"
+    assert create[:2] == ("POST", "https://api.runpod.io/v2/pods")
+    assert create[2]["json"]["mounts"] == {
+        "network": [{"volumeId": "vol-1", "path": "/workspace"}]
+    }
     assert create[2]["json"]["dataCenterIds"] == ["US-KS-2"]
-    assert create[2]["json"]["volumeInGb"] == 0
     assert instance.id == "pod-1"
+    assert instance.hourly_rate == 0.5
+
+
+def test_runpod_network_volume_crud_uses_v2_paths_and_fields():
+    volume = {"id": "vol-9", "name": "cache", "size": 250, "dataCenter": "US-KS-2"}
+    http = Http(
+        Response({"networkVolumes": [volume]}),
+        Response(volume, status=201),
+        Response(None, status=204),
+    )
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    listed = connector.list_storage()
+    created = connector.create_storage(
+        name="cache", size_gb=250, datacenter_id="US-KS-2"
+    )
+    assert connector.delete_storage("vol-9") is True
+
+    assert [item.id for item in listed] == ["vol-9"]
+    assert listed[0].datacenter_id == "US-KS-2"
+    assert created.size_gb == 250
+    assert http.calls[0][:2] == ("GET", "https://api.runpod.io/v2/network-volumes")
+    assert http.calls[1][:2] == ("POST", "https://api.runpod.io/v2/network-volumes")
+    assert http.calls[1][2]["json"] == {
+        "name": "cache",
+        "size": 250,
+        "dataCenter": "US-KS-2",
+    }
+    assert http.calls[2][:2] == (
+        "DELETE",
+        "https://api.runpod.io/v2/network-volumes/vol-9",
+    )
 
 
 def test_runpod_refuses_wrong_dc_community_and_read_only_before_create():
-    wrong = Http(Response({"id": "vol", "size": 10, "dataCenterId": "EU-RO-1"}))
+    wrong = Http(Response({"id": "vol", "size": 10, "dataCenter": "EU-RO-1"}))
     connector = RunPodConnector(api_key="secret", http_client=wrong)
     placement = PlacementConstraints(
         datacenter_ids=("US-KS-2",),
@@ -781,11 +817,11 @@ def test_runpod_refuses_wrong_dc_community_and_read_only_before_create():
         connector.list_available(placement=readonly)
 
 
-@pytest.mark.parametrize("size", [0, 4001])
+@pytest.mark.parametrize("size", [0, 9, 4001])
 def test_runpod_rejects_invalid_network_volume_size_before_rest_call(size):
     http = Http()
     connector = RunPodConnector(api_key="secret", http_client=http)
-    with pytest.raises(ValueError, match="1-4000"):
+    with pytest.raises(ValueError, match="10-4000"):
         connector.create_storage(name="cache", size_gb=size, datacenter_id="US-KS-2")
     assert http.calls == []
 

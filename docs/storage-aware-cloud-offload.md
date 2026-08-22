@@ -31,8 +31,9 @@ and where it is located, prefers compute that can attach it, and gives every new
 worker a verified restore plan. The GPU remains disposable; the prepared bytes
 become a schedulable resource.
 
-For RunPod, the durable primitive is a **network volume**, not the existing Pod
-`volumeInGb`. A Pod volume survives stop/restart only while the Pod exists; the
+For RunPod, the durable primitive is a **network volume**, not a Pod's host-local
+`mounts.persistent`. A host-local volume survives stop/restart only while the Pod
+exists; the
 dispatcher permanently deletes idle Pods. A network volume exists independently,
 can be attached to later Pods in its datacenter, mounts at `/workspace`, and can
 be populated through RunPod's S3-compatible API without renting compute.
@@ -50,7 +51,7 @@ The current cold path has four avoidable properties:
    `/opt/ComfyUI/models`, on the disposable container disk.
 2. Custom-node checkouts and their Python requirements are recreated for a new
    runner unless baked into its image.
-3. The RunPod connector sets `volumeInGb` and `/workspace`, but no ComfyUI path
+3. The RunPod connector can mount host-local storage at `/workspace`, but no ComfyUI path
    or cache path uses that mount, and the volume is deleted with the Pod.
 4. Offer selection sees GPU type and price but not datacenter, attached storage,
    cached contents, or expected hydration time.
@@ -204,8 +205,8 @@ No volume is created until the user confirms this disclosure.
    population path.
 3. The scheduler limits or prefers compute offers in that datacenter according
    to policy.
-4. The connector creates the Pod with `networkVolumeId`; RunPod mounts it at
-   `/workspace` before the entrypoint runs.
+4. The connector creates the Pod with `mounts.network`; RunPod mounts the volume
+   at the requested path (`/workspace`) before the entrypoint runs.
 5. The runner reads the cache root and finds an empty or partial manifest.
 6. Missing portable artifacts are downloaded into an immutable staging prefix on
    the volume and verified by digest.
@@ -455,8 +456,8 @@ accepting an operator-provided attachment.
 
 1. Add network-volume list/get/create/delete operations through the official API.
 2. Include datacenter identity and storage compatibility in normalized offers.
-3. Pass `networkVolumeId` during Pod creation; do not confuse it with
-   `volumeInGb`.
+3. Pass `mounts.network[].volumeId` during Pod creation; do not confuse it with
+   the host-local `mounts.persistent`.
 4. Constrain launch to datacenters where the selected volume is attachable.
 5. Discover whether a volume/datacenter exposes the S3-compatible API instead of
    assuming every network-volume location supports coordinator-side prepopulation.
@@ -751,7 +752,7 @@ times without enabling durable storage.
 
 ### Phase 1 — manually adopted RunPod volume
 
-- Configure one existing `networkVolumeId` and datacenter.
+- Configure one existing network volume ID and datacenter.
 - Pass the attachment during launch.
 - Set `/workspace/cloud-offload` as the runner cache root.
 - Prepopulate one pinned model through RunPod's S3-compatible API.
@@ -839,8 +840,9 @@ The MVP is Phases 0 and 1, not the entire architecture.
 ### Connector contract
 
 - Fake RunPod responses for storage list/create/get/delete.
-- Pod creation includes `networkVolumeId` and datacenter constraints.
-- Pod `volumeInGb` remains distinct from network volume attachment.
+- Pod creation includes `mounts.network` and datacenter constraints.
+- A Pod's host-local `mounts.persistent` remains distinct from a network-volume
+  attachment.
 - No-capacity and wrong-datacenter errors are actionable.
 
 ### Integration
@@ -917,7 +919,8 @@ The MVP is Phases 0 and 1, not the entire architecture.
 - RunPod, [Storage options](https://docs.runpod.io/pods/storage/types)
 - RunPod, [Network volumes](https://docs.runpod.io/storage/network-volumes)
 - RunPod, [S3-compatible API](https://docs.runpod.io/storage/s3-api)
-- RunPod, [Create a Pod](https://docs.runpod.io/api-reference/pods/POST/pods)
+- RunPod, [Create a Pod](https://docs.runpod.io/api-reference-v2/pods/create-a-pod)
+- RunPod, [Migrate from API v1 to v2](https://docs.runpod.io/api-reference-v2/migrate-from-v1)
 - Current connector: `cloud_offload/providers/runpod.py`
 - Current storage abstraction: `cloud_offload/storage.py`
 - Current worker staging: `cloud_offload/worker.py`

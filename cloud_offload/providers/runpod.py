@@ -1,6 +1,8 @@
-"""RunPod cloud connector using the official REST and GraphQL APIs.
+"""RunPod cloud connector using the official REST API v2 and GraphQL.
 
-RunPod is the default Cloud Offload provider.
+RunPod is the default Cloud Offload provider. Everything the connector needs
+rides on REST v2 (``https://api.runpod.io/v2``) except the account balance,
+which v2 does not expose yet and still comes from GraphQL.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from urllib.parse import quote
 from urllib.parse import urlencode
 
 from cloud_offload.config import RUNPOD_NETWORK_VOLUME_MAX_GB
+from cloud_offload.config import RUNPOD_NETWORK_VOLUME_MIN_GB
 from cloud_offload.providers.base import (
     CloudConnector,
     Instance,
@@ -21,54 +24,6 @@ from cloud_offload.providers.base import (
     PlacementError,
     ProviderStorage,
 )
-
-GPU_TYPES_QUERY = """
-query CloudOffloadGpuTypes($secureCloud: Boolean) {
-  gpuTypes {
-    id
-    displayName
-    memoryInGb
-    secureCloud
-    communityCloud
-    lowestPrice(input: { gpuCount: 1, secureCloud: $secureCloud }) {
-      minimumBidPrice
-      uninterruptablePrice
-    }
-  }
-}
-"""
-
-
-DATA_CENTERS_QUERY = """
-query CloudOffloadDataCenterStock {
-  dataCenters {
-    id
-    gpuAvailability {
-      gpuTypeId
-      stockStatus
-    }
-  }
-}
-"""
-
-
-CREATE_POD_MUTATION = """
-mutation CloudOffloadCreatePod($input: PodFindAndDeployOnDemandInput!) {
-  podFindAndDeployOnDemand(input: $input) {
-    id
-    name
-    imageName
-    desiredStatus
-    costPerHr
-    gpuCount
-    memoryInGb
-    machine {
-      gpuDisplayName
-      location
-    }
-  }
-}
-"""
 
 ACCOUNT_QUERY = """
 query CloudOffloadAccountBalance {
@@ -80,6 +35,15 @@ query CloudOffloadAccountBalance {
 """
 
 _USER_AGENT = "cloud-offload-connector/0.1"
+
+# A pod created with a host-local persistent mount: v2 rejects anything under
+# 10 GB, so the connector refuses such a configuration before renting.
+RUNPOD_PERSISTENT_MOUNT_MIN_GB = 10
+
+# v2 reports stock as an AvailabilityLevel enum. Everything except NONE is
+# treated as placeable; the legacy GraphQL wordings stay in the set so an
+# unexpected string is still read conservatively.
+_UNAVAILABLE_STOCK = {"", "none", "unavailable", "out of stock", "no stock"}
 
 # RunPod publishes S3-compatible endpoints only for these datacenters. Keep
 # discovery explicit: fabricating an endpoint for another volume produces an
@@ -95,6 +59,14 @@ RUNPOD_S3_ENDPOINTS = {
 }
 
 
+class RunPodApiError(RuntimeError):
+    """A RunPod REST v2 error, carrying its RFC 9457 problem details."""
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class RunPodConnector(CloudConnector):
     """Provision Cloud Offload workers as RunPod GPU pods."""
 
@@ -103,7 +75,7 @@ class RunPodConnector(CloudConnector):
         api_key: str | None = None,
         *,
         graphql_url: str = "https://api.runpod.io/graphql",
-        rest_url: str = "https://rest.runpod.io/v1",
+        rest_url: str = "https://api.runpod.io/v2",
         cloud_type: str = "SECURE",
         container_disk_gb: int = 20,
         volume_gb: int = 0,
@@ -132,6 +104,11 @@ class RunPodConnector(CloudConnector):
         self.rest_url = rest_url.rstrip("/")
         self.cloud_type = cloud_type
         self.container_disk_gb = container_disk_gb
+        if 0 < int(volume_gb) < RUNPOD_PERSISTENT_MOUNT_MIN_GB:
+            raise ValueError(
+                "RunPod host-local volume must be 0 or at least "
+                f"{RUNPOD_PERSISTENT_MOUNT_MIN_GB} GB"
+            )
         self.volume_gb = volume_gb
         self.registry_auth_id = registry_auth_id.strip()
         self.launch_timeout = launch_timeout
@@ -157,6 +134,13 @@ class RunPodConnector(CloudConnector):
             json={"query": query, "variables": variables or {}},
             timeout=30,
         )
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        # RunPod retires GraphQL in early 2027 with a 410 whose body names the
+        # replacement; surface that verbatim instead of a bare HTTP error.
+        if status_code == 410:
+            raise RunPodApiError(
+                self._problem_message(response, status_code), status_code=410
+            )
         response.raise_for_status()
         payload = response.json()
         errors = payload.get("errors") or []
@@ -173,10 +157,41 @@ class RunPodConnector(CloudConnector):
             timeout=30,
             **kwargs,
         )
-        response.raise_for_status()
-        if response.status_code == 204 or not response.content:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code >= 400:
+            raise RunPodApiError(
+                self._problem_message(response, status_code),
+                status_code=status_code,
+            )
+        if status_code == 204 or not response.content:
             return None
         return response.json()
+
+    @staticmethod
+    def _problem_message(response: Any, status_code: int) -> str:
+        """Render a v2 RFC 9457 problem document as one loggable sentence."""
+        problem: Any = None
+        try:
+            problem = response.json()
+        except Exception:
+            problem = None
+        if not isinstance(problem, dict):
+            return f"RunPod API error {status_code}"
+        parts = [
+            str(problem.get("title") or "").strip(),
+            str(problem.get("detail") or problem.get("message") or "").strip(),
+        ]
+        violations = problem.get("errors")
+        if isinstance(violations, list) and violations:
+            parts.append("; ".join(str(item) for item in violations))
+        summary = ": ".join(part for part in parts if part)
+        return f"RunPod API error {status_code}" + (f": {summary}" if summary else "")
+
+    @staticmethod
+    def _status_code(exc: Exception) -> int | None:
+        if isinstance(exc, RunPodApiError):
+            return exc.status_code
+        return getattr(getattr(exc, "response", None), "status_code", None)
 
     def list_available(
         self,
@@ -187,63 +202,46 @@ class RunPodConnector(CloudConnector):
     ) -> list[dict]:
         """List normalized GPU types with current on-demand prices."""
         self._validate_cloud_placement(placement)
-        placement_stock: dict[str, list[dict[str, str]]] | None = None
-        if placement is not None and placement.datacenter_ids:
-            requested_datacenters = set(placement.datacenter_ids)
-            data_centers = self._graphql(DATA_CENTERS_QUERY).get("dataCenters", [])
-            reported_datacenters = {
-                str(item.get("id"))
-                for item in data_centers
-                if str(item.get("id")) in requested_datacenters
-            }
-            if reported_datacenters != requested_datacenters:
-                missing = sorted(requested_datacenters - reported_datacenters)
-                raise PlacementError(
-                    "RunPod did not report current GPU stock for datacenter(s) "
-                    f"{missing}"
-                )
-            placement_stock = {}
-            for data_center in data_centers:
-                datacenter_id = str(data_center.get("id") or "")
-                if datacenter_id not in requested_datacenters:
-                    continue
-                for availability in data_center.get("gpuAvailability") or []:
-                    stock_status = str(availability.get("stockStatus") or "").strip()
-                    if not self._stock_available(stock_status):
-                        continue
-                    gpu_id = str(availability.get("gpuTypeId") or "")
-                    if not gpu_id:
-                        continue
-                    placement_stock.setdefault(gpu_id, []).append(
-                        {
-                            "datacenter_id": datacenter_id,
-                            "stock_status": stock_status,
-                        }
-                    )
-        # RunPod reports different on-demand prices for Secure and Community
-        # Cloud.  Without this filter ``lowestPrice`` can quote the cheaper
-        # tier even though launch() explicitly requests the other one.
-        gpu_types = self._graphql(
-            GPU_TYPES_QUERY,
-            {"secureCloud": self.cloud_type == "SECURE"},
-        ).get("gpuTypes", [])
+        requested_datacenters = (
+            set(placement.datacenter_ids)
+            if placement is not None and placement.datacenter_ids
+            else set()
+        )
+        if requested_datacenters:
+            self._require_known_datacenters(requested_datacenters)
+        # The catalog quotes a price per cloud tier and reports stock only for
+        # the tier and product asked for, so both are stated: without them the
+        # cheaper tier can be quoted even though launch() requests the other.
+        gpu_types = (
+            self._rest(
+                "GET",
+                "catalog/gpus",
+                params={
+                    "include": "AVAILABILITY",
+                    "product": "POD",
+                    "cloud": self.cloud_type,
+                    "count": 1,
+                },
+            )
+            or {}
+        ).get("gpus") or []
+        price_key = "secure" if self.cloud_type == "SECURE" else "community"
         offers: list[dict] = []
         for gpu in gpu_types:
-            stock = placement_stock.get(str(gpu.get("id") or "")) if placement_stock is not None else None
-            if placement_stock is not None and not stock:
+            stock = self._datacenter_stock(gpu, requested_datacenters)
+            if requested_datacenters and not stock:
                 continue
             if gpu_type and not self._matches_gpu(gpu_type, gpu):
                 continue
-            memory_gb = int(gpu.get("memoryInGb") or 0)
+            memory_gb = int(gpu.get("memory") or 0)
             if min_gpu_ram is not None and memory_gb < min_gpu_ram:
                 continue
-            if self.cloud_type == "SECURE" and not gpu.get("secureCloud"):
+            if self.cloud_type == "SECURE" and not gpu.get("secure"):
                 continue
-            if self.cloud_type == "COMMUNITY" and not gpu.get("communityCloud"):
+            if self.cloud_type == "COMMUNITY" and not gpu.get("community"):
                 continue
 
-            prices = gpu.get("lowestPrice") or {}
-            hourly_rate = prices.get("uninterruptablePrice")
+            hourly_rate = (gpu.get("price") or {}).get(price_key)
             if hourly_rate is None:
                 continue
             hourly_rate = float(hourly_rate)
@@ -253,7 +251,7 @@ class RunPodConnector(CloudConnector):
             offer = {
                     "id": str(gpu["id"]),
                     "provider": self.name,
-                    "gpu_type": gpu.get("displayName") or gpu["id"],
+                    "gpu_type": gpu.get("name") or gpu["id"],
                     "gpu_count": 1,
                     "gpu_ram_gb": memory_gb,
                     "hourly_rate": hourly_rate,
@@ -268,15 +266,45 @@ class RunPodConnector(CloudConnector):
             offers.append(offer)
         return offers
 
+    def _require_known_datacenters(self, requested: set[str]) -> None:
+        """Refuse a datacenter RunPod does not currently offer.
+
+        A retired or mistyped datacenter would otherwise look like an empty
+        catalog, which reads as "no GPU is in stock there" rather than "that
+        placement can never be satisfied".
+        """
+        data_centers = (self._rest("GET", "catalog/datacenters") or {}).get(
+            "dataCenters"
+        ) or []
+        reported = {str(item.get("id")) for item in data_centers}
+        missing = sorted(requested - reported)
+        if missing:
+            raise PlacementError(
+                f"RunPod does not offer datacenter(s) {missing}"
+            )
+
+    def _datacenter_stock(
+        self, gpu: dict, requested: set[str]
+    ) -> list[dict[str, str]] | None:
+        """Per-datacenter stock for one GPU type, restricted to ``requested``."""
+        if not requested:
+            return None
+        stock: list[dict[str, str]] = []
+        for availability in gpu.get("dataCenters") or []:
+            datacenter_id = str(availability.get("id") or "")
+            if datacenter_id not in requested:
+                continue
+            stock_status = str(availability.get("availability") or "").strip()
+            if not self._stock_available(stock_status):
+                continue
+            stock.append(
+                {"datacenter_id": datacenter_id, "stock_status": stock_status}
+            )
+        return stock
+
     @staticmethod
     def _stock_available(status: str) -> bool:
-        normalized = " ".join(status.lower().split())
-        return bool(normalized) and normalized not in {
-            "none",
-            "unavailable",
-            "out of stock",
-            "no stock",
-        }
+        return " ".join(status.lower().split()) not in _UNAVAILABLE_STOCK
 
     @staticmethod
     def _matches_gpu(requested: str, gpu: dict) -> bool:
@@ -286,7 +314,7 @@ class RunPodConnector(CloudConnector):
         needle = normalize(requested)
         candidates = (
             normalize(str(gpu.get("id", ""))),
-            normalize(str(gpu.get("displayName", ""))),
+            normalize(str(gpu.get("name", ""))),
         )
         return any(needle == candidate or needle in candidate for candidate in candidates)
 
@@ -333,65 +361,46 @@ class RunPodConnector(CloudConnector):
                 )
 
         pod_input: dict[str, Any] = {
-            "cloudType": self.cloud_type,
-            "containerDiskInGb": container_disk_gb,
-            "env": [
-                {"key": str(key), "value": str(value)} for key, value in (env_vars or {}).items()
-            ],
-            "gpuCount": 1,
-            "gpuTypeId": offer_id,
-            "imageName": docker_image,
             "name": str(resource_name or f"cloud-offload-worker-{uuid.uuid4().hex[:8]}"),
+            "image": docker_image,
+            "cloud": self.cloud_type,
+            "disk": container_disk_gb,
+            "env": {str(key): str(value) for key, value in (env_vars or {}).items()},
+            "gpu": {"id": offer_id, "count": 1},
+            # ssh.direct, which the dispatcher connects over, needs the port
+            # published explicitly; startSsh alone only injects PUBLIC_KEY.
+            "ports": ["22/tcp"],
             "startSsh": True,
-            "volumeInGb": self.volume_gb,
-            "volumeMountPath": "/workspace",
         }
+        if attachment:
+            pod_input["mounts"] = {
+                "network": [
+                    {
+                        "volumeId": attachment.provider_volume_id,
+                        "path": attachment.mount_path,
+                    }
+                ]
+            }
+        elif self.volume_gb:
+            pod_input["mounts"] = {
+                "persistent": {"size": self.volume_gb, "path": "/workspace"}
+            }
+        if placement is not None and placement.datacenter_ids:
+            pod_input["dataCenterIds"] = list(placement.datacenter_ids)
         if self.registry_auth_id:
-            pod_input["containerRegistryAuthId"] = self.registry_auth_id
+            pod_input["registry"] = self.registry_auth_id
         if startup_script:
             encoded = base64.b64encode(startup_script.encode("utf-8")).decode("ascii")
-            pod_input["dockerArgs"] = "bash -lc 'echo " + encoded + " | base64 -d | bash'"
-        if placement is None:
-            # Disabled/stateless behavior deliberately stays on the established
-            # GraphQL path. Storage-aware launches use the documented REST Pod
-            # contract below because it exposes hard datacenter constraints.
-            data = self._graphql(CREATE_POD_MUTATION, {"input": pod_input})
-            pod = data.get("podFindAndDeployOnDemand")
-        else:
-            rest_input: dict[str, Any] = {
-                "cloudType": self.cloud_type,
-                "computeType": "GPU",
-                "containerDiskInGb": container_disk_gb,
-                "env": {str(k): str(v) for k, v in (env_vars or {}).items()},
-                "gpuCount": 1,
-                "gpuTypeIds": [offer_id],
-                "gpuTypePriority": "custom",
-                "imageName": docker_image,
-                "interruptible": False,
-                "name": pod_input["name"],
-                "ports": ["22/tcp"],
-                "volumeInGb": self.volume_gb,
-                "volumeMountPath": attachment.mount_path if attachment else "/workspace",
-            }
-            if placement.datacenter_ids:
-                rest_input["dataCenterIds"] = list(placement.datacenter_ids)
-                rest_input["dataCenterPriority"] = "custom"
-            if attachment:
-                rest_input["networkVolumeId"] = attachment.provider_volume_id
-            if self.registry_auth_id:
-                rest_input["containerRegistryAuthId"] = self.registry_auth_id
-            if startup_script:
-                command = "echo " + encoded + " | base64 -d | bash"
-                rest_input["dockerEntrypoint"] = ["bash", "-lc"]
-                rest_input["dockerStartCmd"] = [command]
-            try:
-                pod = self._rest("POST", "pods", json=rest_input)
-            except Exception as exc:
-                message = str(exc)
-                raise PlacementError(
-                    "RunPod could not create a Pod in the storage-compatible "
-                    f"datacenter(s) {list(placement.datacenter_ids)}: {message}"
-                ) from exc
+            pod_input["args"] = "bash -lc 'echo " + encoded + " | base64 -d | bash'"
+        try:
+            pod = self._rest("POST", "pods", json=pod_input)
+        except Exception as exc:
+            if placement is None or not placement.datacenter_ids:
+                raise
+            raise PlacementError(
+                "RunPod could not create a Pod in the storage-compatible "
+                f"datacenter(s) {list(placement.datacenter_ids)}: {exc}"
+            ) from exc
         if not pod or not pod.get("id"):
             raise RuntimeError("RunPod pod creation returned no pod ID")
         return self._wait_for_ready(str(pod["id"]))
@@ -435,12 +444,9 @@ class RunPodConnector(CloudConnector):
     def get_instance(self, instance_id: str) -> Instance | None:
         """Get a RunPod pod by ID."""
         try:
-            data = self._rest(
-                "GET", f"pods/{quote(instance_id, safe='')}", params={"includeMachine": "true"}
-            )
+            data = self._rest("GET", f"pods/{quote(instance_id, safe='')}")
         except Exception as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code == 404:
+            if self._status_code(exc) == 404:
                 return None
             raise
         return self._parse_instance(data)
@@ -455,11 +461,12 @@ class RunPodConnector(CloudConnector):
 
     def list_instances(self) -> list[Instance]:
         """List active RunPod GPU pods."""
-        pods = self._rest("GET", "pods", params={"computeType": "GPU"}) or []
+        pods = (self._rest("GET", "pods") or {}).get("pods") or []
         return [
             instance
             for pod in pods
-            if (instance := self._parse_instance(pod)).status in {"pending", "running"}
+            if pod.get("gpu")
+            and (instance := self._parse_instance(pod)).status in {"pending", "running"}
         ]
 
     @staticmethod
@@ -468,17 +475,18 @@ class RunPodConnector(CloudConnector):
         return RUNPOD_S3_ENDPOINTS.get(str(datacenter_id).upper())
 
     def list_storage(self) -> list[ProviderStorage]:
-        volumes = self._rest("GET", "networkvolumes") or []
+        volumes = (self._rest("GET", "network-volumes") or {}).get(
+            "networkVolumes"
+        ) or []
         return [self._parse_storage(item) for item in volumes]
 
     def get_storage(self, storage_id: str) -> ProviderStorage | None:
         try:
             item = self._rest(
-                "GET", f"networkvolumes/{quote(str(storage_id), safe='')}"
+                "GET", f"network-volumes/{quote(str(storage_id), safe='')}"
             )
         except Exception as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code == 404:
+            if self._status_code(exc) == 404:
                 return None
             raise
         return self._parse_storage(item) if item else None
@@ -488,19 +496,24 @@ class RunPodConnector(CloudConnector):
     ) -> ProviderStorage:
         if self.cloud_type != "SECURE":
             raise PlacementError("RunPod network volumes require Secure Cloud")
-        if not 1 <= int(size_gb) <= RUNPOD_NETWORK_VOLUME_MAX_GB:
+        if not (
+            RUNPOD_NETWORK_VOLUME_MIN_GB
+            <= int(size_gb)
+            <= RUNPOD_NETWORK_VOLUME_MAX_GB
+        ):
             raise ValueError(
-                f"RunPod storage size must be 1-{RUNPOD_NETWORK_VOLUME_MAX_GB} GB"
+                f"RunPod storage size must be {RUNPOD_NETWORK_VOLUME_MIN_GB}-"
+                f"{RUNPOD_NETWORK_VOLUME_MAX_GB} GB"
             )
         if not str(datacenter_id).strip():
             raise ValueError("RunPod storage needs a datacenter")
         item = self._rest(
             "POST",
-            "networkvolumes",
+            "network-volumes",
             json={
                 "name": str(name),
                 "size": int(size_gb),
-                "dataCenterId": str(datacenter_id),
+                "dataCenter": str(datacenter_id),
             },
         )
         if not item or not item.get("id"):
@@ -509,13 +522,13 @@ class RunPodConnector(CloudConnector):
 
     def delete_storage(self, storage_id: str) -> bool:
         try:
-            self._rest("DELETE", f"networkvolumes/{quote(str(storage_id), safe='')}")
+            self._rest("DELETE", f"network-volumes/{quote(str(storage_id), safe='')}")
             return True
         except Exception:
             return False
 
     def _parse_storage(self, item: dict) -> ProviderStorage:
-        datacenter_id = str(item.get("dataCenterId") or "")
+        datacenter_id = str(item.get("dataCenter") or "")
         return ProviderStorage(
             id=str(item["id"]),
             provider=self.name,
@@ -542,8 +555,24 @@ class RunPodConnector(CloudConnector):
             )
 
     def account_balance(self) -> dict:
-        """Return RunPod account balance and current hourly spend."""
-        account = self._graphql(ACCOUNT_QUERY).get("myself") or {}
+        """Return RunPod account balance and current hourly spend.
+
+        REST v2 publishes spend (``/v2/billing``) but no credit balance, so this
+        is the connector's last GraphQL call. Once GraphQL is retired the
+        balance is reported as unavailable rather than failing the whole
+        credentials probe, which otherwise only needs REST.
+        """
+        try:
+            data = self._graphql(ACCOUNT_QUERY)
+        except RunPodApiError as exc:
+            if exc.status_code != 410:
+                raise
+            return {
+                "available": False,
+                "currency": "USD",
+                "error": str(exc),
+            }
+        account = data.get("myself") or {}
         return {
             "available": True,
             "currency": "USD",
@@ -552,42 +581,51 @@ class RunPodConnector(CloudConnector):
         }
 
     def _parse_instance(self, data: dict) -> Instance:
-        desired_status = str(data.get("desiredStatus", "")).upper()
         status = {
-            "CREATED": "pending",
-            "PENDING": "pending",
+            "PROVISIONING": "pending",
+            "STARTING": "pending",
             "RUNNING": "running",
-            "RESTARTING": "pending",
             "EXITED": "stopped",
-            "STOPPED": "stopped",
+            # An errored pod still bills while its resources exist, so it is
+            # reported like a stopped one to make the dispatcher reclaim it.
+            "ERROR": "stopped",
             "TERMINATED": "terminated",
-        }.get(desired_status, "unknown")
+        }.get(str(data.get("status", "")).upper(), "unknown")
 
-        machine = data.get("machine") or {}
-        runtime = data.get("runtime") or {}
-        ip_address = None
-        ssh_port = None
-        for port in runtime.get("ports") or []:
-            if port.get("isIpPublic") and int(port.get("privatePort") or 0) == 22:
-                ip_address = port.get("ip")
-                ssh_port = port.get("publicPort")
-                break
+        gpu = data.get("gpu") or {}
+        ip_address, ssh_port = self._ssh_endpoint(data)
 
         return Instance(
             id=str(data["id"]),
             provider=self.name,
-            gpu_type=(machine.get("gpuDisplayName") or data.get("gpuTypeId") or "unknown"),
-            gpu_count=int(data.get("gpuCount") or 1),
-            hourly_rate=float(data.get("costPerHr") or 0),
+            gpu_type=str(gpu.get("id") or "unknown"),
+            gpu_count=int(gpu.get("count") or 1),
+            hourly_rate=float(data.get("cost") or 0),
             status=status,
             ip_address=ip_address,
             ssh_port=int(ssh_port) if ssh_port is not None else None,
             metadata={
                 "name": data.get("name"),
-                "image": data.get("imageName"),
-                "location": machine.get("location"),
+                "image": data.get("image"),
+                "location": data.get("dataCenterId"),
             },
         )
+
+    @staticmethod
+    def _ssh_endpoint(data: dict) -> tuple[str | None, int | None]:
+        """Host and port for direct SSH, preferring the pod's own ssh block.
+
+        ``ssh.direct`` is what RunPod publishes for the mapped 22/tcp port; the
+        runtime port list is read as a fallback so a pod that reports ports
+        before the ssh block is populated is still reachable.
+        """
+        direct = ((data.get("ssh") or {}).get("direct")) or {}
+        if direct.get("host") and direct.get("port"):
+            return str(direct["host"]), int(direct["port"])
+        for port in (data.get("runtime") or {}).get("ports") or []:
+            if int(port.get("private") or 0) == 22 and port.get("public"):
+                return port.get("ip"), int(port["public"])
+        return None, None
 
 
 # Symmetric compatibility name for callers that still use provider terminology.

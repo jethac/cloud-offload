@@ -1361,13 +1361,20 @@ async def create_or_adopt_cache_volume(body: dict[str, Any] = Body(...)):
         )
         from cloud_offload.config import (
             RUNPOD_NETWORK_VOLUME_MAX_GB,
+            RUNPOD_NETWORK_VOLUME_MIN_GB,
             estimate_runpod_storage_monthly,
         )
 
-        if size_gb < 1 or size_gb > RUNPOD_NETWORK_VOLUME_MAX_GB:
+        if (
+            size_gb < RUNPOD_NETWORK_VOLUME_MIN_GB
+            or size_gb > RUNPOD_NETWORK_VOLUME_MAX_GB
+        ):
             raise HTTPException(
                 status_code=409,
-                detail=f"RunPod network volume size must be 1-{RUNPOD_NETWORK_VOLUME_MAX_GB} GB",
+                detail=(
+                    "RunPod network volume size must be "
+                    f"{RUNPOD_NETWORK_VOLUME_MIN_GB}-{RUNPOD_NETWORK_VOLUME_MAX_GB} GB"
+                ),
             )
         budget = policy.get("max_monthly_storage_cost")
         if budget is not None and estimate_runpod_storage_monthly(size_gb) > float(
