@@ -868,6 +868,7 @@ def test_manifest_refresh_reuses_only_exact_models_for_current_profile(
     old_runtime["storage_key"] = bundle_key(old_runtime["digest"])
     config = CloudConfig(
         queue_db_path=tmp_path / "queue.db",
+        scratch_dir=str(tmp_path / "scratch"),
         prepared_storage=replication_policy(),
         worker_profiles={
             "comfyui": {
@@ -922,10 +923,16 @@ def test_manifest_refresh_reuses_only_exact_models_for_current_profile(
             }
 
     store = RefreshStore()
+    store_options = []
+
+    def refresh_store(*args, **kwargs):
+        store_options.append(kwargs)
+        return store
+
     monkeypatch.setattr(server, "_config", lambda **kwargs: config)
     monkeypatch.setattr(server, "_cache_registry", lambda *args: registry)
     monkeypatch.setattr(server, "_cache_connector", lambda *args: object())
-    monkeypatch.setattr(server, "_runpod_s3_store", lambda *args: store)
+    monkeypatch.setattr(server, "_runpod_s3_store", refresh_store)
     monkeypatch.setattr(server, "_prepared_manifest_signer", lambda *args: signer)
     request = {
         "confirmed": True,
@@ -962,6 +969,7 @@ def test_manifest_refresh_reuses_only_exact_models_for_current_profile(
     assert [item["kind"] for item in store.published["artifacts"]] == [
         "model-weight"
     ]
+    assert store_options == [{"scratch_dir": tmp_path / "scratch"}]
 
 
 def test_expiry_route_unpublishes_target_and_keeps_source(tmp_path, monkeypatch):

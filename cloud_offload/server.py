@@ -1638,7 +1638,11 @@ async def refresh_cache_manifest_profile(body: dict[str, Any] = Body(...)):
         )
         manifest = signer.sign(proposal)
         connector = _cache_connector(config, volume.provider)
-        store = _runpod_s3_store(volume, connector)
+        scratch_dir_value = str(getattr(config, "scratch_dir", "") or "").strip()
+        store_options = (
+            {"scratch_dir": Path(scratch_dir_value)} if scratch_dir_value else {}
+        )
+        store = _runpod_s3_store(volume, connector, **store_options)
         await asyncio.to_thread(store.publish_manifest, manifest, signer)
         index = await asyncio.to_thread(store.load_index)
         registry.reconcile_index(
