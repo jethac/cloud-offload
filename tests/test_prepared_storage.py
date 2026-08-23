@@ -1694,6 +1694,9 @@ def test_s3_large_upload_resumes_completed_parts_after_gateway_failure(
     monkeypatch.setattr(
         prepared_state_module, "RUNPOD_S3_MULTIPART_CONCURRENCY", 2
     )
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS", 0
+    )
     monkeypatch.setattr(prepared_state_module.time, "sleep", lambda _seconds: None)
     client = ResumableS3()
     bounded = BoundedPartClient(client)
@@ -1756,6 +1759,299 @@ def test_s3_resume_prefers_the_valid_upload_with_the_most_completed_parts():
 
     assert upload_id == "older"
     assert parts == {1: '"part-1"', 2: '"part-2"'}
+
+
+def test_s3_resume_ignores_sessions_older_than_the_maximum_copy_lifetime():
+    stale_time = datetime.now(timezone.utc) - timedelta(days=8)
+
+    class StaleCandidateS3:
+        def list_multipart_uploads(self, **kwargs):
+            return {
+                "Uploads": [
+                    {
+                        "Key": "cloud-offload/blobs/model",
+                        "UploadId": "stale",
+                        "Initiated": stale_time,
+                    }
+                ],
+                "IsTruncated": False,
+            }
+
+        def list_parts(self, **kwargs):
+            raise AssertionError("stale multipart parts must not be listed")
+
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=StaleCandidateS3(),
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+
+    upload_id, parts = store._find_resumable_multipart(
+        "cloud-offload/blobs/model", source_size=24, part_size=8
+    )
+
+    assert upload_id is None
+    assert parts == {}
+
+
+def test_s3_resume_accepts_a_recent_provider_timestamp():
+    recent_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    class RecentCandidateS3:
+        def list_multipart_uploads(self, **kwargs):
+            return {
+                "Uploads": [
+                    {
+                        "Key": "cloud-offload/blobs/model",
+                        "UploadId": "recent",
+                        "Initiated": recent_time,
+                    }
+                ],
+                "IsTruncated": False,
+            }
+
+        def list_parts(self, **kwargs):
+            return {
+                "Parts": [
+                    {"PartNumber": 1, "ETag": '"part-1"', "Size": 8},
+                ],
+                "IsTruncated": False,
+            }
+
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=RecentCandidateS3(),
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+
+    upload_id, parts = store._find_resumable_multipart(
+        "cloud-offload/blobs/model", source_size=24, part_size=8
+    )
+
+    assert upload_id == "recent"
+    assert parts == {1: '"part-1"'}
+
+
+def test_s3_multipart_failure_does_not_start_queued_parts(monkeypatch, tmp_path):
+    class BoundedFailureS3:
+        def __init__(self):
+            self.started = []
+            self.barrier = threading.Barrier(2)
+
+        def list_multipart_uploads(self, **kwargs):
+            return {"Uploads": [], "IsTruncated": False}
+
+        def create_multipart_upload(self, **kwargs):
+            return {"UploadId": "new"}
+
+        def upload_part(self, PartNumber, **kwargs):
+            self.started.append(PartNumber)
+            self.barrier.wait(timeout=2)
+            if PartNumber == 1:
+                raise PermissionError("part denied")
+            return {"ETag": f'"part-{PartNumber}"'}
+
+    monkeypatch.setattr(prepared_state_module, "RUNPOD_S3_MULTIPART_CHUNK_BYTES", 8)
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_MIN_PART_BYTES", 5
+    )
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_CONCURRENCY", 2
+    )
+    client = BoundedFailureS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=client,
+        range_client=client,
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+    )
+    source = tmp_path / "large-model"
+    source.write_bytes(b"0123456789abcdefghijklmnopqrstuv")
+
+    with pytest.raises(PermissionError, match="part denied"):
+        store._upload_resumable_multipart(
+            source, "blobs/model", source.stat().st_size
+        )
+
+    assert sorted(client.started) == [1, 2]
+
+
+def test_s3_worker_failure_stops_sibling_retry_before_controller_observes_it(
+    monkeypatch, tmp_path
+):
+    class GatewayError(Exception):
+        response = {
+            "ResponseMetadata": {"HTTPStatusCode": 524},
+            "Error": {"Code": "524"},
+        }
+
+    class CoordinatedFailureS3:
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+            self.started = []
+            self.part_two_calls = 0
+
+        def list_multipart_uploads(self, **kwargs):
+            return {"Uploads": [], "IsTruncated": False}
+
+        def create_multipart_upload(self, **kwargs):
+            return {"UploadId": "new"}
+
+        def upload_part(self, PartNumber, **kwargs):
+            self.started.append(PartNumber)
+            if PartNumber == 1:
+                self.barrier.wait(timeout=2)
+                raise PermissionError("part denied")
+            if PartNumber == 2:
+                self.part_two_calls += 1
+                if self.part_two_calls == 1:
+                    self.barrier.wait(timeout=2)
+                raise GatewayError()
+            return {"ETag": f'"part-{PartNumber}"'}
+
+    controller_release = threading.Event()
+    real_wait = prepared_state_module.wait
+
+    def delayed_controller_wait(*args, **kwargs):
+        assert controller_release.wait(timeout=2)
+        return real_wait(*args, **kwargs)
+
+    monkeypatch.setattr(prepared_state_module, "wait", delayed_controller_wait)
+    monkeypatch.setattr(prepared_state_module, "RUNPOD_S3_MULTIPART_CHUNK_BYTES", 8)
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_MIN_PART_BYTES", 5
+    )
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_CONCURRENCY", 2
+    )
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS", 0.05
+    )
+    client = CoordinatedFailureS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=client,
+        range_client=client,
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+    )
+    source = tmp_path / "large-model"
+    source.write_bytes(b"0123456789abcdefghijklmnopqrstuv")
+    errors = []
+
+    def run_upload():
+        try:
+            store._upload_resumable_multipart(
+                source, "blobs/model", source.stat().st_size
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_upload)
+    thread.start()
+    time.sleep(0.25)
+
+    assert client.part_two_calls == 1
+    assert sorted(client.started) == [1, 2]
+
+    controller_release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], (PermissionError, GatewayError))
+    assert str(errors[0]) != "Multipart upload was cancelled"
+
+
+def test_s3_does_not_submit_a_replacement_after_worker_cancellation(
+    monkeypatch, tmp_path
+):
+    cancellation_seen = threading.Event()
+    release_failure = threading.Event()
+
+    class PausingCancelEvent:
+        def __init__(self):
+            self.inner = threading.Event()
+            self.set_calls = 0
+
+        def is_set(self):
+            return self.inner.is_set()
+
+        def wait(self, timeout=None):
+            return self.inner.wait(timeout)
+
+        def set(self):
+            self.set_calls += 1
+            self.inner.set()
+            if self.set_calls == 1:
+                cancellation_seen.set()
+                assert release_failure.wait(timeout=2)
+
+    class OneSuccessOneFailureS3:
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+
+        def list_multipart_uploads(self, **kwargs):
+            return {"Uploads": [], "IsTruncated": False}
+
+        def create_multipart_upload(self, **kwargs):
+            return {"UploadId": "new"}
+
+        def upload_part(self, PartNumber, **kwargs):
+            self.barrier.wait(timeout=2)
+            if PartNumber == 2:
+                raise PermissionError("terminal provider failure")
+            return {"ETag": f'"part-{PartNumber}"'}
+
+    monkeypatch.setattr(prepared_state_module, "RUNPOD_S3_MULTIPART_CHUNK_BYTES", 8)
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_MIN_PART_BYTES", 5
+    )
+    monkeypatch.setattr(
+        prepared_state_module, "RUNPOD_S3_MULTIPART_CONCURRENCY", 2
+    )
+    client = OneSuccessOneFailureS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=client,
+        range_client=client,
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+    )
+    monkeypatch.setattr(
+        prepared_state_module,
+        "threading",
+        SimpleNamespace(Event=PausingCancelEvent),
+    )
+    source = tmp_path / "large-model"
+    source.write_bytes(b"0123456789abcdefghijklmnopqrstuv")
+    errors = []
+
+    def run_upload():
+        try:
+            store._upload_resumable_multipart(
+                source, "blobs/model", source.stat().st_size
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_upload)
+    thread.start()
+
+    assert cancellation_seen.wait(timeout=2)
+    time.sleep(0.1)
+    release_failure.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], PermissionError)
+    assert str(errors[0]) == "terminal provider failure"
 
 
 def test_s3_resume_reuses_exact_parts_and_ignores_partial_part_records():
