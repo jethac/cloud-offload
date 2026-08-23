@@ -697,6 +697,7 @@ This ledger records merged implementation evidence across both repositories.
 | [#89](https://github.com/jethac/cloud-offload/pull/89) | Places coordinator replication scratch data on a configured volume and validates its capacity contract. | Merged as `9b04ffd`; 701 tests passed. |
 | [#90](https://github.com/jethac/cloud-offload/pull/90) | Ignores stale multipart sessions and bounds active multipart work and cancellation. | Merged as `96f152c`; 706 tests passed. |
 | [#91](https://github.com/jethac/cloud-offload/pull/91) | Retries transient TLS, closed-connection, and endpoint-connection failures inside the existing bounded RunPod S3 gateway budget. | 709 tests and 94 prepared-storage tests pass. Independent review found no Critical or Important issue. |
+| [#92](https://github.com/jethac/cloud-offload/pull/92) | Routes current-profile manifest refresh verification through the configured scratch directory. | 709 tests pass. A live 36.66 GB refresh reproduced system temporary-drive exhaustion, then used the configured B-drive scratch path after the fix. |
 
 ### ComfyUI extension repository
 
