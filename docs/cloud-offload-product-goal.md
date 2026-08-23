@@ -664,6 +664,39 @@ This ledger records merged implementation evidence across both repositories.
 | [#55](https://github.com/jethac/cloud-offload/pull/55) | Includes measured bytes from complete compatible runtime-bundle manifests in cold preparation and regional demand. | 648 tests passed. Cold regional demand now records the exact 3,840,000 runtime bytes instead of zero bytes. |
 | [#56](https://github.com/jethac/cloud-offload/pull/56) | Streams verified RunPod S3 downloads through `GetObject` so a valid object does not depend on `HeadObject`, while retaining full digest and size checks. | 649 tests passed. The live 3,420,160-byte environment bundle returned HEAD 403 and GET success; the merged fix completed the regional copy. |
 | [#57](https://github.com/jethac/cloud-offload/pull/57) | Records the redacted paid M6 demand, shadow-accuracy, automatic-copy, repeat-cycle, placement, loss, TTL-expiry, source-preservation, and final-cleanup proof. It marks M6 complete and makes M7 active. | 650 tests pass, including a strict finite and redacted M6 evidence test. Final RunPod state has zero active GPUs and no automatic test volume. |
+| [#58](https://github.com/jethac/cloud-offload/pull/58) | Adds the M7 continuous release controller. | Merged as `d820d33`. |
+| [#59](https://github.com/jethac/cloud-offload/pull/59) | Binds the M7 corruption canary to the declared release region. | Merged as `f80796f`. |
+| [#60](https://github.com/jethac/cloud-offload/pull/60) | Hardens long prepared-state S3 transfers. | Merged as `27cf7d0`. |
+| [#61](https://github.com/jethac/cloud-offload/pull/61) | Fixes complete verification for large S3 prepared-state objects. | Merged as `d5d93ce`. |
+| [#62](https://github.com/jethac/cloud-offload/pull/62) | Hardens large RunPod multipart uploads. | Merged as `3dbbc4c`. |
+| [#63](https://github.com/jethac/cloud-offload/pull/63) | Retries RunPod 524 responses during range reads. | Merged as `fdb1c99`. |
+| [#64](https://github.com/jethac/cloud-offload/pull/64) | Resumes regional copies at missing objects. | Merged as `98d8c48`. |
+| [#65](https://github.com/jethac/cloud-offload/pull/65) | Adds concurrent prepared-state S3 range downloads. | Merged as `75778de`. |
+| [#66](https://github.com/jethac/cloud-offload/pull/66) | Bounds prepared-state range body waits. | Merged as `e4469e3`. |
+| [#67](https://github.com/jethac/cloud-offload/pull/67) | Retries incomplete prepared-state range streams. | Merged as `de2c5a8`. |
+| [#68](https://github.com/jethac/cloud-offload/pull/68) | Resumes partial prepared-state ranges. | Merged as `20df22b`. |
+| [#69](https://github.com/jethac/cloud-offload/pull/69) | Retries RunPod S3 gateway 5xx responses. | Merged as `fb6fed6`. |
+| [#70](https://github.com/jethac/cloud-offload/pull/70) | Resumes RunPod multipart uploads. | Merged as `809f9e0`. |
+| [#71](https://github.com/jethac/cloud-offload/pull/71) | Redacts replication failure records. | Merged as `9ab58a8`. |
+| [#72](https://github.com/jethac/cloud-offload/pull/72) | Refreshes prepared manifests for current profiles. | Merged as `b93a9b6`. |
+| [#73](https://github.com/jethac/cloud-offload/pull/73) | Recovers completed RunPod multipart merges. | Merged as `17df05f`. |
+| [#74](https://github.com/jethac/cloud-offload/pull/74) | Uses multipart uploads for medium RunPod objects. | Merged as `f2edcaa`. |
+| [#75](https://github.com/jethac/cloud-offload/pull/75) | Bounds RunPod range request waits. | Merged as `f6a2ad1`. |
+| [#76](https://github.com/jethac/cloud-offload/pull/76) | Bounds RunPod multipart part waits. | Merged as `8ae9cf0`. |
+| [#77](https://github.com/jethac/cloud-offload/pull/77) | Adds safe per-job result routes. | Merged as `c62771a`. |
+| [#78](https://github.com/jethac/cloud-offload/pull/78) | Prefers the valid multipart session with the most completed bytes. | Merged as `0305722`. |
+| [#79](https://github.com/jethac/cloud-offload/pull/79) | Reduces RunPod range request pressure. | Merged as `e17990f`. |
+| [#80](https://github.com/jethac/cloud-offload/pull/80) | Increases resumable S3 upload throughput. | Merged as `ea5d72a`. |
+| [#81](https://github.com/jethac/cloud-offload/pull/81) | Restores stable RunPod upload pressure. | Merged as `e90f442`. |
+| [#82](https://github.com/jethac/cloud-offload/pull/82) | Records safe S3 replication failure routing. | Merged as `d5b4cb6`. |
+| [#83](https://github.com/jethac/cloud-offload/pull/83) | Starts a bounded new multipart session when RunPod multipart listing is unavailable. | Merged as `1f109ec`. |
+| [#84](https://github.com/jethac/cloud-offload/pull/84) | Extends the bounded RunPod gateway retry budget. | Merged as `067fbff`. |
+| [#85](https://github.com/jethac/cloud-offload/pull/85) | Matches the RunPod large-file multipart part size. | Merged as `00f87cd`. |
+| [#86](https://github.com/jethac/cloud-offload/pull/86) | Resumes multipart uploads around partial provider part records. | Merged as `9f1a9af`. |
+| [#87](https://github.com/jethac/cloud-offload/pull/87) | Migrates the RunPod connector to REST API v2. | Merged as `b2e33bd`. |
+| [#89](https://github.com/jethac/cloud-offload/pull/89) | Places coordinator replication scratch data on a configured volume and validates its capacity contract. | Merged as `9b04ffd`; 701 tests passed. |
+| [#90](https://github.com/jethac/cloud-offload/pull/90) | Ignores stale multipart sessions and bounds active multipart work and cancellation. | Merged as `96f152c`; 706 tests passed. |
+| [#91](https://github.com/jethac/cloud-offload/pull/91) | Retries transient TLS, closed-connection, and endpoint-connection failures inside the existing bounded RunPod S3 gateway budget. | 709 tests and 94 prepared-storage tests pass. Independent review found no Critical or Important issue. |
 
 ### ComfyUI extension repository
 

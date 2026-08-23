@@ -2186,6 +2186,9 @@ class RunPodS3PreparedStore:
                 "ReadTimeoutError",
                 "ConnectTimeoutError",
                 "ResponseStreamingError",
+                "SSLError",
+                "ConnectionClosedError",
+                "EndpointConnectionError",
             }
         )
 

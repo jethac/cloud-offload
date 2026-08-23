@@ -2500,6 +2500,39 @@ def test_s3_verified_download_retries_runpod_gateway_5xx(
     assert sleeps == [2, 4]
 
 
+@pytest.mark.parametrize(
+    "error_name",
+    ["SSLError", "ConnectionClosedError", "EndpointConnectionError"],
+)
+def test_s3_gateway_retry_recovers_transient_transport_failures(
+    monkeypatch, error_name
+):
+    transport_error = type(error_name, (Exception,), {})
+    attempts = 0
+    sleeps = []
+
+    def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise transport_error("transient RunPod S3 transport failure")
+        return {"ETag": '"verified-part"'}
+
+    monkeypatch.setattr(prepared_state_module.time, "sleep", sleeps.append)
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EUR-IS-1",
+        client=MemoryS3(),
+        endpoint_url="https://s3api-eur-is-1.runpod.io/",
+    )
+
+    assert store._call_with_gateway_retry(operation) == {
+        "ETag": '"verified-part"'
+    }
+    assert attempts == 3
+    assert sleeps == [2, 4]
+
+
 def test_s3_verified_download_retries_incomplete_range_stream(monkeypatch, tmp_path):
     class ResponseStreamingError(Exception):
         pass
