@@ -53,6 +53,10 @@ RUNPOD_S3_MULTIPART_CONCURRENCY = 4
 RUNPOD_S3_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024
 RUNPOD_S3_MULTIPART_MAX_PARTS = 10_000
 RUNPOD_S3_COMPLETION_POLL_SECONDS = 5
+# Regional replica actions cannot remain valid for more than seven days. Do not
+# reuse older provider multipart sessions: their object metadata can remain
+# visible after the backing upload route has stopped accepting new parts.
+RUNPOD_S3_MULTIPART_RESUME_MAX_AGE_SECONDS = 7 * 24 * 3600
 # RunPod recommends at least ten attempts for intermittent S3 gateway errors.
 # Keep concurrency bounded and extend only the retry budget.
 RUNPOD_S3_GATEWAY_ATTEMPTS = 10
@@ -1892,36 +1896,80 @@ class RunPodS3PreparedStore:
             if part_number not in completed
         ]
 
-        def upload_part(part_number: int) -> tuple[int, str]:
-            offset = (part_number - 1) * part_size
-            expected_size = min(part_size, source_size - offset)
-            with source.open("rb") as stream:
-                stream.seek(offset)
-                payload = stream.read(expected_size)
-            if len(payload) != expected_size:
-                raise CacheCorruptionError("Multipart source read was incomplete")
-            response = self._call_with_gateway_retry(
-                # Parts are small and independently retryable. Use the bounded
-                # client so a stalled response header cannot hold a worker for
-                # the long multipart-completion timeout.
-                lambda: self.range_client.upload_part(
-                    Bucket=self.volume_id,
-                    Key=object_key,
-                    UploadId=upload_id,
-                    PartNumber=part_number,
-                    Body=payload,
-                )
-            )
-            etag = str(response.get("ETag") or "")
-            if not etag:
-                raise CacheCorruptionError("RunPod S3 multipart part has no ETag")
-            return part_number, etag
+        upload_cancelled = threading.Event()
 
-        with ThreadPoolExecutor(
+        def upload_part(part_number: int) -> tuple[int, str]:
+            try:
+                if upload_cancelled.is_set():
+                    raise RuntimeError("Multipart upload was cancelled")
+                offset = (part_number - 1) * part_size
+                expected_size = min(part_size, source_size - offset)
+                with source.open("rb") as stream:
+                    stream.seek(offset)
+                    payload = stream.read(expected_size)
+                if len(payload) != expected_size:
+                    raise CacheCorruptionError("Multipart source read was incomplete")
+                response = self._call_with_gateway_retry(
+                    # Parts are small and independently retryable. Use the bounded
+                    # client so a stalled response header cannot hold a worker for
+                    # the long multipart-completion timeout.
+                    lambda: self.range_client.upload_part(
+                        Bucket=self.volume_id,
+                        Key=object_key,
+                        UploadId=upload_id,
+                        PartNumber=part_number,
+                        Body=payload,
+                    ),
+                    cancel_event=upload_cancelled,
+                )
+                etag = str(response.get("ETag") or "")
+                if not etag:
+                    raise CacheCorruptionError(
+                        "RunPod S3 multipart part has no ETag"
+                    )
+                return part_number, etag
+            except BaseException:
+                # Signal from the failing worker. Do not wait for the coordinator
+                # thread to observe this future before sibling retry waits stop.
+                upload_cancelled.set()
+                raise
+
+        executor = ThreadPoolExecutor(
             max_workers=RUNPOD_S3_MULTIPART_CONCURRENCY
-        ) as executor:
-            for part_number, etag in executor.map(upload_part, pending):
-                completed[part_number] = etag
+        )
+        pending_parts = iter(pending)
+        in_flight: dict[Any, int] = {}
+
+        def submit_next() -> bool:
+            if upload_cancelled.is_set():
+                return False
+            try:
+                part_number = next(pending_parts)
+            except StopIteration:
+                return False
+            in_flight[executor.submit(upload_part, part_number)] = part_number
+            return True
+
+        for _ in range(RUNPOD_S3_MULTIPART_CONCURRENCY):
+            if not submit_next():
+                break
+        try:
+            while in_flight:
+                done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                results = [future.result() for future in done]
+                for future in done:
+                    in_flight.pop(future, None)
+                for part_number, etag in results:
+                    completed[part_number] = etag
+                for _ in results:
+                    submit_next()
+        except BaseException:
+            upload_cancelled.set()
+            for future in in_flight:
+                future.cancel()
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
         parts = [
             {"PartNumber": part_number, "ETag": completed[part_number]}
@@ -1946,6 +1994,28 @@ class RunPodS3PreparedStore:
         """Return the newest exact-key upload whose completed part sizes match."""
 
         uploads: list[dict[str, Any]] = []
+        resume_cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=RUNPOD_S3_MULTIPART_RESUME_MAX_AGE_SECONDS
+        )
+
+        def is_recent(upload: dict[str, Any]) -> bool:
+            initiated = upload.get("Initiated")
+            if isinstance(initiated, str):
+                try:
+                    initiated = datetime.fromisoformat(
+                        initiated.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    # Some S3-compatible test and provider layers use opaque
+                    # initiation markers. Keep compatibility when no time can
+                    # be established.
+                    return True
+            if not isinstance(initiated, datetime):
+                return True
+            if initiated.tzinfo is None:
+                initiated = initiated.replace(tzinfo=timezone.utc)
+            return initiated.astimezone(timezone.utc) >= resume_cutoff
+
         key_marker: str | None = None
         upload_marker: str | None = None
         while True:
@@ -1965,6 +2035,7 @@ class RunPodS3PreparedStore:
                 for item in response.get("Uploads") or []
                 if str(item.get("Key") or "") == object_key
                 and item.get("UploadId")
+                and is_recent(item)
             )
             if not response.get("IsTruncated"):
                 break
@@ -2069,10 +2140,17 @@ class RunPodS3PreparedStore:
                 time.sleep(RUNPOD_S3_COMPLETION_POLL_SECONDS)
         return False
 
-    def _call_with_gateway_retry(self, operation: Callable[[], Any]) -> Any:
+    def _call_with_gateway_retry(
+        self,
+        operation: Callable[[], Any],
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
         """Retry RunPod gateway timeouts that Botocore does not classify."""
 
         for attempt in range(1, RUNPOD_S3_GATEWAY_ATTEMPTS + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Multipart upload was cancelled")
             try:
                 return operation()
             except Exception as exc:
@@ -2081,9 +2159,12 @@ class RunPodS3PreparedStore:
                     or attempt == RUNPOD_S3_GATEWAY_ATTEMPTS
                 ):
                     raise
-                time.sleep(
-                    min(2**attempt, RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS)
-                )
+                delay = min(2**attempt, RUNPOD_S3_GATEWAY_MAX_BACKOFF_SECONDS)
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        raise
+                else:
+                    time.sleep(delay)
         raise AssertionError("RunPod S3 retry loop ended without a result")
 
     @staticmethod

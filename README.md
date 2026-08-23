@@ -492,6 +492,11 @@ concurrent copy in that directory, even though they do not rent a GPU. Plan
 capacity as approximately twice the largest artifact size multiplied by the
 maximum number of copies that can run at the same time.
 
+Cloud Offload does not resume provider multipart sessions that are more than
+seven days old. Configure provider lifecycle cleanup, or use an exact provider
+cleanup operation, to remove rejected incomplete multipart sessions. The copy
+path does not delete provider data while it checks for a resumable session.
+
 ### On-prem-only assets
 
 Some assets — licensed models, NDA'd meshes — must never leave the building.
