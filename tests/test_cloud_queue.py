@@ -82,6 +82,35 @@ def test_keep_warm_config_round_trips_and_supports_environment(monkeypatch, tmp_
     assert config.to_dict()["keep_warm"] is True
 
 
+def test_scratch_directory_round_trips_and_supports_environment(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    from_file = tmp_path / "from-file"
+    from_environment = tmp_path / "from-environment"
+    config_path.write_text(
+        json.dumps({"cloud": {"scratch_dir": f"  {from_file}  "}}),
+        encoding="utf-8",
+    )
+
+    file_config = CloudConfig.from_file(config_path)
+
+    assert file_config.scratch_dir == str(from_file)
+    assert file_config.to_dict()["scratch_dir"] == str(from_file)
+
+    monkeypatch.setenv(
+        "CLOUD_OFFLOAD_SCRATCH_DIR",
+        f"  {from_environment}  ",
+    )
+    environment_config = CloudConfig.load(config_path, resolve_secrets=False)
+
+    assert environment_config.scratch_dir == str(from_environment)
+    assert environment_config.to_dict()["scratch_dir"] == str(from_environment)
+
+
+def test_scratch_directory_rejects_non_string_value():
+    with pytest.raises(ValueError, match="scratch_dir must be a string"):
+        CloudConfig(scratch_dir=[])
+
+
 def test_config_resolves_provider_credentials_from_the_keychain(monkeypatch, tmp_path):
     """Credentials come from the OS keychain, never from config.json."""
     from cloud_offload import credentials as creds

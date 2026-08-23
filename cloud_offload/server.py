@@ -365,7 +365,7 @@ def _cache_connector(config, provider: str):
     return create_connector(provider, config)
 
 
-def _runpod_s3_store(volume, connector):
+def _runpod_s3_store(volume, connector, *, scratch_dir=None):
     from cloud_offload.prepared_state import RunPodS3PreparedStore
 
     endpoint = connector.s3_endpoint(volume.datacenter_id)
@@ -378,6 +378,7 @@ def _runpod_s3_store(volume, connector):
         datacenter_id=volume.datacenter_id,
         endpoint_url=endpoint,
         prefix="cloud-offload",
+        scratch_dir=scratch_dir,
     )
 
 
@@ -1157,13 +1158,16 @@ async def update_config(updates: dict[str, Any] = Body(...)):
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload):
+    validated_fields = _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload)
+    if "scratch_dir" in payload:
+        validated_fields.add("scratch_dir")
+    if validated_fields:
         try:
             validated = _config(resolve_secrets=False)
-            for field_name in _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload):
+            for field_name in validated_fields:
                 setattr(validated, field_name, payload[field_name])
             validated.__post_init__()
-            for field_name in _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload):
+            for field_name in validated_fields:
                 payload[field_name] = getattr(validated, field_name)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1959,10 +1963,15 @@ async def prepopulate_cache(body: dict[str, Any] = Body(...)):
 async def _copy_cache_manifest(config, registry, source, target, manifest_id: str):
     """Copy one exact signed manifest through provider object APIs."""
 
+    scratch_dir_value = str(getattr(config, "scratch_dir", "") or "").strip()
+    scratch_dir = Path(scratch_dir_value) if scratch_dir_value else None
+    if scratch_dir is not None:
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+    store_options = {"scratch_dir": scratch_dir} if scratch_dir is not None else {}
     source_connector = _cache_connector(config, source.provider)
     target_connector = _cache_connector(config, target.provider)
-    source_store = _runpod_s3_store(source, source_connector)
-    target_store = _runpod_s3_store(target, target_connector)
+    source_store = _runpod_s3_store(source, source_connector, **store_options)
+    target_store = _runpod_s3_store(target, target_connector, **store_options)
     source_index = await asyncio.to_thread(source_store.load_index)
     entry = next(
         (
@@ -1978,7 +1987,9 @@ async def _copy_cache_manifest(config, registry, source, target, manifest_id: st
     document = signer.verify(
         await asyncio.to_thread(source_store.read_json, entry["storage_key"])
     )
-    with tempfile.TemporaryDirectory(prefix="cloud-offload-replica-") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="cloud-offload-replica-", dir=scratch_dir
+    ) as directory:
         for artifact in document["artifacts"]:
             if await asyncio.to_thread(
                 target_store.exists,

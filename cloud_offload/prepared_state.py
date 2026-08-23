@@ -1676,6 +1676,7 @@ class RunPodS3PreparedStore:
         prefix: str = "",
         publication_lock: Any | None = None,
         transfer_config: Any | None = None,
+        scratch_dir: str | Path | None = None,
     ):
         self.volume_id = str(volume_id)
         self.datacenter_id = str(datacenter_id).upper()
@@ -1684,6 +1685,7 @@ class RunPodS3PreparedStore:
         self.endpoint_url = str(endpoint_url)
         self.prefix = str(prefix).strip("/")
         self.transfer_config = transfer_config
+        self.scratch_dir = Path(scratch_dir) if scratch_dir else None
         if any(part in {".", ".."} for part in self.prefix.split("/") if part):
             raise ValueError("RunPod S3 prefix cannot contain relative path segments")
         lock_namespace = (
@@ -1708,6 +1710,7 @@ class RunPodS3PreparedStore:
         endpoint_url: str,
         prefix: str = "",
         client_factory: Callable[..., Any] | None = None,
+        scratch_dir: str | Path | None = None,
     ) -> "RunPodS3PreparedStore":
         access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
         secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
@@ -1781,6 +1784,7 @@ class RunPodS3PreparedStore:
             endpoint_url=endpoint_url,
             prefix=prefix,
             transfer_config=transfer_config,
+            scratch_dir=scratch_dir,
         )
 
     def probe(self) -> bool:
@@ -2514,7 +2518,11 @@ class RunPodS3PreparedStore:
         raise AssertionError("RunPod S3 range retry loop ended without a result")
 
     def _download_verify(self, key: str, digest: str, size: int) -> None:
-        descriptor, temporary_name = tempfile.mkstemp(prefix="cloud-offload-s3-verify-")
+        if self.scratch_dir is not None:
+            self.scratch_dir.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="cloud-offload-s3-verify-", dir=self.scratch_dir
+        )
         os.close(descriptor)
         temporary = Path(temporary_name)
         try:
