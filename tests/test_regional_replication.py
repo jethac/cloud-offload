@@ -720,6 +720,130 @@ def test_manifest_copy_skips_complete_target_objects_and_releases_local_files(
     assert result["artifact_count"] == 2
 
 
+def test_manifest_copy_uses_configured_scratch_directory(tmp_path, monkeypatch):
+    signer = ManifestSigner(b"s" * 32)
+    copied = artifact(b"copy through configured scratch")
+    document = build_manifest(
+        profile_fingerprint=fingerprint({"profile": "scratch"}),
+        producer={
+            "image_digest": "sha256:" + "2" * 64,
+            "cloud_offload_version": "test",
+            "python_abi": "test",
+            "platform": "portable",
+            "torch": "",
+            "cuda": "",
+        },
+        artifacts=[copied],
+        signer=signer,
+    )
+    source = SimpleNamespace(id="source", provider="runpod")
+    target = SimpleNamespace(id="target", provider="runpod")
+    scratch = tmp_path / "scratch"
+
+    class SourceStore:
+        def load_index(self):
+            return {
+                "manifests": [
+                    {
+                        "manifest_id": document["manifest_id"],
+                        "storage_key": "source-manifest.json",
+                    }
+                ]
+            }
+
+        def read_json(self, key):
+            assert key == "source-manifest.json"
+            return document
+
+        def download_verified(self, key, digest, path):
+            path.write_bytes(b"copy through configured scratch")
+
+    class TargetStore:
+        def __init__(self):
+            self.upload_path = None
+
+        def exists(self, key, size):
+            return False
+
+        def upload_verified(self, path, digest, *, storage_key):
+            self.upload_path = path
+
+        def publish_manifest(self, manifest, manifest_signer):
+            manifest_signer.verify(manifest)
+
+        def load_index(self):
+            return {"generation": "target-generation", "manifests": []}
+
+    source_store = SourceStore()
+    target_store = TargetStore()
+    store_calls = []
+    registry = SimpleNamespace(reconcile_index=lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_cache_connector", lambda *args: object())
+
+    def store_for(volume, connector, **kwargs):
+        store_calls.append((volume.id, kwargs))
+        return source_store if volume.id == source.id else target_store
+
+    monkeypatch.setattr(
+        server,
+        "_runpod_s3_store",
+        store_for,
+    )
+    monkeypatch.setattr(server, "_prepared_manifest_signer", lambda config: signer)
+
+    asyncio.run(
+        server._copy_cache_manifest(
+            SimpleNamespace(scratch_dir=str(scratch)),
+            registry,
+            source,
+            target,
+            document["manifest_id"],
+        )
+    )
+
+    assert target_store.upload_path is not None
+    assert target_store.upload_path.is_relative_to(scratch)
+    assert not target_store.upload_path.exists()
+    assert store_calls == [
+        ("source", {"scratch_dir": scratch}),
+        ("target", {"scratch_dir": scratch}),
+    ]
+
+
+def test_runpod_s3_store_forwards_scratch_directory(tmp_path, monkeypatch):
+    from cloud_offload import prepared_state
+
+    scratch = tmp_path / "scratch"
+    volume = SimpleNamespace(
+        provider_volume_id="provider-volume",
+        datacenter_id="EU-RO-1",
+    )
+    connector = SimpleNamespace(
+        s3_endpoint=lambda region: "https://s3api-eu-ro-1.runpod.io/"
+    )
+    observed = {}
+    expected = object()
+
+    def from_environment(**kwargs):
+        observed.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        prepared_state.RunPodS3PreparedStore,
+        "from_environment",
+        from_environment,
+    )
+
+    result = server._runpod_s3_store(
+        volume,
+        connector,
+        scratch_dir=scratch,
+    )
+
+    assert result is expected
+    assert observed["scratch_dir"] == scratch
+
+
 def test_manifest_refresh_reuses_only_exact_models_for_current_profile(
     tmp_path, monkeypatch
 ):

@@ -1075,3 +1075,29 @@ def test_confirmation_policy_settings_are_validated_and_persisted(
         ]
         == 15
     )
+
+
+def test_scratch_directory_settings_are_validated_before_persist(
+    monkeypatch, tmp_path
+):
+    from cloud_offload import config as config_module
+
+    monkeypatch.setattr(config_module, "CONFIG_DIR", tmp_path)
+    client = TestClient(server.app, raise_server_exceptions=False)
+    scratch = tmp_path / "scratch"
+
+    valid = client.post(
+        "/api/config",
+        json={"scratch_dir": f"  {scratch}  "},
+    )
+
+    assert valid.status_code == 200
+    assert valid.json()["config"]["scratch_dir"] == str(scratch)
+    persisted = json.loads((tmp_path / "config.json").read_text())
+    assert persisted["scratch_dir"] == str(scratch)
+
+    invalid = client.post("/api/config", json={"scratch_dir": []})
+
+    assert invalid.status_code == 400
+    persisted = json.loads((tmp_path / "config.json").read_text())
+    assert persisted["scratch_dir"] == str(scratch)

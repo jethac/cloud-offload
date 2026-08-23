@@ -1472,7 +1472,7 @@ class RunPodMissingObject(Exception):
     response = {"Error": {"Code": "InvalidArgument", "Message": "object not found"}}
 
 
-def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
+def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch, tmp_path):
     import boto3
 
     created = []
@@ -1489,6 +1489,7 @@ def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
         volume_id="volume",
         datacenter_id="EU-RO-1",
         endpoint_url="https://s3.example.invalid",
+        scratch_dir=tmp_path / "scratch",
     )
 
     transfer = created[0]["config"]
@@ -1513,6 +1514,7 @@ def test_runpod_s3_default_client_uses_long_transfer_timeouts(monkeypatch):
     assert store.transfer_config.multipart_chunksize == 50 * 1024 * 1024
     assert store.transfer_config.max_concurrency == 4
     assert store.transfer_config.use_threads is True
+    assert store.scratch_dir == tmp_path / "scratch"
 
 
 def test_s3_upload_recovers_completed_merge_after_wrapped_524(monkeypatch, tmp_path):
@@ -1947,6 +1949,33 @@ def test_s3_verified_download_uses_the_bounded_range_client(tmp_path):
     ) == destination
     assert destination.read_bytes() == payload
     assert bounded.ranges == ["bytes=0-67108863"]
+
+
+def test_s3_post_upload_verification_uses_configured_scratch_directory(
+    tmp_path, monkeypatch
+):
+    scratch = tmp_path / "scratch"
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=MemoryS3(),
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        scratch_dir=scratch,
+    )
+    scratch.mkdir()
+    observed = {}
+
+    def download_verified(key, digest, destination):
+        observed["destination"] = destination
+        destination.write_bytes(b"x")
+
+    monkeypatch.setattr(store, "download_verified", download_verified)
+
+    digest = "sha256:2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+    store._download_verify("blobs/value", digest, 1)
+
+    assert observed["destination"].is_relative_to(scratch)
+    assert not observed["destination"].exists()
 
 
 def test_independent_s3_stores_publish_concurrently_without_losing_inventory(tmp_path):

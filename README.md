@@ -483,6 +483,15 @@ A plan above `max_container_disk_gb` (default 500) is a `409` naming the total
 and its largest components, with nothing queued and nothing rented — the same
 discipline as the other pre-flight refusals.
 
+Coordinator-side provider replication also needs local scratch space. Set
+`CLOUD_OFFLOAD_SCRATCH_DIR` to a volume that can hold the largest source
+artifact and its verification copy at the same time. When this setting is
+empty, Cloud Offload uses the operating-system temporary directory. Large
+regional copies can therefore need about twice the largest artifact size per
+concurrent copy in that directory, even though they do not rent a GPU. Plan
+capacity as approximately twice the largest artifact size multiplied by the
+maximum number of copies that can run at the same time.
+
 ### On-prem-only assets
 
 Some assets — licensed models, NDA'd meshes — must never leave the building.

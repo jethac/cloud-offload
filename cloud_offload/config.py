@@ -407,6 +407,9 @@ class CloudConfig:
 
     # Paths
     queue_db_path: str = ""
+    scratch_dir: str = field(
+        default_factory=lambda: os.environ.get("CLOUD_OFFLOAD_SCRATCH_DIR", "")
+    )
 
     # API keys (loaded from env)
     vast_api_key: str = field(default_factory=lambda: os.environ.get("VAST_API_KEY", ""))
@@ -446,6 +449,9 @@ class CloudConfig:
     )
 
     def __post_init__(self):
+        if not isinstance(self.scratch_dir, str):
+            raise ValueError("scratch_dir must be a string")
+        self.scratch_dir = self.scratch_dir.strip()
         self.provider = self.provider.strip().lower()
         if self.provider == "vast":
             self.provider = "vast.ai"
@@ -758,6 +764,7 @@ class CloudConfig:
             "CLOUD_OFFLOAD_STORAGE_TYPE": ("storage_type", str),
             "CLOUD_OFFLOAD_STORAGE_PATH": ("storage_path", str),
             "CLOUD_OFFLOAD_QUEUE_DB": ("queue_db_path", str),
+            "CLOUD_OFFLOAD_SCRATCH_DIR": ("scratch_dir", str),
             "VAST_API_KEY": ("vast_api_key", str),
             "RUNPOD_API_KEY": ("runpod_api_key", str),
             "VAST_API_URL": ("vast_api_url", str),
@@ -815,6 +822,7 @@ class CloudConfig:
             "storage_type": self.storage_type,
             "storage_path": self.storage_path,
             "queue_db_path": self.queue_db_path,
+            "scratch_dir": self.scratch_dir,
             "runpod_cloud_type": self.runpod_cloud_type,
             "runpod_container_disk_gb": self.runpod_container_disk_gb,
             "runpod_volume_gb": self.runpod_volume_gb,
