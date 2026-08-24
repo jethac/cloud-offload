@@ -1,6 +1,7 @@
 .git
 .github
 .runlogs
+.worktrees
 .pytest_cache
 .venv
 **/__pycache__
