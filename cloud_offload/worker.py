@@ -1269,7 +1269,7 @@ class Worker:
                 "-m",
                 "pip",
                 "install",
-                "--target",
+                "--prefix",
                 str(environment_root),
                 "-r",
                 str(requirements),

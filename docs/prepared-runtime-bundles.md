@@ -9,7 +9,9 @@ model files. It is not a mutable shared virtual environment.
 Before ComfyUI starts, the worker installs each profile-pinned custom node. A
 Git source must use a full commit SHA. A registry source must use an exact
 release version. Python requirements install into
-`/opt/cloud-offload/environment`, not the base image environment.
+the `/opt/cloud-offload/environment` prefix, not the base image environment.
+Pip can reuse compatible packages from the pinned base image. The worker adds
+the prefix's Python ABI `site-packages` directory to `PYTHONPATH`.
 
 When the worker claims the authorized job, it builds:
 
@@ -32,9 +34,10 @@ does not permit private data or credentials.
 
 The scheduler counts the pack and environment requirement keys when it measures
 prepared coverage. A compatible Pod restores the environment and every pack
-before ComfyUI starts. The entrypoint puts the restored environment first on
-`PYTHONPATH`. ComfyUI therefore builds its node registry from the restored code
-and packages. It does not repeat Git, registry, or pip downloads.
+before ComfyUI starts. The entrypoint puts the restored prefix's Python ABI
+`site-packages` directory first on `PYTHONPATH`. ComfyUI therefore builds its
+node registry from the restored code and packages. It does not repeat Git,
+registry, or pip downloads.
 
 The boot process writes a small container-local restore report. The first
 claimed job accepts it only when its worker ID, profile fingerprint, manifest

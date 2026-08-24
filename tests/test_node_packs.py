@@ -779,7 +779,7 @@ def test_requirements_are_installed_and_their_output_captured(tmp_path, monkeypa
 
     assert commands[0][1:4] == ["-m", "pip", "install"]
     assert commands[0][4:6] == [
-        "--target",
+        "--prefix",
         str(tmp_path / "cloud-offload-environment"),
     ]
     installed = [item["event"] for item in worker.queue.list_events(job.id)]

@@ -14,7 +14,7 @@ cloud-offload runner-boot
 
 # Custom-node Python packages are installed or restored into one immutable
 # profile environment before ComfyUI imports its node registry.
-export PYTHONPATH="${CLOUD_OFFLOAD_ENV_ROOT:-/opt/cloud-offload/environment}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${CLOUD_OFFLOAD_ENV_ROOT:-/opt/cloud-offload/environment}/lib/python3.11/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
 
 python /opt/ComfyUI/main.py \
   --listen 127.0.0.1 \

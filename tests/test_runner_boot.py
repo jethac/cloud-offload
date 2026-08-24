@@ -489,6 +489,21 @@ def test_the_entrypoint_stages_node_packs_before_it_starts_comfyui():
     assert "CLOUD_OFFLOAD_WORKER_ID" in script
 
 
+def test_the_entrypoint_uses_the_environment_prefix_site_packages():
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "runtime-profiles"
+        / "comfyui"
+        / "entrypoint.sh"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        'export PYTHONPATH="${CLOUD_OFFLOAD_ENV_ROOT:-/opt/cloud-offload/environment}'
+        '/lib/python3.11/site-packages${PYTHONPATH:+:${PYTHONPATH}}"'
+    ) in script
+
+
 def test_the_runner_image_keeps_large_cuda_payloads_in_parallel_pull_layers():
     dockerfile = (
         Path(__file__).resolve().parents[1]
