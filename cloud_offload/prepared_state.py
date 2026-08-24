@@ -2174,6 +2174,7 @@ class RunPodS3PreparedStore:
         error_data = response.get("Error", {}) or {}
         status = metadata.get("HTTPStatusCode")
         code = str(error_data.get("Code") or "")
+        operation = str(getattr(exc, "operation_name", "") or "")
         try:
             numeric_code = int(code)
         except ValueError:
@@ -2181,6 +2182,7 @@ class RunPodS3PreparedStore:
         return (
             (isinstance(status, int) and 500 <= status <= 599)
             or 500 <= numeric_code <= 599
+            or (code == "SignatureDoesNotMatch" and operation == "GetObject")
             or type(exc).__name__
             in {
                 "ReadTimeoutError",

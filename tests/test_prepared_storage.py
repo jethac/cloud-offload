@@ -2500,6 +2500,59 @@ def test_s3_verified_download_retries_runpod_gateway_5xx(
     assert sleeps == [2, 4]
 
 
+def test_s3_verified_download_retries_transient_get_signature_error(
+    monkeypatch, tmp_path
+):
+    class SignatureMismatch(Exception):
+        response = {
+            "ResponseMetadata": {"HTTPStatusCode": 403},
+            "Error": {"Code": "SignatureDoesNotMatch"},
+        }
+        operation_name = "GetObject"
+
+    class TransientSignatureS3(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.remaining_failures = 2
+
+        def get_object(self, Bucket, Key, Range=None):
+            if self.remaining_failures:
+                self.remaining_failures -= 1
+                raise SignatureMismatch()
+            return super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+
+    sleeps = []
+    monkeypatch.setattr(prepared_state_module.time, "sleep", sleeps.append)
+    client = TransientSignatureS3()
+    store = RunPodS3PreparedStore(
+        volume_id="vol",
+        datacenter_id="EU-RO-1",
+        client=client,
+        endpoint_url="https://s3api-eu-ro-1.runpod.io/",
+        prefix="cloud-offload",
+    )
+    payload = b"transient signature object"
+    artifact = portable_artifact(payload)
+    client.objects[store._key(artifact["storage_key"])] = payload
+    destination = tmp_path / "signature-object"
+
+    store.download_verified(artifact["storage_key"], artifact["digest"], destination)
+
+    assert destination.read_bytes() == payload
+    assert sleeps == [2, 4]
+
+
+def test_s3_signature_error_is_not_retryable_for_write_operations():
+    class SignatureMismatch(Exception):
+        response = {
+            "ResponseMetadata": {"HTTPStatusCode": 403},
+            "Error": {"Code": "SignatureDoesNotMatch"},
+        }
+        operation_name = "PutObject"
+
+    assert not RunPodS3PreparedStore._is_gateway_retryable(SignatureMismatch())
+
+
 @pytest.mark.parametrize(
     "error_name",
     ["SSLError", "ConnectionClosedError", "EndpointConnectionError"],
