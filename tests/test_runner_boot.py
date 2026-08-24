@@ -536,6 +536,14 @@ def test_the_runner_image_keeps_large_cuda_payloads_in_parallel_pull_layers():
         assert f"COPY --from=pytorch-runtime {source} {source}" in dockerfile
 
 
+def test_the_runner_build_excludes_local_worktrees():
+    dockerignore = (Path(__file__).resolve().parents[1] / ".dockerignore").read_text(
+        encoding="utf-8"
+    )
+
+    assert ".worktrees" in dockerignore.splitlines()
+
+
 def test_both_boot_phases_answer_to_the_same_worker_id(monkeypatch):
     monkeypatch.setenv("CLOUD_OFFLOAD_WORKER_ID", "worker-abc123")
 
