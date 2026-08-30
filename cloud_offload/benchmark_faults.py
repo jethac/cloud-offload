@@ -265,12 +265,12 @@ def _corruption_target(
             item
             for item in volumes
             if str(item.get("datacenter_id") or "") in normalized_regions
-            and str(item.get("status") or "ready") == "ready"
+            and str(item.get("status") or "ready") in {"ready", "degraded"}
             and item.get("s3_compatible")
         ]
         if len(region_volumes) != 1:
             raise RuntimeError(
-                "Corruption canary requires one ready S3 volume in the allowed region"
+                "Corruption canary requires one usable S3 volume in the allowed region"
             )
         volume = region_volumes[0]
     else:

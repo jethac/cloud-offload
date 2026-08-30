@@ -574,6 +574,7 @@ class CacheRegistry:
                     "UPDATE cache_volumes SET inventory_generation=? WHERE id=?",
                     (inventory_generation, volume_id),
                 )
+            self._refresh_volume_health(connection, volume_id)
             return {
                 "manifests": 1,
                 "artifacts_restored": restored,

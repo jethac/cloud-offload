@@ -1139,6 +1139,32 @@ def test_registry_removes_temporary_manifest_and_restores_prior_projection(tmp_p
     assert registry.get_volume(volume.id).inventory_generation == "base-generation"
 
 
+def test_removing_the_invalidated_manifest_restores_volume_health(tmp_path):
+    registry = CacheRegistry(tmp_path / "queue.db")
+    volume = registered_volume(registry, "temporary", "A")
+    signer = ManifestSigner(b"t" * 32)
+    profile = fingerprint({"profile": "temporary"})
+    synthetic = portable_artifact(b"synthetic")
+    canary = build_manifest(
+        profile_fingerprint=profile,
+        producer={"image_digest": "sha256:" + "a" * 64},
+        artifacts=[synthetic],
+        signer=signer,
+        created_at="2026-01-02T00:00:00Z",
+    )
+    registry.announce_manifest(volume.id, "canary-generation", canary)
+    registry.invalidate(volume.id, synthetic["digest"], "benchmark")
+    assert registry.get_volume(volume.id).status == "degraded"
+
+    registry.remove_manifest(
+        volume.id,
+        canary["manifest_id"],
+        inventory_generation="base-generation",
+    )
+
+    assert registry.get_volume(volume.id).status == "ready"
+
+
 def test_detach_clears_matching_persisted_volume_binding(monkeypatch, tmp_path):
     prepared = policy(existing_volume_id="provider-volume")
     config = CloudConfig(
