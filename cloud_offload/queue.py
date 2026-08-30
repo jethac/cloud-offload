@@ -6,10 +6,19 @@ import json
 import sqlite3
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+
+def utc_now() -> datetime:
+    """Current UTC time as a naive datetime.
+
+    Timestamps are persisted as ISO strings without a UTC offset and compared
+    lexically in SQLite, so the naive form is part of the storage format.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # What a worker may report about itself. ``starting`` is a runner that has told
@@ -266,7 +275,7 @@ class Job:
 
     def __post_init__(self):
         if not self.created_at:
-            self.created_at = datetime.utcnow().isoformat()
+            self.created_at = utc_now().isoformat()
         if not self.updated_at:
             self.updated_at = self.created_at
         if isinstance(self.status, str):
@@ -698,7 +707,7 @@ class JobQueue:
             raise ValueError("Job event is not finite JSON") from exc
         if len(encoded.encode("utf-8")) > 4 * 1024 * 1024:
             raise ValueError("Job event exceeds the 4 MiB limit")
-        normalized_observed_at = str(observed_at or datetime.utcnow().isoformat())
+        normalized_observed_at = str(observed_at or utc_now().isoformat())
         normalized_occurred_at = str(
             occurred_at or normalized_event.get("occurred_at") or normalized_observed_at
         )
@@ -844,7 +853,7 @@ class JobQueue:
         if not normalized_provider or not normalized_profile:
             raise ValueError("A lease requires provider and runtime profile")
         ttl = max(1, int(ttl_seconds))
-        now = datetime.utcnow()
+        now = utc_now()
         now_text = now.isoformat()
         identifier = str(lease_id or uuid.uuid4())
         resource_name = f"cloud-offload-{identifier.replace('-', '')[:16]}"
@@ -982,7 +991,7 @@ class JobQueue:
         return [self._row_to_job(row) for row in rows]
 
     def attach_job_to_lease(self, lease_id: str, job_id: str) -> None:
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             if not conn.execute(
@@ -1021,7 +1030,7 @@ class JobQueue:
         ttl_seconds: int = 300,
     ) -> JobLease:
         """Bind the pre-mutation lease to the exact provider resource."""
-        now = datetime.utcnow()
+        now = utc_now()
         now_text = now.isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1075,7 +1084,7 @@ class JobQueue:
         worker_id: str | None = None,
         ttl_seconds: int = 300,
     ) -> JobLease:
-        now = datetime.utcnow()
+        now = utc_now()
         now_text = now.isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1109,7 +1118,7 @@ class JobQueue:
         return self._row_to_lease(updated)
 
     def request_lease_revocation(self, lease_id: str, reason: str) -> JobLease:
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         safe_reason = str(reason).strip()[:256] or "revoked"
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1155,7 +1164,7 @@ class JobQueue:
     def record_termination_attempt(
         self, lease_id: str, *, error: str | None = None
     ) -> JobLease:
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         safe_error = str(error)[:256] if error else None
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1203,7 +1212,7 @@ class JobQueue:
         provider_absent: bool,
     ) -> JobLease:
         """Persist the provider observation that ends the billing claim."""
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         state = str(observed_state).strip()[:64] or "absent"
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1248,7 +1257,7 @@ class JobQueue:
 
     def close_unbound_lease(self, lease_id: str, reason: str) -> JobLease:
         """Close a launch intent only after the provider reports no resource."""
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -1355,7 +1364,7 @@ class JobQueue:
 
     def update(self, job: Job) -> None:
         """Update a job and journal a status change in the same transaction."""
-        job.updated_at = datetime.utcnow().isoformat()
+        job.updated_at = utc_now().isoformat()
 
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1426,7 +1435,7 @@ class JobQueue:
                 if hasattr(job, key):
                     setattr(job, key, value)
 
-            now = datetime.utcnow().isoformat()
+            now = utc_now().isoformat()
             job.updated_at = now
             if status == JobStatus.RUNNING:
                 job.started_at = now
@@ -1548,7 +1557,7 @@ class JobQueue:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             lease = None
-            now = datetime.utcnow()
+            now = utc_now()
             now_text = now.isoformat()
             if lease_id:
                 lease_row = conn.execute(
@@ -1651,7 +1660,7 @@ class JobQueue:
                 return []
 
             # Claim them atomically
-            claimed_at = datetime.utcnow().isoformat()
+            claimed_at = utc_now().isoformat()
             placeholders = ",".join("?" * len(job_ids))
             conn.execute(
                 f"""
@@ -1741,7 +1750,7 @@ class JobQueue:
             raise PermissionError("Worker lease does not match the claimed job")
         if lease.status in {"revocation_requested", "terminating"}:
             return job
-        if datetime.fromisoformat(lease.expires_at) <= datetime.utcnow():
+        if datetime.fromisoformat(lease.expires_at) <= utc_now():
             raise PermissionError("Worker lease expired")
         renewed = self.renew_lease(
             lease.id,
@@ -1966,7 +1975,7 @@ class JobQueue:
                     result_json = excluded.result_json,
                     created_at = excluded.created_at
                 """,
-                (cache_key, json.dumps(result), datetime.utcnow().isoformat()),
+                (cache_key, json.dumps(result), utc_now().isoformat()),
             )
 
     def record_worker(
@@ -1995,7 +2004,7 @@ class JobQueue:
             )
             if renewed.status != "active":
                 raise PermissionError("Worker lease is not active")
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         idle_since = now if idle else None
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -2045,7 +2054,7 @@ class JobQueue:
     def _list_workers(
         self, max_age_seconds: int, statuses: tuple[str, ...] | None
     ) -> list[dict]:
-        cutoff = (datetime.utcnow() - timedelta(seconds=max_age_seconds)).isoformat()
+        cutoff = (utc_now() - timedelta(seconds=max_age_seconds)).isoformat()
         clause = ""
         parameters: list[Any] = [cutoff]
         if statuses:
@@ -2062,7 +2071,7 @@ class JobQueue:
                 """,
                 parameters,
             ).fetchall()
-        now = datetime.utcnow()
+        now = utc_now()
         return [
             {
                 "worker_id": row[0],
@@ -2101,7 +2110,7 @@ class JobQueue:
             previous_status = job.status
             job.error = error
             job.worker_id = None
-            now = datetime.utcnow().isoformat()
+            now = utc_now().isoformat()
             if job.attempts >= job.max_attempts:
                 job.status = JobStatus.DEAD_LETTER
                 job.completed_at = now
@@ -2133,7 +2142,7 @@ class JobQueue:
 
     def cleanup_old(self, days: int = 7) -> int:
         """Delete terminal jobs older than N days."""
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff = (utc_now() - timedelta(days=days)).isoformat()
 
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(

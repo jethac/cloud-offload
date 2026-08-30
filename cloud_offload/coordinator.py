@@ -9,7 +9,7 @@ from typing import Any
 
 import requests
 
-from cloud_offload.queue import Job, JobStatus
+from cloud_offload.queue import Job, JobStatus, utc_now
 
 
 class CoordinatorQueue:
@@ -193,7 +193,7 @@ class CoordinatorQueue:
                 "event": event,
                 "producer_id": self._event_producer_id,
                 "producer_sequence": producer_sequence,
-                "occurred_at": datetime.utcnow().isoformat(),
+                "occurred_at": utc_now().isoformat(),
             },
         )
 

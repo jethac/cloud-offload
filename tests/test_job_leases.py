@@ -9,7 +9,7 @@ from cloud_offload.config import CloudConfig
 from cloud_offload.dispatcher import Dispatcher
 from cloud_offload.job_visibility import project_job_visibility
 from cloud_offload.providers.base import Instance
-from cloud_offload.queue import JobQueue, JobStatus
+from cloud_offload.queue import JobQueue, JobStatus, utc_now
 from cloud_offload.worker import Worker
 
 
@@ -219,7 +219,7 @@ def test_reconciliation_enforces_runtime_and_dollar_circuit_breakers(
     with sqlite3.connect(queue.db_path) as conn:
         conn.execute(
             f"UPDATE job_leases SET {deadline} = ? WHERE id = ?",
-            ((datetime.utcnow() - timedelta(seconds=1)).isoformat(), lease.id),
+            ((utc_now() - timedelta(seconds=1)).isoformat(), lease.id),
         )
     provider = LeaseProvider(remove_on_terminate=True)
     provider.instances["pod-1"] = Instance(

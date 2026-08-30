@@ -8,7 +8,7 @@ import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from cloud_offload.queue import Job, JobQueue
+from cloud_offload.queue import Job, JobQueue, utc_now
 
 
 _SECRET_MARKERS = (
@@ -199,7 +199,7 @@ def build_support_bundle(queue: JobQueue, job: Job) -> dict[str, Any]:
         safe_snapshot["last_event"] = _redacted_event(snapshot["last_event"])
     return {
         "schema": "cloud-offload.support-bundle.v1",
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utc_now().isoformat(),
         "job": {
             "id": job.id,
             "model": job.model,
