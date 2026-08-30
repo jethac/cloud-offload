@@ -450,3 +450,30 @@ def test_replay_probe_rejects_jobs_with_no_events(offline):
     assert receipt["passed"] is False
     assert "reload_reconnect_event_order" in receipt["failure_codes"]
     assert receipt["replay_probe"]["events_strictly_ordered"] is False
+
+
+def test_harness_crash_is_recorded_as_a_failed_matrix(offline):
+    plan, world, executor, ledger_path, _ = offline
+
+    executor().run(max_matrices=2)
+
+    original = world.scorecard
+
+    def crashing(benchmark):
+        raise ConnectionError("coordinator died mid-matrix")
+
+    world.scorecard = crashing
+    ledger = executor().run(max_matrices=5)
+    world.scorecard = original
+
+    assert ledger["last_stop_reason"] == "matrix_failed"
+    assert ledger["consecutive_passes"] == 0
+    assert len(ledger["matrices"]) == 3
+    receipt = ledger["matrices"][-1]
+    assert receipt["passed"] is False
+    assert receipt["failure_codes"] == ["release_harness_error:ConnectionError"]
+    assert "coordinator died mid-matrix" not in json.dumps(receipt)
+
+    reloaded = load_ledger(ledger_path, plan)
+    assert reloaded["consecutive_passes"] == 0
+    assert len(reloaded["matrices"]) == 3

@@ -833,6 +833,33 @@ def _scorecard_receipt(
     }
 
 
+def _harness_failure_receipt(
+    index: int, case: ReleaseCase, exc: Exception
+) -> dict[str, Any]:
+    """A matrix whose harness dies mid-flight is still a failed matrix.
+
+    The receipt stays redacted: only the exception class reaches the ledger,
+    never its message, which can carry URLs, paths, or provider payloads.
+    """
+
+    now = _utc_now()
+    return {
+        "schema": RELEASE_MATRIX_SCHEMA,
+        "index": index,
+        "case": case.name,
+        "profile": case.profile,
+        "image_digest": case.image_digest,
+        "region": case.region,
+        "started_at": now,
+        "completed_at": now,
+        "duration_seconds": 0.0,
+        "passed": False,
+        "failure_codes": ["release_harness_error:" + type(exc).__name__],
+        "estimated_compute_cost_upper_usd": 0.0,
+        "provider_mutation": False,
+    }
+
+
 class ReleaseExecutor:
     def __init__(
         self,
@@ -867,7 +894,11 @@ class ReleaseExecutor:
                 break
             index = len(ledger["matrices"]) + 1
             case = self.plan.cases[(index - 1) % len(self.plan.cases)]
-            receipt = self._run_matrix(index, case)
+            self._require_reviewed_hooks(case)
+            try:
+                receipt = self._run_matrix(index, case)
+            except Exception as exc:
+                receipt = _harness_failure_receipt(index, case, exc)
             ledger["matrices"].append(receipt)
             update_ledger(ledger, self.plan)
             _atomic_json(self.ledger_path, ledger)
@@ -882,6 +913,15 @@ class ReleaseExecutor:
         ledger["updated_at"] = _utc_now()
         _atomic_json(self.ledger_path, ledger)
         return ledger
+
+    def _require_reviewed_hooks(self, case: ReleaseCase) -> None:
+        hook_scenarios = [
+            item.name
+            for item in case.benchmark_plan.scenarios
+            if item.failure and item.failure.hook_argv
+        ]
+        if hook_scenarios and not self.allow_hooks:
+            raise RuntimeError("full release matrix needs reviewed benchmark hooks")
 
     def _run_matrix(self, index: int, case: ReleaseCase) -> dict[str, Any]:
         started_at = _utc_now()
@@ -922,13 +962,7 @@ class ReleaseExecutor:
                 "estimated_compute_cost_upper_usd": 0.0,
                 "provider_mutation": False,
             }
-        hook_scenarios = [
-            item.name
-            for item in case.benchmark_plan.scenarios
-            if item.failure and item.failure.hook_argv
-        ]
-        if hook_scenarios and not self.allow_hooks:
-            raise RuntimeError("full release matrix needs reviewed benchmark hooks")
+        self._require_reviewed_hooks(case)
         driver = CoordinatorBenchmarkDriver(
             self.service["url"],
             self.service.get("token"),
