@@ -38,6 +38,8 @@ SUBMISSION_ENDPOINTS = {"/api/partitions", "/api/workflows"}
 MANAGED_INSTANCE_PREFIX = "cloud-offload-worker-"
 DEFAULT_HOOK_TIMEOUT_SECONDS = 120
 CORRUPTION_OBSERVE_HOOK_TIMEOUT_SECONDS = 270
+PREFLIGHT_OFFER_RETRY_SECONDS = 300
+PREFLIGHT_OFFER_RETRY_INTERVAL_SECONDS = 15
 
 
 def _utc_now() -> str:
@@ -1373,11 +1375,15 @@ class CoordinatorBenchmarkDriver:
             "changed": changed,
         }
 
-    def submit(self, scenario: BenchmarkScenario) -> str:
-        # Submission is not transport-idempotent yet, so it is deliberately not
-        # retried after an ambiguous connection failure.
-        request_payload = dict(scenario.request)
-        if scenario.endpoint == "/api/partitions":
+    def _ready_preflight(
+        self, scenario: BenchmarkScenario, request_payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Offer availability is transient: the offer a prior scenario's pod
+        # occupied can take a short while to be listed again after that pod is
+        # terminated. Retry a not-ready preflight while it reports no blockers,
+        # since only current-offer availability can change on its own.
+        deadline = time.monotonic() + PREFLIGHT_OFFER_RETRY_SECONDS
+        while True:
             preflight_response = self._request(
                 "POST",
                 "/api/preflight",
@@ -1392,15 +1398,27 @@ class CoordinatorBenchmarkDriver:
             )
             preflight_response.raise_for_status()
             preflight = preflight_response.json()
-            if preflight.get("status") not in {"ready", "ready_with_preparation"}:
-                codes = [
-                    str(item.get("code") or "unknown")
-                    for item in preflight.get("blockers") or preflight.get("unknowns") or []
-                ]
-                raise RuntimeError(
-                    "Benchmark preflight is not ready"
-                    + (f" ({', '.join(codes)})" if codes else "")
-                )
+            if preflight.get("status") in {"ready", "ready_with_preparation"}:
+                return preflight
+            blockers = preflight.get("blockers") or []
+            if not blockers and time.monotonic() < deadline:
+                time.sleep(PREFLIGHT_OFFER_RETRY_INTERVAL_SECONDS)
+                continue
+            codes = [
+                str(item.get("code") or "unknown")
+                for item in blockers or preflight.get("unknowns") or []
+            ]
+            raise RuntimeError(
+                "Benchmark preflight is not ready"
+                + (f" ({', '.join(codes)})" if codes else "")
+            )
+
+    def submit(self, scenario: BenchmarkScenario) -> str:
+        # Submission is not transport-idempotent yet, so it is deliberately not
+        # retried after an ambiguous connection failure.
+        request_payload = dict(scenario.request)
+        if scenario.endpoint == "/api/partitions":
+            preflight = self._ready_preflight(scenario, request_payload)
             candidate_id = (preflight.get("recommendation") or {}).get(
                 "candidate_id"
             )
