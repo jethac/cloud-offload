@@ -3061,6 +3061,59 @@ def test_confirmed_prepared_launch_does_not_silently_fall_back_cold(tmp_path):
     assert all(placement is not None for placement in provider.launches)
 
 
+def test_rebound_strict_binding_fails_provisioning_instead_of_stale_launch(tmp_path):
+    """Strict placement means exactly the configured volume, every launch.
+
+    A quote confirmed against one volume must not launch after the strict
+    binding is pointed elsewhere: the launch fails as provisioning (with
+    retry) rather than renting a GPU against the stale confirmation.
+    """
+    volume = ProviderStorage("vol-1", "runpod", "cache", 100, "US-KS-2", True)
+    config = dispatcher_config(tmp_path, policy(policy="strict"))
+    provider = PlacementProvider(volume=volume)
+    dispatcher = Dispatcher(config, provider=provider)
+    registered = dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-1",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    job = dispatcher.queue.create(
+        "comfyui-workflow",
+        "inline://request",
+        params={
+            "runtime_profile": "comfy",
+            "preflight": {
+                "candidate_id": "sha256:" + "c" * 64,
+                "provider": "runpod",
+                "offer_id": "gpu",
+                "gpu_type": "GPU",
+                "gpu_ram_gb": 24,
+                "hourly_rate": 0.4,
+                "region": "US-KS-2",
+                "prepared_volume_id": registered.id,
+                "expires_at": "2099-01-01T00:00:00Z",
+                "request_policy": {"max_hourly_rate": 1.0},
+            },
+        },
+        request={"workflow": {}},
+        provider="runpod",
+        status=JobStatus.QUEUED,
+    )
+    dispatcher.config.prepared_storage["existing_volume_id"] = "vol-missing"
+
+    instance = dispatcher._launch_worker("runpod", "comfy", [job])
+
+    assert instance is None
+    assert provider.launches == []
+    assert dispatcher.queue.get(job.id).status == JobStatus.QUEUED
+    events = [item["type"] for item in dispatcher.queue.list_events(job.id)]
+    assert "provisioning_failed" in events
+    assert "provisioning_started" not in events
+
+
 def test_worker_manifest_announcement_drives_next_exact_cache_placement(
     monkeypatch, tmp_path
 ):

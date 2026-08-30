@@ -471,6 +471,15 @@ class Dispatcher:
                 placement_decision.action != "launch"
                 or not placement_decision.candidate
             ):
+                if placement_decision.reason == "confirmed_prepared_binding_changed":
+                    self._record_launch_failure(
+                        provider_name,
+                        profile_name,
+                        queued_jobs,
+                        "The strict prepared-storage binding no longer names "
+                        "the confirmed volume",
+                    )
+                    return None
                 self._refuse_preflight_launch(
                     queued_jobs,
                     "The confirmed prepared placement is no longer available.",
@@ -1242,6 +1251,19 @@ class Dispatcher:
         ):
             return PlacementDecision(
                 "unavailable", None, "confirmed_prepared_volume_changed", ()
+            )
+        policy = str(self.config.prepared_storage.get("policy") or "")
+        bound = str(self.config.prepared_storage.get("existing_volume_id") or "")
+        if (
+            policy in {"strict", "pinned"}
+            and bound
+            and bound != volume.provider_volume_id
+        ):
+            # Strict placement means "exactly the configured volume". A quote
+            # confirmed against a volume the config no longer binds must not
+            # launch; the current binding decides, not the stale confirmation.
+            return PlacementDecision(
+                "unavailable", None, "confirmed_prepared_binding_changed", ()
             )
         try:
             actual = connector.get_storage(volume.provider_volume_id)

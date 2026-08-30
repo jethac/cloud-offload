@@ -390,6 +390,11 @@ class ReleasePlan:
         actual_axes = {(case.profile, case.region) for case in cases}
         if actual_axes != expected_axes or len(actual_axes) != len(cases):
             raise ValueError("cases must cover each declared profile-region pair once")
+        if len(cases) > required:
+            raise ValueError(
+                "more cases than required consecutive matrices; the trailing window "
+                "could never cover every case"
+            )
         limits_value = value.get("limits")
         if not isinstance(limits_value, dict):
             raise ValueError("limits must be an object")
@@ -647,7 +652,12 @@ def _replay_probe(
         status_matches = status_matches and snapshot.get("status") == result.get("status")
         events = driver.events(str(job_id), 0)
         sequences = [int(item.get("sequence") or 0) for item in events]
-        ordered = ordered and sequences == sorted(set(sequences)) and all(sequences)
+        ordered = (
+            ordered
+            and bool(sequences)
+            and sequences == sorted(set(sequences))
+            and all(sequences)
+        )
         if sequences:
             pivot_index = max(0, len(sequences) - min(10, len(sequences)))
             cursor = sequences[pivot_index] - 1
@@ -747,8 +757,11 @@ def _scorecard_receipt(
             failure_kind = plan_scenario.get("failure_kind")
             if failure_kind:
                 canaries.add(str(failure_kind))
-        closure = float(result.get("resource_closure_seconds") or 0)
-        maximum_closure = max(maximum_closure, closure)
+        closure = result.get("resource_closure_seconds")
+        if closure is None:
+            failures.append("provider_closure_measurement_missing")
+        else:
+            maximum_closure = max(maximum_closure, float(closure))
         if plan_scenario.get("failure_kind") == "cancellation":
             cancellation_to_absence = result.get(
                 "cancellation_to_provider_absence_seconds"
@@ -820,6 +833,33 @@ def _scorecard_receipt(
     }
 
 
+def _harness_failure_receipt(
+    index: int, case: ReleaseCase, exc: Exception
+) -> dict[str, Any]:
+    """A matrix whose harness dies mid-flight is still a failed matrix.
+
+    The receipt stays redacted: only the exception class reaches the ledger,
+    never its message, which can carry URLs, paths, or provider payloads.
+    """
+
+    now = _utc_now()
+    return {
+        "schema": RELEASE_MATRIX_SCHEMA,
+        "index": index,
+        "case": case.name,
+        "profile": case.profile,
+        "image_digest": case.image_digest,
+        "region": case.region,
+        "started_at": now,
+        "completed_at": now,
+        "duration_seconds": 0.0,
+        "passed": False,
+        "failure_codes": ["release_harness_error:" + type(exc).__name__],
+        "estimated_compute_cost_upper_usd": 0.0,
+        "provider_mutation": False,
+    }
+
+
 class ReleaseExecutor:
     def __init__(
         self,
@@ -854,7 +894,11 @@ class ReleaseExecutor:
                 break
             index = len(ledger["matrices"]) + 1
             case = self.plan.cases[(index - 1) % len(self.plan.cases)]
-            receipt = self._run_matrix(index, case)
+            self._require_reviewed_hooks(case)
+            try:
+                receipt = self._run_matrix(index, case)
+            except Exception as exc:
+                receipt = _harness_failure_receipt(index, case, exc)
             ledger["matrices"].append(receipt)
             update_ledger(ledger, self.plan)
             _atomic_json(self.ledger_path, ledger)
@@ -862,13 +906,22 @@ class ReleaseExecutor:
             if not receipt["passed"]:
                 stop_reason = "matrix_failed"
                 break
-        if ledger.get("passed"):
+        if ledger.get("passed") and stop_reason != "release_already_passed":
             stop_reason = "release_passed"
         ledger["last_stop_reason"] = stop_reason
         ledger["last_run_matrix_count"] = executed
         ledger["updated_at"] = _utc_now()
         _atomic_json(self.ledger_path, ledger)
         return ledger
+
+    def _require_reviewed_hooks(self, case: ReleaseCase) -> None:
+        hook_scenarios = [
+            item.name
+            for item in case.benchmark_plan.scenarios
+            if item.failure and item.failure.hook_argv
+        ]
+        if hook_scenarios and not self.allow_hooks:
+            raise RuntimeError("full release matrix needs reviewed benchmark hooks")
 
     def _run_matrix(self, index: int, case: ReleaseCase) -> dict[str, Any]:
         started_at = _utc_now()
@@ -909,13 +962,7 @@ class ReleaseExecutor:
                 "estimated_compute_cost_upper_usd": 0.0,
                 "provider_mutation": False,
             }
-        hook_scenarios = [
-            item.name
-            for item in case.benchmark_plan.scenarios
-            if item.failure and item.failure.hook_argv
-        ]
-        if hook_scenarios and not self.allow_hooks:
-            raise RuntimeError("full release matrix needs reviewed benchmark hooks")
+        self._require_reviewed_hooks(case)
         driver = CoordinatorBenchmarkDriver(
             self.service["url"],
             self.service.get("token"),

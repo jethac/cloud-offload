@@ -127,6 +127,10 @@ def is_port_available(host: str, port: int) -> bool:
     if host in {"localhost"}:
         bind_host = "127.0.0.1"
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        # Match the server's own bind semantics: uvicorn binds with
+        # SO_REUSEADDR, so lingering TIME_WAIT sockets from a stopped
+        # coordinator must not make the probe report the port as taken.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((bind_host, port))
         except OSError:
