@@ -103,6 +103,13 @@ class CachePolicyError(RuntimeError):
     """An artifact is not eligible under the current tenant/license policy."""
 
 
+class _MultipartUploadCancelled(RuntimeError):
+    """A sibling part failed; this part stopped without an error of its own."""
+
+    def __init__(self) -> None:
+        super().__init__("Multipart upload was cancelled")
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1898,10 +1905,14 @@ class RunPodS3PreparedStore:
 
         upload_cancelled = threading.Event()
 
-        def upload_part(part_number: int) -> tuple[int, str]:
+        def upload_part(part_number: int, refill: bool) -> tuple[int, str]:
             try:
-                if upload_cancelled.is_set():
-                    raise RuntimeError("Multipart upload was cancelled")
+                # The initial window was authorized before any outcome was
+                # known; its parts always run their single cheap attempt so a
+                # resume has verified parts to reuse. Refills submitted while
+                # a sibling failure was propagating must not start new work.
+                if refill and upload_cancelled.is_set():
+                    raise _MultipartUploadCancelled()
                 offset = (part_number - 1) * part_size
                 expected_size = min(part_size, source_size - offset)
                 with source.open("rb") as stream:
@@ -1940,36 +1951,47 @@ class RunPodS3PreparedStore:
         pending_parts = iter(pending)
         in_flight: dict[Any, int] = {}
 
-        def submit_next() -> bool:
+        def submit_next(refill: bool = True) -> bool:
             if upload_cancelled.is_set():
                 return False
             try:
                 part_number = next(pending_parts)
             except StopIteration:
                 return False
-            in_flight[executor.submit(upload_part, part_number)] = part_number
+            in_flight[executor.submit(upload_part, part_number, refill)] = part_number
             return True
 
         for _ in range(RUNPOD_S3_MULTIPART_CONCURRENCY):
-            if not submit_next():
+            if not submit_next(refill=False):
                 break
         try:
             while in_flight:
                 done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
-                results = [future.result() for future in done]
                 for future in done:
                     in_flight.pop(future, None)
+                results = []
+                cancelled: _MultipartUploadCancelled | None = None
+                for future in done:
+                    try:
+                        results.append(future.result())
+                    except _MultipartUploadCancelled as exc:
+                        # A sibling part failed. Keep draining so the sibling's
+                        # own error propagates instead of the cancel signal.
+                        cancelled = exc
+                if cancelled is not None and not in_flight:
+                    raise cancelled
                 for part_number, etag in results:
                     completed[part_number] = etag
                 for _ in results:
                     submit_next()
         except BaseException:
             upload_cancelled.set()
-            for future in in_flight:
-                future.cancel()
             raise
         finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+            # Initial-window parts are left to finish their single attempt so
+            # a resume can reuse them; refills observe the cancel flag and
+            # stop before starting any new work.
+            executor.shutdown(wait=True)
 
         parts = [
             {"PartNumber": part_number, "ETag": completed[part_number]}
@@ -2149,8 +2171,6 @@ class RunPodS3PreparedStore:
         """Retry RunPod gateway timeouts that Botocore does not classify."""
 
         for attempt in range(1, RUNPOD_S3_GATEWAY_ATTEMPTS + 1):
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("Multipart upload was cancelled")
             try:
                 return operation()
             except Exception as exc:

@@ -217,25 +217,34 @@ class Dispatcher:
         try:
             config_path = getattr(self.config, "_source_path", None)
             persisted = CloudConfig.load(config_path, resolve_secrets=False)
-            self.config.keep_warm = persisted.keep_warm
-            self.config.keep_warm_warning_seconds = persisted.keep_warm_warning_seconds
-            self.config.idle_shutdown_seconds = persisted.idle_shutdown_seconds
-            self.config.min_queue_depth = persisted.min_queue_depth
-            self.config.gpu_type = persisted.gpu_type
-            self.config.max_hourly_rate = persisted.max_hourly_rate
-            self.config.max_total_job_cost = persisted.max_total_job_cost
-            self.config.max_job_runtime_seconds = persisted.max_job_runtime_seconds
-            self.config.lease_ttl_seconds = persisted.lease_ttl_seconds
-            self.config.worker_profiles = persisted.worker_profiles
-            self.config.runpod_registry_auth_id = persisted.runpod_registry_auth_id
-            # Prepared storage can create paid durable resources. Only refresh
-            # it for file-backed services; a programmatically constructed
-            # config remains authoritative for this opt-in policy.
-            if config_path is not None:
-                self.config.prepared_storage = persisted.prepared_storage
+            # A programmatically constructed config (no source path) owns its
+            # runtime policy: never overwrite it with the default user config
+            # or with built-in defaults when no file exists on disk.
+            persisted_source = getattr(persisted, "_source_path", None)
+            if persisted_source is None or (
+                config_path is not None and persisted_source.exists()
+            ):
+                self.config.keep_warm = persisted.keep_warm
+                self.config.keep_warm_warning_seconds = (
+                    persisted.keep_warm_warning_seconds
+                )
+                self.config.idle_shutdown_seconds = persisted.idle_shutdown_seconds
+                self.config.min_queue_depth = persisted.min_queue_depth
+                self.config.gpu_type = persisted.gpu_type
+                self.config.max_hourly_rate = persisted.max_hourly_rate
+                self.config.max_total_job_cost = persisted.max_total_job_cost
+                self.config.max_job_runtime_seconds = persisted.max_job_runtime_seconds
+                self.config.lease_ttl_seconds = persisted.lease_ttl_seconds
+                self.config.worker_profiles = persisted.worker_profiles
+                self.config.runpod_registry_auth_id = persisted.runpod_registry_auth_id
+                # Prepared storage can create paid durable resources. Only refresh
+                # it for file-backed services; a programmatically constructed
+                # config remains authoritative for this opt-in policy.
+                if config_path is not None:
+                    self.config.prepared_storage = persisted.prepared_storage
             runpod = self.connectors.get("runpod")
             if runpod is not None and hasattr(runpod, "registry_auth_id"):
-                runpod.registry_auth_id = persisted.runpod_registry_auth_id.strip()
+                runpod.registry_auth_id = self.config.runpod_registry_auth_id.strip()
         except Exception as exc:
             logger.warning("Could not refresh cloud runtime policy: %s", exc)
 
