@@ -3628,6 +3628,40 @@ def test_same_pod_retry_finishes_cache_population_for_an_already_downloaded_asse
     assert [item["digest"] for item in manifest["artifacts"]] == [artifact["digest"]]
 
 
+def test_a_cache_symlinked_asset_is_reverified_through_the_cache_not_rehashed(
+    tmp_path, monkeypatch
+):
+    cas = PreparedStateCAS(tmp_path / "volume", ManifestSigner(b"y" * 32))
+    profile = fingerprint({"symlinked": True})
+    payload = b"already-restored-through-the-cache"
+    artifact = portable_artifact(payload)
+    asset = {
+        "category": "checkpoints",
+        "filename": "linked.safetensors",
+        "sha256": artifact["digest"].removeprefix("sha256:"),
+    }
+    writer = cache_worker(cas, profile, "symlink-writer")
+    writer._fetch_declared_asset = lambda a, target, token: target.write_bytes(payload)
+    writer._stage_declared_asset(asset, tmp_path / "writer-models", None)
+
+    reader = cache_worker(cas, profile, "symlink-reader")
+    reader._fetch_declared_asset = lambda *args: pytest.fail("origin was called")
+    reader._stage_declared_asset(asset, tmp_path / "models", None)
+    target = tmp_path / "models" / "checkpoints" / asset["filename"]
+    assert target.is_symlink()
+
+    import cloud_offload.worker as worker_module
+
+    monkeypatch.setattr(
+        worker_module,
+        "sha256_file",
+        lambda path: pytest.fail("staging re-hashed the materialized file"),
+    )
+    reader._stage_declared_asset(asset, tmp_path / "models", None)
+
+    assert target.read_bytes() == payload
+
+
 def test_hf_snapshot_profile_is_restored_on_a_fresh_worker_without_origin(
     monkeypatch, tmp_path
 ):

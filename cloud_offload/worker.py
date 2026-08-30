@@ -1912,6 +1912,12 @@ class Worker:
         if not target.exists() and self._restore_declared_asset(asset, target):
             return
 
+        # A symlinked target points into the prepared cache, whose restore
+        # verifies content by trust receipt or digest; re-restoring through
+        # the cache proves the bytes without re-hashing the whole file.
+        if target.is_symlink() and self._restore_declared_asset(asset, target):
+            return
+
         if target.is_file():
             present = sha256_file(target)
             if present == expected:
