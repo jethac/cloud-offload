@@ -585,6 +585,10 @@ requires explicit spend confirmation, terminates exact attributable Pods after
 every scenario, and fails its scorecard if the provider inventory still contains
 an orphan.
 
+The Milestone 7 production-release gate (thirty consecutive full canary
+matrices) is operated with the same harness through the release controller;
+the operator guide is **[M7 production-release campaign runbook](docs/m7-release-runbook.md)**.
+
 ## Roadmap
 
 The canonical direction is documented in **[Cloud Offload product goal and

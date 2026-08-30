@@ -95,3 +95,38 @@ def test_lan_bearer_middleware_challenges_and_exempts_worker_channel(
     )
     assert worker.status_code == 401
     assert worker.json()["error"]["code"] != "cloud_offload.auth_required"
+
+
+def test_port_probe_ignores_time_wait_sockets_from_a_stopped_server():
+    """A coordinator restart must not be blocked by its own TIME_WAIT sockets.
+
+    When the coordinator is stopped while it has live keep-alive connections,
+    the server side closes first and the port lingers in TIME_WAIT. The real
+    bind (uvicorn) uses SO_REUSEADDR, so the availability probe must too, or
+    the restart canary fails with "Port ... is already in use" for up to 60s.
+    """
+
+    import socket
+    import threading
+
+    from cloud_offload.service_config import is_port_available
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def connect_and_wait():
+        with socket.create_connection(("127.0.0.1", port)) as client_sock:
+            client_sock.recv(1)
+
+    client = threading.Thread(target=connect_and_wait)
+    client.start()
+    accepted, _ = listener.accept()
+    # Server closes first, leaving the server side of the pair in TIME_WAIT.
+    accepted.close()
+    client.join()
+    listener.close()
+
+    assert is_port_available("127.0.0.1", port)
