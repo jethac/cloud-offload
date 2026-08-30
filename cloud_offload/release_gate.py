@@ -390,6 +390,11 @@ class ReleasePlan:
         actual_axes = {(case.profile, case.region) for case in cases}
         if actual_axes != expected_axes or len(actual_axes) != len(cases):
             raise ValueError("cases must cover each declared profile-region pair once")
+        if len(cases) > required:
+            raise ValueError(
+                "more cases than required consecutive matrices; the trailing window "
+                "could never cover every case"
+            )
         limits_value = value.get("limits")
         if not isinstance(limits_value, dict):
             raise ValueError("limits must be an object")
@@ -647,7 +652,12 @@ def _replay_probe(
         status_matches = status_matches and snapshot.get("status") == result.get("status")
         events = driver.events(str(job_id), 0)
         sequences = [int(item.get("sequence") or 0) for item in events]
-        ordered = ordered and sequences == sorted(set(sequences)) and all(sequences)
+        ordered = (
+            ordered
+            and bool(sequences)
+            and sequences == sorted(set(sequences))
+            and all(sequences)
+        )
         if sequences:
             pivot_index = max(0, len(sequences) - min(10, len(sequences)))
             cursor = sequences[pivot_index] - 1
@@ -747,8 +757,11 @@ def _scorecard_receipt(
             failure_kind = plan_scenario.get("failure_kind")
             if failure_kind:
                 canaries.add(str(failure_kind))
-        closure = float(result.get("resource_closure_seconds") or 0)
-        maximum_closure = max(maximum_closure, closure)
+        closure = result.get("resource_closure_seconds")
+        if closure is None:
+            failures.append("provider_closure_measurement_missing")
+        else:
+            maximum_closure = max(maximum_closure, float(closure))
         if plan_scenario.get("failure_kind") == "cancellation":
             cancellation_to_absence = result.get(
                 "cancellation_to_provider_absence_seconds"
@@ -862,7 +875,7 @@ class ReleaseExecutor:
             if not receipt["passed"]:
                 stop_reason = "matrix_failed"
                 break
-        if ledger.get("passed"):
+        if ledger.get("passed") and stop_reason != "release_already_passed":
             stop_reason = "release_passed"
         ledger["last_stop_reason"] = stop_reason
         ledger["last_run_matrix_count"] = executed
