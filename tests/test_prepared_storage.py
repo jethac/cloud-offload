@@ -3114,6 +3114,64 @@ def test_rebound_strict_binding_fails_provisioning_instead_of_stale_launch(tmp_p
     assert "provisioning_started" not in events
 
 
+def test_strict_binding_in_another_region_does_not_block_regional_volume(tmp_path):
+    """A strict binding naming another region's volume is not a stale binding.
+
+    Multi-region prepared storage keeps one binding slot in the config while a
+    registered volume serves each datacenter. A confirmation against the
+    region's own volume must survive the binding naming a sibling region.
+    """
+    volume = ProviderStorage("vol-1", "runpod", "cache", 100, "US-KS-2", True)
+    config = dispatcher_config(tmp_path, policy(policy="strict"))
+    provider = PlacementProvider(volume=volume)
+    dispatcher = Dispatcher(config, provider=provider)
+    registered = dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-1",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-2",
+        datacenter_id="EU-RO-1",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    dispatcher.config.prepared_storage["existing_volume_id"] = "vol-2"
+    confirmed = {
+        "candidate_id": "sha256:" + "c" * 64,
+        "provider": "runpod",
+        "offer_id": "gpu",
+        "gpu_type": "GPU",
+        "gpu_ram_gb": 24,
+        "hourly_rate": 0.4,
+        "region": "US-KS-2",
+        "prepared_volume_id": registered.id,
+        "expires_at": "2099-01-01T00:00:00Z",
+        "request_policy": {"max_hourly_rate": 1.0},
+    }
+
+    decision = dispatcher._confirmed_cache_placement(
+        connector=dispatcher.connectors["runpod"],
+        provider_name="runpod",
+        gpu_type="GPU",
+        minimum_vram=24,
+        cooling=set(),
+        requirements={
+            "required": {},
+            "logical_required": [],
+            "profile_fingerprint": "fp",
+        },
+        confirmed=confirmed,
+    )
+
+    assert decision.reason != "confirmed_prepared_binding_changed"
+
+
 def test_worker_manifest_announcement_drives_next_exact_cache_placement(
     monkeypatch, tmp_path
 ):

@@ -1268,12 +1268,20 @@ class Dispatcher:
             and bound
             and bound != volume.provider_volume_id
         ):
-            # Strict placement means "exactly the configured volume". A quote
+            # Strict placement means "the configured volume decides". A quote
             # confirmed against a volume the config no longer binds must not
-            # launch; the current binding decides, not the stale confirmation.
-            return PlacementDecision(
-                "unavailable", None, "confirmed_prepared_binding_changed", ()
+            # launch — unless the binding names a registered volume in another
+            # datacenter, which cannot serve this region at all: the regional
+            # confirmed volume then remains the only strict answer.
+            bound_volume = self.cache_registry.get_provider_volume(
+                provider_name, bound
             )
+            if bound_volume is None or bound_volume.datacenter_id == str(
+                confirmed.get("region") or ""
+            ):
+                return PlacementDecision(
+                    "unavailable", None, "confirmed_prepared_binding_changed", ()
+                )
         try:
             actual = connector.get_storage(volume.provider_volume_id)
         except Exception:
