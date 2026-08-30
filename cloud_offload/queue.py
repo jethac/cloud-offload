@@ -1741,6 +1741,8 @@ class JobQueue:
             raise KeyError(f"Job not found: {job_id}")
         leases = self.leases_for_job(job_id, open_only=True)
         if not leases:
+            if self.leases_for_job(job_id):
+                raise PermissionError("Worker lease for this job is closed")
             # Local and pre-M3 workers have no lease. Keep that established path.
             return job
         if not worker_id or job.worker_id != str(worker_id):

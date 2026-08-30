@@ -279,6 +279,26 @@ def test_provider_loss_closes_lease_and_requeues_unfinished_work(tmp_path):
     )
 
 
+def test_dead_worker_callbacks_are_rejected_after_its_lease_closes(tmp_path):
+    config = lease_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    job = queued_job(queue)
+    lease = bound_lease(queue, job)
+    queue.claim_jobs(
+        "worker-1",
+        provider="runpod",
+        models=["comfyui-partition-v1"],
+        lease_id=lease.id,
+    )
+    Dispatcher(config, queue=queue, provider=LeaseProvider())._reconcile_leases()
+    assert queue.get(job.id).status == JobStatus.QUEUED
+
+    with pytest.raises(PermissionError, match="lease for this job is closed"):
+        queue.authorize_worker_job(
+            job.id, worker_id="worker-1", lease_id=lease.id
+        )
+
+
 def test_cancelled_job_cannot_publish_shared_cache_state(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
     job = queued_job(queue)
