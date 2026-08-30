@@ -1899,13 +1899,15 @@ class Worker:
         category = str(asset.get("category") or "")
         filename = str(asset.get("filename") or "")
         expected = str(asset.get("sha256") or "").lower()
-        target = (models_dir / category / filename).resolve()
-        try:
-            target.relative_to(models_dir)
-        except ValueError:
+        relative = PurePosixPath(category) / filename
+        if relative.is_absolute() or ".." in relative.parts:
             raise RuntimeError(
                 f"Declared asset escapes the models directory: {category}/{filename}"
             )
+        # The category directory may itself be a symlink onto a prepared
+        # network volume, so the escape check is lexical: resolving symlinks
+        # here would reject the worker's own restored cache layout.
+        target = models_dir / relative
 
         if not target.exists() and self._restore_declared_asset(asset, target):
             return

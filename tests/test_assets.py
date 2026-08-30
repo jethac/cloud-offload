@@ -647,6 +647,26 @@ def test_a_stored_artifact_comes_down_the_worker_channel(tmp_path, monkeypatch):
     )
 
 
+def test_a_symlinked_category_directory_is_not_an_escape(tmp_path, monkeypatch):
+    """A prepared-cache restore links model category dirs onto the volume.
+
+    The escape check must be lexical: the worker's own restored layout points
+    ``models/checkpoints`` at a network-volume path outside the models tree,
+    and staging a declared asset through that symlink is legitimate.
+    """
+    worker = staging_worker(tmp_path, monkeypatch)
+    volume = tmp_path / "volume" / "checkpoints"
+    volume.mkdir(parents=True)
+    models = models_path(tmp_path)
+    models.mkdir(parents=True)
+    (models / "checkpoints").symlink_to(volume, target_is_directory=True)
+    job = asset_job(worker, source_asset())
+
+    worker._stage_profile_weights(job)
+
+    assert (volume / CHECKPOINT_ASSET["filename"]).read_bytes() == CHECKPOINT_BYTES
+
+
 def test_an_asset_escaping_the_models_directory_is_refused(tmp_path, monkeypatch):
     worker = staging_worker(tmp_path, monkeypatch)
     job = asset_job(worker, source_asset(filename="../../escape.safetensors"))
