@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from cloud_offload.config import CloudConfig
-from cloud_offload.queue import Job, JobQueue, JobStatus
+from cloud_offload.queue import Job, JobQueue, JobStatus, utc_now
 from cloud_offload.storage import Storage, create_storage
 from cloud_offload.profiles import WORKFLOW_CAPABILITIES, load_worker_manifest
 
@@ -123,7 +123,7 @@ class Worker:
         self.storage = storage or create_storage(config)
 
         self.running = False
-        self.last_job_time = datetime.utcnow()
+        self.last_job_time = utc_now()
         self.runtime_profile = config.worker_profile
         self.declared_capabilities = list(dict.fromkeys(config.worker_models))
         self._apply_image_manifest()
@@ -369,7 +369,7 @@ class Worker:
                 "compatible image"
             )
         self.running = True
-        self.last_job_time = datetime.utcnow()
+        self.last_job_time = utc_now()
 
         while self.running:
             try:
@@ -393,7 +393,7 @@ class Worker:
                 )
 
                 if jobs:
-                    self.last_job_time = datetime.utcnow()
+                    self.last_job_time = utc_now()
 
                     for job in jobs:
                         if not self.running:
@@ -414,7 +414,7 @@ class Worker:
                         finally:
                             # Idle time starts when work ends, not when it is
                             # claimed. A job can run longer than the idle limit.
-                            self.last_job_time = datetime.utcnow()
+                            self.last_job_time = utc_now()
                 else:
                     logger.debug("No jobs available")
 
@@ -448,7 +448,7 @@ class Worker:
                 logger.warning("Could not refresh worker lifetime policy: %s", exc)
         if keep_warm:
             return False
-        idle_time = datetime.utcnow() - self.last_job_time
+        idle_time = utc_now() - self.last_job_time
         return idle_time.total_seconds() > idle_shutdown_seconds
 
     def _process_job(self, job: Job):

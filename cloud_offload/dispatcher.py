@@ -29,7 +29,7 @@ from cloud_offload.credentials import huggingface_token
 from cloud_offload.providers import create_connector
 from cloud_offload.providers.base import CloudConnector, CloudProvider, Instance
 from cloud_offload.providers.base import PlacementConstraints, StorageAttachment
-from cloud_offload.queue import JobLease, JobQueue, JobStatus
+from cloud_offload.queue import JobLease, JobQueue, JobStatus, utc_now
 from cloud_offload.profiles import (
     configured_worker_profiles,
     profile_providing,
@@ -938,7 +938,7 @@ class Dispatcher:
         self.active_instances[instance.id] = instance
         self.instance_providers[instance.id] = provider_name
         self.instance_profiles[instance.id] = profile_name
-        launched_at = datetime.utcnow()
+        launched_at = utc_now()
         self.last_activity[instance.id] = launched_at
         self.launched_at[instance.id] = launched_at
         logger.info("Launched worker %s", instance.id)
@@ -1039,7 +1039,7 @@ class Dispatcher:
         try:
             created = datetime.fromisoformat(lease.created_at)
         except ValueError:
-            created = datetime.utcnow()
+            created = utc_now()
         self.launched_at.setdefault(instance.id, created)
         self.last_activity.setdefault(instance.id, created)
 
@@ -1126,7 +1126,7 @@ class Dispatcher:
 
     def _reconcile_leases(self) -> None:
         """Rebuild ownership and close every expired or revoked paid resource."""
-        now = datetime.utcnow()
+        now = utc_now()
         for initial in self.queue.list_open_leases():
             lease = self.queue.get_lease(initial.id) or initial
             connector = self.connectors.get(lease.provider)
@@ -1715,7 +1715,7 @@ cloud-offload worker --poll 10
 
     def _check_unregistered_workers(self):
         """Stop a paid instance whose runner never managed to call home."""
-        now = datetime.utcnow()
+        now = utc_now()
         workers = self.queue.list_active_workers()
         profiles = configured_worker_profiles(self.config)
         for instance_id, launched_at in list(self.launched_at.items()):
@@ -1803,7 +1803,7 @@ cloud-offload worker --poll 10
             return
         # Check for idle workers
         idle_threshold = timedelta(seconds=self.config.idle_shutdown_seconds)
-        now = datetime.utcnow()
+        now = utc_now()
 
         workers = self.queue.list_active_workers()
         profiles = configured_worker_profiles(self.config)

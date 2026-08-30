@@ -10,7 +10,7 @@ from cloud_offload.config import CloudConfig
 from cloud_offload.coordinator import CoordinatorQueue
 from cloud_offload.dispatcher import Dispatcher
 from cloud_offload.providers.base import CloudProvider
-from cloud_offload.queue import JobQueue, JobStatus
+from cloud_offload.queue import JobQueue, JobStatus, utc_now
 from cloud_offload.router import select_provider
 from cloud_offload.worker import Worker
 
@@ -700,7 +700,7 @@ def test_worker_live_policy_can_keep_an_idle_worker_alive():
     worker = Worker.__new__(Worker)
     worker.config = CloudConfig(idle_shutdown_seconds=1)
     worker.queue = PolicyQueue()
-    worker.last_job_time = datetime.utcnow() - timedelta(hours=2)
+    worker.last_job_time = utc_now() - timedelta(hours=2)
 
     assert worker._should_shutdown() is False
 
@@ -724,7 +724,7 @@ def test_worker_idle_time_starts_after_a_job_ends():
     worker.gpu_vram_gb = 80
     worker.gpu_name = "A100"
     worker.cache_volume_id = None
-    old_time = datetime.utcnow() - timedelta(hours=1)
+    old_time = utc_now() - timedelta(hours=1)
 
     def complete_long_job(job):
         worker.last_job_time = old_time
@@ -743,7 +743,7 @@ def test_live_idle_policy_cannot_remove_dispatcher_cleanup_grace():
     worker = Worker.__new__(Worker)
     worker.config = CloudConfig(idle_shutdown_seconds=61)
     worker.queue = PolicyQueue()
-    worker.last_job_time = datetime.utcnow() - timedelta(seconds=30)
+    worker.last_job_time = utc_now() - timedelta(seconds=30)
 
     assert worker._should_shutdown() is False
 
@@ -758,7 +758,7 @@ def test_dispatcher_does_not_terminate_pinned_workers(tmp_path):
     dispatcher.active_instances["pod-1"] = SimpleNamespace(id="pod-1")
     dispatcher.instance_providers["pod-1"] = config.provider
     dispatcher.instance_profiles["pod-1"] = "comfyui"
-    dispatcher.last_activity["pod-1"] = datetime.utcnow() - timedelta(hours=2)
+    dispatcher.last_activity["pod-1"] = utc_now() - timedelta(hours=2)
 
     dispatcher._check_idle_workers()
 
@@ -1636,7 +1636,7 @@ def long_idle_dispatcher(config, queue):
     dispatcher.active_instances["pod-1"] = provider.get_instance("pod-1")
     dispatcher.instance_providers["pod-1"] = "runpod"
     dispatcher.instance_profiles["pod-1"] = "comfyui"
-    dispatcher.last_activity["pod-1"] = datetime.utcnow() - timedelta(hours=1)
+    dispatcher.last_activity["pod-1"] = utc_now() - timedelta(hours=1)
     return dispatcher
 
 
@@ -1653,7 +1653,7 @@ def test_a_pod_that_never_registers_is_terminated(tmp_path, monkeypatch):
         status=JobStatus.QUEUED,
     )
     dispatcher = long_idle_dispatcher(config, queue)
-    dispatcher.launched_at["pod-1"] = datetime.utcnow() - timedelta(minutes=61)
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(minutes=61)
     monkeypatch.setattr(
         "cloud_offload.dispatcher.RUNNER_REGISTRATION_TIMEOUT_SECONDS", 3600
     )
@@ -1681,7 +1681,7 @@ def test_a_paid_starting_pod_emits_elapsed_feedback_before_registration(tmp_path
         status=JobStatus.QUEUED,
     )
     dispatcher = long_idle_dispatcher(config, queue)
-    dispatcher.launched_at["pod-1"] = datetime.utcnow() - timedelta(seconds=35)
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(seconds=35)
 
     dispatcher._check_unregistered_workers()
 
@@ -1703,7 +1703,7 @@ def test_a_registered_starting_runner_is_not_terminated_by_the_boot_deadline(
         "worker-boot", "runpod", status="starting", runtime_profile="comfyui"
     )
     dispatcher = long_idle_dispatcher(config, queue)
-    dispatcher.launched_at["pod-1"] = datetime.utcnow() - timedelta(hours=1)
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(hours=1)
 
     dispatcher._check_unregistered_workers()
 
