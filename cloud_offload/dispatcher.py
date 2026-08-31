@@ -451,13 +451,10 @@ class Dispatcher:
         requirements = resolve_prepared_requirements(
             profile_name, profile, queued_jobs or []
         )
+        # A confirmed quote is volatile by contract; freshness is enforced by
+        # re-validating the exact offer, price, and prepared volume against the
+        # live catalog below, so the quote's age alone is not disqualifying.
         confirmed = self._shared_preflight(queued_jobs)
-        if confirmed and self._preflight_expired(confirmed):
-            self._refuse_preflight_launch(
-                queued_jobs,
-                "The confirmed GPU quote expired before provider launch.",
-            )
-            return None
         if confirmed and confirmed.get("provider") != provider_name:
             self._refuse_preflight_launch(
                 queued_jobs,
@@ -1209,18 +1206,6 @@ class Dispatcher:
         if len(candidate_ids) != 1 or "" in candidate_ids:
             return None
         return entries[0]
-
-    @staticmethod
-    def _preflight_expired(confirmed: dict) -> bool:
-        try:
-            expires = datetime.fromisoformat(
-                str(confirmed.get("expires_at") or "").replace("Z", "+00:00")
-            )
-        except ValueError:
-            return True
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        return expires <= datetime.now(timezone.utc)
 
     @staticmethod
     def _confirmed_offer_matches(confirmed: dict, offer: dict) -> bool:

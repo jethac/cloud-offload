@@ -1293,7 +1293,7 @@ def test_failed_offer_cools_down_and_next_launch_routes_around_it(tmp_path):
     assert provider.launch_attempts == ["offer-dead", "offer-good"]
 
 
-def _confirmed_job(queue, *, rate=0.30):
+def _confirmed_job(queue, *, rate=0.30, expires_at="2099-01-01T00:00:00Z"):
     return queue.create(
         "comfyui-partition-v1",
         "input.part",
@@ -1310,7 +1310,7 @@ def _confirmed_job(queue, *, rate=0.30):
                 "hourly_rate": rate,
                 "region": None,
                 "prepared_volume_id": None,
-                "expires_at": "2099-01-01T00:00:00Z",
+                "expires_at": expires_at,
                 "request_policy": {"max_hourly_rate": 0.5},
             },
         },
@@ -1346,6 +1346,35 @@ def test_dispatcher_refuses_changed_confirmed_price_before_launch(tmp_path):
         item["event"]["type"] == "preflight_confirmation_required"
         for item in events
     )
+
+
+def test_expired_confirmed_quote_still_launches_the_matching_live_offer(tmp_path):
+    """A quote is volatile by contract; freshness comes from re-validating the
+    exact offer and price against the live catalog, so a retry long after
+    confirmation (e.g. after a stalled pod was terminated) must still launch
+    when the live offer is unchanged."""
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    job = _confirmed_job(dispatcher.queue, expires_at="2000-01-01T00:00:00Z")
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert instance is not None
+    assert provider.launch_attempts == ["offer-good"]
+
+
+def test_expired_confirmed_quote_with_changed_price_is_still_refused(tmp_path):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    job = _confirmed_job(
+        dispatcher.queue, rate=0.29, expires_at="2000-01-01T00:00:00Z"
+    )
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert instance is None
+    assert provider.launch_attempts == []
+    assert dispatcher.queue.get(job.id).status == JobStatus.FAILED
 
 
 def test_confirmed_job_launches_without_waiting_for_queue_batch(
