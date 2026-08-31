@@ -46,6 +46,12 @@ OFFER_COOLDOWN_SECONDS = 600
 # runtime. If the entrypoint never runs, no worker can report the failure home.
 RUNNER_REGISTRATION_TIMEOUT_SECONDS = 3600
 
+# A rented pod bills from creation even when its host never starts the
+# container. When the provider reports container telemetry, a pod with zero
+# container uptime this long after rental is stalled, not booting: give it
+# back and rent elsewhere instead of waiting out the registration deadline.
+RUNNER_CONTAINER_START_TIMEOUT_SECONDS = 600
+
 # A managed worker cannot destroy its provider resource when its process exits.
 # Some providers restart the container instead. Give the dispatcher time to
 # destroy the paid resource before the worker's local idle fail-safe can fire.
@@ -1777,6 +1783,25 @@ cloud-offload worker --poll 10
                     },
                 )
                 self.runner_feedback_at[instance_id] = now
+
+            instance = self.active_instances.get(instance_id)
+            if (
+                instance is not None
+                and self.connectors[provider_name].container_started(instance)
+                is False
+                and now - launched_at
+                > timedelta(seconds=RUNNER_CONTAINER_START_TIMEOUT_SECONDS)
+            ):
+                detail = (
+                    "Provider never started the container within "
+                    f"{RUNNER_CONTAINER_START_TIMEOUT_SECONDS}s of rental"
+                )
+                logger.error("Worker %s %s; terminating", instance_id, detail.lower())
+                self._record_launch_failure(
+                    provider_name, profile_name, queued_jobs, detail
+                )
+                self._terminate_worker(instance_id, reason="container_start_timeout")
+                continue
 
             if now - launched_at <= timedelta(
                 seconds=RUNNER_REGISTRATION_TIMEOUT_SECONDS

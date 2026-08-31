@@ -441,6 +441,30 @@ def test_runpod_maps_v2_pod_statuses(pod_status, expected):
     assert connector.get_instance("pod-1").status == expected
 
 
+def test_runpod_reports_whether_the_container_actually_started():
+    stalled_http = FakeHttp(
+        FakeResponse({"id": "pod-1", "status": "RUNNING", "runtime": None})
+    )
+    started_http = FakeHttp(
+        FakeResponse(
+            {
+                "id": "pod-2",
+                "status": "RUNNING",
+                "runtime": {"uptimeInSeconds": 42},
+            }
+        )
+    )
+    connector = RunPodConnector(api_key="secret", http_client=stalled_http)
+
+    stalled = connector.get_instance("pod-1")
+    started = RunPodConnector(
+        api_key="secret", http_client=started_http
+    ).get_instance("pod-2")
+
+    assert connector.container_started(stalled) is False
+    assert connector.container_started(started) is True
+
+
 def test_runpod_get_instance_returns_none_for_missing_pod():
     http = FakeHttp(
         FakeResponse({"title": "Not Found", "detail": "pod not found"}, status_code=404)

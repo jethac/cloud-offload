@@ -1668,6 +1668,90 @@ def test_a_pod_that_never_registers_is_terminated(tmp_path, monkeypatch):
     assert events[-1]["event"]["error"] == "Runner did not register within 3600s"
 
 
+class StalledHostConnector(StartingConnector):
+    """A host that rents the pod but never starts its container."""
+
+    def container_started(self, instance):
+        return False
+
+
+def test_a_rented_pod_whose_container_never_starts_is_terminated_early(
+    tmp_path, monkeypatch
+):
+    """A pod can bill for an hour at full GPU price while its host never
+    creates the container. Container telemetry ends that rental at the start
+    fail-fast, well before the registration deadline."""
+    from datetime import timedelta
+
+    from cloud_offload.dispatcher import Dispatcher
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    job = queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={"runtime_profile": "comfyui-partition-v1"},
+        status=JobStatus.QUEUED,
+    )
+    provider = StalledHostConnector()
+    dispatcher = Dispatcher(config, queue=queue, provider=provider)
+    dispatcher.active_instances["pod-1"] = provider.get_instance("pod-1")
+    dispatcher.instance_providers["pod-1"] = "runpod"
+    dispatcher.instance_profiles["pod-1"] = "comfyui"
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(minutes=11)
+
+    dispatcher._check_unregistered_workers()
+
+    assert "pod-1" not in dispatcher.active_instances
+    assert provider.terminated is True
+    assert queue.get(job.id).status == JobStatus.QUEUED
+    events = queue.list_events(job.id)
+    assert events[-1]["event"]["type"] == "provisioning_failed"
+    assert "never started the container within 600s" in events[-1]["event"]["error"]
+
+
+def test_a_started_but_unregistered_container_keeps_the_full_boot_deadline(
+    tmp_path,
+):
+    from datetime import timedelta
+
+    from cloud_offload.dispatcher import Dispatcher
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+
+    class StartedHostConnector(StartingConnector):
+        def container_started(self, instance):
+            return True
+
+    provider = StartedHostConnector()
+    dispatcher = Dispatcher(config, queue=queue, provider=provider)
+    dispatcher.active_instances["pod-1"] = provider.get_instance("pod-1")
+    dispatcher.instance_providers["pod-1"] = "runpod"
+    dispatcher.instance_profiles["pod-1"] = "comfyui"
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(minutes=11)
+
+    dispatcher._check_unregistered_workers()
+
+    assert "pod-1" in dispatcher.active_instances
+
+
+def test_a_provider_without_container_telemetry_keeps_the_full_boot_deadline(
+    tmp_path,
+):
+    from datetime import timedelta
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    dispatcher = long_idle_dispatcher(config, queue)
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(minutes=11)
+
+    dispatcher._check_unregistered_workers()
+
+    assert "pod-1" in dispatcher.active_instances
+
+
 def test_a_paid_starting_pod_emits_elapsed_feedback_before_registration(tmp_path):
     from datetime import datetime, timedelta
 

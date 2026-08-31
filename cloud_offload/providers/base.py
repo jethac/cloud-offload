@@ -127,6 +127,16 @@ class CloudConnector(ABC):
     def terminate(self, instance_id: str) -> bool:
         """Terminate an instance."""
 
+    def container_started(self, instance: Instance) -> bool | None:
+        """Whether the instance's container has actually begun executing.
+
+        A rented instance bills from creation even when its host never starts
+        the container, so callers use this to distinguish "booting" from
+        "stalled". ``None`` means this provider does not report container-level
+        telemetry and no conclusion should be drawn.
+        """
+        return None
+
     @abstractmethod
     def list_instances(self) -> list[Instance]:
         """List all active instances for this provider."""
