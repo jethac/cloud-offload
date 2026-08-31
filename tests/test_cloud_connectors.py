@@ -443,7 +443,9 @@ def test_runpod_maps_v2_pod_statuses(pod_status, expected):
 
 def test_runpod_reports_whether_the_container_actually_started():
     stalled_http = FakeHttp(
-        FakeResponse({"id": "pod-1", "status": "RUNNING", "runtime": None})
+        FakeResponse(
+            {"id": "pod-1", "status": "RUNNING", "runtime": {"uptimeInSeconds": 0}}
+        )
     )
     started_http = FakeHttp(
         FakeResponse(
@@ -463,6 +465,21 @@ def test_runpod_reports_whether_the_container_actually_started():
 
     assert connector.container_started(stalled) is False
     assert connector.container_started(started) is True
+
+
+def test_runpod_absent_runtime_telemetry_is_unknown_not_stalled():
+    """The API omits the runtime block for some pods whose containers are
+    running, so a missing block must read as "telemetry unavailable" rather
+    than "never started" — otherwise healthy pods get terminated."""
+    http = FakeHttp(
+        FakeResponse({"id": "pod-3", "status": "RUNNING", "runtime": None})
+    )
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    instance = connector.get_instance("pod-3")
+
+    assert instance.metadata["container_uptime_seconds"] is None
+    assert connector.container_started(instance) is None
 
 
 def test_runpod_get_instance_returns_none_for_missing_pod():

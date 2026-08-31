@@ -7,6 +7,10 @@ FROM ${BASE_IMAGE}
 ARG CLOUD_OFFLOAD_SOURCE_REVISION=working-tree
 
 COPY . /opt/cloud-offload/source
+# The capability manifest carries the runner's declared runtime identity
+# (platform, python_abi); it must track the source revision being installed,
+# not whatever the pinned base was built from.
+COPY deploy/runtime-profiles/comfyui/runtime-profile.json /opt/cloud-offload/runtime-profile.json
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps \
     "/opt/cloud-offload/source[cloud]" \
     && python -c "from cloud_offload.worker import Worker; assert hasattr(Worker, '_initialize_prepared_cache')"

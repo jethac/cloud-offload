@@ -594,7 +594,7 @@ class RunPodConnector(CloudConnector):
 
         gpu = data.get("gpu") or {}
         ip_address, ssh_port = self._ssh_endpoint(data)
-        runtime = data.get("runtime") or {}
+        runtime = data.get("runtime")
 
         return Instance(
             id=str(data["id"]),
@@ -609,17 +609,22 @@ class RunPodConnector(CloudConnector):
                 "name": data.get("name"),
                 "image": data.get("image"),
                 "location": data.get("dataCenterId"),
-                "container_uptime_seconds": float(
-                    runtime.get("uptimeInSeconds") or 0
+                "container_uptime_seconds": (
+                    float(runtime.get("uptimeInSeconds") or 0)
+                    if isinstance(runtime, dict)
+                    else None
                 ),
             },
         )
 
     def container_started(self, instance: Instance) -> bool | None:
-        """RunPod reports container uptime; zero means the host never ran it.
+        """RunPod reports container uptime when its telemetry is available.
 
         A pod can sit "RUNNING" (rented and billing) while its host never
-        creates the container, so pod status alone cannot answer this.
+        creates the container, so pod status alone cannot answer this. The
+        API also omits the whole ``runtime`` block for pods whose containers
+        are demonstrably executing, so an absent block means the telemetry is
+        unavailable — not that the container never started.
         """
         uptime = instance.metadata.get("container_uptime_seconds")
         if uptime is None:
