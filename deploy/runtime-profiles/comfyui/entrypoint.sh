@@ -20,8 +20,9 @@ export PYTHONPATH="${CLOUD_OFFLOAD_ENV_ROOT:-/opt/cloud-offload/environment}/lib
 # profile/test to select a supported ComfyUI runtime flag (for example,
 # --disable-triton-backend on a CPU-only smoke runner).
 read -r -a comfyui_extra_args <<< "${CLOUD_OFFLOAD_COMFYUI_ARGS:-}"
+comfyui_root="${CLOUD_OFFLOAD_COMFYUI_ROOT:-/opt/ComfyUI}"
 
-python /opt/ComfyUI/main.py \
+python "${comfyui_root}/main.py" \
   --listen 127.0.0.1 \
   --port 8188 \
   --disable-auto-launch \

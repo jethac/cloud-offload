@@ -169,23 +169,40 @@ def test_local_image_runtime_profile_is_the_declared_profile(tmp_path):
 
 
 @pytest.mark.skipif(not IMAGE, reason="set CLOUD_OFFLOAD_TEST_IMAGE for image smoke")
-def test_local_image_starts_through_its_oci_entrypoint():
-    """Run the actual entrypoint with the supported local queue/no-pack config."""
+def test_local_image_starts_through_its_oci_entrypoint(tmp_path):
+    """Run the actual entrypoint with supported local queue/root configuration."""
 
     name = "cloud-offload-image-smoke"
+    comfyui_root = tmp_path / "ComfyUI"
+    comfyui_root.mkdir()
+    (comfyui_root / "main.py").write_text(
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(b'{}')\n"
+        "    def log_message(self, *_args):\n"
+        "        pass\n"
+        "HTTPServer(('127.0.0.1', 8188), Handler).serve_forever()\n",
+        encoding="utf-8",
+    )
     command = [
-        "docker", "run", "--name", name, "-e", "CLOUD_OFFLOAD_QUEUE_DB=/tmp/cloud-offload-smoke.db",
-        "-e", "CLOUD_OFFLOAD_COMFYUI_READY_TIMEOUT=45", "-e", "CLOUD_OFFLOAD_POLL_INTERVAL=1",
-        "-e", "CLOUD_OFFLOAD_COMFYUI_ARGS=--disable-triton-backend",
+        "docker", "run", "--name", name,
+        "--mount", f"type=bind,source={comfyui_root},target=/tmp/smoke-comfyui,readonly",
+        "-e", "CLOUD_OFFLOAD_QUEUE_DB=/tmp/cloud-offload-smoke.db",
+        "-e", "CLOUD_OFFLOAD_COMFYUI_ROOT=/tmp/smoke-comfyui",
+        "-e", "CLOUD_OFFLOAD_COMFYUI_READY_TIMEOUT=15", "-e", "CLOUD_OFFLOAD_POLL_INTERVAL=1",
         "-e", "CLOUD_OFFLOAD_WORKER_MODELS=comfyui-workflow", IMAGE,
     ]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         try:
-            output, _ = process.communicate(timeout=60)
+            process.wait(timeout=30)
+            output = process.stdout.read() if process.stdout else ""
         except subprocess.TimeoutExpired:
-            subprocess.run(["docker", "logs", name], check=False)
-            output = ""
+            subprocess.run(["docker", "rm", "-f", name], check=False, stdout=subprocess.DEVNULL)
+            output, _ = process.communicate(timeout=10)
         assert "ComfyUI is ready; handing over to the worker loop" in output
     finally:
         subprocess.run(["docker", "rm", "-f", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
