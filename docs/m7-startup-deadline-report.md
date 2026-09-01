@@ -18,6 +18,17 @@ The benchmark runner uses the same rule for worker-quiescence polls, readiness
 polls, scenario polls, campaign polls, and cleanup verification waits. It does
 not call sleep with zero or negative time.
 
+The runner passes the same absolute deadline into production event, snapshot,
+provider-inventory, and active-worker observations. It checks time again after
+each blocking call. A slow call can be recorded as an overrun, but it cannot
+start another poll after the deadline.
+
+Coordinator HTTP retries divide the positive remaining time between connect and
+read timeouts. Provider-inventory and HTTP retries check time before each attempt
+and before each backoff. Cleanup always sends one termination request for every
+exact known paid resource; only retries, waits, and absence proof are deadline
+bounded.
+
 ## Safety behavior
 
 - No preflight request occurs at or after the deadline.
@@ -30,5 +41,6 @@ not call sleep with zero or negative time.
 ## Verification
 
 Fake-clock tests cover zero and negative remaining time, a short final retry,
-a clock jump, request-timeout propagation, cancellation, and Windows timing
-tolerance. These tests use no provider or credential service.
+slow blocking calls, clock jumps, bounded connect/read allocation,
+request-timeout propagation, cancellation, and mandatory first termination.
+These deterministic tests use no provider or credential service.

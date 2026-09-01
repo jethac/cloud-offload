@@ -17,6 +17,7 @@ from cloud_offload.benchmark import (
     _observe_startup_phases,
     _sanitize_public_evidence,
     _preparation_seconds,
+    _ResourceMeter,
     _seconds_from_event_to,
     write_scorecard,
 )
@@ -423,7 +424,7 @@ def test_runner_readiness_timeout_uses_total_active_scenario_time_and_cleans_up(
 
     assert result["limit_triggered"] == "runner_readiness_timeout"
     assert result["scenario_active_seconds"] == 2
-    assert result["duration_seconds"] == 4
+    assert result["duration_seconds"] == 2
     assert driver.cancelled == {"job-1"}
     assert driver.termination_attempts == [("runpod", "pod-waiting")]
 
@@ -456,6 +457,30 @@ def test_readiness_poll_sleep_is_clamped_to_absolute_deadline():
     assert result["scenario_active_seconds"] == pytest.approx(2, abs=0.05)
     assert driver.sleeps[0] == pytest.approx(2, abs=0.001)
     assert all(item > 0 for item in driver.sleeps)
+    assert driver.cancelled == {"job-1"}
+
+
+def test_slow_events_call_crossing_deadline_cancels_without_next_poll():
+    class SlowEventsDriver(FakeDriver):
+        event_calls = 0
+
+        def events(self, job_id, after):
+            self.event_calls += 1
+            self.clock += 10
+            return super().events(job_id, after)
+
+    driver = SlowEventsDriver({"cold": successful_script("pod-slow-events")})
+    plan = BenchmarkPlan.from_dict(plan_dict(
+        [scenario("cold", "cold")], poll_seconds=10,
+        runner_readiness_timeout_seconds=2,
+    ))
+
+    result = BenchmarkRunner(driver).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_timeout"
+    assert result["scenario_active_seconds"] == pytest.approx(10, abs=0.05)
+    assert result["duration_seconds"] >= 10
+    assert driver.event_calls == 1
     assert driver.cancelled == {"job-1"}
 
 
@@ -1019,6 +1044,8 @@ def test_interrupt_at_each_cleanup_boundary_retries_exact_pod_and_publishes_abor
             if self.cleanup_started and boundary == "terminate" and not self.injected:
                 self.injected = True
                 raise KeyboardInterrupt
+            if self.cleanup_started and boundary == "sleep" and not self.injected:
+                return False
             return super().terminate(provider, instance_id)
 
         def sleep(self, seconds):
@@ -1452,10 +1479,10 @@ def test_fresh_pod_waits_for_stale_worker_heartbeat_without_charging_scenario_ti
     scorecard = BenchmarkRunner(driver).run(plan)
 
     assert scorecard["passed"] is True
-    # The result includes one polling second plus two cleanup-verification
-    # seconds, but excludes the three seconds spent aging out the stale worker.
-    assert scorecard["results"][0]["duration_seconds"] == 3
-    assert driver.clock >= 6
+    # The result includes one scenario polling second and excludes the three
+    # seconds spent aging out the stale worker. Exact absence needs no wait.
+    assert scorecard["results"][0]["duration_seconds"] == 1
+    assert driver.clock >= 4
 
 
 def test_scenario_restores_storage_policy_when_submission_fails():
@@ -1832,6 +1859,104 @@ def test_preflight_propagates_provider_request_timeout_without_backoff(monkeypat
     with pytest.raises(requests.Timeout):
         driver._ready_preflight(selected, selected.request)
     assert sleeps == []
+
+
+def test_request_retry_does_not_start_second_call_after_slow_attempt(monkeypatch):
+    import requests
+
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    clock = {"now": 0.0}
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", lambda value: sleeps.append(value))
+
+    def request(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock["now"] = 10.0
+        raise requests.Timeout("slow provider")
+
+    driver.session.request = request
+    with pytest.raises(requests.Timeout):
+        driver._request(
+            "GET", "/safe", retry_safe=True, timeout=30, absolute_deadline=2.0
+        )
+
+    assert len(calls) == 1
+    assert sum(calls[0]) <= 2.001
+    assert sleeps == []
+
+
+def test_inventory_retry_does_not_start_second_provider_call_after_deadline(monkeypatch):
+    class SlowConnector:
+        calls = 0
+
+        def list_instances(self):
+            self.calls += 1
+            clock["now"] = 10.0
+            raise TimeoutError("slow inventory")
+
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    clock = {"now": 0.0}
+    connector = SlowConnector()
+    driver.connectors = {"runpod": connector}
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", lambda value: sleeps.append(value))
+
+    with pytest.raises(TimeoutError):
+        driver.inventory(("runpod",), absolute_deadline=2.0)
+
+    assert connector.calls == 1
+    assert sleeps == []
+
+
+def test_cleanup_deadline_never_suppresses_first_exact_termination():
+    class JumpCleanupDriver:
+        clock = 0.0
+        inventory_calls = 0
+        termination_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory(self, providers):
+            self.inventory_calls += 1
+            return {
+                "runpod": {
+                    "pod-paid": InstanceObservation(
+                        id="pod-paid", provider="runpod", hourly_rate=1,
+                        status="running", managed=True,
+                    )
+                }
+            }
+
+        def terminate(self, provider, instance_id):
+            self.termination_calls.append((provider, instance_id))
+            self.clock = 10.0
+            return True
+
+        def sleep(self, seconds):
+            raise AssertionError("no wait is allowed after the deadline")
+
+    driver = JumpCleanupDriver()
+    meter = _ResourceMeter(
+        id="pod-paid", provider="runpod", hourly_rate=1,
+        first_seen=0, last_seen=0, source="journal", lease_id="lease-paid",
+    )
+    receipt = BenchmarkRunner(driver)._cleanup_resources(
+        ("runpod",), {"runpod": {}}, {("runpod", "pod-paid"): meter}, 1,
+        include_untracked=False,
+    )[0]
+
+    assert driver.termination_calls == [("runpod", "pod-paid")]
+    assert receipt["termination_attempts"] == 1
+    assert receipt["provider_absent"] is False
+    assert receipt["inventory_error"] == "TimeoutError"
 
 
 def test_real_preflight_server_rejects_both_workload_shapes(monkeypatch, tmp_path):

@@ -672,6 +672,14 @@ class BenchmarkRunner:
     def __init__(self, driver: BenchmarkDriver):
         self.driver = driver
 
+    def _deadline_call(
+        self, name: str, *args: Any, absolute_deadline: float
+    ) -> Any:
+        guarded = getattr(self.driver, f"{name}_until", None)
+        if callable(guarded):
+            return guarded(*args, absolute_deadline=absolute_deadline)
+        return getattr(self.driver, name)(*args)
+
     def run(self, plan: BenchmarkPlan) -> dict[str, Any]:
         campaign_started_at = _utc_now()
         campaign_started = self.driver.monotonic()
@@ -919,7 +927,10 @@ class BenchmarkRunner:
     ) -> dict[str, Any]:
         started_at = _utc_now()
         started = self.driver.monotonic()
-        self.driver.inventory(plan.providers)
+        readiness_deadline = started + plan.limits.runner_readiness_timeout_seconds
+        self._deadline_call(
+            "inventory", plan.providers, absolute_deadline=readiness_deadline
+        )
         events: list[dict[str, Any]] = []
         cursor = 0
         resources: dict[tuple[str, str], _ResourceMeter] = {}
@@ -984,7 +995,31 @@ class BenchmarkRunner:
             while True:
                 now = self.driver.monotonic()
                 elapsed = now - started
-                new_events = self.driver.events(job_id, cursor)
+                readiness_deadline = (
+                    started + plan.limits.runner_readiness_timeout_seconds
+                )
+                scenario_deadline = started + scenario.timeout_seconds
+                campaign_deadline = (
+                    campaign_started + plan.limits.max_campaign_seconds
+                )
+                operation_deadline = min(
+                    readiness_deadline, scenario_deadline, campaign_deadline
+                )
+                if now >= operation_deadline:
+                    limit_triggered = (
+                        "runner_readiness_timeout"
+                        if readiness_deadline <= min(scenario_deadline, campaign_deadline)
+                        else (
+                            "scenario_timeout"
+                            if scenario_deadline <= campaign_deadline
+                            else "campaign_runtime_limit"
+                        )
+                    )
+                    self.driver.cancel(job_id)
+                    break
+                new_events = self._deadline_call(
+                    "events", job_id, cursor, absolute_deadline=operation_deadline
+                )
                 if new_events:
                     events.extend(new_events)
                     cursor = max(int(item.get("sequence") or 0) for item in events)
@@ -1098,8 +1133,17 @@ class BenchmarkRunner:
                             ),
                         }
 
+                if self.driver.monotonic() >= operation_deadline:
+                    limit_triggered = "runner_readiness_timeout"
+                    self.driver.cancel(job_id)
+                    break
+
                 current_inventory = (
-                    self.driver.inventory(plan.providers)
+                    self._deadline_call(
+                        "inventory",
+                        plan.providers,
+                        absolute_deadline=operation_deadline,
+                    )
                     if plan.exclusive
                     else {provider: {} for provider in plan.providers}
                 )
@@ -1154,8 +1198,17 @@ class BenchmarkRunner:
                                     / max(plan.limits.poll_seconds, 0.001)
                                 )
 
+                if self.driver.monotonic() >= operation_deadline:
+                    limit_triggered = "runner_readiness_timeout"
+                    self.driver.cancel(job_id)
+                    break
+
                 try:
-                    current_workers = self.driver.active_workers(plan.providers)
+                    current_workers = self._deadline_call(
+                        "active_workers",
+                        plan.providers,
+                        absolute_deadline=operation_deadline,
+                    )
                 except Exception:  # noqa: BLE001 - unavailable facts stay unknown
                     current_workers = []
                 _observe_startup_phases(
@@ -1165,6 +1218,10 @@ class BenchmarkRunner:
                     events,
                     identities,
                 )
+                if self.driver.monotonic() >= operation_deadline:
+                    limit_triggered = "runner_readiness_timeout"
+                    self.driver.cancel(job_id)
+                    break
 
                 estimated = self._estimated_cost(resources, now)
                 estimated += sum(
@@ -1207,8 +1264,14 @@ class BenchmarkRunner:
                     self.driver.cancel(job_id)
                     break
 
-                snapshot = self.driver.snapshot(job_id)
+                snapshot = self._deadline_call(
+                    "snapshot", job_id, absolute_deadline=operation_deadline
+                )
                 status = str(snapshot.get("status") or "")
+                if self.driver.monotonic() >= operation_deadline:
+                    limit_triggered = "runner_readiness_timeout"
+                    self.driver.cancel(job_id)
+                    break
                 if scenario.failure and failure_result is None:
                     failure_result = self._maybe_inject(
                         scenario,
@@ -1635,12 +1698,30 @@ class BenchmarkRunner:
                 "provider": key[0],
                 "instance_id": key[1],
                 "termination_attempts": 0,
-                "provider_absent": False,
+                "provider_absent": (
+                    inventory_error is None
+                    and key[1] not in current.get(key[0], {})
+                ),
             }
             for key in candidates
             if key not in baseline_ids
         }
         deadline = cleanup_now() + timeout_seconds
+        # Every exact paid resource gets one termination request. The deadline
+        # limits retries and proof waits, but never suppresses this first stop.
+        for key, receipt in receipts.items():
+            if receipt["provider_absent"]:
+                continue
+            receipt["termination_attempts"] = 1
+            try:
+                receipt["termination_requested"] = self.driver.terminate(*key)
+            except (KeyboardInterrupt, SystemExit) as exc:
+                receipt["termination_requested"] = False
+                receipt["termination_error"] = type(exc).__name__
+                cleanup_interrupt = cleanup_interrupt or type(exc).__name__
+            except Exception as exc:  # noqa: BLE001
+                receipt["termination_requested"] = False
+                receipt["termination_error"] = type(exc).__name__
         # The attempt bound remains effective even when an interrupt prevents
         # the injected clock/sleep function from advancing.
         attempts_remaining = max(2, math.ceil(timeout_seconds) + 2)
@@ -1686,6 +1767,8 @@ class BenchmarkRunner:
             except (KeyboardInterrupt, SystemExit) as exc:
                 cleanup_interrupt = cleanup_interrupt or type(exc).__name__
         try:
+            if cleanup_now() >= deadline:
+                raise TimeoutError("cleanup_deadline")
             inventory = self.driver.inventory(providers)
             inventory_error = None
         except (KeyboardInterrupt, SystemExit) as exc:
@@ -1796,15 +1879,24 @@ class CoordinatorBenchmarkDriver:
         *,
         retry_safe: bool = False,
         timeout: float = 30,
+        absolute_deadline: float | None = None,
         **kwargs,
     ) -> requests.Response:
         deadline = time.monotonic() + 30
+        if absolute_deadline is not None:
+            deadline = min(deadline, float(absolute_deadline))
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("operation_deadline")
+            attempt_total = min(float(timeout), remaining)
+            connect_timeout = min(5.0, attempt_total / 2)
+            read_timeout = attempt_total - connect_timeout
             try:
                 response = self.session.request(
                     method,
                     f"{self.base_url}{path}",
-                    timeout=timeout,
+                    timeout=(connect_timeout, read_timeout),
                     **kwargs,
                 )
                 if not retry_safe or response.status_code not in {502, 503, 504}:
@@ -1812,9 +1904,10 @@ class CoordinatorBenchmarkDriver:
             except requests.RequestException:
                 if not retry_safe or time.monotonic() >= deadline:
                     raise
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return response
-            time.sleep(1)
+            time.sleep(min(1.0, remaining))
 
     @staticmethod
     def monotonic() -> float:
@@ -1825,19 +1918,28 @@ class CoordinatorBenchmarkDriver:
         time.sleep(max(0.0, seconds))
 
     def inventory(
-        self, providers: tuple[str, ...]
+        self,
+        providers: tuple[str, ...],
+        *,
+        absolute_deadline: float | None = None,
     ) -> dict[str, dict[str, InstanceObservation]]:
         result: dict[str, dict[str, InstanceObservation]] = {}
         for provider in providers:
             deadline = time.monotonic() + 30
+            if absolute_deadline is not None:
+                deadline = min(deadline, float(absolute_deadline))
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("provider_inventory_deadline")
                 try:
                     instances = self.connectors[provider].list_instances()
                     break
                 except Exception:  # noqa: BLE001 - bounded provider retry
-                    if time.monotonic() >= deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         raise
-                    time.sleep(1)
+                    time.sleep(min(1.0, remaining))
             result[provider] = {
                 instance.id: InstanceObservation(
                     id=instance.id,
@@ -1861,9 +1963,32 @@ class CoordinatorBenchmarkDriver:
             }
         return result
 
+    def inventory_until(
+        self, providers: tuple[str, ...], *, absolute_deadline: float
+    ) -> dict[str, dict[str, InstanceObservation]]:
+        return self.inventory(providers, absolute_deadline=absolute_deadline)
+
     def active_workers(self, providers: tuple[str, ...]) -> list[dict[str, Any]]:
         response = self._request(
             "GET", "/api/active-workers", retry_safe=True, timeout=30
+        )
+        response.raise_for_status()
+        allowed = set(providers)
+        return [
+            item
+            for item in response.json().get("workers") or []
+            if str(item.get("provider") or "") in allowed
+        ]
+
+    def active_workers_until(
+        self, providers: tuple[str, ...], *, absolute_deadline: float
+    ) -> list[dict[str, Any]]:
+        response = self._request(
+            "GET",
+            "/api/active-workers",
+            retry_safe=True,
+            timeout=30,
+            absolute_deadline=absolute_deadline,
         )
         response.raise_for_status()
         allowed = set(providers)
@@ -2268,6 +2393,19 @@ class CoordinatorBenchmarkDriver:
         response.raise_for_status()
         return response.json()
 
+    def snapshot_until(
+        self, job_id: str, *, absolute_deadline: float
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            f"/api/jobs/{job_id}/snapshot",
+            retry_safe=True,
+            timeout=30,
+            absolute_deadline=absolute_deadline,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def events(self, job_id: str, after: int) -> list[dict[str, Any]]:
         response = self._request(
             "GET",
@@ -2275,6 +2413,20 @@ class CoordinatorBenchmarkDriver:
             retry_safe=True,
             params={"after": max(0, int(after)), "limit": 1000},
             timeout=30,
+        )
+        response.raise_for_status()
+        return list(response.json().get("events") or [])
+
+    def events_until(
+        self, job_id: str, after: int, *, absolute_deadline: float
+    ) -> list[dict[str, Any]]:
+        response = self._request(
+            "GET",
+            f"/api/jobs/{job_id}/events",
+            retry_safe=True,
+            params={"after": max(0, int(after)), "limit": 1000},
+            timeout=30,
+            absolute_deadline=absolute_deadline,
         )
         response.raise_for_status()
         return list(response.json().get("events") or [])
