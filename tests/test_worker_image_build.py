@@ -44,7 +44,7 @@ def _pinned_source_revision() -> str:
     return _validated_revision(source_revision)
 
 
-def _image_revision() -> str:
+def _image_revision(requested_revision: str | None = None) -> str:
     """Resolve the source revision explicitly requested by an image test.
 
     A locally built image may be tested at any revision by setting
@@ -53,7 +53,7 @@ def _image_revision() -> str:
     (later) HEAD.
     """
 
-    requested = os.environ.get("CLOUD_OFFLOAD_TEST_IMAGE_REVISION")
+    requested = requested_revision or os.environ.get("CLOUD_OFFLOAD_TEST_IMAGE_REVISION")
     if requested:
         return _validated_revision(requested)
     if IMAGE and IMAGE.startswith(f"{IMAGE_REPOSITORY}:m7-"):
@@ -330,7 +330,7 @@ def test_pinned_registry_artifact_matches_pin_revision_and_source_blobs(tmp_path
 def test_local_image_has_revision_label_and_exact_entrypoint_bytes(tmp_path):
     from scripts.build_worker_image import _blob_bytes, tree_entries
 
-    revision = _image_revision()
+    revision = _image_revision(os.environ.get("CLOUD_OFFLOAD_TEST_IMAGE_REVISION"))
     label = subprocess.check_output(
         ["docker", "image", "inspect", IMAGE, "--format", "{{index .Config.Labels \"org.opencontainers.image.revision\"}}"],
         text=True,
@@ -358,7 +358,7 @@ def test_local_image_has_revision_label_and_exact_entrypoint_bytes(tmp_path):
 def test_local_image_source_tree_matches_exact_blobs_and_intended_omissions(tmp_path):
     from scripts.build_worker_image import _blob_bytes, tree_entries
 
-    revision = _image_revision()
+    revision = _image_revision(os.environ.get("CLOUD_OFFLOAD_TEST_IMAGE_REVISION"))
     entries = {entry.path: entry for entry in tree_entries(ROOT, revision)}
     source = _docker_cp_source(tmp_path)
     actual = tuple(sorted(path.relative_to(source).as_posix() for path in source.rglob("*") if path.is_file() or path.is_symlink()))
