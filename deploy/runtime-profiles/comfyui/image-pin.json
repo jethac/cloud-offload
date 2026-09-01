@@ -1,0 +1,13 @@
+{
+  "image": "ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:1039f1e218587b4a08eb6dabd8d4e47e722c0b808d6457fd8922072dfe9c24b1",
+  "tag": "m7-06a5490",
+  "source_revision": "06a54909f7aeb430ffe59542deb3d4c29fc7f973",
+  "runtime_profile": "comfyui",
+  "platform": "linux-x86_64",
+  "python_abi": "cp311",
+  "capabilities": [
+    "comfyui-workflow",
+    "comfyui-partition-v1"
+  ],
+  "partition_protocol": "comfy.partition.bundle.v1"
+}

@@ -234,7 +234,7 @@ it. Persist non-secret config via `POST /api/config` or `~/.cloud-offload/config
   "enabled": true,
   "worker_profiles": {
     "comfyui": {
-      "image": "ghcr.io/jethac/cloud-offload-runner-comfyui@sha256:<digest>",
+      "image": "ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:<digest>",
       "models": ["comfyui-workflow", "comfyui-partition-v1"],
       "providers": ["runpod", "vast.ai"],
       "gpu_type": "any",
