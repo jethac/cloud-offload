@@ -7,12 +7,10 @@ plan -> matrix -> ledger -> gate loop runs without any provider access.
 
 import json
 import subprocess
-import sys
-
 import pytest
 
 import cloud_offload.release_gate as release_gate
-from cloud_offload.benchmark import InstanceObservation
+from cloud_offload.benchmark import InstanceObservation, write_scorecard
 from cloud_offload.config import CloudConfig
 from cloud_offload.release_gate import (
     RELEASE_PLAN_SCHEMA,
@@ -559,6 +557,30 @@ def test_release_layer_interrupt_still_writes_failed_cleanup_unknown_receipts(of
     assert str(output_dir) not in encoded
 
 
+def test_interrupt_fallback_never_trusts_an_older_lower_scorecard_or_clock(offline, monkeypatch):
+    plan, world, executor, _, output_dir = offline
+    release = executor()
+    case = plan.cases[0]
+    matrix_dir = output_dir / f"matrix-0001-{case.name}"
+    stale = world.scorecard(case.benchmark_plan)
+    stale["estimated_compute_cost_upper_usd"] = 0.01
+    for result in stale["results"]:
+        result["duration_seconds"] = 0.01
+    write_scorecard(matrix_dir / "benchmark-scorecard.json", stale)
+    clock = iter([25.0, 40.0])
+    monkeypatch.setattr(release_gate.time, "monotonic", lambda: next(clock, 40.0))
+
+    receipt = release._release_interrupt_receipt(
+        1, case, KeyboardInterrupt(), matrix_started=10.0
+    )
+
+    assert receipt["estimated_compute_cost_upper_usd"] >= plan.limits.max_matrix_cost_usd
+    assert receipt["duration_seconds"] >= plan.limits.max_matrix_seconds
+    published = json.loads((matrix_dir / "benchmark-scorecard.json").read_text())
+    assert published["estimated_compute_cost_upper_usd"] >= plan.limits.max_matrix_cost_usd
+    assert published["campaign_abort"] == "operator_interrupt:KeyboardInterrupt"
+
+
 def test_release_fallback_does_not_delete_unattributed_managed_resource(
     offline, monkeypatch
 ):
@@ -599,3 +621,6 @@ def test_release_fallback_does_not_delete_unattributed_managed_resource(
     assert termination_calls == []
     assert receipt["cleanup_proof"] == {"state": "failed"}
     assert "cleanup_unverified" in receipt["failure_codes"]
+    assert receipt["estimated_compute_cost_upper_usd"] == plan.limits.max_total_cost_usd
+    assert receipt["duration_seconds"] == plan.limits.max_total_seconds
+    assert receipt["ongoing_orphan_cost"] is True

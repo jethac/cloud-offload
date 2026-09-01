@@ -934,10 +934,13 @@ class ReleaseExecutor:
             index = len(ledger["matrices"]) + 1
             case = self.plan.cases[(index - 1) % len(self.plan.cases)]
             self._require_reviewed_hooks(case)
+            matrix_started = time.monotonic()
             try:
                 receipt = self._run_matrix(index, case)
             except (KeyboardInterrupt, SystemExit) as exc:
-                receipt = self._release_interrupt_receipt(index, case, exc)
+                receipt = self._release_interrupt_receipt(
+                    index, case, exc, matrix_started=matrix_started
+                )
             except Exception as exc:
                 receipt = _harness_failure_receipt(index, case, exc)
             ledger["matrices"].append(receipt)
@@ -958,7 +961,12 @@ class ReleaseExecutor:
         return ledger
 
     def _release_interrupt_receipt(
-        self, index: int, case: ReleaseCase, exc: BaseException
+        self,
+        index: int,
+        case: ReleaseCase,
+        exc: BaseException,
+        *,
+        matrix_started: float | None = None,
     ) -> dict[str, Any]:
         """Publish finite failure evidence if an interrupt escapes the runner."""
 
@@ -1009,6 +1017,16 @@ class ReleaseExecutor:
         cleanup_state = (
             "confirmed" if cleanup_error is None and not orphans else "failed"
         )
+        ongoing_orphan_cost = cleanup_state != "confirmed"
+        conservative_cost = (
+            self.plan.limits.max_total_cost_usd
+            if ongoing_orphan_cost
+            else self.plan.limits.max_matrix_cost_usd
+        )
+        scorecard["estimated_compute_cost_upper_usd"] = max(
+            float(scorecard.get("estimated_compute_cost_upper_usd") or 0),
+            conservative_cost,
+        )
         scorecard.update(
             {
                 "completed_at": now,
@@ -1021,19 +1039,23 @@ class ReleaseExecutor:
             }
         )
         scorecard_path = write_scorecard(scorecard_path, scorecard)
-        estimated_cost = float(
-            scorecard.get("estimated_compute_cost_upper_usd")
-            or self.plan.limits.max_matrix_cost_usd
+        estimated_cost = float(scorecard["estimated_compute_cost_upper_usd"])
+        wall_elapsed = (
+            max(0.0, time.monotonic() - matrix_started)
+            if matrix_started is not None
+            else 0.0
         )
-        if detailed_evidence_available:
-            estimated_duration = sum(
-                float(item.get("duration_seconds") or 0)
-                for item in scorecard.get("results") or []
-            )
-            duration_basis = "completed_scenarios"
-        else:
-            estimated_duration = self.plan.limits.max_matrix_seconds
-            duration_basis = "matrix_limit_conservative"
+        completed_duration = sum(
+            float(item.get("duration_seconds") or 0)
+            for item in scorecard.get("results") or []
+        )
+        duration_ceiling = (
+            self.plan.limits.max_total_seconds
+            if ongoing_orphan_cost
+            else self.plan.limits.max_matrix_seconds
+        )
+        estimated_duration = max(wall_elapsed, completed_duration, duration_ceiling)
+        duration_basis = "total_limit_conservative" if ongoing_orphan_cost else "matrix_limit_conservative"
         failure_codes = [reason]
         if cleanup_state != "confirmed":
             failure_codes.append("cleanup_unverified")
@@ -1052,6 +1074,7 @@ class ReleaseExecutor:
             "failure_codes": failure_codes,
             "matrix_stop_reason": reason,
             "estimated_compute_cost_upper_usd": round(estimated_cost, 6),
+            "ongoing_orphan_cost": ongoing_orphan_cost,
             "provider_mutation": "unknown",
             "cleanup_proof": {"state": cleanup_state},
             "detailed_scenario_evidence_available": detailed_evidence_available,

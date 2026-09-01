@@ -225,10 +225,25 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
   provider absence, atomically writes the aborted scorecard, and atomically
   appends its redacted receipt to the ledger. The ledger's `last_stop_reason`
   names the exact safe interrupt or limit code.
+- Resource ownership requires one journal identity with the current job ID,
+  lease ID, provider, and exact provider instance ID. Startup facts and cleanup
+  use only that identity. A concurrent managed Pod is not inferred to belong to
+  the campaign and is never terminated by an inventory difference.
+- Cleanup retries are limited by both elapsed time and attempt count. An
+  interrupt at inventory, termination, wait, or final verification causes an
+  aborted receipt. The exact attributed Pod is either proved absent or recorded
+  as an orphan. An orphan or an unavailable final audit charges the conservative
+  total campaign cost ceiling.
 - If an interrupt escapes before the benchmark can retain resource attribution,
   the release fallback performs a read-only provider audit. It never deletes an
   unattributed resource. It marks cleanup failed when a managed resource remains
-  and charges the matrix time and cost ceilings as conservative evidence.
+  and charges the matrix time and cost ceilings as conservative evidence. If a
+  possible orphan remains, it charges the release total time and cost ceilings
+  for possible ongoing spend. Older partial scorecards can never reduce these
+  bounds.
+- A nonzero provider inventory rate overrides a zero journal rate. If a running
+  attributed Pod has no known rate, the harness assigns a nonzero
+  ceiling-derived rate. It never accounts a known running campaign Pod at zero.
 - Startup evidence separates provider allocation, image pull, container start,
   runner callback, and ComfyUI readiness. `unknown` means the provider or
   coordinator did not prove that phase. In particular, RunPod REST v2 does not

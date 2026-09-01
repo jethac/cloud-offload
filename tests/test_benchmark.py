@@ -37,6 +37,7 @@ def event(
     resources = {"provider": "runpod", "hourly_rate": hourly_rate}
     if instance_id:
         resources["worker_instance_id"] = instance_id
+        resources["lease_id"] = f"lease-{instance_id}"
     return {
         "schema": "cloud-offload.job-event.v2",
         "sequence": sequence,
@@ -375,7 +376,8 @@ def test_first_unexpected_scenario_failure_stops_before_second_submission():
         [
             {
                 "snapshot": {"status": "failed", "lifecycle_phase": "worker_boot"},
-                "events": [event(1, "runner_starting", "worker_boot", 1)],
+                "events": [event(1, "runner_starting", "worker_boot", 1,
+                                 instance_id="pod-failed")],
                 "instances": [{"id": "pod-failed"}],
             }
         ]
@@ -400,7 +402,8 @@ def test_runner_readiness_timeout_uses_total_active_scenario_time_and_cleans_up(
         [
             {
                 "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
-                "events": [event(1, "runner_starting", "worker_boot", 1)],
+                "events": [event(1, "runner_starting", "worker_boot", 1,
+                                 instance_id="pod-waiting")],
                 "instances": [{"id": "pod-waiting", "hourly_rate": 0.36}],
             }
         ]
@@ -429,7 +432,8 @@ def test_runner_readiness_cost_guard_stops_before_general_scenario_budget():
         [
             {
                 "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
-                "events": [event(1, "runner_starting", "worker_boot", 1, hourly_rate=1.0)],
+                "events": [event(1, "runner_starting", "worker_boot", 1,
+                                 instance_id="pod-cost", hourly_rate=1.0)],
                 "instances": [{"id": "pod-cost", "hourly_rate": 1.0}],
             }
         ]
@@ -448,6 +452,82 @@ def test_runner_readiness_cost_guard_stops_before_general_scenario_budget():
     assert result["limit_triggered"] == "runner_readiness_cost_limit"
     assert driver.cancelled == {"job-1"}
     assert driver.termination_attempts == [("runpod", "pod-cost")]
+
+
+def test_provider_rate_overrides_zero_journal_rate_before_readiness_cost_guard():
+    waiting = Script(
+        [
+            {
+                "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
+                "events": [
+                    event(
+                        1,
+                        "runner_starting",
+                        "worker_boot",
+                        1,
+                        instance_id="pod-rate",
+                        hourly_rate=0,
+                    )
+                ],
+                "instances": [
+                    {"id": "pod-rate", "hourly_rate": 3600, "status": "running"}
+                ],
+            }
+        ]
+    )
+    waiting.steps[0]["events"][0]["resources"]["lease_id"] = "lease-rate"
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [scenario("cold", "cold", timeout_seconds=20)],
+            max_total_cost_usd=3,
+            max_scenario_cost_usd=2,
+            max_runner_readiness_cost_usd=0.5,
+            runner_readiness_timeout_seconds=15,
+        )
+    )
+    driver = FakeDriver({"cold": waiting})
+
+    result = BenchmarkRunner(driver).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_cost_limit"
+    assert result["estimated_compute_cost_upper_usd"] >= 1
+    assert result["resources"] == [
+        {
+            "provider": "runpod",
+            "instance_id": "pod-rate",
+            "hourly_rate": 3600,
+            "source": "journal",
+        }
+    ]
+    assert driver.cancelled == {"job-1"}
+
+
+def test_known_running_pod_never_keeps_a_zero_cost_rate():
+    waiting = Script(
+        [
+            {
+                "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
+                "events": [event(1, "runner_starting", "worker_boot", 1,
+                                 instance_id="pod-unknown-rate", hourly_rate=0)],
+                "instances": [
+                    {"id": "pod-unknown-rate", "hourly_rate": 0, "status": "running"}
+                ],
+            }
+        ]
+    )
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [scenario("cold", "cold")],
+            max_runner_readiness_cost_usd=0.1,
+            runner_readiness_timeout_seconds=15,
+        )
+    )
+
+    result = BenchmarkRunner(FakeDriver({"cold": waiting})).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_cost_limit"
+    assert result["resources"][0]["hourly_rate"] > 0
+    assert result["resources"][0]["source"] == "provider_inventory_conservative"
 
 
 def test_startup_diagnostics_keep_authoritative_provider_facts_and_mark_gaps_unknown():
@@ -484,7 +564,8 @@ def test_startup_diagnostics_keep_authoritative_provider_facts_and_mark_gaps_unk
         [
             {
                 "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
-                "events": [event(1, "runner_starting", "worker_boot", 1)],
+                "events": [event(1, "runner_starting", "worker_boot", 1,
+                                 instance_id="pod-phase")],
                 "instances": [{"id": "pod-phase"}],
             }
         ]
@@ -559,6 +640,156 @@ def test_startup_diagnostics_do_not_claim_unmatched_provider_worker_callback():
 
     assert phases["runner_callback"] == {"state": "unknown"}
     assert phases["comfyui_readiness"] == {"state": "unknown"}
+
+
+def test_current_job_identity_ignores_and_never_cleans_an_unrelated_concurrent_pod():
+    class ConcurrentDriver(FakeDriver):
+        def active_workers(self, providers):
+            if self.current_job is None:
+                return []
+            return [
+                {
+                    "worker_id": "worker-campaign",
+                    "provider": "runpod",
+                    "status": "starting",
+                    "lease_id": "lease-campaign",
+                },
+                {
+                    "worker_id": "pod-unrelated",
+                    "provider": "runpod",
+                    "status": "active",
+                    "lease_id": "lease-unrelated",
+                },
+            ]
+
+    waiting = Script(
+        [
+            {
+                "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
+                "events": [event(1, "runner_starting", "worker_boot", 1,
+                                 instance_id="pod-campaign")],
+                "instances": [
+                    {"id": "pod-campaign", "hourly_rate": 0.5},
+                    {"id": "pod-unrelated", "hourly_rate": 99.0},
+                ],
+            }
+        ]
+    )
+    waiting.steps[0]["events"][0]["resources"]["lease_id"] = "lease-campaign"
+    plan = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")], runner_readiness_timeout_seconds=1)
+    )
+    driver = ConcurrentDriver({"cold": waiting})
+
+    result = BenchmarkRunner(driver).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_timeout"
+    assert [item["instance_id"] for item in result["resources"]] == ["pod-campaign"]
+    assert driver.termination_attempts == [("runpod", "pod-campaign")]
+    assert ("runpod", "pod-unrelated") not in driver.terminated
+    assert result["startup_phases"]["comfyui_readiness"] == {"state": "unknown"}
+
+
+@pytest.mark.parametrize("delay_stage", ["preparation", "hook"])
+def test_runner_readiness_time_guard_is_checked_immediately_before_submit(delay_stage):
+    class DelayedDriver(FakeDriver):
+        def prepare_scenario(self, scenario):
+            result = super().prepare_scenario(scenario)
+            if delay_stage == "preparation":
+                self.clock += 2
+            return result
+
+        def run_hook(self, injection, context):
+            result = super().run_hook(injection, context)
+            if delay_stage == "hook" and context["CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE"] == "prepare":
+                self.clock += 2
+            return result
+
+    definition = scenario("cold", "cold")
+    if delay_stage == "hook":
+        definition = scenario(
+            "cold", "failure",
+            failure={
+                "kind": "restart",
+                "before_submit": True,
+                "hook_argv": [sys.executable, "safe-hook.py"],
+            },
+        )
+    plan = BenchmarkPlan.from_dict(
+        plan_dict([definition], runner_readiness_timeout_seconds=1)
+    )
+    driver = DelayedDriver({"cold": successful_script("pod-never-submit")})
+
+    result = BenchmarkRunner(driver).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_timeout"
+    assert result["submission_receipt"] is None
+    assert driver.submit_calls == []
+    assert driver.termination_attempts == []
+
+
+def test_exception_and_support_evidence_is_redacted_before_atomic_publication(tmp_path):
+    hostile = (
+        "https://user:SECRET@private.invalid/path?token=SECRET "
+        "HF_TOKEN=SECRET C:\\Users\\jetha\\private.txt"
+    )
+
+    class HostileDriver(FakeDriver):
+        def prepare_scenario(self, scenario):
+            raise RuntimeError(hostile)
+
+    plan = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+    scorecard = BenchmarkRunner(HostileDriver({})).run(plan)
+    path = write_scorecard(tmp_path / "scorecard.json", scorecard)
+    encoded = path.read_text(encoding="utf-8")
+
+    for forbidden in ("private.invalid", "SECRET", "HF_TOKEN", "jetha", "C:\\\\Users"):
+        assert forbidden not in encoded
+    assert json.loads(encoded)["results"][0]["harness_error"] == "RuntimeError"
+
+
+@pytest.mark.parametrize("boundary", ["inventory", "terminate", "sleep", "verify"])
+def test_interrupt_at_each_cleanup_boundary_retries_exact_pod_and_publishes_abort(boundary):
+    class CleanupInterruptDriver(FakeDriver):
+        cleanup_started = False
+        cleanup_inventory_calls = 0
+        injected = False
+
+        def support_bundle(self, job_id):
+            self.cleanup_started = True
+            return super().support_bundle(job_id)
+
+        def inventory(self, providers):
+            if self.cleanup_started:
+                self.cleanup_inventory_calls += 1
+                target = 1 if boundary == "inventory" else 3
+                if boundary in {"inventory", "verify"} and self.cleanup_inventory_calls == target and not self.injected:
+                    self.injected = True
+                    raise KeyboardInterrupt
+            return super().inventory(providers)
+
+        def terminate(self, provider, instance_id):
+            if self.cleanup_started and boundary == "terminate" and not self.injected:
+                self.injected = True
+                raise KeyboardInterrupt
+            return super().terminate(provider, instance_id)
+
+        def sleep(self, seconds):
+            if self.cleanup_started and boundary == "sleep" and not self.injected:
+                self.injected = True
+                raise KeyboardInterrupt
+            return super().sleep(seconds)
+
+    driver = CleanupInterruptDriver({"cold": successful_script("pod-cleanup")})
+    plan = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert scorecard["passed"] is False
+    assert scorecard["campaign_abort"] == "operator_interrupt:KeyboardInterrupt"
+    assert driver.submit_calls == ["cold"]
+    assert ("runpod", "pod-cleanup") in driver.terminated
+    assert scorecard["orphaned_resources"] == []
 def test_scenario_cost_limit_cancels_and_still_removes_the_pod():
     expensive = successful_script("pod-expensive", rate=3600)
     expensive.steps[1]["snapshot"] = {
@@ -728,7 +959,7 @@ def test_corruption_hook_runs_only_after_a_successful_cold_base_manifest():
         {"cold": successful_script("pod-cold"), "corruption": successful_script("pod-corruption")}
     )
 
-    scorecard = BenchmarkRunner(driver).run(plan)
+    BenchmarkRunner(driver).run(plan)
 
     assert driver.cold_base_manifest_ready
     assert [kind for kind, _ in driver.hooks] == ["corruption", "corruption"]
@@ -970,7 +1201,7 @@ def test_scenario_restores_storage_policy_when_submission_fails():
     result = scorecard["results"][0]
 
     assert result["passed"] is False
-    assert result["harness_error"] == "RuntimeError: submission failed"
+    assert result["harness_error"] == "RuntimeError"
     assert result["scenario_restoration"]["restored"] is True
     assert driver.prepared_storage_policy == "smart"
     assert driver.restoration_calls == [("cold", "smart")]
