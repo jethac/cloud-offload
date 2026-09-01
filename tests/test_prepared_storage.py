@@ -1139,6 +1139,32 @@ def test_registry_removes_temporary_manifest_and_restores_prior_projection(tmp_p
     assert registry.get_volume(volume.id).inventory_generation == "base-generation"
 
 
+def test_removing_the_invalidated_manifest_restores_volume_health(tmp_path):
+    registry = CacheRegistry(tmp_path / "queue.db")
+    volume = registered_volume(registry, "temporary", "A")
+    signer = ManifestSigner(b"t" * 32)
+    profile = fingerprint({"profile": "temporary"})
+    synthetic = portable_artifact(b"synthetic")
+    canary = build_manifest(
+        profile_fingerprint=profile,
+        producer={"image_digest": "sha256:" + "a" * 64},
+        artifacts=[synthetic],
+        signer=signer,
+        created_at="2026-01-02T00:00:00Z",
+    )
+    registry.announce_manifest(volume.id, "canary-generation", canary)
+    registry.invalidate(volume.id, synthetic["digest"], "benchmark")
+    assert registry.get_volume(volume.id).status == "degraded"
+
+    registry.remove_manifest(
+        volume.id,
+        canary["manifest_id"],
+        inventory_generation="base-generation",
+    )
+
+    assert registry.get_volume(volume.id).status == "ready"
+
+
 def test_detach_clears_matching_persisted_volume_binding(monkeypatch, tmp_path):
     prepared = policy(existing_volume_id="provider-volume")
     config = CloudConfig(
@@ -2851,7 +2877,10 @@ class PlacementProvider(CloudConnector):
         )
 
     def get_storage(self, storage_id):
-        return self.volume if self.volume and self.volume.id == storage_id else None
+        for volume in getattr(self, "volumes", [self.volume]):
+            if volume and volume.id == storage_id:
+                return volume
+        return None
 
     def create_storage(self, *, name, size_gb, datacenter_id):
         self.created.append((name, size_gb, datacenter_id))
@@ -3112,6 +3141,121 @@ def test_rebound_strict_binding_fails_provisioning_instead_of_stale_launch(tmp_p
     events = [item["type"] for item in dispatcher.queue.list_events(job.id)]
     assert "provisioning_failed" in events
     assert "provisioning_started" not in events
+
+
+def test_strict_binding_in_another_region_does_not_block_regional_volume(tmp_path):
+    """A strict binding naming another region's volume is not a stale binding.
+
+    Multi-region prepared storage keeps one binding slot in the config while a
+    registered volume serves each datacenter. A confirmation against the
+    region's own volume must survive the binding naming a sibling region.
+    """
+    volume = ProviderStorage("vol-1", "runpod", "cache", 100, "US-KS-2", True)
+    config = dispatcher_config(tmp_path, policy(policy="strict"))
+    provider = PlacementProvider(volume=volume)
+    provider.volumes = [
+        volume,
+        ProviderStorage("vol-2", "runpod", "sibling", 100, "EU-RO-1", True),
+    ]
+    dispatcher = Dispatcher(config, provider=provider)
+    registered = dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-1",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-2",
+        datacenter_id="EU-RO-1",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    dispatcher.config.prepared_storage["existing_volume_id"] = "vol-2"
+    confirmed = {
+        "candidate_id": "sha256:" + "c" * 64,
+        "provider": "runpod",
+        "offer_id": "gpu",
+        "gpu_type": "GPU",
+        "gpu_ram_gb": 24,
+        "hourly_rate": 0.4,
+        "region": "US-KS-2",
+        "prepared_volume_id": registered.id,
+        "expires_at": "2099-01-01T00:00:00Z",
+        "request_policy": {"max_hourly_rate": 1.0},
+    }
+
+    decision = dispatcher._confirmed_cache_placement(
+        connector=dispatcher.connectors["runpod"],
+        provider_name="runpod",
+        gpu_type="GPU",
+        minimum_vram=24,
+        cooling=set(),
+        requirements={
+            "required": {},
+            "logical_required": [],
+            "profile_fingerprint": "fp",
+        },
+        confirmed=confirmed,
+    )
+
+    assert decision.reason != "confirmed_prepared_binding_changed"
+
+
+def test_strict_cross_region_binding_rejects_provider_missing_bound_volume(
+    tmp_path,
+):
+    volume = ProviderStorage("vol-1", "runpod", "cache", 100, "US-KS-2", True)
+    config = dispatcher_config(tmp_path, policy(policy="strict"))
+    provider = PlacementProvider(volume=volume)
+    dispatcher = Dispatcher(config, provider=provider)
+    registered = dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-1",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-2",
+        datacenter_id="EU-RO-1",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    dispatcher.config.prepared_storage["existing_volume_id"] = "vol-2"
+    confirmed = {
+        "candidate_id": "sha256:" + "c" * 64,
+        "provider": "runpod",
+        "offer_id": "gpu",
+        "gpu_type": "GPU",
+        "gpu_ram_gb": 24,
+        "hourly_rate": 0.4,
+        "region": "US-KS-2",
+        "prepared_volume_id": registered.id,
+        "request_policy": {"max_hourly_rate": 1.0},
+    }
+
+    decision = dispatcher._confirmed_cache_placement(
+        connector=dispatcher.connectors["runpod"],
+        provider_name="runpod",
+        gpu_type="GPU",
+        minimum_vram=24,
+        cooling=set(),
+        requirements={
+            "required": {},
+            "logical_required": [],
+            "profile_fingerprint": "fp",
+        },
+        confirmed=confirmed,
+    )
+
+    assert decision.reason == "confirmed_prepared_binding_changed"
 
 
 def test_worker_manifest_announcement_drives_next_exact_cache_placement(
@@ -3542,6 +3686,40 @@ def test_same_pod_retry_finishes_cache_population_for_an_already_downloaded_asse
     manifest = worker._selected_prepared_manifest()
     assert manifest
     assert [item["digest"] for item in manifest["artifacts"]] == [artifact["digest"]]
+
+
+def test_a_cache_symlinked_asset_is_reverified_through_the_cache_not_rehashed(
+    tmp_path, monkeypatch
+):
+    cas = PreparedStateCAS(tmp_path / "volume", ManifestSigner(b"y" * 32))
+    profile = fingerprint({"symlinked": True})
+    payload = b"already-restored-through-the-cache"
+    artifact = portable_artifact(payload)
+    asset = {
+        "category": "checkpoints",
+        "filename": "linked.safetensors",
+        "sha256": artifact["digest"].removeprefix("sha256:"),
+    }
+    writer = cache_worker(cas, profile, "symlink-writer")
+    writer._fetch_declared_asset = lambda a, target, token: target.write_bytes(payload)
+    writer._stage_declared_asset(asset, tmp_path / "writer-models", None)
+
+    reader = cache_worker(cas, profile, "symlink-reader")
+    reader._fetch_declared_asset = lambda *args: pytest.fail("origin was called")
+    reader._stage_declared_asset(asset, tmp_path / "models", None)
+    target = tmp_path / "models" / "checkpoints" / asset["filename"]
+    assert target.is_symlink()
+
+    import cloud_offload.worker as worker_module
+
+    monkeypatch.setattr(
+        worker_module,
+        "sha256_file",
+        lambda path: pytest.fail("staging re-hashed the materialized file"),
+    )
+    reader._stage_declared_asset(asset, tmp_path / "models", None)
+
+    assert target.read_bytes() == payload
 
 
 def test_hf_snapshot_profile_is_restored_on_a_fresh_worker_without_origin(

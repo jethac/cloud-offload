@@ -577,6 +577,27 @@ def test_corruption_target_uses_exact_allowed_region_instead_of_global_binding()
     assert manifest["volume_id"] == "registry-volume-is"
 
 
+def test_corruption_target_accepts_the_volume_the_canary_degraded():
+    class DegradedClient(FakeFaultClient):
+        def get(self, path):
+            value = super().get(path)
+            if path == "/api/cache/status":
+                value["volumes"][0]["status"] = "degraded"
+            return value
+
+    scenario = "degraded-canary"
+    canary = corruption_canary_asset(scenario)
+    volume, manifest = _corruption_target(
+        DegradedClient(),
+        scenario,
+        declared_digests={"a" * 64, "b" * 64, canary["sha256"]},
+        allowed_regions={"EU-RO-1"},
+    )
+
+    assert volume["id"] == "registry-volume"
+    assert manifest["volume_id"] == "registry-volume"
+
+
 def test_corruption_profile_uses_dispatcher_launch_profile_name(monkeypatch):
     from types import SimpleNamespace
 

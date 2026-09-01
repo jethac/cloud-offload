@@ -8,6 +8,7 @@ which v2 does not expose yet and still comes from GraphQL.
 from __future__ import annotations
 
 import base64
+import math
 import os
 import time
 import uuid
@@ -594,6 +595,20 @@ class RunPodConnector(CloudConnector):
 
         gpu = data.get("gpu") or {}
         ip_address, ssh_port = self._ssh_endpoint(data)
+        runtime = data.get("runtime")
+        raw_uptime = (
+            runtime.get("uptimeInSeconds") if isinstance(runtime, dict) else None
+        )
+        try:
+            container_uptime = (
+                float(raw_uptime) if raw_uptime is not None else None
+            )
+        except (TypeError, ValueError):
+            container_uptime = None
+        if container_uptime is not None and (
+            not math.isfinite(container_uptime) or container_uptime < 0
+        ):
+            container_uptime = None
 
         return Instance(
             id=str(data["id"]),
@@ -608,8 +623,28 @@ class RunPodConnector(CloudConnector):
                 "name": data.get("name"),
                 "image": data.get("image"),
                 "location": data.get("dataCenterId"),
+                "container_uptime_seconds": container_uptime,
             },
         )
+
+    def container_started(self, instance: Instance) -> bool | None:
+        """RunPod reports container uptime when its telemetry is available.
+
+        A pod can sit "RUNNING" (rented and billing) while its host never
+        creates the container, so pod status alone cannot answer this. The
+        API also omits the whole ``runtime`` block for pods whose containers
+        are demonstrably executing, so an absent block means the telemetry is
+        unavailable — not that the container never started.
+        """
+        uptime = instance.metadata.get("container_uptime_seconds")
+        if uptime is None:
+            return None
+        uptime = float(uptime)
+        if uptime == 0:
+            return False
+        if uptime > 0:
+            return True
+        return None
 
     @staticmethod
     def _ssh_endpoint(data: dict) -> tuple[str | None, int | None]:

@@ -1293,7 +1293,13 @@ def test_failed_offer_cools_down_and_next_launch_routes_around_it(tmp_path):
     assert provider.launch_attempts == ["offer-dead", "offer-good"]
 
 
-def _confirmed_job(queue, *, rate=0.30):
+def _confirmed_job(
+    queue,
+    *,
+    rate=0.30,
+    max_rate=0.5,
+    expires_at="2099-01-01T00:00:00Z",
+):
     return queue.create(
         "comfyui-partition-v1",
         "input.part",
@@ -1310,8 +1316,8 @@ def _confirmed_job(queue, *, rate=0.30):
                 "hourly_rate": rate,
                 "region": None,
                 "prepared_volume_id": None,
-                "expires_at": "2099-01-01T00:00:00Z",
-                "request_policy": {"max_hourly_rate": 0.5},
+                "expires_at": expires_at,
+                "request_policy": {"max_hourly_rate": max_rate},
             },
         },
         status=JobStatus.QUEUED,
@@ -1346,6 +1352,96 @@ def test_dispatcher_refuses_changed_confirmed_price_before_launch(tmp_path):
         item["event"]["type"] == "preflight_confirmation_required"
         for item in events
     )
+
+
+def test_fail_fast_clock_includes_provider_readiness_wait(tmp_path):
+    dispatcher = _cooldown_dispatcher(tmp_path, TwoOfferProvider())
+    lease = dispatcher.queue.create_lease(
+        provider="runpod",
+        runtime_profile="comfyui",
+        ttl_seconds=900,
+    )
+    rental_started = utc_now() - timedelta(seconds=300)
+    with sqlite3.connect(dispatcher.queue.db_path) as conn:
+        conn.execute(
+            "UPDATE job_leases SET created_at=? WHERE id=?",
+            (rental_started.isoformat(), lease.id),
+        )
+
+    instance = SimpleNamespace(
+        id="pod-readiness-wait",
+        provider="runpod",
+        gpu_type="GPU",
+        hourly_rate=0.3,
+        status="running",
+    )
+    dispatcher._remember_launched_instance(
+        instance, "runpod", "comfyui", [], lease.id
+    )
+
+    assert dispatcher.launched_at[instance.id] == rental_started
+    assert (utc_now() - dispatcher.last_activity[instance.id]).total_seconds() < 10
+
+
+def test_grouped_jobs_with_mixed_confirmed_prices_are_not_launched_together(
+    tmp_path,
+):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    first = _confirmed_job(dispatcher.queue, rate=0.30)
+    second = _confirmed_job(dispatcher.queue, rate=0.29)
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [first, second])
+
+    assert instance is None
+    assert provider.launch_attempts == []
+    assert dispatcher.queue.get(first.id).status == JobStatus.FAILED
+    assert dispatcher.queue.get(second.id).status == JobStatus.FAILED
+
+
+def test_grouped_jobs_with_mixed_rate_ceilings_cannot_exceed_one_confirmation(
+    tmp_path,
+):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    first = _confirmed_job(dispatcher.queue, max_rate=0.5)
+    second = _confirmed_job(dispatcher.queue, max_rate=0.29)
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [first, second])
+
+    assert instance is None
+    assert provider.launch_attempts == []
+    assert dispatcher.queue.get(first.id).status == JobStatus.FAILED
+    assert dispatcher.queue.get(second.id).status == JobStatus.FAILED
+
+
+def test_expired_confirmed_quote_still_launches_the_matching_live_offer(tmp_path):
+    """A quote is volatile by contract; freshness comes from re-validating the
+    exact offer and price against the live catalog, so a retry long after
+    confirmation (e.g. after a stalled pod was terminated) must still launch
+    when the live offer is unchanged."""
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    job = _confirmed_job(dispatcher.queue, expires_at="2000-01-01T00:00:00Z")
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert instance is not None
+    assert provider.launch_attempts == ["offer-good"]
+
+
+def test_expired_confirmed_quote_with_changed_price_is_still_refused(tmp_path):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    job = _confirmed_job(
+        dispatcher.queue, rate=0.29, expires_at="2000-01-01T00:00:00Z"
+    )
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [job])
+
+    assert instance is None
+    assert provider.launch_attempts == []
+    assert dispatcher.queue.get(job.id).status == JobStatus.FAILED
 
 
 def test_confirmed_job_launches_without_waiting_for_queue_batch(
@@ -1666,6 +1762,90 @@ def test_a_pod_that_never_registers_is_terminated(tmp_path, monkeypatch):
     events = queue.list_events(job.id)
     assert events[-1]["event"]["type"] == "provisioning_failed"
     assert events[-1]["event"]["error"] == "Runner did not register within 3600s"
+
+
+class StalledHostConnector(StartingConnector):
+    """A host that rents the pod but never starts its container."""
+
+    def container_started(self, instance):
+        return False
+
+
+def test_a_rented_pod_whose_container_never_starts_is_terminated_early(
+    tmp_path, monkeypatch
+):
+    """A pod can bill for an hour at full GPU price while its host never
+    creates the container. Container telemetry ends that rental at the start
+    fail-fast, well before the registration deadline."""
+    from datetime import timedelta
+
+    from cloud_offload.dispatcher import Dispatcher
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    job = queue.create(
+        "comfyui-partition-v1",
+        "input.part",
+        provider="runpod",
+        params={"runtime_profile": "comfyui-partition-v1"},
+        status=JobStatus.QUEUED,
+    )
+    provider = StalledHostConnector()
+    dispatcher = Dispatcher(config, queue=queue, provider=provider)
+    dispatcher.active_instances["pod-1"] = provider.get_instance("pod-1")
+    dispatcher.instance_providers["pod-1"] = "runpod"
+    dispatcher.instance_profiles["pod-1"] = "comfyui"
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(minutes=11)
+
+    dispatcher._check_unregistered_workers()
+
+    assert "pod-1" not in dispatcher.active_instances
+    assert provider.terminated is True
+    assert queue.get(job.id).status == JobStatus.QUEUED
+    events = queue.list_events(job.id)
+    assert events[-1]["event"]["type"] == "provisioning_failed"
+    assert "never started the container within 600s" in events[-1]["event"]["error"]
+
+
+def test_a_started_but_unregistered_container_keeps_the_full_boot_deadline(
+    tmp_path,
+):
+    from datetime import timedelta
+
+    from cloud_offload.dispatcher import Dispatcher
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+
+    class StartedHostConnector(StartingConnector):
+        def container_started(self, instance):
+            return True
+
+    provider = StartedHostConnector()
+    dispatcher = Dispatcher(config, queue=queue, provider=provider)
+    dispatcher.active_instances["pod-1"] = provider.get_instance("pod-1")
+    dispatcher.instance_providers["pod-1"] = "runpod"
+    dispatcher.instance_profiles["pod-1"] = "comfyui"
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(minutes=11)
+
+    dispatcher._check_unregistered_workers()
+
+    assert "pod-1" in dispatcher.active_instances
+
+
+def test_a_provider_without_container_telemetry_keeps_the_full_boot_deadline(
+    tmp_path,
+):
+    from datetime import timedelta
+
+    config = starting_config(tmp_path)
+    queue = JobQueue(config.queue_db_path)
+    dispatcher = long_idle_dispatcher(config, queue)
+    dispatcher.launched_at["pod-1"] = utc_now() - timedelta(minutes=11)
+
+    dispatcher._check_unregistered_workers()
+
+    assert "pod-1" in dispatcher.active_instances
 
 
 def test_a_paid_starting_pod_emits_elapsed_feedback_before_registration(tmp_path):

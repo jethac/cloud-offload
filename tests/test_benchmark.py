@@ -807,6 +807,91 @@ def test_coordinator_driver_preflights_partition_before_submission():
     }
 
 
+def _ready_preflight_response():
+    return FakeResponse(
+        {
+            "schema": "cloud-offload.preflight.v1",
+            "preflight_id": "preflight-1",
+            "manifest_digest": "sha256:" + "a" * 64,
+            "status": "ready",
+            "recommendation": {"candidate_id": "sha256:" + "b" * 64},
+            "execution_plan": {
+                "profile": "comfyui",
+                "image_digest": "sha256:" + "c" * 64,
+                "provider": "runpod",
+                "region": "US-MD-1",
+                "prepared_volume_id": None,
+            },
+            "preparation": {"complete": False, "coverage_percent": 0},
+            "candidates": [{"region": "US-MD-1", "prepared_volume_id": None}],
+        }
+    )
+
+
+def test_a_transient_no_offer_preflight_is_retried_until_an_offer_returns(
+    monkeypatch,
+):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    monkeypatch.setattr(
+        "cloud_offload.benchmark.time.sleep", lambda seconds: None
+    )
+    preflight_calls = []
+
+    def request(method, path, **kwargs):
+        if path == "/api/preflight":
+            preflight_calls.append(path)
+            if len(preflight_calls) < 3:
+                return FakeResponse(
+                    {
+                        "status": "not_ready",
+                        "blockers": [],
+                        "unknowns": [{"code": "no_current_viable_offer"}],
+                    }
+                )
+            return _ready_preflight_response()
+        return FakeResponse({"job_id": "job-1"})
+
+    driver._request = request
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    assert driver.submit(selected) == "job-1"
+    assert len(preflight_calls) == 3
+
+
+def test_a_blocked_preflight_fails_immediately_without_retry(monkeypatch):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    monkeypatch.setattr(
+        "cloud_offload.benchmark.time.sleep",
+        lambda seconds: pytest.fail("a blocked preflight must not be retried"),
+    )
+    preflight_calls = []
+
+    def request(method, path, **kwargs):
+        preflight_calls.append(path)
+        return FakeResponse(
+            {
+                "status": "blocked",
+                "blockers": [{"code": "huggingface_credential_missing"}],
+                "unknowns": [],
+            }
+        )
+
+    driver._request = request
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(RuntimeError, match="huggingface_credential_missing"):
+        driver.submit(selected)
+    assert preflight_calls == ["/api/preflight"]
+
+
 def test_preparation_measurement_uses_staging_to_execution_transition():
     events = [
         event(1, "job_created", "readiness", 1),

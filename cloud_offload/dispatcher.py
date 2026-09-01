@@ -46,6 +46,12 @@ OFFER_COOLDOWN_SECONDS = 600
 # runtime. If the entrypoint never runs, no worker can report the failure home.
 RUNNER_REGISTRATION_TIMEOUT_SECONDS = 3600
 
+# A rented pod bills from creation even when its host never starts the
+# container. When the provider reports container telemetry, a pod with zero
+# container uptime this long after rental is stalled, not booting: give it
+# back and rent elsewhere instead of waiting out the registration deadline.
+RUNNER_CONTAINER_START_TIMEOUT_SECONDS = 600
+
 # A managed worker cannot destroy its provider resource when its process exits.
 # Some providers restart the container instead. Give the dispatcher time to
 # destroy the paid resource before the worker's local idle fail-safe can fire.
@@ -445,11 +451,17 @@ class Dispatcher:
         requirements = resolve_prepared_requirements(
             profile_name, profile, queued_jobs or []
         )
+        # A confirmed quote is volatile by contract; freshness is enforced by
+        # re-validating the exact offer, price, and prepared volume against the
+        # live catalog below, so the quote's age alone is not disqualifying.
+        confirmations = self._preflight_entries(queued_jobs)
         confirmed = self._shared_preflight(queued_jobs)
-        if confirmed and self._preflight_expired(confirmed):
+        if confirmations and (
+            len(confirmations) != len(queued_jobs or []) or confirmed is None
+        ):
             self._refuse_preflight_launch(
                 queued_jobs,
-                "The confirmed GPU quote expired before provider launch.",
+                "Queued jobs have conflicting preflight confirmations.",
             )
             return None
         if confirmed and confirmed.get("provider") != provider_name:
@@ -584,6 +596,13 @@ class Dispatcher:
             )
             self._record_launch_failure(
                 provider_name, profile_name, queued_jobs, detail
+            )
+            return None
+
+        if confirmations and not self._confirmed_offers_allowed(confirmations, offer):
+            self._refuse_preflight_launch(
+                queued_jobs,
+                "A queued preflight confirmation does not permit the live offer.",
             )
             return None
 
@@ -928,18 +947,26 @@ class Dispatcher:
         queued_jobs: list | None,
         lease_id: str | None = None,
     ) -> Instance:
+        # The provider may spend minutes polling for readiness after rental.
+        # Anchor startup accounting to the durable pre-mutation lease timestamp
+        # so fail-fast includes all billable time, including that wait.
+        activity_at = utc_now()
+        launched_at = activity_at
         if lease_id:
-            self.queue.bind_lease(
+            bound_lease = self.queue.bind_lease(
                 lease_id,
                 instance.id,
                 ttl_seconds=self._runner_registration_lease_ttl_seconds(),
             )
             self.instance_leases[instance.id] = lease_id
+            try:
+                launched_at = datetime.fromisoformat(bound_lease.created_at)
+            except ValueError:
+                pass
         self.active_instances[instance.id] = instance
         self.instance_providers[instance.id] = provider_name
         self.instance_profiles[instance.id] = profile_name
-        launched_at = utc_now()
-        self.last_activity[instance.id] = launched_at
+        self.last_activity[instance.id] = activity_at
         self.launched_at[instance.id] = launched_at
         logger.info("Launched worker %s", instance.id)
         self.launch_failures.pop((provider_name, profile_name), None)
@@ -1205,16 +1232,34 @@ class Dispatcher:
         return entries[0]
 
     @staticmethod
-    def _preflight_expired(confirmed: dict) -> bool:
+    def _preflight_entries(jobs: list | None) -> list[dict]:
+        return [
+            item
+            for job in (jobs or [])
+            if isinstance(item := job.params.get("preflight"), dict)
+        ]
+
+    def _confirmed_offers_allowed(
+        self, confirmations: list[dict], offer: dict
+    ) -> bool:
+        """Ensure every queued confirmation permits the exact live offer."""
         try:
-            expires = datetime.fromisoformat(
-                str(confirmed.get("expires_at") or "").replace("Z", "+00:00")
-            )
-        except ValueError:
-            return True
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        return expires <= datetime.now(timezone.utc)
+            live_rate = float(offer.get("hourly_rate"))
+        except (TypeError, ValueError):
+            return False
+        for confirmed in confirmations:
+            if not self._confirmed_offer_matches(confirmed, offer):
+                return False
+            policy = confirmed.get("request_policy") or {}
+            try:
+                ceiling = float(
+                    policy.get("max_hourly_rate", self.config.max_hourly_rate)
+                )
+            except (TypeError, ValueError):
+                return False
+            if live_rate > ceiling:
+                return False
+        return True
 
     @staticmethod
     def _confirmed_offer_matches(confirmed: dict, offer: dict) -> bool:
@@ -1268,12 +1313,29 @@ class Dispatcher:
             and bound
             and bound != volume.provider_volume_id
         ):
-            # Strict placement means "exactly the configured volume". A quote
+            # Strict placement means "the configured volume decides". A quote
             # confirmed against a volume the config no longer binds must not
-            # launch; the current binding decides, not the stale confirmation.
-            return PlacementDecision(
-                "unavailable", None, "confirmed_prepared_binding_changed", ()
+            # launch — unless the binding names a registered volume in another
+            # datacenter, which cannot serve this region at all: the regional
+            # confirmed volume then remains the only strict answer.
+            bound_volume = self.cache_registry.get_provider_volume(
+                provider_name, bound
             )
+            try:
+                bound_actual = (
+                    connector.get_storage(bound) if bound_volume is not None else None
+                )
+            except Exception:
+                bound_actual = None
+            if (
+                bound_volume is None
+                or bound_actual is None
+                or bound_actual.datacenter_id != bound_volume.datacenter_id
+                or bound_volume.datacenter_id == str(confirmed.get("region") or "")
+            ):
+                return PlacementDecision(
+                    "unavailable", None, "confirmed_prepared_binding_changed", ()
+                )
         try:
             actual = connector.get_storage(volume.provider_volume_id)
         except Exception:
@@ -1769,6 +1831,25 @@ cloud-offload worker --poll 10
                     },
                 )
                 self.runner_feedback_at[instance_id] = now
+
+            instance = self.active_instances.get(instance_id)
+            if (
+                instance is not None
+                and self.connectors[provider_name].container_started(instance)
+                is False
+                and now - launched_at
+                > timedelta(seconds=RUNNER_CONTAINER_START_TIMEOUT_SECONDS)
+            ):
+                detail = (
+                    "Provider never started the container within "
+                    f"{RUNNER_CONTAINER_START_TIMEOUT_SECONDS}s of rental"
+                )
+                logger.error("Worker %s %s; terminating", instance_id, detail.lower())
+                self._record_launch_failure(
+                    provider_name, profile_name, queued_jobs, detail
+                )
+                self._terminate_worker(instance_id, reason="container_start_timeout")
+                continue
 
             if now - launched_at <= timedelta(
                 seconds=RUNNER_REGISTRATION_TIMEOUT_SECONDS

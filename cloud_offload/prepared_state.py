@@ -1584,8 +1584,12 @@ class PreparedStateCAS:
                     verification["receipt_issued"] = issued is not None
                 except (ManifestError, RuntimeError, ValueError, OSError):
                     pass
-        destination = Path(destination).resolve()
+        # Resolve the parent only: resolving a destination that is already a
+        # symlink into this cache would follow it to the blob itself, and the
+        # atomic replace below would then overwrite the cached object.
+        destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
+        destination = destination.parent.resolve() / destination.name
         if (
             artifact["portability"] == "runtime-bound"
             or artifact.get("materialization") == "extract"
