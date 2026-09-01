@@ -1167,6 +1167,20 @@ async def update_config(updates: dict[str, Any] = Body(...)):
             status_code=400,
             detail=f"Secrets must be supplied through environment variables: {', '.join(rejected)}",
         )
+    from cloud_offload.config import CloudConfig, READ_ONLY_CONFIG_FIELDS
+
+    writable_fields = set(CloudConfig.__dataclass_fields__) - secret_fields
+    unknown_fields = set(payload) - writable_fields - READ_ONLY_CONFIG_FIELDS
+    if unknown_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown config fields: " + ", ".join(sorted(unknown_fields)),
+        )
+    payload = {
+        field_name: value
+        for field_name, value in payload.items()
+        if field_name not in READ_ONLY_CONFIG_FIELDS
+    }
     if "prepared_storage" in payload:
         from cloud_offload.config import normalized_prepared_storage
 
@@ -1182,25 +1196,28 @@ async def update_config(updates: dict[str, Any] = Body(...)):
     with _config_write_lock:
         current = _config()
         candidate = copy.deepcopy(current)
-        mutable_fields = (
-            set(getattr(candidate, "__dataclass_fields__", {})) - secret_fields
-        )
+        mutable_fields = writable_fields
         updated_fields = mutable_fields.intersection(payload)
         try:
             for field_name in updated_fields:
                 setattr(candidate, field_name, copy.deepcopy(payload[field_name]))
             candidate.__post_init__()
-            for field_name in updated_fields:
-                payload[field_name] = copy.deepcopy(
-                    getattr(candidate, field_name)
-                )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        applied_fields = updated_fields.intersection(
+        changed_fields = {
+            field_name
+            for field_name in updated_fields
+            if getattr(candidate, field_name) != getattr(current, field_name)
+        }
+        payload = {
+            field_name: copy.deepcopy(getattr(candidate, field_name))
+            for field_name in changed_fields
+        }
+        applied_fields = changed_fields.intersection(
             LIVE_RELOADABLE_CONFIG_FIELDS
         )
-        pending_restart_fields = set(payload) - applied_fields
+        pending_restart_fields = changed_fields - applied_fields
         live_candidate = copy.deepcopy(current)
         for field_name in applied_fields:
             setattr(
@@ -1209,7 +1226,8 @@ async def update_config(updates: dict[str, Any] = Body(...)):
                 copy.deepcopy(getattr(candidate, field_name)),
             )
         live_candidate.__post_init__()
-        _persist_config_updates(payload, current)
+        if payload:
+            _persist_config_updates(payload, current)
         if _runtime_config is not None:
             _runtime_config = live_candidate
             effective = live_candidate

@@ -321,3 +321,57 @@ def test_serve_without_explicit_config_pins_one_runtime_snapshot(
     server.serve(config=None)
 
     assert server._runtime_config is runtime
+
+
+def test_unknown_config_field_is_rejected_without_state_or_file_change(
+    monkeypatch, tmp_path
+):
+    isolated_home = tmp_path / "isolated"
+    source = isolated_home / "config.json"
+    _write_config(source)
+    source_before = source.read_bytes()
+    runtime = CloudConfig.from_file(source, home=isolated_home)
+    old_queue = runtime.queue_db_path
+    monkeypatch.setattr(server, "_runtime_config", runtime)
+    monkeypatch.setattr(server, "auth_required", False)
+
+    response = TestClient(server.app).post(
+        "/api/config",
+        json={"queue_db_pth": str(isolated_home / "typo.db")},
+    )
+
+    assert response.status_code == 400
+    assert "Unknown config fields: queue_db_pth" in response.json()["error"]["message"]
+    assert server._runtime_config.queue_db_path == old_queue
+    assert source.read_bytes() == source_before
+
+
+def test_round_tripped_public_config_ignores_read_only_and_unchanged_fields(
+    monkeypatch, tmp_path
+):
+    isolated_home = tmp_path / "isolated"
+    source = isolated_home / "config.json"
+    _write_config(source)
+    source_before = source.read_bytes()
+    runtime = CloudConfig.from_file(source, home=isolated_home)
+    monkeypatch.setattr(server, "_runtime_config", runtime)
+    monkeypatch.setattr(server, "auth_required", False)
+    client = TestClient(server.app)
+
+    public = client.get("/api/config").json()
+    response = client.post("/api/config", json=public)
+
+    assert response.status_code == 200
+    assert response.json()["applied_fields"] == []
+    assert response.json()["pending_restart_fields"] == []
+    assert response.json()["restart_required"] is False
+    assert source.read_bytes() == source_before
+    persisted = json.loads(source.read_text(encoding="utf-8"))["cloud"]
+    for field_name in (
+        "provider_auth_configured",
+        "huggingface_configured",
+        "worker_auth_configured",
+        "worker_wheelhouse_configured",
+        "coordinator_configured",
+    ):
+        assert field_name not in persisted

@@ -30,6 +30,38 @@ class _InMemoryKeyring:
 
 
 @pytest.fixture(autouse=True)
+def isolate_server_module_state():
+    """Keep one in-process coordinator test from changing the next test."""
+    from cloud_offload import server
+
+    snapshot = {
+        "auth_required": server.auth_required,
+        "auth_token": server.auth_token,
+        "last_error": server.last_error,
+        "runtime_config": server._runtime_config,
+        "hf_source_digests": dict(server._HF_SOURCE_DIGESTS),
+        "dependency_overrides": dict(server.app.dependency_overrides),
+    }
+    server.auth_required = False
+    server.auth_token = None
+    server.last_error = None
+    server._runtime_config = None
+    server._HF_SOURCE_DIGESTS.clear()
+    server.app.dependency_overrides.clear()
+    try:
+        yield
+    finally:
+        server.auth_required = snapshot["auth_required"]
+        server.auth_token = snapshot["auth_token"]
+        server.last_error = snapshot["last_error"]
+        server._runtime_config = snapshot["runtime_config"]
+        server._HF_SOURCE_DIGESTS.clear()
+        server._HF_SOURCE_DIGESTS.update(snapshot["hf_source_digests"])
+        server.app.dependency_overrides.clear()
+        server.app.dependency_overrides.update(snapshot["dependency_overrides"])
+
+
+@pytest.fixture(autouse=True)
 def isolate_credentials(monkeypatch, tmp_path):
     """Point credential storage at throwaway state for every test."""
     from cloud_offload import config, credentials

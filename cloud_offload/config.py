@@ -45,6 +45,19 @@ LIVE_RELOADABLE_CONFIG_FIELDS = frozenset(
     }
 )
 
+# These values describe resolved credentials or hidden configuration. They are
+# safe to return to clients, but they are not writable configuration fields.
+# A client can send a complete GET response back without persisting them.
+READ_ONLY_CONFIG_FIELDS = frozenset(
+    {
+        "coordinator_configured",
+        "huggingface_configured",
+        "provider_auth_configured",
+        "worker_auth_configured",
+        "worker_wheelhouse_configured",
+    }
+)
+
 # Plaintext credential file written by versions before keychain storage. Kept
 # only so existing keys can be migrated out of it; nothing writes it now. The
 # credentials module reads this attribute, so tests can redirect it.
