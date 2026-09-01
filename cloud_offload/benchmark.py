@@ -1556,6 +1556,12 @@ class CoordinatorBenchmarkDriver:
             )
             if expected_artifacts:
                 submission_receipt["expected_artifact_digests"] = expected_artifacts
+            expected_model = str(
+                request_payload.get("model")
+                or ("comfyui-partition-v1" if scenario.endpoint == "/api/partitions" else "")
+            )
+            if expected_model:
+                submission_receipt["expected_model"] = expected_model
             self._submission_receipts[job_id] = submission_receipt
         return job_id
 
@@ -1576,7 +1582,10 @@ class CoordinatorBenchmarkDriver:
         job_id = str(cold_result.get("job_id") or "")
         if not job_id:
             return None
-        region = str(receipt.get("region") or "")
+        receipt_region = str(receipt.get("region") or "")
+        requested_regions = tuple(
+            str(item).strip() for item in (receipt.get("allowed_regions") or []) if str(item).strip()
+        )
         started_at = _parse_timestamp(cold_result.get("started_at"))
         job_response = self._request(
             "GET", f"/api/jobs/{job_id}", retry_safe=True, timeout=30
@@ -1588,7 +1597,21 @@ class CoordinatorBenchmarkDriver:
         params = job.get("params") or {}
         lease_id = str(params.get("lease_id") or "")
         volume_id = str(params.get("cache_volume_id") or "")
-        region = str(params.get("cache_datacenter_id") or region)
+        job_region = str(params.get("cache_datacenter_id") or "")
+        expected_model = str(receipt.get("expected_model") or "")
+        job_model = str(job.get("model") or "")
+        if (
+            not expected_model
+            or not job_model
+            or job_model != expected_model
+            or not receipt_region
+            or len(requested_regions) != 1
+            or requested_regions[0] != receipt_region
+            or not job_region
+            or job_region != receipt_region
+        ):
+            return None
+        region = receipt_region
         profile_fingerprint = str(receipt.get("profile_fingerprint") or "")
         image_digest = str(receipt.get("image_digest") or "")
         if (

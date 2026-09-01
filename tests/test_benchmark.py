@@ -958,6 +958,7 @@ def test_coordinator_driver_preflights_partition_before_submission():
         "preflight_status": "ready",
         "profile": "comfyui",
         "image_digest": "sha256:" + "c" * 64,
+        "expected_model": "comfyui-partition-v1",
         "provider": "runpod",
         "region": "US-MD-1",
         "allowed_regions": ["US-MD-1"],
@@ -976,6 +977,8 @@ def test_coordinator_driver_accepts_only_manifest_bound_to_cold_job_and_lease():
     driver._submission_receipts["job-1"] = {
         "profile_fingerprint": profile,
         "image_digest": "sha256:" + "i" * 64,
+        "expected_model": "comfyui-partition-v1",
+        "allowed_regions": ["US-MD-1"],
         "region": "US-MD-1",
     }
     valid = {
@@ -1003,6 +1006,7 @@ def test_coordinator_driver_accepts_only_manifest_bound_to_cold_job_and_lease():
                     "cache_volume_id": "volume-1",
                     "cache_datacenter_id": "US-MD-1",
                 },
+                "model": "comfyui-partition-v1",
             })
         assert path == "/api/cache/manifests"
         return FakeResponse({"manifests": [unrelated, valid]})
@@ -1015,6 +1019,60 @@ def test_coordinator_driver_accepts_only_manifest_bound_to_cold_job_and_lease():
     })
     assert result["manifest_id"] == valid["manifest_id"]
     assert result["lease_id"] == "lease-1"
+
+
+@pytest.mark.parametrize(
+    ("job_model", "receipt_region", "job_region", "manifest_region"),
+    [
+        ("wrong-model", "US-MD-1", "US-MD-1", "US-MD-1"),
+        ("comfyui-partition-v1", "EU-RO-1", "US-MD-1", "US-MD-1"),
+        ("comfyui-partition-v1", "US-MD-1", "EU-RO-1", "EU-RO-1"),
+    ],
+)
+def test_base_manifest_rejects_model_or_region_identity_mismatch(
+    job_model, receipt_region, job_region, manifest_region
+):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    profile = "sha256:" + "p" * 64
+    image = "sha256:" + "i" * 64
+    driver._submission_receipts["job-1"] = {
+        "profile_fingerprint": profile,
+        "image_digest": image,
+        "expected_model": "comfyui-partition-v1",
+        "allowed_regions": [receipt_region],
+        "region": receipt_region,
+    }
+    manifest = {
+        "manifest_id": "sha256:" + "m" * 64,
+        "profile_fingerprint": profile,
+        "created_at": "2026-08-01T00:00:02+00:00",
+        "producer": {
+            "job_id": "job-1", "lease_id": "lease-1",
+            "image_digest": image, "cloud_offload_version": "test",
+        },
+        "artifacts": [{"digest": "sha256:" + "a" * 64, "size": 1}],
+        "volume_id": "volume-1",
+        "datacenter_id": manifest_region,
+    }
+
+    def request(method, path, **kwargs):
+        if path == "/api/jobs/job-1":
+            return FakeResponse({
+                "id": "job-1", "model": job_model,
+                "params": {
+                    "lease_id": "lease-1", "cache_volume_id": "volume-1",
+                    "cache_datacenter_id": job_region,
+                },
+            })
+        return FakeResponse({"manifests": [manifest]})
+
+    driver._request = request
+    assert driver.base_manifest({
+        "job_id": "job-1", "started_at": "2026-08-01T00:00:01+00:00",
+        "submission_receipt": driver.submission_receipt("job-1"),
+    }) is None
 
 
 def _ready_preflight_response():

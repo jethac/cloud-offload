@@ -1060,6 +1060,8 @@ def test_signed_worker_manifest_keeps_coordinator_job_lease_context_for_m7_proof
     driver._submission_receipts["cold-job"] = {
         "profile_fingerprint": profile,
         "image_digest": "sha256:" + "a" * 64,
+        "expected_model": "comfyui-partition-v1",
+        "allowed_regions": ["US-MD-1"],
         "region": "US-MD-1",
     }
     unrelated = dict(signed)
@@ -1069,7 +1071,7 @@ def test_signed_worker_manifest_keeps_coordinator_job_lease_context_for_m7_proof
     def request(method, path, **kwargs):
         if path == "/api/jobs/cold-job":
             return SimpleNamespace(
-                json=lambda: {"id": "cold-job", "params": {
+                    json=lambda: {"id": "cold-job", "model": "comfyui-partition-v1", "params": {
                     "lease_id": "cold-lease", "cache_volume_id": "cache-volume",
                     "cache_datacenter_id": "US-MD-1",
                 }},
