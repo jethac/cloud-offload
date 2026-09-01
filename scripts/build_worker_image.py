@@ -50,7 +50,7 @@ def tree_entries(repo_root: Path, revision: str) -> tuple[TreeEntry, ...]:
 
     repo_root = Path(repo_root).resolve()
     commit = _commit_revision(repo_root, revision)
-    raw = _git(repo_root, "ls-tree", "-r", "-z", commit, text=False)
+    raw = _git(repo_root, "ls-tree", "-r", "-t", "-z", commit, text=False)
     entries: list[TreeEntry] = []
     for record in bytes(raw).split(b"\0"):
         if not record:
@@ -62,6 +62,10 @@ def tree_entries(repo_root: Path, revision: str) -> tuple[TreeEntry, ...]:
         mode = int(mode_raw, 8)
         object_type = object_type_raw.decode("ascii")
         oid = oid_raw.decode("ascii")
+        if path == MODE_MANIFEST_NAME:
+            raise ValueError(f"reserved mode manifest path is tracked: {path!r}")
+        if object_type == "tree":
+            continue
         if object_type != "blob" or mode not in {0o100644, 0o100755, 0o120000}:
             raise ValueError(f"unsupported Git tree entry: {path!r} ({mode_raw!r})")
         entries.append(TreeEntry(path, mode, object_type, oid))

@@ -145,6 +145,42 @@ def test_context_rejects_reserved_mode_manifest_collisions(tmp_path, collision):
         prepare_context(repo, revision, tmp_path / "context")
 
 
+def test_context_rejects_empty_reserved_mode_manifest_tree(tmp_path):
+    from scripts.build_worker_image import MODE_MANIFEST_NAME, prepare_context
+
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "--quiet")
+    empty_tree = subprocess.run(
+        ["git", "-C", str(repo), "mktree"],
+        input=b"",
+        capture_output=True,
+        check=True,
+    ).stdout.strip().decode("ascii")
+    tree_input = f"040000 tree {empty_tree}\t{MODE_MANIFEST_NAME}\n".encode("utf-8")
+    root_tree = subprocess.run(
+        ["git", "-C", str(repo), "mktree"],
+        input=tree_input,
+        capture_output=True,
+        check=True,
+    ).stdout.strip().decode("ascii")
+    env = os.environ | {
+        "GIT_AUTHOR_NAME": "image-test",
+        "GIT_AUTHOR_EMAIL": "image-test@example.invalid",
+        "GIT_COMMITTER_NAME": "image-test",
+        "GIT_COMMITTER_EMAIL": "image-test@example.invalid",
+    }
+    revision = subprocess.run(
+        ["git", "-C", str(repo), "commit-tree", root_tree, "-m", "empty reserved tree"],
+        capture_output=True,
+        check=True,
+        env=env,
+        text=True,
+    ).stdout.strip()
+    with pytest.raises(ValueError, match="reserved mode manifest"):
+        prepare_context(repo, revision, tmp_path / "context")
+
+
 def test_context_is_contained_and_disjoint_from_source(tmp_path):
     from scripts.build_worker_image import prepare_context
 
