@@ -22,13 +22,23 @@ export PYTHONPATH="${CLOUD_OFFLOAD_ENV_ROOT:-/opt/cloud-offload/environment}/lib
 read -r -a comfyui_extra_args <<< "${CLOUD_OFFLOAD_COMFYUI_ARGS:-}"
 comfyui_root="${CLOUD_OFFLOAD_COMFYUI_ROOT:-/opt/ComfyUI}"
 
-python "${comfyui_root}/main.py" \
-  --listen 127.0.0.1 \
-  --port 8188 \
-  --disable-auto-launch \
-  --disable-metadata \
-  "${comfyui_extra_args[@]}" \
-  >/tmp/comfyui.log 2>&1 &
+if [[ "${comfyui_root}" == "/opt/ComfyUI" ]]; then
+  python /opt/ComfyUI/main.py \
+    --listen 127.0.0.1 \
+    --port 8188 \
+    --disable-auto-launch \
+    --disable-metadata \
+    "${comfyui_extra_args[@]}" \
+    >/tmp/comfyui.log 2>&1 &
+else
+  python "${comfyui_root}/main.py" \
+    --listen 127.0.0.1 \
+    --port 8188 \
+    --disable-auto-launch \
+    --disable-metadata \
+    "${comfyui_extra_args[@]}" \
+    >/tmp/comfyui.log 2>&1 &
+fi
 comfy_pid=$!
 
 cleanup() {
