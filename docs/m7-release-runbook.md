@@ -262,6 +262,9 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
   positive hourly rate. Its worst-case scenario cost must fit the remaining
   readiness, scenario, and campaign budgets. Missing, malformed, zero, or
   unaffordable quotes stop before the provider-starting POST.
+- The free preflight wire carries exactly one workload: `partition` for
+  `/api/partitions`, or `capsule` for `/api/workflows`. It never sends an empty
+  field for the other workload type.
 - Published scorecards use explicit field and finite-value projections. Support
   bundles keep only their schema, job ID, and approved event facts. Provider
   detail text, commands, URLs, paths, environment data, and exception messages
@@ -274,6 +277,9 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
 - Request digests preserve the harness's canonical lowercase bare 64-hex form.
   The public projection also accepts `sha256:<64-hex>` as a normalized input;
   malformed or non-hex request digests are dropped.
+- Image, profile, test-set, plan, scorecard, and other release digests require
+  the contracted `sha256:<64-hex>` form; only `request_digest` also accepts the
+  canonical bare form.
 - An exception in replay, storage checks, or another post-submit release step
   uses the same durable scorecard audit as an operator stop. Exact attributed
   Pods receive bounded cleanup. Unknown ownership or ongoing spend charges the

@@ -620,6 +620,29 @@ def test_live_cost_sums_each_unknown_pod_exactly_once(pod_count):
     assert sum(item["hourly_rate"] for item in result["unknown_paid_resources"]) == pytest.approx(pod_count * 0.6)
 
 
+@pytest.mark.parametrize("order", ["verified_then_incomplete", "incomplete_then_verified"])
+def test_resource_identity_promotion_and_incomplete_events_are_exactly_once(order):
+    script = successful_script("pod-promoted")
+    if order == "verified_then_incomplete":
+        extra = event(4, "executed", "execution", 3, instance_id="pod-promoted")
+        extra["resources"].pop("lease_id", None)
+        script.steps[1]["events"].append(extra)
+    else:
+        script.steps[0]["events"][1]["resources"].pop("lease_id", None)
+    driver = FakeDriver({"cold": script})
+
+    scorecard = BenchmarkRunner(driver).run(
+        BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+    )
+    result = scorecard["results"][0]
+
+    assert len(result["resources"]) == 1
+    assert result["unknown_paid_resources"] == []
+    assert result["orphaned_resources"] == []
+    assert driver.termination_attempts == [("runpod", "pod-promoted")]
+    assert scorecard["estimated_compute_cost_upper_usd"] < 1
+
+
 def test_worker_with_current_lease_but_wrong_pod_never_proves_readiness():
     phases = _initial_startup_phases()
     observation = InstanceObservation(
@@ -920,6 +943,18 @@ def test_request_digest_projection_preserves_canonical_bare_and_prefixed_sha256(
     }
     assert _sanitize_public_evidence({"request_digest": "sha256:" + bare}) == {
         "request_digest": "sha256:" + bare
+    }
+
+
+@pytest.mark.parametrize("key", [
+    "image_digest", "profile_fingerprint", "test_set_digest",
+    "benchmark_plan_digest", "benchmark_scorecard_digest",
+])
+def test_release_digest_fields_require_prefixed_sha256(key):
+    bare = "a" * 64
+    assert _sanitize_public_evidence({key: bare}) == {}
+    assert _sanitize_public_evidence({key: "sha256:" + bare}) == {
+        key: "sha256:" + bare
     }
 
 
@@ -1624,11 +1659,57 @@ def test_workflow_submission_uses_same_quote_guard_before_paid_post(workflow_rat
         absolute_deadline=driver.monotonic() + 100, max_cost_usd=0.000001
     )
     definition = scenario("workflow", "cold", endpoint="/api/workflows")
+    definition["request"] = {"capsule": {"schema": "cloud-offload.workflow-capsule.v1"}}
     selected = BenchmarkPlan.from_dict(plan_dict([definition])).scenarios[0]
 
     with pytest.raises(RuntimeError):
         driver.submit(selected)
     assert "/api/workflows" not in posts
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "workload_key"),
+    [("/api/partitions", "partition"), ("/api/workflows", "capsule")],
+)
+def test_preflight_wire_sends_exactly_one_workload_shape(endpoint, workload_key):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    payloads = []
+
+    def request(method, path, **kwargs):
+        payloads.append(kwargs["json"])
+        return FakeResponse({"status": "not_ready", "blockers": [{"code": "stop"}]})
+
+    driver._request = request
+    definition = scenario("shape", "cold", endpoint=endpoint)
+    definition["request"] = {workload_key: {"schema": "cloud-offload.shape.v1"}}
+    if endpoint == "/api/partitions":
+        definition["request"]["force_execution"] = True
+    selected = BenchmarkPlan.from_dict(plan_dict([definition])).scenarios[0]
+
+    with pytest.raises(RuntimeError):
+        driver._ready_preflight(selected, selected.request)
+
+    assert workload_key in payloads[0]
+    assert ({"partition", "capsule"} & set(payloads[0])) == {workload_key}
+
+
+def test_real_preflight_server_rejects_both_workload_shapes(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    from cloud_offload import server
+    from tests.test_preflight import config_for_preflight
+
+    config = config_for_preflight(tmp_path)
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    response = TestClient(server.app).post(
+        "/api/preflight",
+        json={"partition": {"partition_id": "p"},
+              "capsule": {"schema": "cloud-offload.workflow-capsule.v1"}},
+    )
+
+    assert response.status_code == 400
+    assert "exactly one" in response.text
 
 
 def test_coordinator_driver_refuses_to_overwrite_a_concurrent_config_change():

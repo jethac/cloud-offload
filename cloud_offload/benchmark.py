@@ -1000,6 +1000,15 @@ class BenchmarkRunner:
                         or item.get("lease_id")
                         or ""
                     )
+                    key = (provider, str(instance_id)) if instance_id else None
+                    if key is not None and key in resources and not lease_id:
+                        # An incomplete later event cannot demote an identity
+                        # that this job already proved.
+                        meter = resources[key]
+                        meter.last_seen = now
+                        meter.hourly_rate = max(meter.hourly_rate, last_rate)
+                        unverified_resources.pop(key, None)
+                        continue
                     if instance_id and not lease_id:
                         key = (provider, str(instance_id))
                         unverified_resources[key] = {
@@ -1946,12 +1955,18 @@ class CoordinatorBenchmarkDriver:
         # terminated. Retry a not-ready preflight while it reports no blockers,
         # since only current-offer availability can change on its own.
         deadline = time.monotonic() + PREFLIGHT_OFFER_RETRY_SECONDS
+        workload_key = (
+            "capsule" if scenario.endpoint == "/api/workflows" else "partition"
+        )
+        workload = request_payload.get(workload_key)
+        if not isinstance(workload, dict) or not workload:
+            raise RuntimeError(f"benchmark_{workload_key}_missing")
         while True:
             preflight_response = self._request(
                 "POST",
                 "/api/preflight",
                 json={
-                    "partition": request_payload.get("partition") or {},
+                    workload_key: workload,
                     "input_artifacts": request_payload.get("input_artifacts") or {},
                     "provider": request_payload.get("provider") or "auto",
                     "recommendation_policy": "balanced",
@@ -2334,7 +2349,7 @@ _SEMANTIC_VALUES = {
     },
 }
 _DIGEST_KEYS = {
-    "image_digest", "profile_fingerprint", "request_digest", "test_set_digest",
+    "image_digest", "profile_fingerprint", "test_set_digest",
     "benchmark_plan_digest", "benchmark_scorecard_digest",
 }
 _TIME_KEYS = {"started_at", "completed_at", "observed_at", "created_at"}
@@ -2409,6 +2424,12 @@ def _sanitize_public_evidence(value: Any, key: str | None = None) -> Any:
         if key == "schema":
             return value if re.fullmatch(r"cloud-offload\.[a-z0-9.-]+\.v[0-9]+", value) else _DROP
         if key in _DIGEST_KEYS:
+            return (
+                value
+                if value.startswith("sha256:") and _PUBLIC_DIGEST.fullmatch(value)
+                else _DROP
+            )
+        if key == "request_digest":
             return value if _PUBLIC_DIGEST.fullmatch(value) else _DROP
         if key in _TIME_KEYS:
             return value if _parse_timestamp(value) is not None else _DROP
