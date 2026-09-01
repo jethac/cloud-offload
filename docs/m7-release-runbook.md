@@ -233,6 +233,10 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
   accepts the Pod only when the job, lease, provider, and instance all match. If
   that proof is not available, the Pod is an unknown paid resource: no delete is
   attempted, the release is blocked, and the campaign cost ceiling is charged.
+- Unknown paid Pods also enter the live readiness cost meter. Provider inventory
+  supplies the rate when available; otherwise the meter uses a nonzero
+  ceiling-derived rate. They can stop a startup validation on cost before its
+  time limit, and are never accounted at zero.
 - Worker readiness needs the exact attributed Pod. A worker with the current
   lease but a different Pod ID cannot prove a callback or ComfyUI readiness.
 - Cleanup retries are limited by both elapsed time and attempt count. An
@@ -254,10 +258,19 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
   cost budget. It checks both after preflight and immediately before the
   provider-starting POST. A slow preflight therefore cannot start a Pod after a
   startup-only validation limit has expired.
+- Submission also requires exactly one selected candidate with a finite,
+  positive hourly rate. Its worst-case scenario cost must fit the remaining
+  readiness, scenario, and campaign budgets. Missing, malformed, zero, or
+  unaffordable quotes stop before the provider-starting POST.
 - Published scorecards use explicit field and finite-value projections. Support
   bundles keep only their schema, job ID, and approved event facts. Provider
   detail text, commands, URLs, paths, environment data, and exception messages
   are not publication fields.
+- Public strings use field-specific rules: finite provider values, strict
+  bounded identifiers, SHA-256 digest syntax, parsed timestamps, and bounded
+  stop codes. URL syntax, paths, whitespace-bearing detail text, email-style
+  values, and AWS access-key forms are rejected even when placed under an
+  otherwise public field name.
 - An exception in replay, storage checks, or another post-submit release step
   uses the same durable scorecard audit as an operator stop. Exact attributed
   Pods receive bounded cleanup. Unknown ownership or ongoing spend charges the

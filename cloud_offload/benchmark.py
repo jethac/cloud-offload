@@ -646,8 +646,10 @@ def _observe_startup_phases(
         key = (provider, worker_id)
         worker_lease = str(item.get("lease_id") or "")
         expected_lease = (identities or {}).get(key)
-        if key in (identities or {}) and (
-            not worker_lease or worker_lease == expected_lease
+        if (
+            key in (identities or {})
+            and bool(worker_lease)
+            and worker_lease == expected_lease
         ):
             matching_workers.append(item)
     if matching_workers:
@@ -832,9 +834,13 @@ class BenchmarkRunner:
             "cleanup_proof": {
                 "state": (
                     "confirmed"
-                    if final_audit_error is None and not orphaned
+                    if final_audit_error is None
+                    and not orphaned
+                    and not unknown_paid_resources
                     else "failed"
-                )
+                ),
+                "verified_remaining_count": len(orphaned),
+                "unknown_paid_resource_count": len(unknown_paid_resources),
             },
             "orphaned_resources": [
                 {"provider": provider, "instance_id": instance}
@@ -965,6 +971,7 @@ class BenchmarkRunner:
                     max_cost_usd=min(
                         plan.limits.max_scenario_cost_usd,
                         float(plan.limits.max_runner_readiness_cost_usd or 0),
+                        max(0.0, plan.limits.max_total_cost_usd - cost_before),
                     ),
                 )
             job_id = self.driver.submit(scenario)
@@ -1009,6 +1016,9 @@ class BenchmarkRunner:
                             "ownership_state": "unknown",
                             "provider_absent": False,
                             "termination_attempts": 0,
+                            "first_seen": unverified_resources.get(key, {}).get(
+                                "first_seen", now
+                            ),
                         }
                         resolver = getattr(
                             self.driver, "resolve_resource_identity", None
@@ -1071,6 +1081,9 @@ class BenchmarkRunner:
                             "ownership_state": "unknown",
                             "provider_absent": False,
                             "termination_attempts": 0,
+                            "first_seen": unverified_resources.get(key, {}).get(
+                                "first_seen", now
+                            ),
                         }
 
                 current_inventory = (
@@ -1115,6 +1128,19 @@ class BenchmarkRunner:
                                 float(unknown.get("hourly_rate") or 0),
                                 observation.hourly_rate,
                             )
+                            if (
+                                float(unknown.get("hourly_rate") or 0) <= 0
+                                and str(observation.status).lower()
+                                in {"running", "starting", "provisioning"}
+                            ):
+                                unknown["hourly_rate"] = (
+                                    float(
+                                        plan.limits.max_runner_readiness_cost_usd
+                                        or plan.limits.max_scenario_cost_usd
+                                    )
+                                    * 3600
+                                    / max(plan.limits.poll_seconds, 0.001)
+                                )
 
                 try:
                     current_workers = self.driver.active_workers(plan.providers)
@@ -1129,6 +1155,12 @@ class BenchmarkRunner:
                 )
 
                 estimated = self._estimated_cost(resources, now)
+                estimated += sum(
+                    max(0.0, now - float(item.get("first_seen") or started))
+                    * float(item.get("hourly_rate") or 0)
+                    / 3600
+                    for item in unverified_resources.values()
+                )
                 if not resources and last_rate:
                     estimated = last_rate * elapsed / 3600
                 if estimated >= plan.limits.max_scenario_cost_usd:
@@ -1308,6 +1340,12 @@ class BenchmarkRunner:
             completed = active_completed
         cleanup_duration = max(0.0, completed - cleanup_started)
         estimated_cost = self._estimated_cost(resources, completed)
+        estimated_cost += sum(
+            max(0.0, completed - float(item.get("first_seen") or started))
+            * float(item.get("hourly_rate") or 0)
+            / 3600
+            for item in unverified_resources.values()
+        )
         orphaned_resources = [
             item for item in cleanup if not item.get("provider_absent")
         ] + list(unverified_resources.values())
@@ -1964,22 +2002,25 @@ class CoordinatorBenchmarkDriver:
             and time.monotonic() >= self._submission_deadline
         ):
             raise TimeoutError("runner_readiness_deadline")
-        if self._submission_cost_budget is not None and self._submission_cost_budget <= 0:
+        if self._submission_cost_budget is None or self._submission_cost_budget <= 0:
             raise RuntimeError("runner_readiness_cost_budget")
-        recommendation = preflight.get("recommendation") or {} if scenario.endpoint == "/api/partitions" else {}
-        quoted_cost = recommendation.get("estimated_cost_usd")
-        if quoted_cost is None and recommendation.get("hourly_rate") is not None:
-            quoted_cost = (
-                float(recommendation["hourly_rate"])
-                * scenario.timeout_seconds
-                / 3600
-            )
-        if (
-            self._submission_cost_budget is not None
-            and quoted_cost is not None
-            and float(quoted_cost) > self._submission_cost_budget
-        ):
-            raise RuntimeError("runner_readiness_cost_budget")
+        if scenario.endpoint == "/api/partitions":
+            selected = [
+                item
+                for item in preflight.get("candidates") or []
+                if str(item.get("candidate_id") or "") == str(candidate_id)
+            ]
+            if len(selected) != 1:
+                raise RuntimeError("runner_readiness_quote_unproved")
+            try:
+                hourly_rate = float(selected[0].get("hourly_rate"))
+            except (TypeError, ValueError):
+                raise RuntimeError("runner_readiness_quote_unproved") from None
+            if not math.isfinite(hourly_rate) or hourly_rate <= 0:
+                raise RuntimeError("runner_readiness_quote_unproved")
+            quoted_cost = hourly_rate * scenario.timeout_seconds / 3600
+            if quoted_cost > self._submission_cost_budget:
+                raise RuntimeError("runner_readiness_cost_budget")
         response = self._request(
             "POST",
             scenario.endpoint,
@@ -2258,20 +2299,30 @@ class CoordinatorBenchmarkDriver:
         }
 
 
-_PUBLIC_TEXT_KEYS = {
-    "schema", "name", "cache_state", "state", "provider_state", "provider",
-    "instance_id", "lease_id", "job_id", "status", "source", "type", "phase",
-    "kind", "abort_reason", "campaign_abort", "limit_triggered", "harness_error",
-    "error", "error_type", "inventory_error", "cleanup_interrupt", "requested_policy",
-    "previous_policy", "restored_policy", "profile", "image_digest", "region",
-    "profile_fingerprint", "manifest_id", "volume_id", "datacenter_id",
-    "matrix_stop_reason", "duration_basis", "ownership_state", "failure_kind",
-    "preflight_status", "expected_model", "request_digest", "test_set_digest",
-    "benchmark_plan_digest", "benchmark_scorecard_digest", "started_at", "completed_at",
-    "observed_at", "created_at", "dependency_failure", "failure_codes", "providers",
-    "expected_statuses", "allowed_regions", "missing_canaries", "canaries",
+_PUBLIC_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_PUBLIC_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_PUBLIC_CODE = re.compile(
+    r"[A-Za-z][A-Za-z0-9_.-]{0,63}(?::[A-Za-z][A-Za-z0-9_.-]{0,63})?\Z"
+)
+_PROVIDER_VALUES = {"runpod", "vast"}
+_DIGEST_KEYS = {
+    "image_digest", "profile_fingerprint", "request_digest", "test_set_digest",
+    "benchmark_plan_digest", "benchmark_scorecard_digest",
 }
-_PUBLIC_TEXT = re.compile(r"[A-Za-z0-9_.:+@/-]{1,256}\Z")
+_TIME_KEYS = {"started_at", "completed_at", "observed_at", "created_at"}
+_CODE_KEYS = {
+    "abort_reason", "campaign_abort", "limit_triggered", "harness_error", "error",
+    "error_type", "inventory_error", "cleanup_interrupt", "matrix_stop_reason",
+    "failure_codes",
+}
+_IDENTIFIER_KEYS = {
+    "name", "instance_id", "lease_id", "job_id", "status", "source", "type", "phase",
+    "kind", "state", "provider_state", "cache_state", "requested_policy",
+    "previous_policy", "restored_policy", "profile", "region", "manifest_id", "volume_id",
+    "datacenter_id", "duration_basis", "ownership_state", "failure_kind",
+    "preflight_status", "expected_model", "expected_statuses", "allowed_regions",
+    "missing_canaries", "canaries",
+}
 _DROP = object()
 _SUPPORT_EVENT_TYPES = {
     "allocation_started", "provider_request_completed", "runner_starting",
@@ -2288,7 +2339,7 @@ def _project_support_bundle(value: Any) -> dict[str, Any] | None:
     projected: dict[str, Any] = {"schema": "cloud-offload.support-bundle.v1"}
     job = value.get("job") or {}
     job_id = str(job.get("id") or "") if isinstance(job, dict) else ""
-    if _PUBLIC_TEXT.fullmatch(job_id):
+    if _PUBLIC_IDENTIFIER.fullmatch(job_id):
         projected["job"] = {"id": job_id}
     events = []
     for item in value.get("events") or []:
@@ -2301,7 +2352,7 @@ def _project_support_bundle(value: Any) -> dict[str, Any] | None:
         if isinstance(item.get("sequence"), int):
             event["sequence"] = item["sequence"]
         phase = str(item.get("phase") or "")
-        if phase and _PUBLIC_TEXT.fullmatch(phase):
+        if phase and _PUBLIC_IDENTIFIER.fullmatch(phase):
             event["phase"] = phase
         events.append(event)
     projected["events"] = events
@@ -2327,7 +2378,19 @@ def _sanitize_public_evidence(value: Any, key: str | None = None) -> Any:
     if isinstance(value, tuple):
         return _sanitize_public_evidence(list(value), key)
     if isinstance(value, str):
-        if key in _PUBLIC_TEXT_KEYS and _PUBLIC_TEXT.fullmatch(value):
+        if re.fullmatch(r"(?:AKIA|ASIA)[0-9A-Z]{16}", value):
+            return _DROP
+        if key == "provider" or key == "providers":
+            return value if value in _PROVIDER_VALUES else _DROP
+        if key == "schema":
+            return value if re.fullmatch(r"cloud-offload\.[a-z0-9.-]+\.v[0-9]+", value) else _DROP
+        if key in _DIGEST_KEYS:
+            return value if _PUBLIC_DIGEST.fullmatch(value) else _DROP
+        if key in _TIME_KEYS:
+            return value if _parse_timestamp(value) is not None else _DROP
+        if key in _CODE_KEYS:
+            return value if _PUBLIC_CODE.fullmatch(value) else _DROP
+        if key in _IDENTIFIER_KEYS and _PUBLIC_IDENTIFIER.fullmatch(value):
             return value
         return _DROP
     return value

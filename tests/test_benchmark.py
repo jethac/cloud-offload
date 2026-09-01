@@ -15,6 +15,7 @@ from cloud_offload.benchmark import (
     InstanceObservation,
     _initial_startup_phases,
     _observe_startup_phases,
+    _sanitize_public_evidence,
     _preparation_seconds,
     _seconds_from_event_to,
     write_scorecard,
@@ -562,6 +563,33 @@ def test_missing_event_lease_is_resolved_authoritatively_or_charged_as_unknown(o
         assert scorecard["passed"] is False
 
 
+def test_unknown_paid_pod_uses_provider_rate_in_live_readiness_cost_guard():
+    waiting = successful_script("pod-unknown-expensive", rate=0)
+    for step in waiting.steps:
+        for item in step.get("events", []):
+            item["resources"].pop("lease_id", None)
+        step["instances"] = [
+            {"id": "pod-unknown-expensive", "hourly_rate": 3600, "status": "running"}
+        ]
+        step["snapshot"] = {"status": "running", "lifecycle_phase": "worker_boot"}
+    plan = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")],
+                  max_runner_readiness_cost_usd=0.10,
+                  runner_readiness_timeout_seconds=10,
+                  max_scenario_cost_usd=2, max_total_cost_usd=3)
+    )
+
+    scorecard = BenchmarkRunner(FakeDriver({"cold": waiting})).run(plan)
+    result = scorecard["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_cost_limit"
+    assert result["scenario_active_seconds"] < 10
+    assert result["unknown_paid_resources"][0]["hourly_rate"] == 3600
+    assert result["estimated_compute_cost_upper_usd"] >= 1
+    assert scorecard["cleanup_proof"]["state"] == "failed"
+    assert scorecard["cleanup_proof"]["unknown_paid_resource_count"] == 1
+
+
 def test_worker_with_current_lease_but_wrong_pod_never_proves_readiness():
     phases = _initial_startup_phases()
     observation = InstanceObservation(
@@ -579,6 +607,20 @@ def test_worker_with_current_lease_but_wrong_pod_never_proves_readiness():
     )
 
     assert phases["runner_callback"] == {"state": "unknown"}
+    assert phases["comfyui_readiness"] == {"state": "unknown"}
+
+
+def test_exact_worker_pod_without_lease_never_proves_readiness():
+    phases = _initial_startup_phases()
+    observation = InstanceObservation(
+        id="pod-current", provider="runpod", hourly_rate=0.5,
+        status="running", managed=True,
+    )
+    _observe_startup_phases(
+        phases, {"runpod": {"pod-current": observation}},
+        [{"worker_id": "pod-current", "provider": "runpod", "status": "active"}],
+        [], {("runpod", "pod-current"): "lease-current"},
+    )
     assert phases["comfyui_readiness"] == {"state": "unknown"}
 
 
@@ -822,6 +864,20 @@ def test_support_projection_drops_arbitrary_cloud_text_aws_keys_unc_paths_and_ur
         assert forbidden not in encoded
 
 
+@pytest.mark.parametrize("hostile", [
+    "https://example.invalid/x", "AKIAABCDEFGHIJKLMNOP", "user@example.com",
+    "/home/private/model", r"C:\\Users\\private", r"\\server\share", "private text",
+])
+def test_every_public_string_field_uses_semantic_validation(hostile):
+    projected = _sanitize_public_evidence(
+        {key: hostile for key in (
+            "provider", "instance_id", "job_id", "lease_id", "name", "schema",
+            "status", "source", "phase", "failure_codes", "region", "image_digest",
+        )}
+    )
+    assert projected == {}
+
+
 @pytest.mark.parametrize("boundary", ["clock", "inventory", "terminate", "sleep", "verify"])
 def test_interrupt_at_each_cleanup_boundary_retries_exact_pod_and_publishes_abort(boundary):
     class CleanupInterruptDriver(FakeDriver):
@@ -891,7 +947,7 @@ def test_keyboard_interrupt_in_failure_cleanup_hook_still_cleans_exact_pod():
 
     assert scorecard["campaign_abort"] == "operator_interrupt:KeyboardInterrupt"
     assert driver.termination_attempts == [("runpod", "pod-hook-stop")]
-    assert scorecard["cleanup_proof"] == {"state": "confirmed"}
+    assert scorecard["cleanup_proof"]["state"] == "confirmed"
 def test_scenario_cost_limit_cancels_and_still_removes_the_pod():
     expensive = successful_script("pod-expensive", rate=3600)
     expensive.steps[1]["snapshot"] = {
@@ -1333,7 +1389,7 @@ def test_operator_interrupt_returns_aborted_scorecard_after_cleanup_and_restore(
 
     assert scorecard["passed"] is False
     assert scorecard["campaign_abort"] == "operator_interrupt:KeyboardInterrupt"
-    assert scorecard["cleanup_proof"] == {"state": "confirmed"}
+    assert scorecard["cleanup_proof"]["state"] == "confirmed"
     result = scorecard["results"][0]
     assert result["abort_reason"] == "operator_interrupt:KeyboardInterrupt"
     assert result["passed"] is False
@@ -1470,6 +1526,34 @@ def test_production_submit_rechecks_absolute_deadline_after_long_preflight(monke
     assert calls == []
 
 
+@pytest.mark.parametrize("quote", [None, 0, "bad", float("nan")])
+def test_production_submit_rejects_missing_or_invalid_quote_before_mutation(quote):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    calls = []
+    candidate = {"candidate_id": "sha256:" + "b" * 64}
+    if quote is not None:
+        candidate["hourly_rate"] = quote
+    driver._ready_preflight = lambda *args: {
+        "status": "ready", "preflight_id": "preflight-1",
+        "manifest_digest": "sha256:" + "a" * 64,
+        "recommendation": {"candidate_id": candidate["candidate_id"]},
+        "candidates": [candidate],
+    }
+    driver._request = lambda *args, **kwargs: calls.append((args, kwargs))
+    driver.configure_submission_guard(
+        absolute_deadline=driver.monotonic() + 100.0, max_cost_usd=0.01
+    )
+    definition = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises((RuntimeError, ValueError)):
+        driver.submit(definition)
+    assert calls == []
+
+
 def test_coordinator_driver_refuses_to_overwrite_a_concurrent_config_change():
     original = CloudConfig(
         prepared_storage={
@@ -1529,9 +1613,11 @@ def test_coordinator_driver_preflights_partition_before_submission():
                         "complete": False,
                         "coverage_percent": 0,
                     },
-                    "candidates": [
-                        {
-                            "region": "US-MD-1",
+                        "candidates": [
+                            {
+                                "candidate_id": "sha256:" + "b" * 64,
+                                "hourly_rate": 0.1,
+                                "region": "US-MD-1",
                             "prepared_volume_id": None,
                         }
                     ],
@@ -1543,6 +1629,9 @@ def test_coordinator_driver_preflights_partition_before_submission():
     selected_value = scenario("cold", "cold")
     selected_value["allowed_regions"] = ["US-MD-1"]
     selected = BenchmarkPlan.from_dict(plan_dict([selected_value])).scenarios[0]
+    driver.configure_submission_guard(
+        absolute_deadline=driver.monotonic() + 100, max_cost_usd=1
+    )
 
     assert driver.submit(selected) == "job-1"
     assert [item[1] for item in calls] == ["/api/preflight", "/api/partitions"]
@@ -1690,7 +1779,11 @@ def _ready_preflight_response():
                 "prepared_volume_id": None,
             },
             "preparation": {"complete": False, "coverage_percent": 0},
-            "candidates": [{"region": "US-MD-1", "prepared_volume_id": None}],
+            "candidates": [{
+                "candidate_id": "sha256:" + "b" * 64,
+                "hourly_rate": 0.1,
+                "region": "US-MD-1", "prepared_volume_id": None,
+            }],
         }
     )
 
@@ -1724,6 +1817,9 @@ def test_a_transient_no_offer_preflight_is_retried_until_an_offer_returns(
     selected = BenchmarkPlan.from_dict(
         plan_dict([scenario("cold", "cold")])
     ).scenarios[0]
+    driver.configure_submission_guard(
+        absolute_deadline=driver.monotonic() + 100, max_cost_usd=1
+    )
 
     assert driver.submit(selected) == "job-1"
     assert len(preflight_calls) == 3
