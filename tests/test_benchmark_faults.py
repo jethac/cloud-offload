@@ -240,10 +240,20 @@ class FakeKernel32:
 
 
 class FakeRestartClient:
-    def __init__(self, pid, status="queued"):
+    def __init__(
+        self,
+        pid,
+        status="queued",
+        *,
+        auth_required=False,
+        token=None,
+        base_url="http://127.0.0.1:11435",
+    ):
         self.pid = pid
         self.status = status
         self.posts = []
+        self.base_url = base_url
+        self.service = {"auth_required": auth_required, "token": token}
 
     def get(self, path):
         assert path == "/api/health"
@@ -263,6 +273,40 @@ class FakeReplacementProcess:
     @staticmethod
     def poll():
         return None
+
+
+class RestartAuthWorld:
+    """Model the old benchmark session across a replacement service launch."""
+
+    protected_paths = {
+        "/api/health",
+        "/api/status",
+        "/api/config",
+        "/api/jobs/job-restart/snapshot",
+        "/api/jobs/job-restart/events?after=0",
+        "/api/jobs/job-restart/support-bundle",
+    }
+
+    def __init__(self):
+        self.replacement_requires_auth = False
+
+    def launch(self, command, environment):
+        # The original benchmark session has no token because its coordinator
+        # allowed anonymous loopback. A replacement that changes that contract
+        # makes every later harness request fail with 401.
+        require_auth = "--require-auth" in command or environment.get(
+            "CLOUD_OFFLOAD_REQUIRE_AUTH", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        allow_anonymous = "--allow-anonymous-loopback" in command or environment.get(
+            "CLOUD_OFFLOAD_ALLOW_ANONYMOUS_LOOPBACK", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        self.replacement_requires_auth = require_auth or not allow_anonymous
+
+    def harness_get(self, path):
+        assert path in self.protected_paths
+        if self.replacement_requires_auth:
+            raise PermissionError(f"401 Unauthorized: {path}")
+        return {"path": path}
 
 
 def test_fault_hook_refuses_direct_invocation(monkeypatch):
@@ -301,24 +345,34 @@ def test_process_exists_uses_native_windows_probe(monkeypatch):
     assert _process_exists(456) is False
 
 
+@pytest.mark.parametrize(
+    ("host", "url", "expected_bind_host"),
+    [
+        ("127.0.0.1", "http://127.0.0.1:11435", "127.0.0.1"),
+        ("::1", "http://[::1]:11435", "::1"),
+        ("localhost", "http://localhost:11435", "127.0.0.1"),
+    ],
+)
 def test_restart_replays_and_cancels_through_replacement_coordinator(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, host, url, expected_bind_host
 ):
-    old = FakeRestartClient(111)
-    replacement = FakeRestartClient(222, status="running")
+    old = FakeRestartClient(111, base_url=url)
+    replacement = FakeRestartClient(222, status="running", base_url=url)
     service_reads = iter(
         [
             {
-                "url": "http://127.0.0.1:11435",
-                "host": "127.0.0.1",
+                "url": url,
+                "host": host,
                 "port": 11435,
                 "pid": 111,
+                "auth_required": False,
             },
             {
-                "url": "http://127.0.0.1:11435",
-                "host": "127.0.0.1",
+                "url": url,
+                "host": host,
                 "port": 11435,
                 "pid": 222,
+                "auth_required": False,
             },
         ]
     )
@@ -327,7 +381,7 @@ def test_restart_replays_and_cancels_through_replacement_coordinator(
     monkeypatch.setattr(
         benchmark_faults,
         "read_service_info",
-        lambda require_healthy=True: next(service_reads),
+        lambda **kwargs: next(service_reads),
     )
     monkeypatch.setattr(
         benchmark_faults, "_process_exists", lambda pid: next(process_states)
@@ -358,6 +412,208 @@ def test_restart_replays_and_cancels_through_replacement_coordinator(
     }
     assert replacement.posts == [("/api/jobs/job-restart/cancel", {})]
     assert len(launches) == 1
+    command = launches[0][0][0]
+    assert command[command.index("--host") + 1] == expected_bind_host
+
+
+def test_restart_preserves_anonymous_auth_for_all_benchmark_harness_routes(
+    monkeypatch, tmp_path
+):
+    """Removing the preserved auth mode must recreate the M7 401 failure."""
+
+    world = RestartAuthWorld()
+    old = FakeRestartClient(111)
+    replacement = FakeRestartClient(222, status="running")
+    service_reads = iter(
+        [
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": 11435,
+                "pid": 111,
+                "auth_required": False,
+            },
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": 11435,
+                "pid": 222,
+                "auth_required": False,
+            },
+        ]
+    )
+    process_states = iter([True, False, False])
+    monkeypatch.setattr(
+        benchmark_faults,
+        "read_service_info",
+        lambda **kwargs: next(service_reads),
+    )
+    monkeypatch.setattr(
+        benchmark_faults, "_process_exists", lambda pid: next(process_states)
+    )
+    monkeypatch.setattr(benchmark_faults.os, "kill", lambda pid, signal: None)
+    monkeypatch.setattr(benchmark_faults, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(
+        benchmark_faults,
+        "CoordinatorFaultClient",
+        lambda service: replacement,
+    )
+
+    def launch(command, **kwargs):
+        world.launch(command, kwargs.get("env", benchmark_faults.os.environ))
+        return FakeReplacementProcess()
+
+    monkeypatch.setattr(benchmark_faults.subprocess, "Popen", launch)
+
+    restart_coordinator(old, "job-restart")
+
+    for path in sorted(world.protected_paths):
+        assert world.harness_get(path) == {"path": path}
+
+
+def test_restart_preserves_required_auth_under_inherited_anonymous_environment(
+    monkeypatch, tmp_path
+):
+    world = RestartAuthWorld()
+    old = FakeRestartClient(
+        111, auth_required=True, token="persisted-service-token"
+    )
+    replacement = FakeRestartClient(
+        222,
+        status="running",
+        auth_required=True,
+        token="persisted-service-token",
+    )
+    service_reads = iter(
+        [
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": 11435,
+                "pid": 111,
+                "auth_required": True,
+                "token": "persisted-service-token",
+            },
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": 11435,
+                "pid": 222,
+                "auth_required": True,
+                "token": "persisted-service-token",
+            },
+        ]
+    )
+    process_states = iter([True, False, False])
+    monkeypatch.setenv("CLOUD_OFFLOAD_ALLOW_ANONYMOUS_LOOPBACK", "true")
+    monkeypatch.setattr(
+        benchmark_faults,
+        "read_service_info",
+        lambda **kwargs: next(service_reads),
+    )
+    monkeypatch.setattr(
+        benchmark_faults, "_process_exists", lambda pid: next(process_states)
+    )
+    monkeypatch.setattr(benchmark_faults.os, "kill", lambda pid, signal: None)
+    monkeypatch.setattr(benchmark_faults, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(
+        benchmark_faults,
+        "CoordinatorFaultClient",
+        lambda service: replacement,
+    )
+
+    def launch(command, **kwargs):
+        world.launch(command, kwargs.get("env", benchmark_faults.os.environ))
+        return FakeReplacementProcess()
+
+    monkeypatch.setattr(benchmark_faults.subprocess, "Popen", launch)
+
+    restart_coordinator(old, "job-restart")
+
+    assert world.replacement_requires_auth is True
+
+
+@pytest.mark.parametrize(
+    "service_update",
+    [
+        {"__remove__": "port"},
+        {"port": "11435"},
+        {"port": 0},
+        {"port": 65536},
+        {"url": "http://127.0.0.1:11436"},
+        {"__remove__": "host"},
+        {"host": "example.com", "url": "http://example.com:11435"},
+        {"host": "127.example.com", "url": "http://127.example.com:11435"},
+        {"host": "localhost", "url": "http://127.0.0.1:11435"},
+        {"pid": "111"},
+        {"__remove__": "auth_required"},
+        {"auth_required": "false"},
+        {"auth_required": True, "token": None},
+    ],
+    ids=[
+        "missing-port",
+        "malformed-port",
+        "zero-port",
+        "out-of-range-port",
+        "url-port-mismatch",
+        "missing-host",
+        "non-local-host",
+        "dns-name-with-loopback-prefix",
+        "url-host-mismatch",
+        "malformed-pid",
+        "missing-auth-contract",
+        "malformed-auth-contract",
+        "required-auth-without-token",
+    ],
+)
+def test_restart_rejects_invalid_discovery_before_process_termination(
+    monkeypatch, tmp_path, service_update
+):
+    service = {
+        "url": "http://127.0.0.1:11435",
+        "host": "127.0.0.1",
+        "port": 11435,
+        "pid": 111,
+        "auth_required": False,
+    }
+    service_update = dict(service_update)
+    removed_field = service_update.pop("__remove__", None)
+    service.update(service_update)
+    if removed_field:
+        service.pop(removed_field)
+    kills = []
+    launches = []
+    monkeypatch.setattr(
+        benchmark_faults,
+        "read_service_info",
+        lambda **kwargs: service,
+    )
+    process_states = iter([True, False, False])
+    monkeypatch.setattr(
+        benchmark_faults, "_process_exists", lambda pid: next(process_states)
+    )
+    monkeypatch.setattr(benchmark_faults.os, "kill", lambda *args: kills.append(args))
+
+    def launch(*args, **kwargs):
+        launches.append((args, kwargs))
+        raise RuntimeError("Invalid discovery reached process launch")
+
+    monkeypatch.setattr(benchmark_faults.subprocess, "Popen", launch)
+    monkeypatch.setattr(benchmark_faults, "CONFIG_DIR", tmp_path)
+
+    with pytest.raises((RuntimeError, benchmark_faults.ServiceConfigError, ValueError)):
+        restart_coordinator(
+            FakeRestartClient(
+                111,
+                auth_required=service.get("auth_required"),
+                token=service.get("token"),
+                base_url=str(service.get("url") or ""),
+            ),
+            "job-restart",
+        )
+
+    assert kills == []
+    assert launches == []
 
 
 def test_storage_fault_is_observed_without_mutating_provider_storage():

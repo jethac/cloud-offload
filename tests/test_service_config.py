@@ -1,5 +1,7 @@
-import pytest
+import json
 import os
+
+import pytest
 from fastapi.testclient import TestClient
 
 from cloud_offload import server
@@ -10,6 +12,7 @@ from cloud_offload.service_config import (
     SERVICE_NAME,
     ServiceConfigError,
     choose_service_port,
+    is_local_host,
     normalize_service_url,
     read_service_info,
     reject_ollama_port,
@@ -39,6 +42,14 @@ def test_bind_host_requires_allow_lan_for_non_localhost():
     validate_bind_host("0.0.0.0", allow_lan=True)  # explicit opt-in
 
 
+def test_local_host_check_rejects_dns_names_that_only_start_with_127():
+    assert is_local_host("127.0.0.1") is True
+    assert is_local_host("127.255.255.255") is True
+    assert is_local_host("::1") is True
+    assert is_local_host("localhost") is True
+    assert is_local_host("127.example.com") is False
+
+
 def test_service_info_round_trip(tmp_path):
     service_file = tmp_path / "service.json"
     write_service_info("127.0.0.1", 11435, service_file)
@@ -47,6 +58,25 @@ def test_service_info_round_trip(tmp_path):
     assert info["url"] == "http://127.0.0.1:11435"
     assert info["port"] == 11435
     assert info["version"]
+
+
+def test_strict_service_info_rejects_a_string_port(tmp_path):
+    service_file = tmp_path / "service.json"
+    service_file.write_text(
+        json.dumps(
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": "11435",
+                "pid": 111,
+                "auth_required": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ServiceConfigError, match="integer"):
+        read_service_info(service_file, strict=True)
 
 
 def test_health_endpoint_reports_service_name():
