@@ -17,6 +17,7 @@ from cloud_offload.benchmark import (
     _observe_startup_phases,
     _sanitize_public_evidence,
     _preparation_seconds,
+    _ResourceMeter,
     _seconds_from_event_to,
     write_scorecard,
 )
@@ -112,12 +113,18 @@ class FakeDriver:
             result[key[0]][item["id"]] = observation
         return result
 
+    def inventory_until(self, providers, *, absolute_deadline):
+        return self.inventory(providers)
+
     def active_workers(self, providers):
         return (
             [{"provider": "runpod", "worker_id": "stale-worker"}]
             if self.clock < self.active_until
             else []
         )
+
+    def active_workers_until(self, providers, *, absolute_deadline):
+        return self.active_workers(providers)
 
     def prepare_scenario(self, scenario):
         previous = self.prepared_storage_policy
@@ -423,9 +430,64 @@ def test_runner_readiness_timeout_uses_total_active_scenario_time_and_cleans_up(
 
     assert result["limit_triggered"] == "runner_readiness_timeout"
     assert result["scenario_active_seconds"] == 2
-    assert result["duration_seconds"] == 4
+    assert result["duration_seconds"] == 2
     assert driver.cancelled == {"job-1"}
     assert driver.termination_attempts == [("runpod", "pod-waiting")]
+
+
+def test_readiness_poll_sleep_is_clamped_to_absolute_deadline():
+    class RecordingDriver(FakeDriver):
+        def __init__(self, scripts):
+            super().__init__(scripts)
+            self.sleeps = []
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            super().sleep(seconds)
+
+    waiting = Script([{
+        "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
+        "events": [event(1, "provisioning_started", "provisioning", 0,
+                         instance_id=None, hourly_rate=0.1)],
+        "instances": [],
+    }])
+    plan = BenchmarkPlan.from_dict(plan_dict(
+        [scenario("cold", "cold")], poll_seconds=15,
+        runner_readiness_timeout_seconds=2,
+    ))
+    driver = RecordingDriver({"cold": waiting})
+
+    result = BenchmarkRunner(driver).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_timeout"
+    assert result["scenario_active_seconds"] == pytest.approx(2, abs=0.05)
+    assert driver.sleeps[0] == pytest.approx(2, abs=0.001)
+    assert all(item > 0 for item in driver.sleeps)
+    assert driver.cancelled == {"job-1"}
+
+
+def test_slow_events_call_crossing_deadline_cancels_without_next_poll():
+    class SlowEventsDriver(FakeDriver):
+        event_calls = 0
+
+        def events(self, job_id, after):
+            self.event_calls += 1
+            self.clock += 10
+            return super().events(job_id, after)
+
+    driver = SlowEventsDriver({"cold": successful_script("pod-slow-events")})
+    plan = BenchmarkPlan.from_dict(plan_dict(
+        [scenario("cold", "cold")], poll_seconds=10,
+        runner_readiness_timeout_seconds=2,
+    ))
+
+    result = BenchmarkRunner(driver).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_timeout"
+    assert result["scenario_active_seconds"] == pytest.approx(10, abs=0.05)
+    assert result["duration_seconds"] >= 10
+    assert driver.event_calls == 1
+    assert driver.cancelled == {"job-1"}
 
 
 def test_runner_readiness_cost_guard_stops_before_general_scenario_budget():
@@ -988,6 +1050,8 @@ def test_interrupt_at_each_cleanup_boundary_retries_exact_pod_and_publishes_abor
             if self.cleanup_started and boundary == "terminate" and not self.injected:
                 self.injected = True
                 raise KeyboardInterrupt
+            if self.cleanup_started and boundary == "sleep" and not self.injected:
+                return False
             return super().terminate(provider, instance_id)
 
         def sleep(self, seconds):
@@ -1421,10 +1485,10 @@ def test_fresh_pod_waits_for_stale_worker_heartbeat_without_charging_scenario_ti
     scorecard = BenchmarkRunner(driver).run(plan)
 
     assert scorecard["passed"] is True
-    # The result includes one polling second plus two cleanup-verification
-    # seconds, but excludes the three seconds spent aging out the stale worker.
-    assert scorecard["results"][0]["duration_seconds"] == 3
-    assert driver.clock >= 6
+    # The result includes one scenario polling second and excludes the three
+    # seconds spent aging out the stale worker. Exact absence needs no wait.
+    assert scorecard["results"][0]["duration_seconds"] == 1
+    assert driver.clock >= 4
 
 
 def test_scenario_restores_storage_policy_when_submission_fails():
@@ -1693,6 +1757,453 @@ def test_preflight_wire_sends_exactly_one_workload_shape(endpoint, workload_key)
 
     assert workload_key in payloads[0]
     assert ({"partition", "capsule"} & set(payloads[0])) == {workload_key}
+
+
+@pytest.mark.parametrize("initial_remaining", [0, -1])
+def test_preflight_makes_no_call_when_deadline_has_no_positive_time(
+    monkeypatch, initial_remaining
+):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    calls = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: 10.0)
+    driver._request = lambda *args, **kwargs: calls.append((args, kwargs))
+    driver.configure_submission_guard(
+        absolute_deadline=10.0 + initial_remaining, max_cost_usd=1
+    )
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(TimeoutError):
+        driver._ready_preflight(selected, selected.request)
+    assert calls == []
+
+
+def test_preflight_clamps_retry_sleep_and_request_timeout_to_deadline(monkeypatch):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    clock = {"now": 0.0}
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+
+    def sleep(seconds):
+        assert seconds > 0
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    def request(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock["now"] += 0.1
+        return FakeResponse({"status": "not_ready", "blockers": [], "unknowns": []})
+
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", sleep)
+    driver._request = request
+    driver.configure_submission_guard(absolute_deadline=2.0, max_cost_usd=1)
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(TimeoutError):
+        driver._ready_preflight(selected, selected.request)
+
+    assert calls == [pytest.approx(2.0, abs=0.001)]
+    assert sleeps == [pytest.approx(1.9, abs=0.001)]
+    assert clock["now"] == pytest.approx(2.0, abs=0.001)
+
+
+def test_preflight_clock_jump_never_retries_or_sleeps(monkeypatch):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    clock = {"now": 0.0}
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", lambda value: sleeps.append(value))
+
+    def request(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock["now"] = 3.0
+        return FakeResponse({"status": "not_ready", "blockers": [], "unknowns": []})
+
+    driver._request = request
+    driver.configure_submission_guard(absolute_deadline=2.0, max_cost_usd=1)
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(TimeoutError):
+        driver._ready_preflight(selected, selected.request)
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_preflight_propagates_provider_request_timeout_without_backoff(monkeypatch):
+    import requests
+
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: 5.0)
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", lambda value: sleeps.append(value))
+
+    def request(*args, **kwargs):
+        assert kwargs["timeout"] == pytest.approx(2.0, abs=0.001)
+        raise requests.Timeout("provider timeout")
+
+    driver._request = request
+    driver.configure_submission_guard(absolute_deadline=7.0, max_cost_usd=1)
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(requests.Timeout):
+        driver._ready_preflight(selected, selected.request)
+    assert sleeps == []
+
+
+def test_request_retry_does_not_start_second_call_after_slow_attempt(monkeypatch):
+    import requests
+
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    clock = {"now": 0.0}
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", lambda value: sleeps.append(value))
+
+    def request(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock["now"] = 10.0
+        raise requests.Timeout("slow provider")
+
+    driver.session.request = request
+    with pytest.raises(requests.Timeout):
+        driver._request(
+            "GET", "/safe", retry_safe=True, timeout=30, absolute_deadline=2.0
+        )
+
+    assert len(calls) == 1
+    assert sum(calls[0]) <= 2.001
+    assert sleeps == []
+
+
+def test_inventory_retry_does_not_start_second_provider_call_after_deadline(monkeypatch):
+    class SlowConnector:
+        calls = 0
+
+        def list_instances(self):
+            self.calls += 1
+            clock["now"] = 10.0
+            raise TimeoutError("slow inventory")
+
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    clock = {"now": 0.0}
+    connector = SlowConnector()
+    driver.connectors = {"runpod": connector}
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", lambda value: sleeps.append(value))
+
+    with pytest.raises(TimeoutError):
+        driver.inventory(("runpod",), absolute_deadline=2.0)
+
+    assert connector.calls == 1
+    assert sleeps == []
+
+
+def test_cleanup_deadline_never_suppresses_first_exact_termination():
+    class JumpCleanupDriver:
+        clock = 0.0
+        inventory_calls = 0
+        termination_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory(self, providers):
+            self.inventory_calls += 1
+            return {
+                "runpod": {
+                    "pod-paid": InstanceObservation(
+                        id="pod-paid", provider="runpod", hourly_rate=1,
+                        status="running", managed=True,
+                    )
+                }
+            }
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            return self.inventory(providers)
+
+        def terminate(self, provider, instance_id):
+            self.termination_calls.append((provider, instance_id))
+            self.clock = 10.0
+            return True
+
+        def sleep(self, seconds):
+            raise AssertionError("no wait is allowed after the deadline")
+
+    driver = JumpCleanupDriver()
+    meter = _ResourceMeter(
+        id="pod-paid", provider="runpod", hourly_rate=1,
+        first_seen=0, last_seen=0, source="journal", lease_id="lease-paid",
+    )
+    receipt = BenchmarkRunner(driver)._cleanup_resources(
+        ("runpod",), {"runpod": {}}, {("runpod", "pod-paid"): meter}, 1,
+        include_untracked=False,
+    )[0]
+
+    assert driver.termination_calls == [("runpod", "pod-paid")]
+    assert receipt["termination_attempts"] == 1
+    assert receipt["provider_absent"] is False
+    assert receipt["inventory_error"] == "TimeoutError"
+
+
+def test_worker_quiescence_uses_deadline_aware_worker_call_and_stops_after_overrun():
+    class SlowWorkerDriver:
+        clock = 0.0
+        guarded_calls = []
+        sleeps = []
+
+        def monotonic(self):
+            return self.clock
+
+        def active_workers(self, providers):
+            raise AssertionError("deadline-bound worker wait used the plain method")
+
+        def active_workers_until(self, providers, *, absolute_deadline):
+            self.guarded_calls.append((providers, absolute_deadline))
+            self.clock = 30.0
+            return [{"provider": "runpod", "worker_id": "paid-worker"}]
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+
+    driver = SlowWorkerDriver()
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [scenario("cold", "cold")],
+            fresh_worker_timeout_seconds=1,
+            max_campaign_seconds=10,
+        )
+    )
+
+    assert BenchmarkRunner(driver)._wait_for_worker_quiescence(plan, 0.0) is False
+    assert driver.guarded_calls == [(('runpod',), 1.0)]
+    assert driver.sleeps == []
+
+
+def test_cleanup_clamps_initial_inventory_and_does_not_prove_after_overrun():
+    class SlowCleanupDriver:
+        clock = 0.0
+        guarded_calls = []
+        termination_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory(self, providers):
+            raise AssertionError("deadline-bound cleanup used the plain method")
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            self.guarded_calls.append((providers, absolute_deadline))
+            self.clock = 30.0
+            return {
+                "runpod": {
+                    "pod-paid": InstanceObservation(
+                        id="pod-paid", provider="runpod", hourly_rate=1,
+                        status="running", managed=True,
+                    )
+                }
+            }
+
+        def terminate(self, provider, instance_id):
+            self.termination_calls.append((provider, instance_id))
+            return True
+
+        def sleep(self, seconds):
+            raise AssertionError("cleanup cannot wait after its deadline")
+
+    driver = SlowCleanupDriver()
+    meter = _ResourceMeter(
+        id="pod-paid", provider="runpod", hourly_rate=1,
+        first_seen=0, last_seen=0, source="journal", lease_id="lease-paid",
+    )
+
+    receipt = BenchmarkRunner(driver)._cleanup_resources(
+        ("runpod",), {"runpod": {}}, {("runpod", "pod-paid"): meter}, 1,
+        include_untracked=False,
+    )[0]
+
+    assert driver.guarded_calls == [(('runpod',), 1.0)]
+    assert driver.termination_calls == [("runpod", "pod-paid")]
+    assert receipt["termination_attempts"] == 1
+    assert receipt["provider_absent"] is False
+    assert receipt["inventory_error"] == "TimeoutError"
+
+
+def test_late_empty_cleanup_inventory_cannot_suppress_first_exact_termination():
+    class LateEmptyCleanupDriver:
+        clock = 0.0
+        guarded_calls = []
+        termination_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            self.guarded_calls.append((providers, absolute_deadline))
+            self.clock = 30.0
+            return {"runpod": {}}
+
+        def terminate(self, provider, instance_id):
+            self.termination_calls.append((provider, instance_id))
+            return True
+
+        def sleep(self, seconds):
+            raise AssertionError("cleanup cannot wait after its deadline")
+
+    driver = LateEmptyCleanupDriver()
+    meter = _ResourceMeter(
+        id="pod-paid", provider="runpod", hourly_rate=1,
+        first_seen=0, last_seen=0, source="journal", lease_id="lease-paid",
+    )
+
+    receipt = BenchmarkRunner(driver)._cleanup_resources(
+        ("runpod",), {"runpod": {}}, {("runpod", "pod-paid"): meter}, 1,
+        include_untracked=False,
+    )[0]
+
+    assert driver.guarded_calls == [(('runpod',), 1.0)]
+    assert driver.termination_calls == [("runpod", "pod-paid")]
+    assert receipt["termination_attempts"] == 1
+    assert receipt["provider_absent"] is False
+    assert receipt["inventory_error"] == "TimeoutError"
+
+
+def test_cleanup_does_not_retry_termination_after_slow_proof_crosses_deadline():
+    class SlowProofDriver:
+        clock = 0.0
+        inventory_calls = 0
+        termination_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            self.inventory_calls += 1
+            if self.inventory_calls == 2:
+                self.clock = 30.0
+            return {
+                "runpod": {
+                    "pod-paid": InstanceObservation(
+                        id="pod-paid", provider="runpod", hourly_rate=1,
+                        status="running", managed=True,
+                    )
+                }
+            }
+
+        def terminate(self, provider, instance_id):
+            self.termination_calls.append((provider, instance_id))
+            return True
+
+        def sleep(self, seconds):
+            raise AssertionError("cleanup cannot wait after its deadline")
+
+    driver = SlowProofDriver()
+    meter = _ResourceMeter(
+        id="pod-paid", provider="runpod", hourly_rate=1,
+        first_seen=0, last_seen=0, source="journal", lease_id="lease-paid",
+    )
+
+    receipt = BenchmarkRunner(driver)._cleanup_resources(
+        ("runpod",), {"runpod": {}}, {("runpod", "pod-paid"): meter}, 1,
+        include_untracked=False,
+    )[0]
+
+    assert driver.inventory_calls == 2
+    assert driver.termination_calls == [("runpod", "pod-paid")]
+    assert receipt["provider_absent"] is False
+    assert receipt["inventory_error"] == "TimeoutError"
+
+
+def test_paid_scenario_uses_only_deadline_aware_inventory_and_worker_reads():
+    class DeadlineOnlyDriver(FakeDriver):
+        plain_paid_inventory_calls = 0
+        plain_worker_calls = 0
+
+        def inventory(self, providers):
+            if self.current_job is not None:
+                self.plain_paid_inventory_calls += 1
+                raise AssertionError("paid inventory read has no deadline")
+            return FakeDriver.inventory(self, providers)
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            return FakeDriver.inventory(self, providers)
+
+        def active_workers(self, providers):
+            self.plain_worker_calls += 1
+            raise AssertionError("worker read has no deadline")
+
+        def active_workers_until(self, providers, *, absolute_deadline):
+            return FakeDriver.active_workers(self, providers)
+
+    driver = DeadlineOnlyDriver({"cold": successful_script("pod-deadline")})
+    plan = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert scorecard["results"][0]["passed"] is True
+    assert driver.plain_paid_inventory_calls == 0
+    assert driver.plain_worker_calls == 0
+
+
+def test_campaign_baseline_overrun_aborts_after_one_bounded_inventory_call():
+    class SlowBaselineDriver:
+        clock = 0.0
+        guarded_calls = []
+        plain_calls = 0
+        submit_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory(self, providers):
+            self.plain_calls += 1
+            raise AssertionError("campaign baseline used the plain method")
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            self.guarded_calls.append((providers, absolute_deadline))
+            self.clock = 10.0
+            return {"runpod": {}}
+
+        def submit(self, scenario):
+            self.submit_calls.append(scenario.name)
+            raise AssertionError("scenario cannot start after baseline deadline")
+
+    driver = SlowBaselineDriver()
+    plan = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")], max_campaign_seconds=1)
+    )
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert driver.guarded_calls == [(('runpod',), 1.0)]
+    assert driver.plain_calls == 0
+    assert driver.submit_calls == []
+    assert scorecard["campaign_abort"] == "campaign_runtime_limit"
+    assert scorecard["results"] == []
+    assert scorecard["final_audit_error"] == "TimeoutError"
+    assert scorecard["estimated_compute_cost_upper_usd"] == 1.0
 
 
 def test_real_preflight_server_rejects_both_workload_shapes(monkeypatch, tmp_path):

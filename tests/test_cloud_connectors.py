@@ -2,6 +2,7 @@ import base64
 
 import pytest
 
+from cloud_offload.benchmark import CoordinatorBenchmarkDriver
 from cloud_offload.config import CloudConfig
 from cloud_offload.providers import (
     connector_metadata,
@@ -70,6 +71,56 @@ def test_runpod_is_the_default_provider():
     assert config.provider_order[0] == "runpod"
     connector = create_connector("runpod", CloudConfig(runpod_api_key="secret"))
     assert connector.name == "runpod"
+
+
+def test_runpod_inventory_clamps_real_http_timeout_to_absolute_deadline(monkeypatch):
+    http = FakeHttp(FakeResponse({"pods": []}))
+    connector = RunPodConnector(api_key="secret", http_client=http)
+    monkeypatch.setattr(
+        "cloud_offload.providers.runpod.time.monotonic", lambda: 100.0
+    )
+
+    assert connector.list_instances_until(absolute_deadline=101.0) == []
+
+    assert len(http.requests) == 1
+    timeout = http.requests[0][2]["timeout"]
+    assert isinstance(timeout, tuple)
+    assert 0 < sum(timeout) <= 1.0
+
+
+def test_runpod_inventory_makes_no_http_call_after_deadline(monkeypatch):
+    http = FakeHttp()
+    connector = RunPodConnector(api_key="secret", http_client=http)
+    monkeypatch.setattr(
+        "cloud_offload.providers.runpod.time.monotonic", lambda: 100.0
+    )
+
+    with pytest.raises(TimeoutError):
+        connector.list_instances_until(absolute_deadline=100.0)
+
+    assert http.requests == []
+
+
+def test_benchmark_inventory_propagates_deadline_through_runpod_http(monkeypatch):
+    http = FakeHttp(FakeResponse({"pods": []}))
+    connector = RunPodConnector(api_key="secret", http_client=http)
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    driver.connectors = {"runpod": connector}
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        "cloud_offload.providers.runpod.time.monotonic", lambda: 100.0
+    )
+
+    assert driver.inventory(("runpod",), absolute_deadline=101.0) == {
+        "runpod": {}
+    }
+
+    assert len(http.requests) == 1
+    timeout = http.requests[0][2]["timeout"]
+    assert isinstance(timeout, tuple)
+    assert 0 < sum(timeout) <= 1.0
 
 
 def test_custom_connector_can_be_registered(tmp_path):
