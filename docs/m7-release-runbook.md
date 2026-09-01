@@ -271,6 +271,9 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
   stop codes. URL syntax, paths, whitespace-bearing detail text, email-style
   values, and AWS access-key forms are rejected even when placed under an
   otherwise public field name.
+- Request digests preserve the harness's canonical lowercase bare 64-hex form.
+  The public projection also accepts `sha256:<64-hex>` as a normalized input;
+  malformed or non-hex request digests are dropped.
 - An exception in replay, storage checks, or another post-submit release step
   uses the same durable scorecard audit as an operator stop. Exact attributed
   Pods receive bounded cleanup. Unknown ownership or ongoing spend charges the

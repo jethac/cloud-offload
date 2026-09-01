@@ -112,6 +112,9 @@ general performance setting.
 
 The request body remains local in the plan. Validation and scorecards include
 only its canonical SHA-256 digest, never the workflow, prompt, or input values.
+The canonical request digest is the lowercase bare 64-hex SHA-256 value produced
+by the harness. Public evidence readers also accept the normalized
+`sha256:<64-hex>` form; all other digest syntax is rejected.
 
 `runner_readiness_timeout_seconds` defaults to 300 seconds. Its clock starts at
 the start of the scenario, before preparation and submission, and stops when an

@@ -1161,7 +1161,7 @@ class BenchmarkRunner:
                     / 3600
                     for item in unverified_resources.values()
                 )
-                if not resources and last_rate:
+                if not resources and not unverified_resources and last_rate:
                     estimated = last_rate * elapsed / 3600
                 if estimated >= plan.limits.max_scenario_cost_usd:
                     limit_triggered = "scenario_cost_limit"
@@ -1980,21 +1980,20 @@ class CoordinatorBenchmarkDriver:
         # Submission is not transport-idempotent yet, so it is deliberately not
         # retried after an ambiguous connection failure.
         request_payload = dict(scenario.request)
-        if scenario.endpoint == "/api/partitions":
-            preflight = self._ready_preflight(scenario, request_payload)
-            candidate_id = (preflight.get("recommendation") or {}).get(
-                "candidate_id"
-            )
-            if not candidate_id:
-                raise RuntimeError("Benchmark preflight returned no recommendation")
-            request_payload.update(
-                {
-                    "preflight_id": preflight["preflight_id"],
-                    "manifest_digest": preflight["manifest_digest"],
-                    "candidate_id": candidate_id,
-                    "confirmation_action": "start_now",
-                }
-            )
+        if scenario.endpoint not in SUBMISSION_ENDPOINTS:
+            raise RuntimeError("unsupported_paid_submission_endpoint")
+        preflight = self._ready_preflight(scenario, request_payload)
+        candidate_id = (preflight.get("recommendation") or {}).get("candidate_id")
+        if not candidate_id:
+            raise RuntimeError("Benchmark preflight returned no recommendation")
+        request_payload.update(
+            {
+                "preflight_id": preflight["preflight_id"],
+                "manifest_digest": preflight["manifest_digest"],
+                "candidate_id": candidate_id,
+                "confirmation_action": "start_now",
+            }
+        )
         # This is the final local instruction before the provider-starting
         # coordinator POST. A long preflight cannot bypass the campaign guard.
         if (
@@ -2004,23 +2003,22 @@ class CoordinatorBenchmarkDriver:
             raise TimeoutError("runner_readiness_deadline")
         if self._submission_cost_budget is None or self._submission_cost_budget <= 0:
             raise RuntimeError("runner_readiness_cost_budget")
-        if scenario.endpoint == "/api/partitions":
-            selected = [
-                item
-                for item in preflight.get("candidates") or []
-                if str(item.get("candidate_id") or "") == str(candidate_id)
-            ]
-            if len(selected) != 1:
-                raise RuntimeError("runner_readiness_quote_unproved")
-            try:
-                hourly_rate = float(selected[0].get("hourly_rate"))
-            except (TypeError, ValueError):
-                raise RuntimeError("runner_readiness_quote_unproved") from None
-            if not math.isfinite(hourly_rate) or hourly_rate <= 0:
-                raise RuntimeError("runner_readiness_quote_unproved")
-            quoted_cost = hourly_rate * scenario.timeout_seconds / 3600
-            if quoted_cost > self._submission_cost_budget:
-                raise RuntimeError("runner_readiness_cost_budget")
+        selected = [
+            item
+            for item in preflight.get("candidates") or []
+            if str(item.get("candidate_id") or "") == str(candidate_id)
+        ]
+        if len(selected) != 1:
+            raise RuntimeError("runner_readiness_quote_unproved")
+        try:
+            hourly_rate = float(selected[0].get("hourly_rate"))
+        except (TypeError, ValueError):
+            raise RuntimeError("runner_readiness_quote_unproved") from None
+        if not math.isfinite(hourly_rate) or hourly_rate <= 0:
+            raise RuntimeError("runner_readiness_quote_unproved")
+        quoted_cost = hourly_rate * scenario.timeout_seconds / 3600
+        if quoted_cost > self._submission_cost_budget:
+            raise RuntimeError("runner_readiness_cost_budget")
         response = self._request(
             "POST",
             scenario.endpoint,
@@ -2300,11 +2298,41 @@ class CoordinatorBenchmarkDriver:
 
 
 _PUBLIC_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
-_PUBLIC_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_PUBLIC_DIGEST = re.compile(r"(?:sha256:)?[0-9a-f]{64}\Z")
 _PUBLIC_CODE = re.compile(
     r"[A-Za-z][A-Za-z0-9_.-]{0,63}(?::[A-Za-z][A-Za-z0-9_.-]{0,63})?\Z"
 )
 _PROVIDER_VALUES = {"runpod", "vast"}
+_SUPPORT_EVENT_TYPES = {
+    "allocation_started", "provider_request_completed", "runner_starting",
+    "runner_ready", "job_status_changed", "executed", "cancellation_requested",
+    "lease_revoked", "cache_artifact_quarantined", "cache_mount_ready",
+}
+_SEMANTIC_VALUES = {
+    "status": {
+        "queued", "running", "completed", "failed", "dead_letter", "starting",
+        "provisioning", "exited", "error", "terminated", "unknown", "active",
+    },
+    "state": {"unknown", "confirmed", "failed", "not_started"},
+    "source": {
+        "journal", "provider_inventory", "provider_inventory_conservative",
+        "release_fallback",
+    },
+    "type": _SUPPORT_EVENT_TYPES | {
+        "provisioning_started", "executed", "lease_acquired", "preparation_started",
+        "preparation_completed",
+    },
+    "phase": {
+        "provisioning", "worker_boot", "execution", "result_transfer", "closure",
+        "preparation", "cancellation", "storage", "unknown",
+    },
+    "kind": FAILURE_KINDS,
+    "cache_state": CACHE_STATES,
+    "provider_state": {
+        "PROVISIONING", "STARTING", "RUNNING", "EXITED", "ERROR", "TERMINATED",
+        "UNKNOWN",
+    },
+}
 _DIGEST_KEYS = {
     "image_digest", "profile_fingerprint", "request_digest", "test_set_digest",
     "benchmark_plan_digest", "benchmark_scorecard_digest",
@@ -2316,19 +2344,13 @@ _CODE_KEYS = {
     "failure_codes",
 }
 _IDENTIFIER_KEYS = {
-    "name", "instance_id", "lease_id", "job_id", "status", "source", "type", "phase",
-    "kind", "state", "provider_state", "cache_state", "requested_policy",
+    "name", "instance_id", "lease_id", "job_id", "requested_policy",
     "previous_policy", "restored_policy", "profile", "region", "manifest_id", "volume_id",
     "datacenter_id", "duration_basis", "ownership_state", "failure_kind",
     "preflight_status", "expected_model", "expected_statuses", "allowed_regions",
     "missing_canaries", "canaries",
 }
 _DROP = object()
-_SUPPORT_EVENT_TYPES = {
-    "allocation_started", "provider_request_completed", "runner_starting",
-    "runner_ready", "job_status_changed", "executed", "cancellation_requested",
-    "lease_revoked", "cache_artifact_quarantined", "cache_mount_ready",
-}
 
 
 def _project_support_bundle(value: Any) -> dict[str, Any] | None:
@@ -2382,6 +2404,8 @@ def _sanitize_public_evidence(value: Any, key: str | None = None) -> Any:
             return _DROP
         if key == "provider" or key == "providers":
             return value if value in _PROVIDER_VALUES else _DROP
+        if key in _SEMANTIC_VALUES:
+            return value if value in _SEMANTIC_VALUES[key] else _DROP
         if key == "schema":
             return value if re.fullmatch(r"cloud-offload\.[a-z0-9.-]+\.v[0-9]+", value) else _DROP
         if key in _DIGEST_KEYS:

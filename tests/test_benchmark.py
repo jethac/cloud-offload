@@ -590,6 +590,36 @@ def test_unknown_paid_pod_uses_provider_rate_in_live_readiness_cost_guard():
     assert scorecard["cleanup_proof"]["unknown_paid_resource_count"] == 1
 
 
+@pytest.mark.parametrize("pod_count", [2, 3, 5])
+def test_live_cost_sums_each_unknown_pod_exactly_once(pod_count):
+    events = []
+    instances = []
+    for index in range(pod_count):
+        item = event(index + 1, "runner_starting", "worker_boot", 1,
+                     instance_id=f"pod-{index}", hourly_rate=0)
+        item["resources"].pop("lease_id", None)
+        events.append(item)
+        instances.append({"id": f"pod-{index}", "hourly_rate": 0.6,
+                          "status": "running"})
+    waiting = Script([{
+        "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
+        "events": events, "instances": instances,
+    }])
+    one_second_cost = pod_count * 0.6 / 3600
+    plan = BenchmarkPlan.from_dict(plan_dict(
+        [scenario("cold", "cold")], max_runner_readiness_cost_usd=one_second_cost * 0.9,
+        runner_readiness_timeout_seconds=10, max_scenario_cost_usd=2,
+        max_total_cost_usd=3,
+    ))
+
+    result = BenchmarkRunner(FakeDriver({"cold": waiting})).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_cost_limit"
+    assert result["scenario_active_seconds"] == 1
+    assert len(result["unknown_paid_resources"]) == pod_count
+    assert sum(item["hourly_rate"] for item in result["unknown_paid_resources"]) == pytest.approx(pod_count * 0.6)
+
+
 def test_worker_with_current_lease_but_wrong_pod_never_proves_readiness():
     phases = _initial_startup_phases()
     observation = InstanceObservation(
@@ -876,6 +906,21 @@ def test_every_public_string_field_uses_semantic_validation(hostile):
         )}
     )
     assert projected == {}
+
+
+@pytest.mark.parametrize("key", ["status", "state", "source", "type", "phase"])
+def test_semantic_public_fields_reject_arbitrary_identifier_looking_values(key):
+    assert _sanitize_public_evidence({key: "privateLookingButSyntactic"}) == {}
+
+
+def test_request_digest_projection_preserves_canonical_bare_and_prefixed_sha256():
+    bare = "a" * 64
+    assert _sanitize_public_evidence({"request_digest": bare}) == {
+        "request_digest": bare
+    }
+    assert _sanitize_public_evidence({"request_digest": "sha256:" + bare}) == {
+        "request_digest": "sha256:" + bare
+    }
 
 
 @pytest.mark.parametrize("boundary", ["clock", "inventory", "terminate", "sleep", "verify"])
@@ -1552,6 +1597,38 @@ def test_production_submit_rejects_missing_or_invalid_quote_before_mutation(quot
     with pytest.raises((RuntimeError, ValueError)):
         driver.submit(definition)
     assert calls == []
+
+
+@pytest.mark.parametrize("workflow_rate", [None, 3600])
+def test_workflow_submission_uses_same_quote_guard_before_paid_post(workflow_rate):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    posts = []
+    candidate = {"candidate_id": "candidate-workflow"}
+    if workflow_rate is not None:
+        candidate["hourly_rate"] = workflow_rate
+    driver._ready_preflight = lambda *args: {
+        "status": "ready", "preflight_id": "preflight-workflow",
+        "manifest_digest": "sha256:" + "a" * 64,
+        "recommendation": {"candidate_id": "candidate-workflow"},
+        "candidates": [candidate],
+    }
+
+    def request(method, path, **kwargs):
+        posts.append(path)
+        return FakeResponse({"job_id": "must-not-exist"})
+
+    driver._request = request
+    driver.configure_submission_guard(
+        absolute_deadline=driver.monotonic() + 100, max_cost_usd=0.000001
+    )
+    definition = scenario("workflow", "cold", endpoint="/api/workflows")
+    selected = BenchmarkPlan.from_dict(plan_dict([definition])).scenarios[0]
+
+    with pytest.raises(RuntimeError):
+        driver.submit(selected)
+    assert "/api/workflows" not in posts
 
 
 def test_coordinator_driver_refuses_to_overwrite_a_concurrent_config_change():
