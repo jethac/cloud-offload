@@ -2051,6 +2051,45 @@ def test_cleanup_clamps_initial_inventory_and_does_not_prove_after_overrun():
     assert receipt["inventory_error"] == "TimeoutError"
 
 
+def test_late_empty_cleanup_inventory_cannot_suppress_first_exact_termination():
+    class LateEmptyCleanupDriver:
+        clock = 0.0
+        guarded_calls = []
+        termination_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            self.guarded_calls.append((providers, absolute_deadline))
+            self.clock = 30.0
+            return {"runpod": {}}
+
+        def terminate(self, provider, instance_id):
+            self.termination_calls.append((provider, instance_id))
+            return True
+
+        def sleep(self, seconds):
+            raise AssertionError("cleanup cannot wait after its deadline")
+
+    driver = LateEmptyCleanupDriver()
+    meter = _ResourceMeter(
+        id="pod-paid", provider="runpod", hourly_rate=1,
+        first_seen=0, last_seen=0, source="journal", lease_id="lease-paid",
+    )
+
+    receipt = BenchmarkRunner(driver)._cleanup_resources(
+        ("runpod",), {"runpod": {}}, {("runpod", "pod-paid"): meter}, 1,
+        include_untracked=False,
+    )[0]
+
+    assert driver.guarded_calls == [(('runpod',), 1.0)]
+    assert driver.termination_calls == [("runpod", "pod-paid")]
+    assert receipt["termination_attempts"] == 1
+    assert receipt["provider_absent"] is False
+    assert receipt["inventory_error"] == "TimeoutError"
+
+
 def test_cleanup_does_not_retry_termination_after_slow_proof_crosses_deadline():
     class SlowProofDriver:
         clock = 0.0
@@ -2126,6 +2165,45 @@ def test_paid_scenario_uses_only_deadline_aware_inventory_and_worker_reads():
     assert scorecard["results"][0]["passed"] is True
     assert driver.plain_paid_inventory_calls == 0
     assert driver.plain_worker_calls == 0
+
+
+def test_campaign_baseline_overrun_aborts_after_one_bounded_inventory_call():
+    class SlowBaselineDriver:
+        clock = 0.0
+        guarded_calls = []
+        plain_calls = 0
+        submit_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory(self, providers):
+            self.plain_calls += 1
+            raise AssertionError("campaign baseline used the plain method")
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            self.guarded_calls.append((providers, absolute_deadline))
+            self.clock = 10.0
+            return {"runpod": {}}
+
+        def submit(self, scenario):
+            self.submit_calls.append(scenario.name)
+            raise AssertionError("scenario cannot start after baseline deadline")
+
+    driver = SlowBaselineDriver()
+    plan = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")], max_campaign_seconds=1)
+    )
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert driver.guarded_calls == [(('runpod',), 1.0)]
+    assert driver.plain_calls == 0
+    assert driver.submit_calls == []
+    assert scorecard["campaign_abort"] == "campaign_runtime_limit"
+    assert scorecard["results"] == []
+    assert scorecard["final_audit_error"] == "TimeoutError"
+    assert scorecard["estimated_compute_cost_upper_usd"] == 1.0
 
 
 def test_real_preflight_server_rejects_both_workload_shapes(monkeypatch, tmp_path):

@@ -36,6 +36,13 @@ resource. The deadline limits all later termination attempts, waits, and absence
 proof. The bounded cleanup receipt is also the final audit, so the campaign does
 not start a second unbounded provider read after cleanup.
 
+The campaign baseline also uses the campaign absolute deadline. A baseline read
+that returns after that deadline is untrusted. The campaign records a runtime
+limit and conservative cost, and it starts no scenario or second provider read.
+In the same way, a late cleanup read cannot claim that a known paid resource is
+absent. Cleanup still sends its first exact idempotent termination request and
+records absence as unverified.
+
 ## Safety behavior
 
 - No preflight request occurs at or after the deadline.

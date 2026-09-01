@@ -683,7 +683,24 @@ class BenchmarkRunner:
     def run(self, plan: BenchmarkPlan) -> dict[str, Any]:
         campaign_started_at = _utc_now()
         campaign_started = self.driver.monotonic()
-        baseline = self.driver.inventory(plan.providers)
+        campaign_deadline = campaign_started + plan.limits.max_campaign_seconds
+        baseline_error: str | None = None
+        guarded_inventory = getattr(self.driver, "inventory_until", None)
+        if not callable(guarded_inventory):
+            baseline = {provider: {} for provider in plan.providers}
+            baseline_error = "TimeoutError"
+        else:
+            try:
+                if self.driver.monotonic() >= campaign_deadline:
+                    raise TimeoutError("campaign_deadline")
+                baseline = guarded_inventory(
+                    plan.providers, absolute_deadline=campaign_deadline
+                )
+                if self.driver.monotonic() >= campaign_deadline:
+                    raise TimeoutError("campaign_deadline")
+            except TimeoutError:
+                baseline = {provider: {} for provider in plan.providers}
+                baseline_error = "TimeoutError"
         baseline_managed = _managed_ids(baseline)
         if plan.exclusive and baseline_managed:
             names = ", ".join(
@@ -697,9 +714,13 @@ class BenchmarkRunner:
 
         results: list[dict[str, Any]] = []
         estimated_total = 0.0
-        campaign_abort: str | None = None
+        campaign_abort: str | None = (
+            "campaign_runtime_limit" if baseline_error else None
+        )
         cold_base_manifest_ready = False
         for scenario in plan.scenarios:
+            if campaign_abort is not None:
+                break
             elapsed = self.driver.monotonic() - campaign_started
             if elapsed >= plan.limits.max_campaign_seconds:
                 campaign_abort = "campaign_runtime_limit"
@@ -770,12 +791,16 @@ class BenchmarkRunner:
             for result in results
             for item in result.get("resources") or []
         }
-        final_cleanup = self._cleanup_resources(
-            plan.providers,
-            baseline,
-            campaign_resources,
-            plan.limits.cleanup_timeout_seconds,
-            include_untracked=False,
+        final_cleanup = (
+            []
+            if baseline_error and not campaign_resources
+            else self._cleanup_resources(
+                plan.providers,
+                baseline,
+                campaign_resources,
+                plan.limits.cleanup_timeout_seconds,
+                include_untracked=False,
+            )
         )
         final_cleanup_interrupt = next(
             (
@@ -801,7 +826,9 @@ class BenchmarkRunner:
             for item in final_cleanup
             if item.get("inventory_error")
         ]
-        final_audit_error = audit_errors[0] if audit_errors else None
+        final_audit_error = baseline_error or (
+            audit_errors[0] if audit_errors else None
+        )
         unknown_paid_resources = [
             item
             for result in results
@@ -1713,6 +1740,9 @@ class BenchmarkRunner:
             raise TimeoutError("deadline_aware_provider_inventory_required")
         try:
             current = guarded_inventory(providers, absolute_deadline=deadline)
+            if cleanup_now() >= deadline:
+                current = {provider: {} for provider in providers}
+                inventory_error = "TimeoutError"
         except (KeyboardInterrupt, SystemExit) as exc:
             current = {provider: {} for provider in providers}
             inventory_error = type(exc).__name__
@@ -1722,7 +1752,7 @@ class BenchmarkRunner:
             inventory_error = type(exc).__name__
         baseline_ids = _managed_ids(baseline)
         candidates = set(resources)
-        if include_untracked:
+        if include_untracked and inventory_error is None:
             candidates |= _managed_ids(current) - baseline_ids
         receipts = {
             key: {
