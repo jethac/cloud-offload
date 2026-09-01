@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 
@@ -11,11 +12,70 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "deploy" / "runtime-profiles" / "comfyui" / "Dockerfile.overlay"
 ENTRYPOINT = ROOT / "deploy" / "runtime-profiles" / "comfyui" / "entrypoint.sh"
+PIN_PATH = ROOT / "deploy" / "runtime-profiles" / "comfyui" / "image-pin.json"
+IMAGE_REPOSITORY = "ghcr.io/jethac/cloud-offload-worker-comfyui"
 IMAGE = os.environ.get("CLOUD_OFFLOAD_TEST_IMAGE")
 
 
 def _git(repo: Path, *args: str, text: bool = True):
     return subprocess.check_output(["git", "-C", str(repo), *args], text=text)
+
+
+def _validated_revision(revision: object) -> str:
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40,64}", revision):
+        pytest.fail("image source_revision must be a 40-64 character lowercase commit SHA")
+    try:
+        _git(ROOT, "cat-file", "-e", f"{revision}^{{commit}}")
+    except subprocess.CalledProcessError as exc:
+        pytest.fail(f"image source_revision is not a commit in this repository: {revision}")
+    return revision
+
+
+def _pinned_source_revision() -> str:
+    """Load and fail closed on the reviewed pin used by registry inspection."""
+
+    try:
+        pin = json.loads(PIN_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        pytest.fail(f"cannot read image pin: {exc}")
+    if not isinstance(pin, dict):
+        pytest.fail("image pin must be a JSON object with source_revision")
+    source_revision = pin.get("source_revision")
+    return _validated_revision(source_revision)
+
+
+def _image_revision() -> str:
+    """Resolve the source revision explicitly requested by an image test.
+
+    A locally built image may be tested at any revision by setting
+    ``CLOUD_OFFLOAD_TEST_IMAGE_REVISION``. The published M7 tag is instead
+    bound to the committed pin, so its inspection never follows this branch's
+    (later) HEAD.
+    """
+
+    requested = os.environ.get("CLOUD_OFFLOAD_TEST_IMAGE_REVISION")
+    if requested:
+        return _validated_revision(requested)
+    if IMAGE and IMAGE.startswith(f"{IMAGE_REPOSITORY}:m7-"):
+        return _pinned_source_revision()
+    return _validated_revision(_git(ROOT, "rev-parse", "HEAD").strip())
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        {},
+        {"source_revision": "not-a-commit"},
+        {"source_revision": "f" * 40},
+    ],
+)
+def test_pinned_source_revision_rejects_missing_malformed_or_unknown_commit(tmp_path, monkeypatch, pin):
+    pin_path = tmp_path / "image-pin.json"
+    pin_path.write_text(json.dumps(pin), encoding="utf-8")
+    monkeypatch.setattr("tests.test_worker_image_build.PIN_PATH", pin_path)
+
+    with pytest.raises(pytest.fail.Exception, match="source_revision"):
+        _pinned_source_revision()
 
 
 def test_overlay_copies_current_entrypoint_and_makes_it_executable():
@@ -213,11 +273,64 @@ def _docker_cp_file(tmp_path: Path, remote: str, name: str) -> Path:
     return destination
 
 
+@pytest.mark.skipif(
+    not (IMAGE and os.environ.get("CLOUD_OFFLOAD_PINNED_IMAGE_INSPECTION")),
+    reason="set image and CLOUD_OFFLOAD_PINNED_IMAGE_INSPECTION for pinned artifact inspection",
+)
+def test_pinned_registry_artifact_matches_pin_revision_and_source_blobs(tmp_path):
+    pin = json.loads(PIN_PATH.read_text(encoding="utf-8"))
+    revision = _pinned_source_revision()
+    assert IMAGE == f"{IMAGE_REPOSITORY}:{pin['tag']}"
+
+    # Pull the tag being inspected so label and source checks cover the
+    # registry artifact rather than a separately built local image.
+    subprocess.run(["docker", "pull", IMAGE], check=True, capture_output=True, text=True)
+    label = subprocess.check_output(
+        [
+            "docker",
+            "image",
+            "inspect",
+            IMAGE,
+            "--format",
+            '{{index .Config.Labels "org.opencontainers.image.revision"}}',
+        ],
+        text=True,
+    ).strip()
+    assert label == revision
+
+    from scripts.build_worker_image import _blob_bytes, tree_entries
+
+    entries = {entry.path: entry for entry in tree_entries(ROOT, revision)}
+    source = _docker_cp_source(tmp_path)
+    actual = {
+        path.relative_to(source).as_posix()
+        for path in source.rglob("*")
+        if path.is_file() or path.is_symlink()
+    }
+    ignored = {
+        path
+        for path in entries
+        if path == ".github"
+        or path.startswith(".github/")
+        or path == "tests"
+        or path.startswith("tests/")
+        or path.startswith((".git/", ".runlogs/", ".worktrees/", ".pytest_cache/", ".venv/"))
+        or "/__pycache__/" in f"/{path}/"
+        or path.endswith(".pyc")
+        or path.endswith(".egg-info")
+        or ".egg-info/" in path
+        or path.startswith(("build/", "dist/", "htmlcov/"))
+    }
+    assert actual == set(entries) - ignored
+    for path in actual:
+        assert (source / path).read_bytes() == _blob_bytes(ROOT, entries[path].oid)
+
+
 @pytest.mark.skipif(not IMAGE, reason="set CLOUD_OFFLOAD_TEST_IMAGE for image inspection")
 def test_local_image_has_revision_label_and_exact_entrypoint_bytes(tmp_path):
     from scripts.build_worker_image import _blob_bytes, tree_entries
 
-    revision = _git(ROOT, "rev-parse", "HEAD").strip()
+    revision = _image_revision()
     label = subprocess.check_output(
         ["docker", "image", "inspect", IMAGE, "--format", "{{index .Config.Labels \"org.opencontainers.image.revision\"}}"],
         text=True,
@@ -245,7 +358,7 @@ def test_local_image_has_revision_label_and_exact_entrypoint_bytes(tmp_path):
 def test_local_image_source_tree_matches_exact_blobs_and_intended_omissions(tmp_path):
     from scripts.build_worker_image import _blob_bytes, tree_entries
 
-    revision = _git(ROOT, "rev-parse", "HEAD").strip()
+    revision = _image_revision()
     entries = {entry.path: entry for entry in tree_entries(ROOT, revision)}
     source = _docker_cp_source(tmp_path)
     actual = tuple(sorted(path.relative_to(source).as_posix() for path in source.rglob("*") if path.is_file() or path.is_symlink()))
