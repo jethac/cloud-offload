@@ -454,7 +454,16 @@ class Dispatcher:
         # A confirmed quote is volatile by contract; freshness is enforced by
         # re-validating the exact offer, price, and prepared volume against the
         # live catalog below, so the quote's age alone is not disqualifying.
+        confirmations = self._preflight_entries(queued_jobs)
         confirmed = self._shared_preflight(queued_jobs)
+        if confirmations and (
+            len(confirmations) != len(queued_jobs or []) or confirmed is None
+        ):
+            self._refuse_preflight_launch(
+                queued_jobs,
+                "Queued jobs have conflicting preflight confirmations.",
+            )
+            return None
         if confirmed and confirmed.get("provider") != provider_name:
             self._refuse_preflight_launch(
                 queued_jobs,
@@ -587,6 +596,13 @@ class Dispatcher:
             )
             self._record_launch_failure(
                 provider_name, profile_name, queued_jobs, detail
+            )
+            return None
+
+        if confirmations and not self._confirmed_offers_allowed(confirmations, offer):
+            self._refuse_preflight_launch(
+                queued_jobs,
+                "A queued preflight confirmation does not permit the live offer.",
             )
             return None
 
@@ -931,18 +947,26 @@ class Dispatcher:
         queued_jobs: list | None,
         lease_id: str | None = None,
     ) -> Instance:
+        # The provider may spend minutes polling for readiness after rental.
+        # Anchor startup accounting to the durable pre-mutation lease timestamp
+        # so fail-fast includes all billable time, including that wait.
+        activity_at = utc_now()
+        launched_at = activity_at
         if lease_id:
-            self.queue.bind_lease(
+            bound_lease = self.queue.bind_lease(
                 lease_id,
                 instance.id,
                 ttl_seconds=self._runner_registration_lease_ttl_seconds(),
             )
             self.instance_leases[instance.id] = lease_id
+            try:
+                launched_at = datetime.fromisoformat(bound_lease.created_at)
+            except ValueError:
+                pass
         self.active_instances[instance.id] = instance
         self.instance_providers[instance.id] = provider_name
         self.instance_profiles[instance.id] = profile_name
-        launched_at = utc_now()
-        self.last_activity[instance.id] = launched_at
+        self.last_activity[instance.id] = activity_at
         self.launched_at[instance.id] = launched_at
         logger.info("Launched worker %s", instance.id)
         self.launch_failures.pop((provider_name, profile_name), None)
@@ -1208,6 +1232,36 @@ class Dispatcher:
         return entries[0]
 
     @staticmethod
+    def _preflight_entries(jobs: list | None) -> list[dict]:
+        return [
+            item
+            for job in (jobs or [])
+            if isinstance(item := job.params.get("preflight"), dict)
+        ]
+
+    def _confirmed_offers_allowed(
+        self, confirmations: list[dict], offer: dict
+    ) -> bool:
+        """Ensure every queued confirmation permits the exact live offer."""
+        try:
+            live_rate = float(offer.get("hourly_rate"))
+        except (TypeError, ValueError):
+            return False
+        for confirmed in confirmations:
+            if not self._confirmed_offer_matches(confirmed, offer):
+                return False
+            policy = confirmed.get("request_policy") or {}
+            try:
+                ceiling = float(
+                    policy.get("max_hourly_rate", self.config.max_hourly_rate)
+                )
+            except (TypeError, ValueError):
+                return False
+            if live_rate > ceiling:
+                return False
+        return True
+
+    @staticmethod
     def _confirmed_offer_matches(confirmed: dict, offer: dict) -> bool:
         try:
             return (
@@ -1267,8 +1321,17 @@ class Dispatcher:
             bound_volume = self.cache_registry.get_provider_volume(
                 provider_name, bound
             )
-            if bound_volume is None or bound_volume.datacenter_id == str(
-                confirmed.get("region") or ""
+            try:
+                bound_actual = (
+                    connector.get_storage(bound) if bound_volume is not None else None
+                )
+            except Exception:
+                bound_actual = None
+            if (
+                bound_volume is None
+                or bound_actual is None
+                or bound_actual.datacenter_id != bound_volume.datacenter_id
+                or bound_volume.datacenter_id == str(confirmed.get("region") or "")
             ):
                 return PlacementDecision(
                     "unavailable", None, "confirmed_prepared_binding_changed", ()

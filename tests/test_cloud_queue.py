@@ -1293,7 +1293,13 @@ def test_failed_offer_cools_down_and_next_launch_routes_around_it(tmp_path):
     assert provider.launch_attempts == ["offer-dead", "offer-good"]
 
 
-def _confirmed_job(queue, *, rate=0.30, expires_at="2099-01-01T00:00:00Z"):
+def _confirmed_job(
+    queue,
+    *,
+    rate=0.30,
+    max_rate=0.5,
+    expires_at="2099-01-01T00:00:00Z",
+):
     return queue.create(
         "comfyui-partition-v1",
         "input.part",
@@ -1311,7 +1317,7 @@ def _confirmed_job(queue, *, rate=0.30, expires_at="2099-01-01T00:00:00Z"):
                 "region": None,
                 "prepared_volume_id": None,
                 "expires_at": expires_at,
-                "request_policy": {"max_hourly_rate": 0.5},
+                "request_policy": {"max_hourly_rate": max_rate},
             },
         },
         status=JobStatus.QUEUED,
@@ -1346,6 +1352,67 @@ def test_dispatcher_refuses_changed_confirmed_price_before_launch(tmp_path):
         item["event"]["type"] == "preflight_confirmation_required"
         for item in events
     )
+
+
+def test_fail_fast_clock_includes_provider_readiness_wait(tmp_path):
+    dispatcher = _cooldown_dispatcher(tmp_path, TwoOfferProvider())
+    lease = dispatcher.queue.create_lease(
+        provider="runpod",
+        runtime_profile="comfyui",
+        ttl_seconds=900,
+    )
+    rental_started = utc_now() - timedelta(seconds=300)
+    with sqlite3.connect(dispatcher.queue.db_path) as conn:
+        conn.execute(
+            "UPDATE job_leases SET created_at=? WHERE id=?",
+            (rental_started.isoformat(), lease.id),
+        )
+
+    instance = SimpleNamespace(
+        id="pod-readiness-wait",
+        provider="runpod",
+        gpu_type="GPU",
+        hourly_rate=0.3,
+        status="running",
+    )
+    dispatcher._remember_launched_instance(
+        instance, "runpod", "comfyui", [], lease.id
+    )
+
+    assert dispatcher.launched_at[instance.id] == rental_started
+    assert (utc_now() - dispatcher.last_activity[instance.id]).total_seconds() < 10
+
+
+def test_grouped_jobs_with_mixed_confirmed_prices_are_not_launched_together(
+    tmp_path,
+):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    first = _confirmed_job(dispatcher.queue, rate=0.30)
+    second = _confirmed_job(dispatcher.queue, rate=0.29)
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [first, second])
+
+    assert instance is None
+    assert provider.launch_attempts == []
+    assert dispatcher.queue.get(first.id).status == JobStatus.FAILED
+    assert dispatcher.queue.get(second.id).status == JobStatus.FAILED
+
+
+def test_grouped_jobs_with_mixed_rate_ceilings_cannot_exceed_one_confirmation(
+    tmp_path,
+):
+    provider = TwoOfferProvider()
+    dispatcher = _cooldown_dispatcher(tmp_path, provider)
+    first = _confirmed_job(dispatcher.queue, max_rate=0.5)
+    second = _confirmed_job(dispatcher.queue, max_rate=0.29)
+
+    instance = dispatcher._launch_worker("runpod", "comfyui", [first, second])
+
+    assert instance is None
+    assert provider.launch_attempts == []
+    assert dispatcher.queue.get(first.id).status == JobStatus.FAILED
+    assert dispatcher.queue.get(second.id).status == JobStatus.FAILED
 
 
 def test_expired_confirmed_quote_still_launches_the_matching_live_offer(tmp_path):

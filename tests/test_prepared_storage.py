@@ -2877,7 +2877,10 @@ class PlacementProvider(CloudConnector):
         )
 
     def get_storage(self, storage_id):
-        return self.volume if self.volume and self.volume.id == storage_id else None
+        for volume in getattr(self, "volumes", [self.volume]):
+            if volume and volume.id == storage_id:
+                return volume
+        return None
 
     def create_storage(self, *, name, size_gb, datacenter_id):
         self.created.append((name, size_gb, datacenter_id))
@@ -3150,6 +3153,10 @@ def test_strict_binding_in_another_region_does_not_block_regional_volume(tmp_pat
     volume = ProviderStorage("vol-1", "runpod", "cache", 100, "US-KS-2", True)
     config = dispatcher_config(tmp_path, policy(policy="strict"))
     provider = PlacementProvider(volume=volume)
+    provider.volumes = [
+        volume,
+        ProviderStorage("vol-2", "runpod", "sibling", 100, "EU-RO-1", True),
+    ]
     dispatcher = Dispatcher(config, provider=provider)
     registered = dispatcher.cache_registry.upsert_volume(
         provider="runpod",
@@ -3196,6 +3203,59 @@ def test_strict_binding_in_another_region_does_not_block_regional_volume(tmp_pat
     )
 
     assert decision.reason != "confirmed_prepared_binding_changed"
+
+
+def test_strict_cross_region_binding_rejects_provider_missing_bound_volume(
+    tmp_path,
+):
+    volume = ProviderStorage("vol-1", "runpod", "cache", 100, "US-KS-2", True)
+    config = dispatcher_config(tmp_path, policy(policy="strict"))
+    provider = PlacementProvider(volume=volume)
+    dispatcher = Dispatcher(config, provider=provider)
+    registered = dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-1",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="vol-2",
+        datacenter_id="EU-RO-1",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+    )
+    dispatcher.config.prepared_storage["existing_volume_id"] = "vol-2"
+    confirmed = {
+        "candidate_id": "sha256:" + "c" * 64,
+        "provider": "runpod",
+        "offer_id": "gpu",
+        "gpu_type": "GPU",
+        "gpu_ram_gb": 24,
+        "hourly_rate": 0.4,
+        "region": "US-KS-2",
+        "prepared_volume_id": registered.id,
+        "request_policy": {"max_hourly_rate": 1.0},
+    }
+
+    decision = dispatcher._confirmed_cache_placement(
+        connector=dispatcher.connectors["runpod"],
+        provider_name="runpod",
+        gpu_type="GPU",
+        minimum_vram=24,
+        cooling=set(),
+        requirements={
+            "required": {},
+            "logical_required": [],
+            "profile_fingerprint": "fp",
+        },
+        confirmed=confirmed,
+    )
+
+    assert decision.reason == "confirmed_prepared_binding_changed"
 
 
 def test_worker_manifest_announcement_drives_next_exact_cache_placement(
