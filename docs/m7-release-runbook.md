@@ -258,6 +258,11 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
   cost budget. It checks both after preflight and immediately before the
   provider-starting POST. A slow preflight therefore cannot start a Pod after a
   startup-only validation limit has expired.
+- Preflight retry waits and benchmark poll waits use only the positive time that
+  remains before the absolute deadline. A 15-second retry interval is shortened
+  when less than 15 seconds remain. At zero remaining time, the harness makes no
+  request and does not sleep. The remaining time also bounds the preflight HTTP
+  request timeout.
 - Submission also requires exactly one selected candidate with a finite,
   positive hourly rate. Its worst-case scenario cost must fit the remaining
   readiness, scenario, and campaign budgets. Missing, malformed, zero, or

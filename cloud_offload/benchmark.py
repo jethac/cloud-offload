@@ -903,7 +903,10 @@ class BenchmarkRunner:
         while self.driver.active_workers(plan.providers):
             if self.driver.monotonic() >= deadline:
                 return False
-            self.driver.sleep(plan.limits.poll_seconds)
+            remaining = deadline - self.driver.monotonic()
+            if remaining <= 0:
+                return False
+            self.driver.sleep(min(plan.limits.poll_seconds, remaining))
         return True
 
     def _run_scenario(
@@ -1218,7 +1221,19 @@ class BenchmarkRunner:
                     )
                 if status in TERMINAL_STATUSES:
                     break
-                self.driver.sleep(plan.limits.poll_seconds)
+                readiness_deadline = (
+                    started + plan.limits.runner_readiness_timeout_seconds
+                )
+                scenario_deadline = started + scenario.timeout_seconds
+                campaign_deadline = (
+                    campaign_started + plan.limits.max_campaign_seconds
+                )
+                remaining = min(
+                    readiness_deadline, scenario_deadline, campaign_deadline
+                ) - self.driver.monotonic()
+                if remaining <= 0:
+                    continue
+                self.driver.sleep(min(plan.limits.poll_seconds, remaining))
         except _PreSubmitLimit:
             pass
         except (KeyboardInterrupt, SystemExit) as exc:
@@ -1664,7 +1679,10 @@ class BenchmarkRunner:
             if not pending:
                 break
             try:
-                self.driver.sleep(min(2.0, timeout_seconds))
+                remaining = deadline - cleanup_now()
+                if remaining <= 0:
+                    break
+                self.driver.sleep(min(2.0, remaining))
             except (KeyboardInterrupt, SystemExit) as exc:
                 cleanup_interrupt = cleanup_interrupt or type(exc).__name__
         try:
@@ -1955,6 +1973,8 @@ class CoordinatorBenchmarkDriver:
         # terminated. Retry a not-ready preflight while it reports no blockers,
         # since only current-offer availability can change on its own.
         deadline = time.monotonic() + PREFLIGHT_OFFER_RETRY_SECONDS
+        if self._submission_deadline is not None:
+            deadline = min(deadline, self._submission_deadline)
         workload_key = (
             "capsule" if scenario.endpoint == "/api/workflows" else "partition"
         )
@@ -1962,6 +1982,9 @@ class CoordinatorBenchmarkDriver:
         if not isinstance(workload, dict) or not workload:
             raise RuntimeError(f"benchmark_{workload_key}_missing")
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("runner_readiness_deadline")
             preflight_response = self._request(
                 "POST",
                 "/api/preflight",
@@ -1972,16 +1995,21 @@ class CoordinatorBenchmarkDriver:
                     "recommendation_policy": "balanced",
                     "allowed_regions": list(scenario.allowed_regions) or None,
                 },
-                timeout=120,
+                timeout=max(0.001, min(120.0, remaining)),
             )
             preflight_response.raise_for_status()
             preflight = preflight_response.json()
             if preflight.get("status") in {"ready", "ready_with_preparation"}:
                 return preflight
             blockers = preflight.get("blockers") or []
-            if not blockers and time.monotonic() < deadline:
-                time.sleep(PREFLIGHT_OFFER_RETRY_INTERVAL_SECONDS)
+            remaining = deadline - time.monotonic()
+            if not blockers and remaining > 0:
+                time.sleep(
+                    min(PREFLIGHT_OFFER_RETRY_INTERVAL_SECONDS, remaining)
+                )
                 continue
+            if not blockers:
+                raise TimeoutError("runner_readiness_deadline")
             codes = [
                 str(item.get("code") or "unknown")
                 for item in blockers or preflight.get("unknowns") or []

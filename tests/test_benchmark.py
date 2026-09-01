@@ -428,6 +428,37 @@ def test_runner_readiness_timeout_uses_total_active_scenario_time_and_cleans_up(
     assert driver.termination_attempts == [("runpod", "pod-waiting")]
 
 
+def test_readiness_poll_sleep_is_clamped_to_absolute_deadline():
+    class RecordingDriver(FakeDriver):
+        def __init__(self, scripts):
+            super().__init__(scripts)
+            self.sleeps = []
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            super().sleep(seconds)
+
+    waiting = Script([{
+        "snapshot": {"status": "running", "lifecycle_phase": "worker_boot"},
+        "events": [event(1, "provisioning_started", "provisioning", 0,
+                         instance_id=None, hourly_rate=0.1)],
+        "instances": [],
+    }])
+    plan = BenchmarkPlan.from_dict(plan_dict(
+        [scenario("cold", "cold")], poll_seconds=15,
+        runner_readiness_timeout_seconds=2,
+    ))
+    driver = RecordingDriver({"cold": waiting})
+
+    result = BenchmarkRunner(driver).run(plan)["results"][0]
+
+    assert result["limit_triggered"] == "runner_readiness_timeout"
+    assert result["scenario_active_seconds"] == pytest.approx(2, abs=0.05)
+    assert driver.sleeps[0] == pytest.approx(2, abs=0.001)
+    assert all(item > 0 for item in driver.sleeps)
+    assert driver.cancelled == {"job-1"}
+
+
 def test_runner_readiness_cost_guard_stops_before_general_scenario_budget():
     waiting = Script(
         [
@@ -1693,6 +1724,114 @@ def test_preflight_wire_sends_exactly_one_workload_shape(endpoint, workload_key)
 
     assert workload_key in payloads[0]
     assert ({"partition", "capsule"} & set(payloads[0])) == {workload_key}
+
+
+@pytest.mark.parametrize("initial_remaining", [0, -1])
+def test_preflight_makes_no_call_when_deadline_has_no_positive_time(
+    monkeypatch, initial_remaining
+):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    calls = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: 10.0)
+    driver._request = lambda *args, **kwargs: calls.append((args, kwargs))
+    driver.configure_submission_guard(
+        absolute_deadline=10.0 + initial_remaining, max_cost_usd=1
+    )
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(TimeoutError):
+        driver._ready_preflight(selected, selected.request)
+    assert calls == []
+
+
+def test_preflight_clamps_retry_sleep_and_request_timeout_to_deadline(monkeypatch):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    clock = {"now": 0.0}
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+
+    def sleep(seconds):
+        assert seconds > 0
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    def request(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock["now"] += 0.1
+        return FakeResponse({"status": "not_ready", "blockers": [], "unknowns": []})
+
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", sleep)
+    driver._request = request
+    driver.configure_submission_guard(absolute_deadline=2.0, max_cost_usd=1)
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(TimeoutError):
+        driver._ready_preflight(selected, selected.request)
+
+    assert calls == [pytest.approx(2.0, abs=0.001)]
+    assert sleeps == [pytest.approx(1.9, abs=0.001)]
+    assert clock["now"] == pytest.approx(2.0, abs=0.001)
+
+
+def test_preflight_clock_jump_never_retries_or_sleeps(monkeypatch):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    clock = {"now": 0.0}
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", lambda value: sleeps.append(value))
+
+    def request(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock["now"] = 3.0
+        return FakeResponse({"status": "not_ready", "blockers": [], "unknowns": []})
+
+    driver._request = request
+    driver.configure_submission_guard(absolute_deadline=2.0, max_cost_usd=1)
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(TimeoutError):
+        driver._ready_preflight(selected, selected.request)
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_preflight_propagates_provider_request_timeout_without_backoff(monkeypatch):
+    import requests
+
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    sleeps = []
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: 5.0)
+    monkeypatch.setattr("cloud_offload.benchmark.time.sleep", lambda value: sleeps.append(value))
+
+    def request(*args, **kwargs):
+        assert kwargs["timeout"] == pytest.approx(2.0, abs=0.001)
+        raise requests.Timeout("provider timeout")
+
+    driver._request = request
+    driver.configure_submission_guard(absolute_deadline=7.0, max_cost_usd=1)
+    selected = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(requests.Timeout):
+        driver._ready_preflight(selected, selected.request)
+    assert sleeps == []
 
 
 def test_real_preflight_server_rejects_both_workload_shapes(monkeypatch, tmp_path):
