@@ -16,13 +16,13 @@ submitted subgraph, so a graph that uses Hunyuan/TRELLIS/etc. just needs a
 ComfyUI that has those nodes installed — add them as an extra build layer if you
 want a "batteries included" variant.
 
-Build from the repository root and pin the image by digest (never a mutable
-tag):
+Build from the repository root with the deterministic Git-context builder and
+pin the published image by digest (never a mutable tag):
 
 ```bash
-docker build -f deploy/runtime-profiles/comfyui/Dockerfile \
-  --build-arg CLOUD_OFFLOAD_SOURCE_REVISION=$(git rev-parse HEAD) \
-  -t ghcr.io/jethac/cloud-offload-runner-comfyui:0.1.0 .
+python scripts/build_worker_image.py \
+  --revision $(git rev-parse HEAD) \
+  --tag ghcr.io/jethac/cloud-offload-worker-comfyui:m7-<short-source-revision>
 ```
 
 The Dockerfile copies PyTorch and the large CUDA libraries into separate image
@@ -43,7 +43,7 @@ the digest:
 {
   "worker_profiles": {
     "comfyui": {
-      "image": "ghcr.io/jethac/cloud-offload-runner-comfyui@sha256:<digest>",
+      "image": "ghcr.io/jethac/cloud-offload-worker-comfyui@sha256:<digest>",
       "platform": "linux-x86_64",
       "python_abi": "cp311",
       "models": ["comfyui-workflow", "comfyui-partition-v1"],
@@ -54,6 +54,11 @@ the digest:
   }
 }
 ```
+
+The current M7 worker pin is recorded in
+[`comfyui/image-pin.json`](comfyui/image-pin.json). It contains the immutable
+registry reference, source revision, and runtime-profile contract baked into
+that image; release plans should copy its `image` digest exactly.
 
 The platform and Python ABI must match the immutable runner image. The
 coordinator uses these declarations to prove that a runtime-bound environment

@@ -80,7 +80,7 @@ region via `allowed_regions`.
     {"name": "extension", "path": "/home/op/ComfyUI-Cloud-Offload", "revision": "7b2a60f…40 hex…"}
   ],
   "profiles": [
-    {"name": "comfyui", "image_digest": "sha256:c4c85999c3d2824fcedcae6f0fb26c6903bfc66cdd174d650c9ccfaead210c16"}
+    {"name": "comfyui", "image_digest": "sha256:1039f1e218587b4a08eb6dabd8d4e47e722c0b808d6457fd8922072dfe9c24b1"}
   ],
   "regions": ["US-MD-1", "EU-RO-1"],
   "cases": [
