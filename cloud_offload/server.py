@@ -70,18 +70,6 @@ _runtime_config: Any | None = None
 _config_write_lock = threading.RLock()
 _ANY_VOLUME_BINDING = object()
 _HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
-_PREFLIGHT_POLICY_CONFIG_FIELDS = {
-    "max_hourly_rate",
-    "max_total_job_cost",
-    "max_job_runtime_seconds",
-    "recommendation_policy",
-    "rental_confirmation",
-    "confirmation_countdown_seconds",
-    "allowed_regions",
-    "material_price_change_percent",
-    "material_cost_change_percent",
-    "lease_ttl_seconds",
-}
 
 
 # === Request/Response Models ===
@@ -1090,10 +1078,16 @@ def _atomic_write_persisted_config(path: Path, data: dict[str, Any]) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _persist_config_updates(payload: dict[str, Any]) -> None:
+def _config_source_path(config: Any) -> Path:
     from cloud_offload.config import CONFIG_DIR
 
-    config_path = CONFIG_DIR / "config.json"
+    source_path = getattr(config, "_source_path", None)
+    return Path(source_path) if source_path else CONFIG_DIR / "config.json"
+
+
+def _persist_config_updates(payload: dict[str, Any], config: Any | None = None) -> None:
+    config = config or _config(resolve_secrets=False)
+    config_path = _config_source_path(config)
     with _config_write_lock:
         data = _read_persisted_config(config_path)
         if "cloud" in data and isinstance(data["cloud"], dict):
@@ -1114,9 +1108,10 @@ def _persist_prepared_volume_binding(
     A conditional clear prevents a delayed detach request for volume A from
     erasing a newer user choice of volume B.
     """
-    from cloud_offload.config import CONFIG_DIR, normalized_prepared_storage
+    global _runtime_config
+    from cloud_offload.config import normalized_prepared_storage
 
-    config_path = CONFIG_DIR / "config.json"
+    config_path = _config_source_path(config)
     with _config_write_lock:
         data = _read_persisted_config(config_path)
         target = (
@@ -1133,23 +1128,46 @@ def _persist_prepared_volume_binding(
         ):
             return False
         prepared["existing_volume_id"] = provider_volume_id
-        target["prepared_storage"] = normalized_prepared_storage(prepared)
+        prepared = normalized_prepared_storage(prepared)
+        target["prepared_storage"] = prepared
+        live = _runtime_config
+        base = (
+            live
+            if live is not None and _config_source_path(live) == config_path
+            else config
+        )
+        candidate = copy.deepcopy(base)
+        candidate.prepared_storage = copy.deepcopy(prepared)
+        candidate.__post_init__()
         _atomic_write_persisted_config(config_path, data)
+        if live is not None and _config_source_path(live) == config_path:
+            _runtime_config = candidate
         return True
+
+
+def _persisted_config_snapshot(config: Any, writable_fields: set[str]) -> Any:
+    """Overlay durable fields on live state without importing unrelated homes."""
+    config_path = _config_source_path(config)
+    data = _read_persisted_config(config_path)
+    target = (
+        data["cloud"]
+        if "cloud" in data and isinstance(data["cloud"], dict)
+        else data
+    )
+    durable = copy.deepcopy(config)
+    for field_name in writable_fields.intersection(target):
+        setattr(durable, field_name, copy.deepcopy(target[field_name]))
+    durable.__post_init__()
+    return durable
 
 
 @app.post("/api/config")
 async def update_config(updates: dict[str, Any] = Body(...)):
     """Persist non-secret configuration. Secrets come from the environment only."""
-    secret_fields = {
-        "vast_api_key",
-        "runpod_api_key",
-        "worker_token",
-        "gcs_credentials",
-        # Connector credentials are written through /api/providers/{name}/credentials,
-        # which stores them outside config.json.
-        "provider_credentials",
-    }
+    global _runtime_config
+    from cloud_offload.config import SECRET_CONFIG_FIELDS
+
+    secret_fields = SECRET_CONFIG_FIELDS
     payload = updates.get("cloud", updates) if isinstance(updates, dict) else {}
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Config body must be a JSON object")
@@ -1159,6 +1177,20 @@ async def update_config(updates: dict[str, Any] = Body(...)):
             status_code=400,
             detail=f"Secrets must be supplied through environment variables: {', '.join(rejected)}",
         )
+    from cloud_offload.config import CloudConfig, READ_ONLY_CONFIG_FIELDS
+
+    writable_fields = set(CloudConfig.__dataclass_fields__) - secret_fields
+    unknown_fields = set(payload) - writable_fields - READ_ONLY_CONFIG_FIELDS
+    if unknown_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown config fields: " + ", ".join(sorted(unknown_fields)),
+        )
+    payload = {
+        field_name: value
+        for field_name, value in payload.items()
+        if field_name not in READ_ONLY_CONFIG_FIELDS
+    }
     if "prepared_storage" in payload:
         from cloud_offload.config import normalized_prepared_storage
 
@@ -1168,23 +1200,69 @@ async def update_config(updates: dict[str, Any] = Body(...)):
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    validated_fields = _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload)
-    if "scratch_dir" in payload:
-        validated_fields.add("scratch_dir")
-    if validated_fields:
+
+    from cloud_offload.config import (
+        LIVE_RELOADABLE_CONFIG_FIELDS,
+        RESTART_REQUIRED_CONFIG_FIELDS,
+    )
+
+    with _config_write_lock:
+        current = _config()
+        durable = _persisted_config_snapshot(current, writable_fields)
+        candidate = copy.deepcopy(durable)
+        mutable_fields = writable_fields
+        updated_fields = mutable_fields.intersection(payload)
         try:
-            validated = _config(resolve_secrets=False)
-            for field_name in validated_fields:
-                setattr(validated, field_name, payload[field_name])
-            validated.__post_init__()
-            for field_name in validated_fields:
-                payload[field_name] = getattr(validated, field_name)
+            for field_name in updated_fields:
+                setattr(candidate, field_name, copy.deepcopy(payload[field_name]))
+            candidate.__post_init__()
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _persist_config_updates(payload)
+        persistence_changed_fields = {
+            field_name
+            for field_name in updated_fields
+            if getattr(candidate, field_name) != getattr(durable, field_name)
+        }
+        payload = {
+            field_name: copy.deepcopy(getattr(candidate, field_name))
+            for field_name in persistence_changed_fields
+        }
+        applied_fields = {
+            field_name
+            for field_name in updated_fields.intersection(
+                LIVE_RELOADABLE_CONFIG_FIELDS
+            )
+            if getattr(candidate, field_name) != getattr(current, field_name)
+        }
+        live_candidate = copy.deepcopy(current)
+        for field_name in applied_fields:
+            setattr(
+                live_candidate,
+                field_name,
+                copy.deepcopy(getattr(candidate, field_name)),
+            )
+        live_candidate.__post_init__()
+        if payload:
+            _persist_config_updates(payload, current)
+        pending_restart_fields = {
+            field_name
+            for field_name in RESTART_REQUIRED_CONFIG_FIELDS
+            if getattr(candidate, field_name) != getattr(live_candidate, field_name)
+        }
+        if _runtime_config is not None:
+            _runtime_config = live_candidate
+            effective = live_candidate
+        else:
+            effective = _config()
 
-    return {"status": "updated", "config": _config().to_dict()}
+    return {
+        "status": "updated",
+        "config": effective.to_dict(),
+        "applied_fields": sorted(applied_fields),
+        "pending_restart_fields": sorted(pending_restart_fields),
+        "restart_required": bool(pending_restart_fields),
+    }
 
 
 @app.get("/api/providers")
@@ -4485,8 +4563,11 @@ def serve(
     front — a tunnel or reverse proxy — is terminating TLS for you.
     """
     global _runtime_config
-    if config is not None:
-        _runtime_config = config
+    if config is None:
+        from cloud_offload.config import CloudConfig
+
+        config = CloudConfig.load()
+    _runtime_config = config
     validate_bind_host(host, allow_lan=allow_lan)
     cert, key = _resolve_tls(tls_cert, tls_key)
     port = choose_service_port(host, port)

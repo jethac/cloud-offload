@@ -15,6 +15,88 @@ CONFIG_DIR = Path(
 )
 DEFAULT_WORKER_MANIFEST = "/opt/cloud-offload/runtime-profile.json"
 
+# These fields are safe to replace in a running coordinator and are refreshed
+# by an existing dispatcher on its next tick. Every other field can affect
+# process-owned queues, stores, connectors, credentials, or network state and
+# therefore takes effect only after both services restart.
+LIVE_RELOADABLE_CONFIG_FIELDS = frozenset(
+    {
+        "allowed_regions",
+        "asset_sources",
+        "confirmation_countdown_seconds",
+        "gpu_type",
+        "idle_shutdown_seconds",
+        "keep_warm",
+        "keep_warm_warning_seconds",
+        "lease_ttl_seconds",
+        "material_cost_change_percent",
+        "material_price_change_percent",
+        "max_container_disk_gb",
+        "max_hourly_rate",
+        "max_job_runtime_seconds",
+        "max_total_job_cost",
+        "min_queue_depth",
+        "on_prem_assets",
+        "prepared_storage",
+        "recommendation_policy",
+        "rental_confirmation",
+        "runpod_registry_auth_id",
+        "worker_profiles",
+    }
+)
+
+# These values describe resolved credentials or hidden configuration. They are
+# safe to return to clients, but they are not writable configuration fields.
+# A client can send a complete GET response back without persisting them.
+READ_ONLY_CONFIG_FIELDS = frozenset(
+    {
+        "coordinator_configured",
+        "huggingface_configured",
+        "provider_auth_configured",
+        "worker_auth_configured",
+        "worker_wheelhouse_configured",
+    }
+)
+
+SECRET_CONFIG_FIELDS = frozenset(
+    {
+        "gcs_credentials",
+        "provider_credentials",
+        "runpod_api_key",
+        "vast_api_key",
+        "worker_token",
+    }
+)
+
+RESTART_REQUIRED_CONFIG_FIELDS = frozenset(
+    {
+        "connector_options",
+        "coordinator_url",
+        "enabled",
+        "ingress",
+        "poll_interval_seconds",
+        "provider",
+        "provider_order",
+        "queue_db_path",
+        "routing_policy",
+        "runpod_cloud_type",
+        "runpod_container_disk_gb",
+        "runpod_graphql_url",
+        "runpod_rest_url",
+        "runpod_volume_gb",
+        "scratch_dir",
+        "storage_path",
+        "storage_type",
+        "vast_api_url",
+        "worker_image_profile",
+        "worker_manifest_path",
+        "worker_models",
+        "worker_profile",
+        "worker_wheelhouse_sha256",
+        "worker_wheelhouse_url",
+    }
+)
+
 # Plaintext credential file written by versions before keychain storage. Kept
 # only so existing keys can be migrated out of it; nothing writes it now. The
 # credentials module reads this attribute, so tests can redirect it.
