@@ -482,6 +482,42 @@ def test_runpod_absent_runtime_telemetry_is_unknown_not_stalled():
     assert connector.container_started(instance) is None
 
 
+def test_runpod_null_runtime_uptime_is_unknown_not_stalled():
+    http = FakeHttp(
+        FakeResponse(
+            {
+                "id": "pod-4",
+                "status": "RUNNING",
+                "runtime": {"uptimeInSeconds": None},
+            }
+        )
+    )
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    instance = connector.get_instance("pod-4")
+
+    assert instance.metadata["container_uptime_seconds"] is None
+    assert connector.container_started(instance) is None
+
+
+def test_runpod_invalid_runtime_uptime_is_unknown_not_stalled():
+    http = FakeHttp(
+        FakeResponse(
+            {
+                "id": "pod-5",
+                "status": "RUNNING",
+                "runtime": {"uptimeInSeconds": -1},
+            }
+        )
+    )
+    connector = RunPodConnector(api_key="secret", http_client=http)
+
+    instance = connector.get_instance("pod-5")
+
+    assert instance.metadata["container_uptime_seconds"] is None
+    assert connector.container_started(instance) is None
+
+
 def test_runpod_get_instance_returns_none_for_missing_pod():
     http = FakeHttp(
         FakeResponse({"title": "Not Found", "detail": "pod not found"}, status_code=404)
