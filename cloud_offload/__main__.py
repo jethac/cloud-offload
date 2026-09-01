@@ -16,6 +16,26 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+
+def _set_explicit_home_before_config_import() -> None:
+    """Make an explicit release/serve home win before config imports."""
+    if len(sys.argv) < 2 or sys.argv[1] not in {"serve", "release"}:
+        return
+    arguments = sys.argv[2:]
+    for index, argument in enumerate(arguments):
+        if argument == "--home" and index + 1 < len(arguments):
+            home = arguments[index + 1]
+        elif argument.startswith("--home="):
+            home = argument.split("=", 1)[1]
+        else:
+            continue
+        if home:
+            os.environ["CLOUD_OFFLOAD_HOME"] = str(Path(home).resolve())
+            return
+
+
+_set_explicit_home_before_config_import()
+
 from cloud_offload.config import CONFIG_DIR
 
 
@@ -265,7 +285,6 @@ def main():
                 config_artifact_store,
                 config_digest,
                 declared_input_artifacts,
-                file_digest,
                 verify_bootstrap_receipt,
             )
             from cloud_offload.config import CloudConfig
@@ -282,7 +301,9 @@ def main():
                 verify_bootstrap_receipt(
                     destination,
                     declarations,
-                    release_plan_digest=file_digest(args.release_plan),
+                    release_plan_digest=getattr(
+                        isolated_plan, "source_digest", "0" * 64
+                    ),
                     config_digest=config_digest(isolated_config, destination),
                 )
             except (ArtifactBootstrapError, OSError, ValueError, json.JSONDecodeError) as exc:
@@ -462,33 +483,9 @@ def main():
             from cloud_offload.service_config import discover_service_info
 
             config = (
-                CloudConfig.from_file(args.config, home=args.home)
-                if args.config
-                else CloudConfig.load()
+                CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
             )
             try:
-                if args.home:
-                    if not args.config:
-                        raise ValueError("isolated M7 release run requires --config")
-                    from cloud_offload.artifact_bootstrap import (
-                        config_artifact_store,
-                        config_digest,
-                        declared_input_artifacts,
-                        file_digest,
-                        verify_bootstrap_receipt,
-                    )
-
-                    destination = config_artifact_store(config, args.home)
-                    declarations = declared_input_artifacts(
-                        (case.benchmark_plan_digest, case.benchmark_plan)
-                        for case in plan.cases
-                    )
-                    verify_bootstrap_receipt(
-                        destination,
-                        declarations,
-                        release_plan_digest=file_digest(args.plan),
-                        config_digest=config_digest(config, destination),
-                    )
                 service = discover_service_info(require_healthy=True)
                 driver = CoordinatorBenchmarkDriver(
                     service["url"],
@@ -546,7 +543,6 @@ def main():
                 config_artifact_store,
                 config_digest,
                 declared_input_artifacts,
-                file_digest,
                 import_declared_artifacts,
             )
             from cloud_offload.config import CloudConfig
@@ -561,7 +557,7 @@ def main():
                     args.source_root,
                     destination,
                     declarations,
-                    release_plan_digest=file_digest(args.plan),
+                    release_plan_digest=getattr(plan, "source_digest", "0" * 64),
                     config_digest=config_digest(config, destination),
                 )
             except (OSError, ValueError, ArtifactBootstrapError) as exc:
@@ -598,15 +594,42 @@ def main():
             if args.max_matrices is not None and args.max_matrices <= 0:
                 print("--max-matrices must be positive", file=sys.stderr)
                 raise SystemExit(2)
+            from cloud_offload.config import CloudConfig
+            isolated_config = None
+            if args.home:
+                if not args.config:
+                    print("Isolated M7 release run requires --config.", file=sys.stderr)
+                    raise SystemExit(2)
+                from cloud_offload.artifact_bootstrap import (
+                    ArtifactBootstrapError,
+                    config_artifact_store,
+                    config_digest,
+                    declared_input_artifacts,
+                    verify_bootstrap_receipt,
+                )
+                try:
+                    isolated_config = CloudConfig.from_file(args.config, home=args.home)
+                    destination = config_artifact_store(isolated_config, args.home)
+                    declarations = declared_input_artifacts(
+                        (case.benchmark_plan_digest, case.benchmark_plan)
+                        for case in plan.cases
+                    )
+                    verify_bootstrap_receipt(
+                        destination,
+                        declarations,
+                        release_plan_digest=getattr(plan, "source_digest", "0" * 64),
+                        config_digest=config_digest(isolated_config, destination),
+                    )
+                except (ArtifactBootstrapError, OSError, ValueError, json.JSONDecodeError) as exc:
+                    print(f"Isolated M7 release startup refused: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from exc
             setup_logging("release", home=args.home)
             load_plugins()
             from cloud_offload.config import CloudConfig
             from cloud_offload.service_config import discover_service_info
 
-            config = (
-                CloudConfig.from_file(args.config)
-                if args.config
-                else CloudConfig.load()
+            config = isolated_config or (
+                CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
             )
             try:
                 service = discover_service_info(require_healthy=True)

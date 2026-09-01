@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -18,6 +20,7 @@ from cloud_offload.artifact_bootstrap import (
     verify_bootstrap_receipt,
 )
 from cloud_offload.cache_registry import CacheRegistry
+from cloud_offload import config as config_module
 from cloud_offload.config import CloudConfig
 from cloud_offload.preflight import build_partition_preflight
 from cloud_offload.storage import LocalStorage, partition_artifact_key
@@ -469,6 +472,98 @@ def test_bootstrap_enforces_normal_partition_upload_size_limit(tmp_path, monkeyp
             release_plan_digest="a" * 64,
             config_digest="b" * 64,
         )
+
+
+def test_receipt_preserves_declared_and_measured_sizes_and_remeasures_destination(tmp_path):
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    payload = b"declared-size"
+    digest = _bundle(source_root, payload)
+    declaration = DeclaredArtifact(digest, expected_size=len(payload))
+
+    import_declared_artifacts(
+        source_root,
+        destination_root,
+        [declaration],
+        release_plan_digest="a" * 64,
+        config_digest="b" * 64,
+    )
+    receipt = json.loads(bootstrap_receipt_path(destination_root).read_text())
+    assert receipt["artifacts"][0]["declared_size"] == len(payload)
+    assert receipt["artifacts"][0]["stored_size"] == len(payload)
+
+    target = destination_root / partition_artifact_key(digest)
+    target.write_bytes(payload + b"-changed")
+    with pytest.raises(ArtifactBootstrapError, match="destination artifact mismatch"):
+        verify_bootstrap_receipt(
+            destination_root,
+            [declaration],
+            release_plan_digest="a" * 64,
+            config_digest="b" * 64,
+        )
+
+
+def test_from_file_resolves_all_relative_runtime_paths_against_isolated_home(tmp_path, monkeypatch):
+    process_home = tmp_path / "process-home"
+    isolated_home = tmp_path / "isolated-home"
+    other_cwd = tmp_path / "other-cwd"
+    other_cwd.mkdir()
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"cloud": {
+        "storage_type": "local",
+        "storage_path": "relative-store",
+        "queue_db_path": "relative.db",
+        "scratch_dir": "relative-scratch",
+    }}))
+    monkeypatch.chdir(other_cwd)
+    monkeypatch.setattr(config_module, "CONFIG_DIR", process_home)
+    config = CloudConfig.from_file(config_path, home=isolated_home)
+    assert Path(config.storage_path) == isolated_home / "relative-store"
+    assert Path(config.queue_db_path) == isolated_home / "relative.db"
+    assert Path(config.scratch_dir) == isolated_home / "relative-scratch"
+    assert config._source_path == isolated_home / "config.json"
+
+
+@pytest.mark.parametrize("command", ["serve", "release"])
+def test_isolated_cli_refuses_before_service_discovery_and_keeps_global_home_clean(
+    tmp_path, command
+):
+    from tests.test_release_gate import release_plan
+
+    plan_path, _ = release_plan(tmp_path)
+    isolated_home = tmp_path / "isolated-home"
+    global_home = tmp_path / "global-home"
+    (tmp_path / "cwd").mkdir()
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"cloud": {"storage_type": "local"}}))
+    environment = dict(os.environ)
+    environment["CLOUD_OFFLOAD_HOME"] = str(global_home)
+    repository_root = Path(__file__).resolve().parents[1]
+    environment["PYTHONPATH"] = str(repository_root) + os.pathsep + environment.get("PYTHONPATH", "")
+    if command == "serve":
+        arguments = [
+            "serve", "--config", str(config_path), "--home", str(isolated_home),
+            "--release-plan", str(plan_path), "--allow-anonymous-loopback",
+        ]
+    else:
+        arguments = [
+            "release", "run", "--plan", str(plan_path), "--ledger",
+            str(tmp_path / "ledger.json"), "--output-dir", str(tmp_path / "out"),
+            "--config", str(config_path), "--home", str(isolated_home),
+            "--confirm-spend",
+        ]
+    result = subprocess.run(
+        [sys.executable, "-m", "cloud_offload", *arguments],
+        cwd=tmp_path / "cwd",
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "receipt" in result.stderr.lower()
+    assert not global_home.exists()
+    assert not (isolated_home / "logs").exists()
 
 
 def test_isolated_serve_refuses_to_start_without_matching_bootstrap_receipt(

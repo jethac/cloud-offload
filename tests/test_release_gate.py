@@ -1,5 +1,7 @@
 import json
 import sys
+import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -158,6 +160,30 @@ def test_release_plan_requires_full_axes_and_redacts_private_benchmark(tmp_path)
     assert "workflow" not in safe
     assert all(item.benchmark_plan_digest.startswith("sha256:") for item in plan.cases)
     assert ReleasePlan.load(path).digest == plan.digest
+
+
+def test_release_plan_binds_digest_to_the_same_bytes_it_parses(tmp_path, monkeypatch):
+    path, _ = release_plan(tmp_path)
+    benchmark_path = tmp_path / "benchmark-US-MD-1.json"
+    original = benchmark_path.read_bytes()
+    mutated = original.replace(b'"cold"', b'"hot"', 1)
+    real_read = Path.read_bytes
+    reads = {"benchmark": 0}
+
+    def read_once(target):
+        raw = real_read(target)
+        if target == benchmark_path and reads["benchmark"] == 0:
+            reads["benchmark"] += 1
+            target.write_bytes(mutated)
+        return raw
+
+    monkeypatch.setattr(Path, "read_bytes", read_once)
+    plan = ReleasePlan.load(path)
+    assert plan.cases[0].benchmark_plan.scenarios[0].cache_state == "cold"
+    assert plan.cases[0].benchmark_plan_digest == (
+        "sha256:" + hashlib.sha256(original).hexdigest()
+    )
+    assert reads["benchmark"] == 1
 
 
 def test_release_plan_rejects_short_gate_and_unbound_region(tmp_path):

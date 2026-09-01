@@ -105,6 +105,10 @@ def _file_digest(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _bytes_digest(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def _positive(value: Any, label: str) -> float:
     try:
         number = float(value)
@@ -241,6 +245,7 @@ class ReleaseCase:
         base_dir: Path,
         profiles: dict[str, ReleaseProfile],
         regions: set[str],
+        benchmark_snapshot: tuple[bytes, str] | None = None,
     ) -> "ReleaseCase":
         name = _simple_name(value.get("name"), f"cases[{index}].name")
         profile_name = _simple_name(
@@ -255,7 +260,12 @@ class ReleaseCase:
         if not raw_path:
             raise ValueError(f"cases[{index}].benchmark_plan is required")
         path = (base_dir / raw_path).resolve() if not Path(raw_path).is_absolute() else Path(raw_path).resolve()
-        benchmark = BenchmarkPlan.load(path)
+        if benchmark_snapshot is None:
+            benchmark_raw = path.read_bytes()
+            benchmark_digest = _bytes_digest(benchmark_raw)
+        else:
+            benchmark_raw, benchmark_digest = benchmark_snapshot
+        benchmark = BenchmarkPlan.from_bytes(benchmark_raw)
         failure_kinds = {
             item.failure.kind for item in benchmark.scenarios if item.failure
         }
@@ -279,7 +289,7 @@ class ReleaseCase:
             image_digest=profiles[profile_name].image_digest,
             region=region,
             benchmark_plan_path=path,
-            benchmark_plan_digest=_file_digest(path),
+            benchmark_plan_digest=benchmark_digest,
             benchmark_plan=benchmark,
         )
 
@@ -320,11 +330,13 @@ class ReleasePlan:
     cases: tuple[ReleaseCase, ...]
     limits: ReleaseLimits
     plan_path: Path
+    source_digest: str
 
     @classmethod
     def load(cls, path: str | Path) -> "ReleasePlan":
         plan_path = Path(path).resolve()
-        value = json.loads(plan_path.read_text(encoding="utf-8"))
+        raw_plan = plan_path.read_bytes()
+        value = json.loads(raw_plan)
         if not isinstance(value, dict) or value.get("schema") != RELEASE_PLAN_SCHEMA:
             raise ValueError(f"release plan schema must be {RELEASE_PLAN_SCHEMA}")
         required = int(value.get("required_consecutive_matrices") or 0)
@@ -370,17 +382,28 @@ class ReleasePlan:
         raw_cases = value.get("cases") or []
         if not isinstance(raw_cases, list) or not raw_cases:
             raise ValueError("cases must be a non-empty list")
-        cases = tuple(
-            ReleaseCase.from_dict(
-                item,
-                index,
-                base_dir=plan_path.parent,
-                profiles=profile_map,
-                regions=set(regions),
+        cases_list = []
+        for index, item in enumerate(raw_cases):
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("benchmark_plan") or "").strip()
+            benchmark_path = (
+                (plan_path.parent / raw_path).resolve()
+                if not Path(raw_path).is_absolute()
+                else Path(raw_path).resolve()
             )
-            for index, item in enumerate(raw_cases)
-            if isinstance(item, dict)
-        )
+            benchmark_raw = benchmark_path.read_bytes()
+            cases_list.append(
+                ReleaseCase.from_dict(
+                    item,
+                    index,
+                    base_dir=plan_path.parent,
+                    profiles=profile_map,
+                    regions=set(regions),
+                    benchmark_snapshot=(benchmark_raw, _bytes_digest(benchmark_raw)),
+                )
+            )
+        cases = tuple(cases_list)
         if len(cases) != len(raw_cases):
             raise ValueError("every case must be an object")
         case_names = {item.name for item in cases}
@@ -420,6 +443,7 @@ class ReleasePlan:
             cases=cases,
             limits=limits,
             plan_path=plan_path,
+            source_digest=_bytes_digest(raw_plan),
         )
 
     def safe_summary(self) -> dict[str, Any]:

@@ -583,18 +583,24 @@ class CloudConfig:
         if home is not None:
             cloud_data = dict(cloud_data)
             isolated_home = Path(home).resolve()
-            if not str(cloud_data.get("storage_path") or "").strip():
-                cloud_data["storage_path"] = str(isolated_home / "job_files")
-            if not str(cloud_data.get("queue_db_path") or "").strip():
-                cloud_data["queue_db_path"] = str(isolated_home / "jobs.db")
-            if not str(cloud_data.get("scratch_dir") or "").strip():
-                cloud_data["scratch_dir"] = str(isolated_home / "scratch")
+            for field_name, default_name in (
+                ("storage_path", "job_files"),
+                ("queue_db_path", "jobs.db"),
+                ("scratch_dir", "scratch"),
+            ):
+                configured = str(cloud_data.get(field_name) or "").strip()
+                path_value = Path(configured) if configured else Path(default_name)
+                if not path_value.is_absolute():
+                    path_value = isolated_home / path_value
+                cloud_data[field_name] = str(path_value.resolve())
         allowed = {item.name for item in fields(cls)}
         config = cls(**{key: value for key, value in cloud_data.items() if key in allowed})
         # Runtime services may refresh mutable policy while they run. Keep the
         # exact source private so an explicitly supplied config never starts
         # reading unrelated preferences from the default user config.
-        config._source_path = Path(path)
+        config._source_path = (
+            Path(home).resolve() / "config.json" if home is not None else Path(path)
+        )
         return config
 
     @classmethod

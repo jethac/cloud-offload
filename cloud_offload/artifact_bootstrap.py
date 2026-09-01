@@ -172,6 +172,7 @@ def _receipt_payload(
     *,
     release_plan_digest: str,
     config_digest: str,
+    stored_sizes: dict[str, int],
 ) -> dict[str, Any]:
     return {
         "schema": RECEIPT_SCHEMA,
@@ -181,7 +182,8 @@ def _receipt_payload(
         "artifacts": [
             {
                 "digest": item.digest,
-                "size": item.expected_size,
+                "declared_size": item.expected_size,
+                "stored_size": int(stored_sizes[item.digest]),
                 "roles": list(item.roles),
                 "plan_digests": list(item.plan_digests),
             }
@@ -250,20 +252,13 @@ def import_declared_artifacts(
             raise ArtifactBootstrapError(f"source size mismatch: {declaration.digest}")
         source_records.append((declaration, source, source_size))
 
-    receipt_declarations = [
-        DeclaredArtifact(
-            digest=declaration.digest,
-            expected_size=source_size,
-            roles=declaration.roles,
-            plan_digests=declaration.plan_digests,
-        )
-        for declaration, _, source_size in source_records
-    ]
+    stored_sizes = {declaration.digest: source_size for declaration, _, source_size in source_records}
     receipt_payload = _receipt_payload(
         destination_root,
-        receipt_declarations,
+        declarations,
         release_plan_digest=release_plan_digest,
         config_digest=config_digest,
+        stored_sizes=stored_sizes,
     )
     if receipt_path.exists():
         try:
@@ -352,20 +347,37 @@ def verify_bootstrap_receipt(
         actual = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ArtifactBootstrapError("bootstrap receipt is unreadable") from exc
-    expected = _receipt_payload(
-        destination_root,
-        list(declarations),
-        release_plan_digest=release_plan_digest,
-        config_digest=config_digest,
-    )
-    if actual != expected:
+    declarations = [
+        item if isinstance(item, DeclaredArtifact) else DeclaredArtifact(**item.__dict__)
+        for item in declarations
+    ]
+    actual_artifacts = actual.get("artifacts") if isinstance(actual, dict) else None
+    if not isinstance(actual_artifacts, list) or len(actual_artifacts) != len(declarations):
         raise ArtifactBootstrapError("bootstrap receipt mismatch")
-    for item in expected["artifacts"]:
+    measured_sizes: dict[str, int] = {}
+    for declaration, item in zip(declarations, actual_artifacts):
+        if not isinstance(item, dict) or item.get("digest") != declaration.digest:
+            raise ArtifactBootstrapError("bootstrap receipt mismatch")
+        if item.get("declared_size") != declaration.expected_size:
+            raise ArtifactBootstrapError("bootstrap receipt mismatch")
         declaration = DeclaredArtifact(
             digest=item["digest"],
-            expected_size=item["size"],
+            expected_size=item.get("declared_size"),
             roles=tuple(item["roles"]),
             plan_digests=tuple(item["plan_digests"]),
         )
-        _verify_destination(destination_root, declaration, int(item["size"]))
+        stored_size = item.get("stored_size")
+        if not isinstance(stored_size, int) or stored_size < 0:
+            raise ArtifactBootstrapError("bootstrap receipt mismatch")
+        _verify_destination(destination_root, declaration, stored_size)
+        measured_sizes[declaration.digest] = stored_size
+    expected = _receipt_payload(
+        destination_root,
+        declarations,
+        release_plan_digest=release_plan_digest,
+        config_digest=config_digest,
+        stored_sizes=measured_sizes,
+    )
+    if actual != expected:
+        raise ArtifactBootstrapError("bootstrap receipt mismatch")
     return actual

@@ -968,6 +968,50 @@ def test_coordinator_driver_preflights_partition_before_submission():
     }
 
 
+def test_coordinator_driver_accepts_only_manifest_bound_to_cold_job_and_lease():
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    profile = "sha256:" + "p" * 64
+    driver._submission_receipts["job-1"] = {
+        "profile_fingerprint": profile,
+        "region": "US-MD-1",
+    }
+    valid = {
+        "manifest_id": "sha256:" + "m" * 64,
+        "profile_fingerprint": profile,
+        "created_at": "2026-08-01T00:00:02+00:00",
+        "producer": {"job_id": "job-1", "lease_id": "lease-1"},
+        "artifacts": [{"digest": "sha256:" + "a" * 64, "size": 1}],
+        "volume_id": "volume-1",
+        "datacenter_id": "US-MD-1",
+    }
+    unrelated = {**valid, "manifest_id": "sha256:" + "u" * 64,
+                 "producer": {"job_id": "other", "lease_id": "other"}}
+
+    def request(method, path, **kwargs):
+        if path == "/api/jobs/job-1":
+            return FakeResponse({
+                "id": "job-1",
+                "params": {
+                    "lease_id": "lease-1",
+                    "cache_volume_id": "volume-1",
+                    "cache_datacenter_id": "US-MD-1",
+                },
+            })
+        assert path == "/api/cache/manifests"
+        return FakeResponse({"manifests": [unrelated, valid]})
+
+    driver._request = request
+    result = driver.base_manifest({
+        "job_id": "job-1",
+        "started_at": "2026-08-01T00:00:01+00:00",
+        "submission_receipt": driver.submission_receipt("job-1"),
+    })
+    assert result["manifest_id"] == valid["manifest_id"]
+    assert result["lease_id"] == "lease-1"
+
+
 def _ready_preflight_response():
     return FakeResponse(
         {

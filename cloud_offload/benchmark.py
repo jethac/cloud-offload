@@ -357,7 +357,14 @@ class BenchmarkPlan:
 
     @classmethod
     def load(cls, path: str | Path) -> "BenchmarkPlan":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        payload = json.loads(Path(path).read_bytes())
+        if not isinstance(payload, dict):
+            raise ValueError("benchmark plan must contain a JSON object")
+        return cls.from_dict(payload)
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> "BenchmarkPlan":
+        payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise ValueError("benchmark plan must contain a JSON object")
         return cls.from_dict(payload)
@@ -1517,7 +1524,7 @@ class CoordinatorBenchmarkDriver:
             preparation = preflight.get("preparation") or {}
             candidates = preflight.get("candidates") or []
             selected_region = str(execution.get("region") or "") or None
-            self._submission_receipts[job_id] = {
+            submission_receipt = {
                 "schema": "cloud-offload.benchmark-submission-receipt.v1",
                 "preflight_status": str(preflight.get("status") or ""),
                 "profile": str(execution.get("profile") or ""),
@@ -1536,6 +1543,20 @@ class CoordinatorBenchmarkDriver:
                     for item in candidates
                 ),
             }
+            profile_fingerprint = str(execution.get("profile_fingerprint") or "")
+            if profile_fingerprint:
+                submission_receipt["profile_fingerprint"] = profile_fingerprint
+            expected_model = str(request_payload.get("model") or "")
+            if expected_model:
+                submission_receipt["expected_model"] = expected_model
+            expected_artifacts = sorted(
+                str(item).lower()
+                for item in (request_payload.get("input_artifacts") or {}).values()
+                if item
+            )
+            if expected_artifacts:
+                submission_receipt["expected_artifact_digests"] = expected_artifacts
+            self._submission_receipts[job_id] = submission_receipt
         return job_id
 
     def submission_receipt(self, job_id: str) -> dict[str, Any] | None:
@@ -1552,30 +1573,69 @@ class CoordinatorBenchmarkDriver:
     def base_manifest(self, cold_result: dict[str, Any]) -> dict[str, Any] | None:
         """Return the exact cache-registry manifest created by the cold run."""
         receipt = cold_result.get("submission_receipt") or {}
+        job_id = str(cold_result.get("job_id") or "")
+        if not job_id:
+            return None
         region = str(receipt.get("region") or "")
         started_at = _parse_timestamp(cold_result.get("started_at"))
+        job_response = self._request(
+            "GET", f"/api/jobs/{job_id}", retry_safe=True, timeout=30
+        )
+        job_response.raise_for_status()
+        job = job_response.json()
+        if str(job.get("id") or job_id) != job_id:
+            return None
+        params = job.get("params") or {}
+        lease_id = str(params.get("lease_id") or "")
+        volume_id = str(params.get("cache_volume_id") or "")
+        region = str(params.get("cache_datacenter_id") or region)
+        profile_fingerprint = str(receipt.get("profile_fingerprint") or "")
+        if not lease_id or not volume_id or not region or not profile_fingerprint:
+            return None
         response = self._request(
             "GET",
             "/api/cache/manifests",
             retry_safe=True,
             timeout=30,
-            params={"datacenter_id": region} if region else None,
+            params={
+                "datacenter_id": region,
+                "profile_fingerprint": profile_fingerprint,
+            },
         )
         response.raise_for_status()
         manifests = response.json().get("manifests") or []
         candidates = []
         for manifest in manifests:
             created_at = _parse_timestamp(manifest.get("created_at"))
-            if started_at is not None and (created_at is None or created_at < started_at):
+            if (
+                started_at is not None
+                and (created_at is None or created_at <= started_at)
+            ):
+                continue
+            manifest_id = str(manifest.get("manifest_id") or "")
+            producer = manifest.get("producer") or {}
+            if (
+                not manifest_id
+                or str(manifest.get("volume_id") or "") != volume_id
+                or str(manifest.get("datacenter_id") or "") != region
+                or str(manifest.get("profile_fingerprint") or "") != profile_fingerprint
+                or str(producer.get("job_id") or "") != job_id
+                or str(producer.get("lease_id") or "") != lease_id
+                or not manifest.get("artifacts")
+            ):
                 continue
             candidates.append(manifest)
         if len(candidates) != 1:
             return None
         selected = candidates[0]
         return {
-            "manifest_id": str(selected.get("manifest_id") or ""),
-            "volume_id": str(selected.get("volume_id") or ""),
-            "datacenter_id": str(selected.get("datacenter_id") or region),
+            "manifest_id": str(selected["manifest_id"]),
+            "volume_id": volume_id,
+            "datacenter_id": region,
+            "profile_fingerprint": profile_fingerprint,
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "created_at": selected.get("created_at"),
         }
 
     def snapshot(self, job_id: str) -> dict[str, Any]:
