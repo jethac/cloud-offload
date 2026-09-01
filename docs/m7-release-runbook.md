@@ -106,6 +106,27 @@ region via `allowed_regions`.
 
 ## Commands
 
+Before starting an isolated coordinator, import the boundary bundles referenced
+by the private benchmark plans into that coordinator's configured local artifact
+root. The source root is read-only; the command verifies each source digest and
+size, publishes through the same content-addressed `partition-artifacts/` layout
+used by `/api/artifacts`, and accepts only exact duplicate objects on repeat
+runs. Missing sources, digest/size mismatches, interrupted copies, and conflicting
+destination bytes stop the command without publishing a partial object. It emits
+only artifact digests, sizes, roles, and duplicate status—never source paths or
+credentials.
+
+```bash
+cloud-offload release bootstrap-artifacts \
+  --plan .runlogs/m7-release-plan.json \
+  --source-root /read-only/prior-cloud-offload/job_files \
+  --config /isolated/m7/config.json
+```
+
+Run this command before `cloud-offload serve`; verify its safe summary and then
+start the coordinator using the same isolated config. Do not repoint an isolated
+campaign at a prior mutable Cloud Offload home.
+
 Validate a plan (free, no credentials, no provider reads; prints only the
 redacted safe summary):
 

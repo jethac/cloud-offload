@@ -202,6 +202,15 @@ def _build_parser() -> tuple[
         action="store_true",
         help="Allow the reviewed storage, corruption, and restart canaries",
     )
+    release_bootstrap = release_sub.add_parser(
+        "bootstrap-artifacts",
+        help="Verify and import private benchmark input artifacts before startup",
+    )
+    release_bootstrap.add_argument("--plan", required=True, help="Release plan JSON")
+    release_bootstrap.add_argument(
+        "--source-root", required=True, help="Read-only content-addressed source root"
+    )
+    release_bootstrap.add_argument("--config", help="Isolated Cloud Offload config")
 
     benchmark_hook = subparsers.add_parser(
         "benchmark-hook",
@@ -456,6 +465,54 @@ def main():
                 print(f"Invalid release ledger: {exc}", file=sys.stderr)
                 raise SystemExit(2) from exc
             print(json.dumps(ledger, indent=2, sort_keys=True))
+        elif args.release_command == "bootstrap-artifacts":
+            from cloud_offload.artifact_bootstrap import (
+                ArtifactBootstrapError,
+                declared_input_artifacts,
+                import_declared_artifacts,
+            )
+            from cloud_offload.config import CloudConfig
+            config = (
+                CloudConfig.from_file(args.config)
+                if args.config
+                else CloudConfig.load(resolve_secrets=False)
+            )
+            if config.storage_type != "local":
+                print(
+                    "Artifact bootstrap requires a local configured storage root.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            declarations = declared_input_artifacts(
+                case.benchmark_plan_path for case in plan.cases
+            )
+            try:
+                records = import_declared_artifacts(
+                    args.source_root,
+                    config.storage_path,
+                    declarations,
+                )
+            except (OSError, ValueError, ArtifactBootstrapError) as exc:
+                print(f"Artifact bootstrap stopped safely: {exc}", file=sys.stderr)
+                raise SystemExit(2) from exc
+            print(
+                json.dumps(
+                    {
+                        "artifact_count": len(records),
+                        "artifacts": [
+                            {
+                                "digest": item.digest,
+                                "size": item.size,
+                                "roles": list(item.roles),
+                                "already_present": item.already_present,
+                            }
+                            for item in records
+                        ],
+                    },
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(0)
         elif args.release_command == "run":
             if not args.confirm_spend:
                 print(

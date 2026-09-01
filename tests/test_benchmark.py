@@ -434,7 +434,7 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
     )
     selected["allowed_regions"] = ["EU-RO-1"]
     plan = BenchmarkPlan.from_dict(
-        plan_dict([selected])
+        plan_dict([scenario("cold", "cold"), selected])
     )
     script = successful_script("pod-corruption")
     script.steps[0]["events"].append(
@@ -448,16 +448,16 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
         )
     )
     script.steps[1]["events"][0]["sequence"] = 4
-    driver = FakeDriver({"corruption": script})
+    driver = FakeDriver({"cold": successful_script("pod-cold"), "corruption": script})
 
-    assets = plan.scenarios[0].request["partition"]["assets"]
+    assets = plan.scenarios[1].request["partition"]["assets"]
     assert len(assets) == 1
     assert assets[0]["filename"].startswith("cloud_offload_benchmark_canary_")
     assert len(assets[0][CORRUPTION_NONCE_FIELD]) == 32
-    assert plan.scenarios[0].failure.trigger_event == "cache_mount_ready"
+    assert plan.scenarios[1].failure.trigger_event == "cache_mount_ready"
 
     scorecard = BenchmarkRunner(driver).run(plan)
-    result = scorecard["results"][0]
+    result = scorecard["results"][1]
 
     assert scorecard["passed"] is True
     assert [
@@ -483,10 +483,96 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
         driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_CANARY_NONCE"]
         == assets[0][CORRUPTION_NONCE_FIELD]
     )
-    assert driver.hooks[1][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == "job-1"
+    assert driver.hooks[1][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == "job-2"
     assert result["failure_injection"]["preparation_hook"]["exit_code"] == 0
     assert result["failure_injection"]["hook"]["exit_code"] == 0
     assert result["failure_injection"]["cleanup_hook"]["exit_code"] == 0
+
+
+def test_corruption_hook_runs_only_after_a_successful_cold_base_manifest():
+    class OrderedDriver(FakeDriver):
+        def __init__(self, scripts):
+            super().__init__(scripts)
+            self.cold_base_manifest_ready = False
+
+        def snapshot(self, job_id):
+            snapshot = super().snapshot(job_id)
+            if (
+                self.jobs[job_id]["scenario"].name == "cold"
+                and snapshot.get("status") == "completed"
+            ):
+                self.cold_base_manifest_ready = True
+            return snapshot
+
+        def run_hook(self, injection, context):
+            if injection.kind == "corruption":
+                assert self.cold_base_manifest_ready
+            return super().run_hook(injection, context)
+
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [
+                scenario("cold", "cold"),
+                scenario(
+                    "corruption",
+                    "failure",
+                    failure={
+                        "kind": "corruption",
+                        "before_submit": True,
+                        "hook_argv": ["corruption-canary"],
+                    },
+                ),
+            ]
+        )
+    )
+    driver = OrderedDriver(
+        {"cold": successful_script("pod-cold"), "corruption": successful_script("pod-corruption")}
+    )
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert driver.cold_base_manifest_ready
+    assert [kind for kind, _ in driver.hooks] == ["corruption", "corruption"]
+
+
+def test_corruption_reports_dependency_failure_without_running_when_cold_fails():
+    class ColdFailureDriver(FakeDriver):
+        def submit(self, scenario):
+            if scenario.name == "cold":
+                raise RuntimeError("cold base manifest was not created")
+            return super().submit(scenario)
+
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [
+                scenario("cold", "cold"),
+                scenario(
+                    "corruption",
+                    "failure",
+                    failure={
+                        "kind": "corruption",
+                        "before_submit": True,
+                        "hook_argv": ["corruption-canary"],
+                    },
+                ),
+            ]
+        )
+    )
+    driver = ColdFailureDriver({"corruption": successful_script("pod-corruption")})
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    result = scorecard["results"][1]
+    assert driver.hooks == []
+    assert result["passed"] is False
+    assert result["failure_injection"]["triggered"] is False
+    assert result["failure_injection"]["dependency_failure"] == (
+        "corruption requires a successful cold scenario that created a base manifest"
+    )
+    assert result["harness_error"] == (
+        "Dependency failure: corruption requires a successful cold scenario "
+        "that created a base manifest"
+    )
 
 
 def test_corruption_observation_hook_has_a_longer_bounded_timeout():
@@ -520,11 +606,14 @@ def test_corruption_plan_load_creates_a_new_canary_for_each_campaign():
 def test_two_phase_hook_cleans_up_when_submission_never_creates_a_job():
     class BrokenSubmitDriver(FakeDriver):
         def submit(self, scenario):
-            raise RuntimeError("submission failed")
+            if scenario.name == "corruption":
+                raise RuntimeError("submission failed")
+            return super().submit(scenario)
 
     plan = BenchmarkPlan.from_dict(
         plan_dict(
             [
+                scenario("cold", "cold"),
                 scenario(
                     "corruption",
                     "failure",
@@ -537,9 +626,9 @@ def test_two_phase_hook_cleans_up_when_submission_never_creates_a_job():
             ]
         )
     )
-    driver = BrokenSubmitDriver({})
+    driver = BrokenSubmitDriver({"cold": successful_script("pod-cold")})
 
-    result = BenchmarkRunner(driver).run(plan)["results"][0]
+    result = BenchmarkRunner(driver).run(plan)["results"][1]
 
     assert result["passed"] is False
     assert [

@@ -559,6 +559,7 @@ class BenchmarkRunner:
         results: list[dict[str, Any]] = []
         estimated_total = 0.0
         campaign_abort: str | None = None
+        cold_base_manifest_ready = False
         for scenario in plan.scenarios:
             elapsed = self.driver.monotonic() - campaign_started
             if elapsed >= plan.limits.max_campaign_seconds:
@@ -572,14 +573,26 @@ class BenchmarkRunner:
             ):
                 campaign_abort = "fresh_worker_quiescence_timeout"
                 break
-            result = self._run_scenario(
-                plan,
-                scenario,
-                baseline,
-                campaign_started,
-                estimated_total,
-            )
+            if (
+                scenario.failure
+                and scenario.failure.kind == "corruption"
+                and not cold_base_manifest_ready
+            ):
+                result = self._dependent_failure_result(
+                    scenario,
+                    "corruption requires a successful cold scenario that created a base manifest",
+                )
+            else:
+                result = self._run_scenario(
+                    plan,
+                    scenario,
+                    baseline,
+                    campaign_started,
+                    estimated_total,
+                )
             results.append(result)
+            if scenario.cache_state == "cold":
+                cold_base_manifest_ready = bool(result.get("passed"))
             estimated_total += float(result["estimated_compute_cost_upper_usd"])
             if result.get("orphaned_resources"):
                 campaign_abort = "orphan_cleanup_failed"
@@ -645,6 +658,50 @@ class BenchmarkRunner:
             ],
         }
         return scorecard
+
+    @staticmethod
+    def _dependent_failure_result(
+        scenario: BenchmarkScenario, reason: str
+    ) -> dict[str, Any]:
+        """Record a dependent canary failure without running its hook."""
+
+        now = _utc_now()
+        return {
+            "schema": SCENARIO_SCHEMA,
+            "name": scenario.name,
+            "cache_state": scenario.cache_state,
+            "request_digest": _canonical_digest(scenario.request),
+            "started_at": now,
+            "completed_at": now,
+            "duration_seconds": 0.0,
+            "resource_closure_seconds": 0.0,
+            "cancellation_to_provider_absence_seconds": None,
+            "revocation_to_provider_absence_seconds": None,
+            "job_id": None,
+            "status": None,
+            "expected_statuses": list(scenario.expected_statuses),
+            "passed": False,
+            "fresh_instance_required": scenario.fresh_instance,
+            "fresh_instance_observed": False,
+            "scenario_preparation": None,
+            "scenario_restoration": None,
+            "event_count": 0,
+            "event_cursor": 0,
+            "phase_durations_seconds": {},
+            "preparation_seconds": None,
+            "estimated_compute_cost_upper_usd": 0.0,
+            "resources": [],
+            "orphaned_resources": [],
+            "failure_injection": {
+                "kind": scenario.failure.kind if scenario.failure else None,
+                "triggered": False,
+                "dependency_failure": reason,
+            },
+            "limit_triggered": None,
+            "harness_error": f"Dependency failure: {reason}",
+            "support_bundle": None,
+            "submission_receipt": None,
+        }
 
     def _wait_for_worker_quiescence(
         self, plan: BenchmarkPlan, campaign_started: float
