@@ -106,6 +106,16 @@ def _docker_cp_source(tmp_path: Path) -> Path:
     return tmp_path / "source"
 
 
+def _docker_cp_file(tmp_path: Path, remote: str, name: str) -> Path:
+    container = _docker_create()
+    destination = tmp_path / name
+    try:
+        subprocess.run(["docker", "cp", f"{container}:{remote}", str(destination)], check=True)
+    finally:
+        subprocess.run(["docker", "rm", "-f", container], check=True, stdout=subprocess.DEVNULL)
+    return destination
+
+
 @pytest.mark.skipif(not IMAGE, reason="set CLOUD_OFFLOAD_TEST_IMAGE for image inspection")
 def test_local_image_has_revision_label_and_exact_entrypoint_bytes(tmp_path):
     from scripts.build_worker_image import _blob_bytes, tree_entries
@@ -121,6 +131,9 @@ def test_local_image_has_revision_label_and_exact_entrypoint_bytes(tmp_path):
     assert (source / entry.path).read_bytes() == _blob_bytes(ROOT, entry.oid)
     assert hashlib.sha256((source / entry.path).read_bytes()).hexdigest() == hashlib.sha256(_blob_bytes(ROOT, entry.oid)).hexdigest()
     assert (source / entry.path).read_bytes().startswith(b"#!/bin/bash\n")
+    active = _docker_cp_file(tmp_path, "/opt/cloud-offload/entrypoint.sh", "active-entrypoint.sh")
+    assert active.read_bytes() == _blob_bytes(ROOT, entry.oid)
+    assert active.read_bytes().startswith(b"#!/bin/bash\n")
 
 
 @pytest.mark.skipif(not IMAGE, reason="set CLOUD_OFFLOAD_TEST_IMAGE for image inspection")
