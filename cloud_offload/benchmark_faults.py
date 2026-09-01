@@ -967,6 +967,8 @@ def restart_coordinator(client: CoordinatorFaultClient, job_id: str) -> dict[str
         "--port",
         str(info["port"]),
     ]
+    if info.get("auth_required") is False:
+        command.append("--allow-anonymous-loopback")
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
         process = subprocess.Popen(

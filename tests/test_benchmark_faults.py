@@ -265,6 +265,34 @@ class FakeReplacementProcess:
         return None
 
 
+class RestartAuthWorld:
+    """Model the old benchmark session across a replacement service launch."""
+
+    protected_paths = {
+        "/api/health",
+        "/api/status",
+        "/api/config",
+        "/api/jobs/job-restart/snapshot",
+        "/api/jobs/job-restart/events?after=0",
+        "/api/jobs/job-restart/support-bundle",
+    }
+
+    def __init__(self):
+        self.replacement_requires_auth = False
+
+    def launch(self, command):
+        # The original benchmark session has no token because its coordinator
+        # allowed anonymous loopback. A replacement that changes that contract
+        # makes every later harness request fail with 401.
+        self.replacement_requires_auth = "--allow-anonymous-loopback" not in command
+
+    def harness_get(self, path):
+        assert path in self.protected_paths
+        if self.replacement_requires_auth:
+            raise PermissionError(f"401 Unauthorized: {path}")
+        return {"path": path}
+
+
 def test_fault_hook_refuses_direct_invocation(monkeypatch):
     monkeypatch.delenv("CLOUD_OFFLOAD_BENCHMARK_FAILURE_KIND", raising=False)
     monkeypatch.delenv("CLOUD_OFFLOAD_BENCHMARK_JOB_ID", raising=False)
@@ -358,6 +386,61 @@ def test_restart_replays_and_cancels_through_replacement_coordinator(
     }
     assert replacement.posts == [("/api/jobs/job-restart/cancel", {})]
     assert len(launches) == 1
+
+
+def test_restart_preserves_anonymous_auth_for_all_benchmark_harness_routes(
+    monkeypatch, tmp_path
+):
+    """Removing the preserved auth mode must recreate the M7 401 failure."""
+
+    world = RestartAuthWorld()
+    old = FakeRestartClient(111)
+    replacement = FakeRestartClient(222, status="running")
+    service_reads = iter(
+        [
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": 11435,
+                "pid": 111,
+                "auth_required": False,
+            },
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": 11435,
+                "pid": 222,
+                "auth_required": False,
+            },
+        ]
+    )
+    process_states = iter([True, False, False])
+    monkeypatch.setattr(
+        benchmark_faults,
+        "read_service_info",
+        lambda require_healthy=True: next(service_reads),
+    )
+    monkeypatch.setattr(
+        benchmark_faults, "_process_exists", lambda pid: next(process_states)
+    )
+    monkeypatch.setattr(benchmark_faults.os, "kill", lambda pid, signal: None)
+    monkeypatch.setattr(benchmark_faults, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(
+        benchmark_faults,
+        "CoordinatorFaultClient",
+        lambda service: replacement,
+    )
+
+    def launch(command, **kwargs):
+        world.launch(command)
+        return FakeReplacementProcess()
+
+    monkeypatch.setattr(benchmark_faults.subprocess, "Popen", launch)
+
+    restart_coordinator(old, "job-restart")
+
+    for path in sorted(world.protected_paths):
+        assert world.harness_get(path) == {"path": path}
 
 
 def test_storage_fault_is_observed_without_mutating_provider_storage():
