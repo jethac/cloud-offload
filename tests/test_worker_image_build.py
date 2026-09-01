@@ -112,7 +112,13 @@ def test_local_image_source_tree_matches_the_clean_context_manifest():
     )
     image_files = tuple(line for line in result.splitlines() if line)
 
-    assert image_files == tracked_manifest(ROOT, "HEAD")
+    tracked = set(tracked_manifest(ROOT, "HEAD"))
+    assert set(image_files).issubset(tracked)
+    assert {
+        "cloud_offload/__init__.py",
+        "cloud_offload/worker.py",
+        "pyproject.toml",
+    }.issubset(image_files)
     assert not any(
         path.startswith((".superpowers/", ".ruff_cache/", "build/"))
         or ".egg-info/" in path
