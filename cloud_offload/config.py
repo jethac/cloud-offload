@@ -15,6 +15,36 @@ CONFIG_DIR = Path(
 )
 DEFAULT_WORKER_MANIFEST = "/opt/cloud-offload/runtime-profile.json"
 
+# These fields are safe to replace in a running coordinator and are refreshed
+# by an existing dispatcher on its next tick. Every other field can affect
+# process-owned queues, stores, connectors, credentials, or network state and
+# therefore takes effect only after both services restart.
+LIVE_RELOADABLE_CONFIG_FIELDS = frozenset(
+    {
+        "allowed_regions",
+        "asset_sources",
+        "confirmation_countdown_seconds",
+        "gpu_type",
+        "idle_shutdown_seconds",
+        "keep_warm",
+        "keep_warm_warning_seconds",
+        "lease_ttl_seconds",
+        "material_cost_change_percent",
+        "material_price_change_percent",
+        "max_container_disk_gb",
+        "max_hourly_rate",
+        "max_job_runtime_seconds",
+        "max_total_job_cost",
+        "min_queue_depth",
+        "on_prem_assets",
+        "prepared_storage",
+        "recommendation_policy",
+        "rental_confirmation",
+        "runpod_registry_auth_id",
+        "worker_profiles",
+    }
+)
+
 # Plaintext credential file written by versions before keychain storage. Kept
 # only so existing keys can be migrated out of it; nothing writes it now. The
 # credentials module reads this attribute, so tests can redirect it.
