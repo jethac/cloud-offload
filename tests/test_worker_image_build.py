@@ -72,7 +72,7 @@ def _image_revision(requested_revision: str | None = None) -> str:
 def test_pinned_source_revision_rejects_missing_malformed_or_unknown_commit(tmp_path, monkeypatch, pin):
     pin_path = tmp_path / "image-pin.json"
     pin_path.write_text(json.dumps(pin), encoding="utf-8")
-    monkeypatch.setattr("tests.test_worker_image_build.PIN_PATH", pin_path)
+    monkeypatch.setitem(_pinned_source_revision.__globals__, "PIN_PATH", pin_path)
 
     with pytest.raises(pytest.fail.Exception, match="source_revision"):
         _pinned_source_revision()
