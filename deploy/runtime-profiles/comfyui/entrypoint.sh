@@ -16,12 +16,29 @@ cloud-offload runner-boot
 # profile environment before ComfyUI imports its node registry.
 export PYTHONPATH="${CLOUD_OFFLOAD_ENV_ROOT:-/opt/cloud-offload/environment}/lib/python3.11/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
 
-python /opt/ComfyUI/main.py \
-  --listen 127.0.0.1 \
-  --port 8188 \
-  --disable-auto-launch \
-  --disable-metadata \
-  >/tmp/comfyui.log 2>&1 &
+# Keep the image's normal command as the source of truth, while allowing a
+# profile/test to select a supported ComfyUI runtime flag (for example,
+# --disable-triton-backend on a CPU-only smoke runner).
+read -r -a comfyui_extra_args <<< "${CLOUD_OFFLOAD_COMFYUI_ARGS:-}"
+comfyui_root="${CLOUD_OFFLOAD_COMFYUI_ROOT:-/opt/ComfyUI}"
+
+if [[ "${comfyui_root}" == "/opt/ComfyUI" ]]; then
+  python /opt/ComfyUI/main.py \
+    --listen 127.0.0.1 \
+    --port 8188 \
+    --disable-auto-launch \
+    --disable-metadata \
+    "${comfyui_extra_args[@]}" \
+    >/tmp/comfyui.log 2>&1 &
+else
+  python "${comfyui_root}/main.py" \
+    --listen 127.0.0.1 \
+    --port 8188 \
+    --disable-auto-launch \
+    --disable-metadata \
+    "${comfyui_extra_args[@]}" \
+    >/tmp/comfyui.log 2>&1 &
+fi
 comfy_pid=$!
 
 cleanup() {

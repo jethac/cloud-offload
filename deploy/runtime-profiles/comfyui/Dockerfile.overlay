@@ -6,13 +6,28 @@ FROM ${BASE_IMAGE}
 
 ARG CLOUD_OFFLOAD_SOURCE_REVISION=working-tree
 
+# The pinned base may contain source/build artifacts from the image that
+# produced it. Start with an empty destination so the overlay cannot inherit
+# untracked files even when its build context is clean.
+RUN rm -rf /opt/cloud-offload/source
 COPY . /opt/cloud-offload/source
+
+# BuildKit normalizes COPY modes when the context originates on Windows. The
+# generated manifest is derived from the exact Git tree by the build script;
+# restore each included regular file's committed mode explicitly.
+RUN python -c "import json, os, stat; from pathlib import Path; root=Path('/opt/cloud-offload/source'); manifest=root / '.cloud-offload-source-modes.json'; payload=json.loads(manifest.read_text(encoding='utf-8')); assert payload['revision'] == '${CLOUD_OFFLOAD_SOURCE_REVISION}'; [(os.chmod(root / item['path'], stat.S_IMODE(item['mode']))) for item in payload['files'] if (root / item['path']).is_file() and not (root / item['path']).is_symlink()]; manifest.unlink()"
+
 # The capability manifest carries the runner's declared runtime identity
 # (platform, python_abi); it must track the source revision being installed,
 # not whatever the pinned base was built from.
 COPY deploy/runtime-profiles/comfyui/runtime-profile.json /opt/cloud-offload/runtime-profile.json
+COPY deploy/runtime-profiles/comfyui/entrypoint.sh /opt/cloud-offload/entrypoint.sh
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps \
     "/opt/cloud-offload/source[cloud]" \
-    && python -c "from cloud_offload.worker import Worker; assert hasattr(Worker, '_initialize_prepared_cache')"
+    && rm -rf /opt/cloud-offload/source/build \
+        /opt/cloud-offload/source/.ruff_cache \
+        /opt/cloud-offload/source/*.egg-info \
+    && python -c "from cloud_offload.worker import Worker; assert hasattr(Worker, '_initialize_prepared_cache')" \
+    && chmod +x /opt/cloud-offload/entrypoint.sh
 
 LABEL org.opencontainers.image.revision="${CLOUD_OFFLOAD_SOURCE_REVISION}"
