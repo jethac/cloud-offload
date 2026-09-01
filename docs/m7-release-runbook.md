@@ -69,6 +69,13 @@ cold and hot runs plus cancellation, provider, storage, corruption, and
 restart failure scenarios, with every scenario bound to exactly the case's
 region via `allowed_regions`.
 
+For the first startup-only paid validation, set the benchmark plan's
+`runner_readiness_timeout_seconds` and `max_runner_readiness_cost_usd` to a
+smaller explicit budget, for example 180 seconds and USD 0.05. These are
+scenario controls. They do not reduce the normal dispatcher's worker startup
+policy. The readiness clock includes preparation and submission time. Provider
+cleanup and config restore are measured separately and remain mandatory.
+
 ### Worked example
 
 ```json
@@ -184,7 +191,8 @@ cloud-offload release status \
 
 `release run` exits zero when it stops for a good reason
 (`release_passed`, `release_already_passed`, `requested_matrix_limit`) and
-non-zero for `matrix_failed`, `total_cost_limit`, or `total_runtime_limit`.
+non-zero for `matrix_failed`, `total_cost_limit`, `total_runtime_limit`, a
+scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
 
 ## The ledger and `.runlogs/`
 
@@ -212,6 +220,75 @@ non-zero for `matrix_failed`, `total_cost_limit`, or `total_runtime_limit`.
   window. Precheck failures (wrong revision, dirty tree, failed contract
   tests, image-digest mismatch) are recorded as failed matrices too, but cost
   $0 because they stop before any provider call.
+- The first failed or interrupted scenario stops before the next scenario can
+  submit a job. An operator interrupt still cancels the current job, verifies
+  provider absence, atomically writes the aborted scorecard, and atomically
+  appends its redacted receipt to the ledger. The ledger's `last_stop_reason`
+  names the exact safe interrupt or limit code.
+- Resource ownership requires one journal identity with the current job ID,
+  lease ID, provider, and exact provider instance ID. Startup facts and cleanup
+  use only that identity. A concurrent managed Pod is not inferred to belong to
+  the campaign and is never terminated by an inventory difference.
+- If a Pod event omits its lease, the harness queries the current job record and
+  accepts the Pod only when the job, lease, provider, and instance all match. If
+  that proof is not available, the Pod is an unknown paid resource: no delete is
+  attempted, the release is blocked, and the campaign cost ceiling is charged.
+- Unknown paid Pods also enter the live readiness cost meter. Provider inventory
+  supplies the rate when available; otherwise the meter uses a nonzero
+  ceiling-derived rate. They can stop a startup validation on cost before its
+  time limit, and are never accounted at zero.
+- Worker readiness needs the exact attributed Pod. A worker with the current
+  lease but a different Pod ID cannot prove a callback or ComfyUI readiness.
+- Cleanup retries are limited by both elapsed time and attempt count. An
+  interrupt at inventory, termination, wait, or final verification causes an
+  aborted receipt. The exact attributed Pod is either proved absent or recorded
+  as an orphan. An orphan or an unavailable final audit charges the conservative
+  total campaign cost ceiling.
+- If an interrupt escapes before the benchmark can retain resource attribution,
+  the release fallback performs a read-only provider audit. It never deletes an
+  unattributed resource. It marks cleanup failed when a managed resource remains
+  and charges the matrix time and cost ceilings as conservative evidence. If a
+  possible orphan remains, it charges the release total time and cost ceilings
+  for possible ongoing spend. Older partial scorecards can never reduce these
+  bounds.
+- A nonzero provider inventory rate overrides a zero journal rate. If a running
+  attributed Pod has no known rate, the harness assigns a nonzero
+  ceiling-derived rate. It never accounts a known running campaign Pod at zero.
+- The production submission driver receives an absolute startup deadline and a
+  cost budget. It checks both after preflight and immediately before the
+  provider-starting POST. A slow preflight therefore cannot start a Pod after a
+  startup-only validation limit has expired.
+- Submission also requires exactly one selected candidate with a finite,
+  positive hourly rate. Its worst-case scenario cost must fit the remaining
+  readiness, scenario, and campaign budgets. Missing, malformed, zero, or
+  unaffordable quotes stop before the provider-starting POST.
+- The free preflight wire carries exactly one workload: `partition` for
+  `/api/partitions`, or `capsule` for `/api/workflows`. It never sends an empty
+  field for the other workload type.
+- Published scorecards use explicit field and finite-value projections. Support
+  bundles keep only their schema, job ID, and approved event facts. Provider
+  detail text, commands, URLs, paths, environment data, and exception messages
+  are not publication fields.
+- Public strings use field-specific rules: finite provider values, strict
+  bounded identifiers, SHA-256 digest syntax, parsed timestamps, and bounded
+  stop codes. URL syntax, paths, whitespace-bearing detail text, email-style
+  values, and AWS access-key forms are rejected even when placed under an
+  otherwise public field name.
+- Request digests preserve the harness's canonical lowercase bare 64-hex form.
+  The public projection also accepts `sha256:<64-hex>` as a normalized input;
+  malformed or non-hex request digests are dropped.
+- Image, profile, test-set, plan, scorecard, and other release digests require
+  the contracted `sha256:<64-hex>` form; only `request_digest` also accepts the
+  canonical bare form.
+- An exception in replay, storage checks, or another post-submit release step
+  uses the same durable scorecard audit as an operator stop. Exact attributed
+  Pods receive bounded cleanup. Unknown ownership or ongoing spend charges the
+  conservative release ceiling; a normal exception cannot publish a zero-cost,
+  zero-duration, no-mutation receipt without proof.
+- Startup evidence separates provider allocation, image pull, container start,
+  runner callback, and ComfyUI readiness. `unknown` means the provider or
+  coordinator did not prove that phase. In particular, RunPod REST v2 does not
+  expose an authoritative image-pull phase.
 - To **resume**, rerun the same `release run` command with the same plan and
   ledger. Passed history is kept; the gate needs 30 *trailing* passes, and
   that trailing window alone must cover every case, profile, and region.

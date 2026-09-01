@@ -12,8 +12,10 @@ import hashlib
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -73,17 +75,28 @@ class BenchmarkLimits:
     poll_seconds: float = 2.0
     cleanup_timeout_seconds: float = 90.0
     fresh_worker_timeout_seconds: float = 120.0
+    runner_readiness_timeout_seconds: float = 300.0
+    max_runner_readiness_cost_usd: float | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "BenchmarkLimits":
+        max_scenario_cost = _bounded_positive(
+            value.get("max_scenario_cost_usd"),
+            "limits.max_scenario_cost_usd",
+        )
+        readiness_cost = _bounded_positive(
+            value.get("max_runner_readiness_cost_usd", max_scenario_cost),
+            "limits.max_runner_readiness_cost_usd",
+        )
+        if readiness_cost > max_scenario_cost:
+            raise ValueError(
+                "runner readiness cost limit cannot exceed scenario cost limit"
+            )
         return cls(
             max_total_cost_usd=_bounded_positive(
                 value.get("max_total_cost_usd"), "limits.max_total_cost_usd"
             ),
-            max_scenario_cost_usd=_bounded_positive(
-                value.get("max_scenario_cost_usd"),
-                "limits.max_scenario_cost_usd",
-            ),
+            max_scenario_cost_usd=max_scenario_cost,
             max_campaign_seconds=_bounded_positive(
                 value.get("max_campaign_seconds"), "limits.max_campaign_seconds"
             ),
@@ -98,6 +111,11 @@ class BenchmarkLimits:
                 value.get("fresh_worker_timeout_seconds", 120),
                 "limits.fresh_worker_timeout_seconds",
             ),
+            runner_readiness_timeout_seconds=_bounded_positive(
+                value.get("runner_readiness_timeout_seconds", 300),
+                "limits.runner_readiness_timeout_seconds",
+            ),
+            max_runner_readiness_cost_usd=readiness_cost,
         )
 
 
@@ -379,6 +397,8 @@ class BenchmarkPlan:
                 "max_scenario_cost_usd": self.limits.max_scenario_cost_usd,
                 "max_campaign_seconds": self.limits.max_campaign_seconds,
                 "fresh_worker_timeout_seconds": self.limits.fresh_worker_timeout_seconds,
+                "runner_readiness_timeout_seconds": self.limits.runner_readiness_timeout_seconds,
+                "max_runner_readiness_cost_usd": self.limits.max_runner_readiness_cost_usd,
             },
             "scenarios": [
                 {
@@ -408,6 +428,8 @@ class InstanceObservation:
     status: str
     managed: bool
     name: str | None = None
+    provider_state: str | None = None
+    container_started: bool | None = None
 
 
 class BenchmarkDriver(Protocol):
@@ -450,6 +472,12 @@ class _ResourceMeter:
     first_seen: float
     last_seen: float
     source: str
+    job_id: str | None = None
+    lease_id: str | None = None
+
+
+class _PreSubmitLimit(Exception):
+    """Internal control flow for a guard that stops before submission."""
 
 
 def _managed_ids(
@@ -544,6 +572,102 @@ def _seconds_from_event_to(
     return None
 
 
+def _initial_startup_phases() -> dict[str, dict[str, Any]]:
+    """Finite startup facts; unknown is explicit when no authority proves a phase."""
+
+    return {
+        "allocation": {"state": "unknown"},
+        # RunPod REST v2 does not expose an authoritative image-pull state.
+        "image_pull": {"state": "unknown"},
+        "container_start": {"state": "unknown"},
+        "runner_callback": {"state": "unknown"},
+        "comfyui_readiness": {"state": "unknown"},
+    }
+
+
+def _safe_provider_state(value: Any) -> str:
+    state = str(value or "UNKNOWN").upper()
+    return state if state in {
+        "PROVISIONING",
+        "STARTING",
+        "RUNNING",
+        "EXITED",
+        "ERROR",
+        "TERMINATED",
+        "UNKNOWN",
+    } else "UNKNOWN"
+
+
+def _observe_startup_phases(
+    phases: dict[str, dict[str, Any]],
+    inventory: dict[str, dict[str, InstanceObservation]],
+    workers: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    identities: dict[tuple[str, str], str] | None = None,
+) -> None:
+    """Merge only provider enums, container telemetry, and worker status facts."""
+
+    allowed = set(identities) if identities is not None else None
+    instances = [
+        instance
+        for provider, provider_instances in inventory.items()
+        for instance in provider_instances.values()
+        if instance.managed
+        and (allowed is None or (provider, instance.id) in allowed)
+    ]
+    if instances:
+        provider_states = sorted(
+            {
+                _safe_provider_state(instance.provider_state or instance.status)
+                for instance in instances
+            }
+        )
+        phases["allocation"] = {
+            "state": "confirmed",
+            "provider_state": provider_states[-1] if len(provider_states) == 1 else "MIXED",
+        }
+        container_states = [instance.container_started for instance in instances]
+        if any(item is True for item in container_states):
+            phases["container_start"] = {"state": "confirmed"}
+        elif container_states and all(item is False for item in container_states):
+            phases["container_start"] = {"state": "not_started"}
+
+    managed_ids = {instance.id for instance in instances}
+    lease_ids = set((identities or {}).values()) or {
+        str((item.get("resources") or {}).get("lease_id") or item.get("lease_id") or "")
+        for item in events
+    } - {""}
+    matching_workers = []
+    for item in workers:
+        provider = str(item.get("provider") or "")
+        worker_id = str(
+            item.get("instance_id") or item.get("pod_id") or item.get("worker_id") or ""
+        )
+        key = (provider, worker_id)
+        worker_lease = str(item.get("lease_id") or "")
+        expected_lease = (identities or {}).get(key)
+        if (
+            key in (identities or {})
+            and bool(worker_lease)
+            and worker_lease == expected_lease
+        ):
+            matching_workers.append(item)
+    if matching_workers:
+        phases["runner_callback"] = {"state": "confirmed"}
+    ready_event = any(
+        str(item.get("type") or "") == "runner_ready"
+        and str((item.get("resources") or {}).get("lease_id") or item.get("lease_id") or "") in lease_ids
+        and str((item.get("resources") or {}).get("worker_instance_id") or (item.get("resources") or {}).get("pod_id") or "") in managed_ids
+        for item in events
+    )
+    if any(str(item.get("status") or "") == "active" for item in matching_workers) or ready_event:
+        phases["comfyui_readiness"] = {"state": "confirmed"}
+
+
+def _runner_is_ready(phases: dict[str, dict[str, Any]]) -> bool:
+    return phases["comfyui_readiness"].get("state") == "confirmed"
+
+
 class BenchmarkRunner:
     def __init__(self, driver: BenchmarkDriver):
         self.driver = driver
@@ -618,33 +742,61 @@ class BenchmarkRunner:
             if result.get("limit_triggered") == "campaign_cost_limit":
                 campaign_abort = "campaign_cost_limit"
                 break
+            if not result.get("passed"):
+                campaign_abort = str(
+                    result.get("abort_reason")
+                    or result.get("limit_triggered")
+                    or "unexpected_scenario_failure"
+                )
+                break
 
-        final_cleanup = (
-            self._cleanup_new_managed(
-                plan.providers,
-                baseline,
-                plan.limits.cleanup_timeout_seconds,
+        campaign_resources = {
+            (str(item["provider"]), str(item["instance_id"])): _ResourceMeter(
+                id=str(item["instance_id"]),
+                provider=str(item["provider"]),
+                hourly_rate=float(item.get("hourly_rate") or 0),
+                first_seen=campaign_started,
+                last_seen=self.driver.monotonic(),
+                source=str(item.get("source") or "journal"),
             )
-            if plan.exclusive
-            else []
+            for result in results
+            for item in result.get("resources") or []
+        }
+        final_cleanup = self._cleanup_resources(
+            plan.providers,
+            baseline,
+            campaign_resources,
+            plan.limits.cleanup_timeout_seconds,
+            include_untracked=False,
         )
+        final_cleanup_interrupt = next(
+            (
+                item.get("cleanup_interrupt")
+                for item in final_cleanup
+                if item.get("cleanup_interrupt")
+            ),
+            None,
+        )
+        if final_cleanup_interrupt:
+            campaign_abort = campaign_abort or (
+                f"operator_interrupt:{final_cleanup_interrupt}"
+            )
         final_audit_error = None
         try:
             final_inventory = self.driver.inventory(plan.providers)
-            orphaned = sorted(_managed_ids(final_inventory) - baseline_managed)
-            if orphaned and plan.exclusive:
-                final_cleanup.extend(
-                    self._cleanup_new_managed(
-                        plan.providers,
-                        baseline,
-                        plan.limits.cleanup_timeout_seconds,
-                    )
-                )
-                final_inventory = self.driver.inventory(plan.providers)
-                orphaned = sorted(_managed_ids(final_inventory) - baseline_managed)
+            orphaned = sorted(set(campaign_resources) & _managed_ids(final_inventory))
+        except (KeyboardInterrupt, SystemExit) as exc:
+            campaign_abort = campaign_abort or f"operator_interrupt:{type(exc).__name__}"
+            final_audit_error = type(exc).__name__
+            orphaned = sorted(campaign_resources)
         except Exception as exc:  # noqa: BLE001 - a missing audit is a failed audit
             final_audit_error = type(exc).__name__
             orphaned = []
+        unknown_paid_resources = [
+            item
+            for result in results
+            for item in result.get("unknown_paid_resources") or []
+        ]
         passed = (
             campaign_abort is None
             and not orphaned
@@ -659,21 +811,41 @@ class BenchmarkRunner:
             "plan": plan.safe_summary(),
             "passed": passed,
             "campaign_abort": campaign_abort,
-            "estimated_compute_cost_upper_usd": round(estimated_total, 6),
+            "estimated_compute_cost_upper_usd": round(
+                (
+                    plan.limits.max_total_cost_usd
+                    if orphaned or unknown_paid_resources or final_audit_error
+                    else estimated_total
+                ),
+                6,
+            ),
             "limits": {
                 "max_total_cost_usd": plan.limits.max_total_cost_usd,
                 "max_scenario_cost_usd": plan.limits.max_scenario_cost_usd,
                 "max_campaign_seconds": plan.limits.max_campaign_seconds,
                 "fresh_worker_timeout_seconds": plan.limits.fresh_worker_timeout_seconds,
+                "runner_readiness_timeout_seconds": plan.limits.runner_readiness_timeout_seconds,
+                "max_runner_readiness_cost_usd": plan.limits.max_runner_readiness_cost_usd,
             },
             "results": results,
             "distributions": self._score_distributions(results),
             "final_cleanup": final_cleanup,
             "final_audit_error": final_audit_error,
+            "cleanup_proof": {
+                "state": (
+                    "confirmed"
+                    if final_audit_error is None
+                    and not orphaned
+                    and not unknown_paid_resources
+                    else "failed"
+                ),
+                "verified_remaining_count": len(orphaned),
+                "unknown_paid_resource_count": len(unknown_paid_resources),
+            },
             "orphaned_resources": [
                 {"provider": provider, "instance_id": instance}
                 for provider, instance in orphaned
-            ],
+            ] + unknown_paid_resources,
         }
         return scorecard
 
@@ -744,10 +916,12 @@ class BenchmarkRunner:
     ) -> dict[str, Any]:
         started_at = _utc_now()
         started = self.driver.monotonic()
-        scenario_baseline = self.driver.inventory(plan.providers)
+        self.driver.inventory(plan.providers)
         events: list[dict[str, Any]] = []
         cursor = 0
         resources: dict[tuple[str, str], _ResourceMeter] = {}
+        identities: dict[tuple[str, str], str] = {}
+        unverified_resources: dict[tuple[str, str], dict[str, Any]] = {}
         last_provider = plan.providers[0]
         last_rate = 0.0
         job_id: str | None = None
@@ -762,6 +936,9 @@ class BenchmarkRunner:
         restoration: dict[str, Any] | None = None
         failure_preparation: dict[str, Any] | None = None
         failure_cleanup: dict[str, Any] | None = None
+        abort_reason: str | None = None
+        interrupt_cancellation: dict[str, Any] | None = None
+        startup_phases = _initial_startup_phases()
 
         try:
             preparation = self.driver.prepare_scenario(scenario)
@@ -777,6 +954,26 @@ class BenchmarkRunner:
                 )
                 if failure_preparation.get("exit_code") != 0:
                     raise RuntimeError("Pre-submit failure hook did not succeed")
+            # Preparation and reviewed hooks are part of runner-readiness time.
+            # Check again at the last point before any provider mutation.
+            if (
+                self.driver.monotonic() - started
+                >= plan.limits.runner_readiness_timeout_seconds
+            ):
+                limit_triggered = "runner_readiness_timeout"
+                raise _PreSubmitLimit
+            guard = getattr(self.driver, "configure_submission_guard", None)
+            if callable(guard):
+                guard(
+                    absolute_deadline=(
+                        started + plan.limits.runner_readiness_timeout_seconds
+                    ),
+                    max_cost_usd=min(
+                        plan.limits.max_scenario_cost_usd,
+                        float(plan.limits.max_runner_readiness_cost_usd or 0),
+                        max(0.0, plan.limits.max_total_cost_usd - cost_before),
+                    ),
+                )
             job_id = self.driver.submit(scenario)
             receipt_reader = getattr(self.driver, "submission_receipt", None)
             if callable(receipt_reader):
@@ -798,8 +995,70 @@ class BenchmarkRunner:
                     instance_id = event_resources.get(
                         "worker_instance_id"
                     ) or event_resources.get("pod_id")
-                    if instance_id:
+                    lease_id = str(
+                        event_resources.get("lease_id")
+                        or item.get("lease_id")
+                        or ""
+                    )
+                    key = (provider, str(instance_id)) if instance_id else None
+                    if key is not None and key in resources and not lease_id:
+                        # An incomplete later event cannot demote an identity
+                        # that this job already proved.
+                        meter = resources[key]
+                        meter.last_seen = now
+                        meter.hourly_rate = max(meter.hourly_rate, last_rate)
+                        unverified_resources.pop(key, None)
+                        continue
+                    if instance_id and not lease_id:
                         key = (provider, str(instance_id))
+                        unverified_resources[key] = {
+                            "provider": provider,
+                            "instance_id": str(instance_id),
+                            "hourly_rate": max(
+                                float(
+                                    unverified_resources.get(key, {}).get(
+                                        "hourly_rate", 0
+                                    )
+                                ),
+                                last_rate,
+                            ),
+                            "ownership_state": "unknown",
+                            "provider_absent": False,
+                            "termination_attempts": 0,
+                            "first_seen": unverified_resources.get(key, {}).get(
+                                "first_seen", now
+                            ),
+                        }
+                        resolver = getattr(
+                            self.driver, "resolve_resource_identity", None
+                        )
+                        try:
+                            proof = (
+                                resolver(job_id, provider, str(instance_id))
+                                if callable(resolver)
+                                else None
+                            )
+                        except Exception:  # failed proof remains unknown and paid
+                            proof = None
+                        if (
+                            isinstance(proof, dict)
+                            and str(proof.get("job_id") or "") == job_id
+                            and str(proof.get("provider") or "") == provider
+                            and str(proof.get("instance_id") or "")
+                            == str(instance_id)
+                            and str(proof.get("lease_id") or "")
+                        ):
+                            lease_id = str(proof["lease_id"])
+                    if instance_id and lease_id:
+                        key = (provider, str(instance_id))
+                        if (
+                            key in identities and identities[key] != lease_id
+                        ) or (
+                            lease_id in identities.values() and key not in identities
+                        ):
+                            continue
+                        identities[key] = lease_id
+                        unverified_resources.pop(key, None)
                         meter = resources.get(key)
                         if meter is None:
                             resources[key] = _ResourceMeter(
@@ -809,31 +1068,109 @@ class BenchmarkRunner:
                                 first_seen=started,
                                 last_seen=now,
                                 source="journal",
+                                job_id=job_id,
+                                lease_id=lease_id,
                             )
                         else:
                             meter.last_seen = now
                             meter.hourly_rate = max(meter.hourly_rate, last_rate)
+                    elif instance_id:
+                        key = (provider, str(instance_id))
+                        unverified_resources[key] = {
+                            "provider": provider,
+                            "instance_id": str(instance_id),
+                            "hourly_rate": max(
+                                float(
+                                    unverified_resources.get(key, {}).get(
+                                        "hourly_rate", 0
+                                    )
+                                ),
+                                last_rate,
+                            ),
+                            "ownership_state": "unknown",
+                            "provider_absent": False,
+                            "termination_attempts": 0,
+                            "first_seen": unverified_resources.get(key, {}).get(
+                                "first_seen", now
+                            ),
+                        }
 
+                current_inventory = (
+                    self.driver.inventory(plan.providers)
+                    if plan.exclusive
+                    else {provider: {} for provider in plan.providers}
+                )
                 if plan.exclusive:
-                    current_inventory = self.driver.inventory(plan.providers)
-                    scenario_new = _managed_ids(current_inventory) - _managed_ids(
-                        scenario_baseline
-                    )
-                    for provider, instance_id in scenario_new:
-                        observation = current_inventory[provider][instance_id]
-                        key = (provider, instance_id)
-                        if key not in resources:
-                            resources[key] = _ResourceMeter(
-                                id=instance_id,
-                                provider=provider,
-                                hourly_rate=max(last_rate, observation.hourly_rate),
-                                first_seen=started,
-                                last_seen=now,
-                                source="provider_inventory",
+                    for key, meter in resources.items():
+                        observation = current_inventory.get(key[0], {}).get(key[1])
+                        if observation is not None:
+                            meter.last_seen = now
+                            # Provider inventory is authoritative for a known
+                            # running Pod. It must override a zero journal rate.
+                            meter.hourly_rate = max(
+                                meter.hourly_rate, observation.hourly_rate
                             )
+                            if (
+                                meter.hourly_rate <= 0
+                                and str(observation.status).lower()
+                                in {"running", "starting", "provisioning"}
+                            ):
+                                # A known paid resource with an unknown rate is
+                                # charged at a ceiling-derived rate. Zero is not
+                                # a safe estimate for a running provider Pod.
+                                meter.hourly_rate = (
+                                    min(
+                                        plan.limits.max_scenario_cost_usd,
+                                        float(
+                                            plan.limits.max_runner_readiness_cost_usd
+                                            or plan.limits.max_scenario_cost_usd
+                                        ),
+                                    )
+                                    * 3600
+                                    / max(plan.limits.poll_seconds, 0.001)
+                                )
+                                meter.source = "provider_inventory_conservative"
+                    for key, unknown in unverified_resources.items():
+                        observation = current_inventory.get(key[0], {}).get(key[1])
+                        if observation is not None:
+                            unknown["hourly_rate"] = max(
+                                float(unknown.get("hourly_rate") or 0),
+                                observation.hourly_rate,
+                            )
+                            if (
+                                float(unknown.get("hourly_rate") or 0) <= 0
+                                and str(observation.status).lower()
+                                in {"running", "starting", "provisioning"}
+                            ):
+                                unknown["hourly_rate"] = (
+                                    float(
+                                        plan.limits.max_runner_readiness_cost_usd
+                                        or plan.limits.max_scenario_cost_usd
+                                    )
+                                    * 3600
+                                    / max(plan.limits.poll_seconds, 0.001)
+                                )
+
+                try:
+                    current_workers = self.driver.active_workers(plan.providers)
+                except Exception:  # noqa: BLE001 - unavailable facts stay unknown
+                    current_workers = []
+                _observe_startup_phases(
+                    startup_phases,
+                    current_inventory,
+                    current_workers,
+                    events,
+                    identities,
+                )
 
                 estimated = self._estimated_cost(resources, now)
-                if not resources and last_rate:
+                estimated += sum(
+                    max(0.0, now - float(item.get("first_seen") or started))
+                    * float(item.get("hourly_rate") or 0)
+                    / 3600
+                    for item in unverified_resources.values()
+                )
+                if not resources and not unverified_resources and last_rate:
                     estimated = last_rate * elapsed / 3600
                 if estimated >= plan.limits.max_scenario_cost_usd:
                     limit_triggered = "scenario_cost_limit"
@@ -841,6 +1178,21 @@ class BenchmarkRunner:
                     break
                 if cost_before + estimated >= plan.limits.max_total_cost_usd:
                     limit_triggered = "campaign_cost_limit"
+                    self.driver.cancel(job_id)
+                    break
+                if (
+                    not _runner_is_ready(startup_phases)
+                    and estimated
+                    >= float(plan.limits.max_runner_readiness_cost_usd or 0)
+                ):
+                    limit_triggered = "runner_readiness_cost_limit"
+                    self.driver.cancel(job_id)
+                    break
+                if (
+                    not _runner_is_ready(startup_phases)
+                    and elapsed >= plan.limits.runner_readiness_timeout_seconds
+                ):
+                    limit_triggered = "runner_readiness_timeout"
                     self.driver.cancel(job_id)
                     break
                 if now - campaign_started >= plan.limits.max_campaign_seconds:
@@ -867,20 +1219,40 @@ class BenchmarkRunner:
                 if status in TERMINAL_STATUSES:
                     break
                 self.driver.sleep(plan.limits.poll_seconds)
+        except _PreSubmitLimit:
+            pass
         except (KeyboardInterrupt, SystemExit) as exc:
             # Paid resource cleanup and config restoration still run before the
-            # operator interrupt is allowed to escape.
+            # aborted scorecard and release ledger are published.
             fatal_error = exc
+            abort_reason = f"operator_interrupt:{type(exc).__name__}"
+            if job_id:
+                try:
+                    response = self.driver.cancel(job_id)
+                    interrupt_cancellation = {
+                        "accepted": bool(response.get("accepted")),
+                        "status_code": response.get("status_code"),
+                    }
+                except Exception as cancel_exc:  # noqa: BLE001
+                    interrupt_cancellation = {
+                        "accepted": False,
+                        "error_type": type(cancel_exc).__name__,
+                    }
         except Exception as exc:  # noqa: BLE001 - preserve cleanup on harness faults
-            harness_error = f"{type(exc).__name__}: {exc}"
+            harness_error = type(exc).__name__
         finally:
             if job_id:
                 try:
-                    support_bundle = self.driver.support_bundle(job_id)
+                    support_bundle = _project_support_bundle(
+                        self.driver.support_bundle(job_id)
+                    )
+                except (KeyboardInterrupt, SystemExit) as exc:
+                    fatal_error = fatal_error or exc
+                    abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
                 except Exception as exc:  # noqa: BLE001
                     support_bundle = {
                         "schema": "cloud-offload.support-bundle-error.v1",
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "error": type(exc).__name__,
                     }
 
         if scenario.failure and scenario.failure.before_submit and failure_preparation:
@@ -894,6 +1266,16 @@ class BenchmarkRunner:
                         resources=resources,
                     ),
                 )
+            except (KeyboardInterrupt, SystemExit) as exc:
+                fatal_error = fatal_error or exc
+                abort_reason = abort_reason or (
+                    f"operator_interrupt:{type(exc).__name__}"
+                )
+                failure_cleanup = {
+                    "exit_code": None,
+                    "error_type": type(exc).__name__,
+                    "output_omitted": True,
+                }
             except Exception as exc:  # noqa: BLE001 - cleanup must remain visible
                 failure_cleanup = {
                     "exit_code": None,
@@ -908,29 +1290,77 @@ class BenchmarkRunner:
                 }
             failure_result["cleanup_hook"] = failure_cleanup
 
-        cleanup_started = self.driver.monotonic()
+        # Capture the last provider and worker facts before deletion. A failed
+        # read leaves an explicit unknown value and cannot block cleanup.
+        try:
+            final_startup_inventory = self.driver.inventory(plan.providers)
+            try:
+                final_startup_workers = self.driver.active_workers(plan.providers)
+            except Exception:  # noqa: BLE001
+                final_startup_workers = []
+            _observe_startup_phases(
+                startup_phases,
+                final_startup_inventory,
+                final_startup_workers,
+                events,
+                identities,
+            )
+        except (KeyboardInterrupt, SystemExit) as exc:
+            fatal_error = fatal_error or exc
+            abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            active_completed = self.driver.monotonic()
+        except (KeyboardInterrupt, SystemExit) as exc:
+            fatal_error = fatal_error or exc
+            abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
+            active_completed = started
+        cleanup_started = active_completed
         cleanup = self._cleanup_resources(
             plan.providers,
             campaign_baseline,
             resources,
             plan.limits.cleanup_timeout_seconds,
-            include_untracked=plan.exclusive,
+            include_untracked=False,
         )
+        cleanup_interrupt = next(
+            (item.get("cleanup_interrupt") for item in cleanup if item.get("cleanup_interrupt")),
+            None,
+        )
+        if cleanup_interrupt:
+            abort_reason = abort_reason or f"operator_interrupt:{cleanup_interrupt}"
         try:
             restoration = self.driver.restore_scenario(scenario)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
+            restoration = {"required": True, "restored": False, "error_type": type(exc).__name__}
         except Exception as exc:  # noqa: BLE001 - report without leaking config
             restoration = {
                 "required": scenario.prepared_storage_policy is not None,
                 "restored": False,
                 "error_type": type(exc).__name__,
             }
-        completed = self.driver.monotonic()
+        try:
+            completed = self.driver.monotonic()
+        except (KeyboardInterrupt, SystemExit) as exc:
+            fatal_error = fatal_error or exc
+            abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
+            completed = active_completed
         cleanup_duration = max(0.0, completed - cleanup_started)
         estimated_cost = self._estimated_cost(resources, completed)
+        estimated_cost += sum(
+            max(0.0, completed - float(item.get("first_seen") or started))
+            * float(item.get("hourly_rate") or 0)
+            / 3600
+            for item in unverified_resources.values()
+        )
         orphaned_resources = [
             item for item in cleanup if not item.get("provider_absent")
-        ]
-        if job_id and status not in TERMINAL_STATUSES:
+        ] + list(unverified_resources.values())
+        if orphaned_resources:
+            estimated_cost = max(estimated_cost, plan.limits.max_scenario_cost_usd)
+        if fatal_error is None and job_id and status not in TERMINAL_STATUSES:
             try:
                 status = str(self.driver.snapshot(job_id).get("status") or status or "")
             except Exception:  # noqa: BLE001
@@ -941,7 +1371,9 @@ class BenchmarkRunner:
         )
         failure_succeeded = self._failure_injection_succeeded(failure_result)
         passed = (
-            harness_error is None
+            fatal_error is None
+            and abort_reason is None
+            and harness_error is None
             and limit_triggered is None
             and status in scenario.expected_statuses
             and not orphaned_resources
@@ -950,8 +1382,6 @@ class BenchmarkRunner:
             and (not failure_expected or (failure_triggered and failure_succeeded))
             and (not scenario.fresh_instance or bool(resources))
         )
-        if fatal_error is not None:
-            raise fatal_error
         completed_at = _utc_now()
         return {
             "schema": SCENARIO_SCHEMA,
@@ -961,6 +1391,9 @@ class BenchmarkRunner:
             "started_at": started_at,
             "completed_at": completed_at,
             "duration_seconds": round(max(0.0, completed - started), 6),
+            "scenario_active_seconds": round(
+                max(0.0, active_completed - started), 6
+            ),
             "resource_closure_seconds": round(cleanup_duration, 6),
             "cancellation_to_provider_absence_seconds": _seconds_from_event_to(
                 events, "cancellation_requested", completed_at
@@ -987,6 +1420,7 @@ class BenchmarkRunner:
                     "instance_id": meter.id,
                     "hourly_rate": meter.hourly_rate,
                     "source": meter.source,
+                    "lease_id": meter.lease_id,
                 }
                 for meter in sorted(
                     resources.values(), key=lambda item: (item.provider, item.id)
@@ -995,8 +1429,12 @@ class BenchmarkRunner:
             "failure_injection": failure_result,
             "limit_triggered": limit_triggered,
             "harness_error": harness_error,
+            "abort_reason": abort_reason,
+            "interrupt_cancellation": interrupt_cancellation,
+            "startup_phases": startup_phases,
             "cleanup": cleanup,
             "orphaned_resources": orphaned_resources,
+            "unknown_paid_resources": list(unverified_resources.values()),
             "support_bundle": support_bundle,
             "submission_receipt": submission_receipt,
         }
@@ -1154,8 +1592,22 @@ class BenchmarkRunner:
         include_untracked: bool = True,
     ) -> list[dict[str, Any]]:
         inventory_error = None
+        cleanup_interrupt: str | None = None
+        last_clock = 0.0
+
+        def cleanup_now() -> float:
+            nonlocal cleanup_interrupt, last_clock
+            try:
+                last_clock = max(last_clock, float(self.driver.monotonic()))
+            except (KeyboardInterrupt, SystemExit) as exc:
+                cleanup_interrupt = cleanup_interrupt or type(exc).__name__
+            return last_clock
         try:
             current = self.driver.inventory(providers)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            current = {provider: {} for provider in providers}
+            inventory_error = type(exc).__name__
+            cleanup_interrupt = type(exc).__name__
         except Exception as exc:  # noqa: BLE001
             current = {provider: {} for provider in providers}
             inventory_error = type(exc).__name__
@@ -1173,11 +1625,23 @@ class BenchmarkRunner:
             for key in candidates
             if key not in baseline_ids
         }
-        deadline = self.driver.monotonic() + timeout_seconds
-        while receipts and self.driver.monotonic() <= deadline:
+        deadline = cleanup_now() + timeout_seconds
+        # The attempt bound remains effective even when an interrupt prevents
+        # the injected clock/sleep function from advancing.
+        attempts_remaining = max(2, math.ceil(timeout_seconds) + 2)
+        while (
+            receipts
+            and attempts_remaining > 0
+            and cleanup_now() <= deadline
+        ):
+            attempts_remaining -= 1
             try:
                 inventory = self.driver.inventory(providers)
                 inventory_error = None
+            except (KeyboardInterrupt, SystemExit) as exc:
+                inventory = {provider: {} for provider in providers}
+                inventory_error = type(exc).__name__
+                cleanup_interrupt = cleanup_interrupt or type(exc).__name__
             except Exception as exc:  # noqa: BLE001
                 inventory = {provider: {} for provider in providers}
                 inventory_error = type(exc).__name__
@@ -1190,15 +1654,30 @@ class BenchmarkRunner:
                 receipt["termination_attempts"] += 1
                 try:
                     receipt["termination_requested"] = self.driver.terminate(*key)
+                except (KeyboardInterrupt, SystemExit) as exc:
+                    receipt["termination_requested"] = False
+                    receipt["termination_error"] = type(exc).__name__
+                    cleanup_interrupt = cleanup_interrupt or type(exc).__name__
                 except Exception as exc:  # noqa: BLE001
                     receipt["termination_requested"] = False
                     receipt["termination_error"] = type(exc).__name__
             if not pending:
                 break
-            self.driver.sleep(min(2.0, timeout_seconds))
+            try:
+                self.driver.sleep(min(2.0, timeout_seconds))
+            except (KeyboardInterrupt, SystemExit) as exc:
+                cleanup_interrupt = cleanup_interrupt or type(exc).__name__
         try:
             inventory = self.driver.inventory(providers)
             inventory_error = None
+        except (KeyboardInterrupt, SystemExit) as exc:
+            cleanup_interrupt = cleanup_interrupt or type(exc).__name__
+            try:
+                inventory = self.driver.inventory(providers)
+                inventory_error = None
+            except BaseException as retry_exc:  # final bounded proof attempt
+                inventory = {provider: {} for provider in providers}
+                inventory_error = type(retry_exc).__name__
         except Exception as exc:  # noqa: BLE001
             inventory = {provider: {} for provider in providers}
             inventory_error = type(exc).__name__
@@ -1208,6 +1687,8 @@ class BenchmarkRunner:
             ] not in inventory.get(key[0], {})
             if inventory_error:
                 receipt["inventory_error"] = inventory_error
+            if cleanup_interrupt:
+                receipt["cleanup_interrupt"] = cleanup_interrupt
         return [receipts[key] for key in sorted(receipts)]
 
     def _cleanup_new_managed(
@@ -1281,6 +1762,14 @@ class CoordinatorBenchmarkDriver:
         self.allow_hooks = allow_hooks
         self._prepared_storage_restore: dict[str, dict[str, dict[str, Any]]] = {}
         self._submission_receipts: dict[str, dict[str, Any]] = {}
+        self._submission_deadline: float | None = None
+        self._submission_cost_budget: float | None = None
+
+    def configure_submission_guard(
+        self, *, absolute_deadline: float, max_cost_usd: float
+    ) -> None:
+        self._submission_deadline = float(absolute_deadline)
+        self._submission_cost_budget = max(0.0, float(max_cost_usd))
 
     def _request(
         self,
@@ -1341,6 +1830,14 @@ class CoordinatorBenchmarkDriver:
                         MANAGED_INSTANCE_PREFIX
                     ),
                     name=instance.metadata.get("name"),
+                    provider_state=str(
+                        instance.metadata.get("provider_state")
+                        or instance.status
+                        or "unknown"
+                    ).upper(),
+                    container_started=self.connectors[provider].container_started(
+                        instance
+                    ),
                 )
                 for instance in instances
             }
@@ -1458,12 +1955,18 @@ class CoordinatorBenchmarkDriver:
         # terminated. Retry a not-ready preflight while it reports no blockers,
         # since only current-offer availability can change on its own.
         deadline = time.monotonic() + PREFLIGHT_OFFER_RETRY_SECONDS
+        workload_key = (
+            "capsule" if scenario.endpoint == "/api/workflows" else "partition"
+        )
+        workload = request_payload.get(workload_key)
+        if not isinstance(workload, dict) or not workload:
+            raise RuntimeError(f"benchmark_{workload_key}_missing")
         while True:
             preflight_response = self._request(
                 "POST",
                 "/api/preflight",
                 json={
-                    "partition": request_payload.get("partition") or {},
+                    workload_key: workload,
                     "input_artifacts": request_payload.get("input_artifacts") or {},
                     "provider": request_payload.get("provider") or "auto",
                     "recommendation_policy": "balanced",
@@ -1492,21 +1995,45 @@ class CoordinatorBenchmarkDriver:
         # Submission is not transport-idempotent yet, so it is deliberately not
         # retried after an ambiguous connection failure.
         request_payload = dict(scenario.request)
-        if scenario.endpoint == "/api/partitions":
-            preflight = self._ready_preflight(scenario, request_payload)
-            candidate_id = (preflight.get("recommendation") or {}).get(
-                "candidate_id"
-            )
-            if not candidate_id:
-                raise RuntimeError("Benchmark preflight returned no recommendation")
-            request_payload.update(
-                {
-                    "preflight_id": preflight["preflight_id"],
-                    "manifest_digest": preflight["manifest_digest"],
-                    "candidate_id": candidate_id,
-                    "confirmation_action": "start_now",
-                }
-            )
+        if scenario.endpoint not in SUBMISSION_ENDPOINTS:
+            raise RuntimeError("unsupported_paid_submission_endpoint")
+        preflight = self._ready_preflight(scenario, request_payload)
+        candidate_id = (preflight.get("recommendation") or {}).get("candidate_id")
+        if not candidate_id:
+            raise RuntimeError("Benchmark preflight returned no recommendation")
+        request_payload.update(
+            {
+                "preflight_id": preflight["preflight_id"],
+                "manifest_digest": preflight["manifest_digest"],
+                "candidate_id": candidate_id,
+                "confirmation_action": "start_now",
+            }
+        )
+        # This is the final local instruction before the provider-starting
+        # coordinator POST. A long preflight cannot bypass the campaign guard.
+        if (
+            self._submission_deadline is not None
+            and time.monotonic() >= self._submission_deadline
+        ):
+            raise TimeoutError("runner_readiness_deadline")
+        if self._submission_cost_budget is None or self._submission_cost_budget <= 0:
+            raise RuntimeError("runner_readiness_cost_budget")
+        selected = [
+            item
+            for item in preflight.get("candidates") or []
+            if str(item.get("candidate_id") or "") == str(candidate_id)
+        ]
+        if len(selected) != 1:
+            raise RuntimeError("runner_readiness_quote_unproved")
+        try:
+            hourly_rate = float(selected[0].get("hourly_rate"))
+        except (TypeError, ValueError):
+            raise RuntimeError("runner_readiness_quote_unproved") from None
+        if not math.isfinite(hourly_rate) or hourly_rate <= 0:
+            raise RuntimeError("runner_readiness_quote_unproved")
+        quoted_cost = hourly_rate * scenario.timeout_seconds / 3600
+        if quoted_cost > self._submission_cost_budget:
+            raise RuntimeError("runner_readiness_cost_budget")
         response = self._request(
             "POST",
             scenario.endpoint,
@@ -1564,6 +2091,39 @@ class CoordinatorBenchmarkDriver:
                 submission_receipt["expected_model"] = expected_model
             self._submission_receipts[job_id] = submission_receipt
         return job_id
+
+    def resolve_resource_identity(
+        self, job_id: str, provider: str, instance_id: str
+    ) -> dict[str, str] | None:
+        """Prove the current job, lease, provider, and Pod as one identity."""
+
+        response = self._request(
+            "GET", f"/api/jobs/{job_id}", retry_safe=True, timeout=30
+        )
+        response.raise_for_status()
+        job = response.json()
+        params = job.get("params") or {}
+        lease_id = str(params.get("lease_id") or "")
+        expected_instance = str(
+            params.get("worker_instance_id")
+            or params.get("pod_id")
+            or job.get("worker_id")
+            or ""
+        )
+        expected_provider = str(params.get("provider") or provider)
+        if (
+            str(job.get("id") or job_id) != job_id
+            or not lease_id
+            or expected_provider != provider
+            or expected_instance != instance_id
+        ):
+            return None
+        return {
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "provider": provider,
+            "instance_id": instance_id,
+        }
 
     def submission_receipt(self, job_id: str) -> dict[str, Any] | None:
         receipt = self._submission_receipts.get(job_id)
@@ -1752,12 +2312,155 @@ class CoordinatorBenchmarkDriver:
         }
 
 
+_PUBLIC_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_PUBLIC_DIGEST = re.compile(r"(?:sha256:)?[0-9a-f]{64}\Z")
+_PUBLIC_CODE = re.compile(
+    r"[A-Za-z][A-Za-z0-9_.-]{0,63}(?::[A-Za-z][A-Za-z0-9_.-]{0,63})?\Z"
+)
+_PROVIDER_VALUES = {"runpod", "vast"}
+_SUPPORT_EVENT_TYPES = {
+    "allocation_started", "provider_request_completed", "runner_starting",
+    "runner_ready", "job_status_changed", "executed", "cancellation_requested",
+    "lease_revoked", "cache_artifact_quarantined", "cache_mount_ready",
+}
+_SEMANTIC_VALUES = {
+    "status": {
+        "queued", "running", "completed", "failed", "dead_letter", "starting",
+        "provisioning", "exited", "error", "terminated", "unknown", "active",
+    },
+    "state": {"unknown", "confirmed", "failed", "not_started"},
+    "source": {
+        "journal", "provider_inventory", "provider_inventory_conservative",
+        "release_fallback",
+    },
+    "type": _SUPPORT_EVENT_TYPES | {
+        "provisioning_started", "executed", "lease_acquired", "preparation_started",
+        "preparation_completed",
+    },
+    "phase": {
+        "provisioning", "worker_boot", "execution", "result_transfer", "closure",
+        "preparation", "cancellation", "storage", "unknown",
+    },
+    "kind": FAILURE_KINDS,
+    "cache_state": CACHE_STATES,
+    "provider_state": {
+        "PROVISIONING", "STARTING", "RUNNING", "EXITED", "ERROR", "TERMINATED",
+        "UNKNOWN",
+    },
+}
+_DIGEST_KEYS = {
+    "image_digest", "profile_fingerprint", "test_set_digest",
+    "benchmark_plan_digest", "benchmark_scorecard_digest",
+}
+_TIME_KEYS = {"started_at", "completed_at", "observed_at", "created_at"}
+_CODE_KEYS = {
+    "abort_reason", "campaign_abort", "limit_triggered", "harness_error", "error",
+    "error_type", "inventory_error", "cleanup_interrupt", "matrix_stop_reason",
+    "failure_codes",
+}
+_IDENTIFIER_KEYS = {
+    "name", "instance_id", "lease_id", "job_id", "requested_policy",
+    "previous_policy", "restored_policy", "profile", "region", "manifest_id", "volume_id",
+    "datacenter_id", "duration_basis", "ownership_state", "failure_kind",
+    "preflight_status", "expected_model", "expected_statuses", "allowed_regions",
+    "missing_canaries", "canaries",
+}
+_DROP = object()
+
+
+def _project_support_bundle(value: Any) -> dict[str, Any] | None:
+    """Project support data to a small, explicit evidence schema."""
+
+    if not isinstance(value, dict) or value.get("schema") != "cloud-offload.support-bundle.v1":
+        return None
+    projected: dict[str, Any] = {"schema": "cloud-offload.support-bundle.v1"}
+    job = value.get("job") or {}
+    job_id = str(job.get("id") or "") if isinstance(job, dict) else ""
+    if _PUBLIC_IDENTIFIER.fullmatch(job_id):
+        projected["job"] = {"id": job_id}
+    events = []
+    for item in value.get("events") or []:
+        if not isinstance(item, dict):
+            continue
+        event_type = str(item.get("type") or "")
+        if event_type not in _SUPPORT_EVENT_TYPES:
+            continue
+        event = {"type": event_type}
+        if isinstance(item.get("sequence"), int):
+            event["sequence"] = item["sequence"]
+        phase = str(item.get("phase") or "")
+        if phase and _PUBLIC_IDENTIFIER.fullmatch(phase):
+            event["phase"] = phase
+        events.append(event)
+    projected["events"] = events
+    return projected
+
+
+def _sanitize_public_evidence(value: Any, key: str | None = None) -> Any:
+    """Apply an explicit scalar allowlist to the published scorecard schema."""
+    if isinstance(value, dict):
+        projected = {}
+        for child_key, item in value.items():
+            child_key = str(child_key)
+            child = _sanitize_public_evidence(item, child_key)
+            if child is not _DROP:
+                projected[child_key] = child
+        return projected
+    if isinstance(value, list):
+        return [
+            item
+            for child in value
+            if (item := _sanitize_public_evidence(child, key)) is not _DROP
+        ]
+    if isinstance(value, tuple):
+        return _sanitize_public_evidence(list(value), key)
+    if isinstance(value, str):
+        if re.fullmatch(r"(?:AKIA|ASIA)[0-9A-Z]{16}", value):
+            return _DROP
+        if key == "provider" or key == "providers":
+            return value if value in _PROVIDER_VALUES else _DROP
+        if key in _SEMANTIC_VALUES:
+            return value if value in _SEMANTIC_VALUES[key] else _DROP
+        if key == "schema":
+            return value if re.fullmatch(r"cloud-offload\.[a-z0-9.-]+\.v[0-9]+", value) else _DROP
+        if key in _DIGEST_KEYS:
+            return (
+                value
+                if value.startswith("sha256:") and _PUBLIC_DIGEST.fullmatch(value)
+                else _DROP
+            )
+        if key == "request_digest":
+            return value if _PUBLIC_DIGEST.fullmatch(value) else _DROP
+        if key in _TIME_KEYS:
+            return value if _parse_timestamp(value) is not None else _DROP
+        if key in _CODE_KEYS:
+            return value if _PUBLIC_CODE.fullmatch(value) else _DROP
+        if key in _IDENTIFIER_KEYS and _PUBLIC_IDENTIFIER.fullmatch(value):
+            return value
+        return _DROP
+    return value
+
+
 def write_scorecard(path: str | Path, scorecard: dict[str, Any]) -> Path:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(scorecard, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=destination.name + ".", suffix=".tmp"
     )
-    os.replace(temporary, destination)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                _sanitize_public_evidence(scorecard),
+                handle,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination

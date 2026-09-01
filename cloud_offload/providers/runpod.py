@@ -582,6 +582,7 @@ class RunPodConnector(CloudConnector):
         }
 
     def _parse_instance(self, data: dict) -> Instance:
+        provider_state = str(data.get("status", "")).upper()
         status = {
             "PROVISIONING": "pending",
             "STARTING": "pending",
@@ -591,7 +592,7 @@ class RunPodConnector(CloudConnector):
             # reported like a stopped one to make the dispatcher reclaim it.
             "ERROR": "stopped",
             "TERMINATED": "terminated",
-        }.get(str(data.get("status", "")).upper(), "unknown")
+        }.get(provider_state, "unknown")
 
         gpu = data.get("gpu") or {}
         ip_address, ssh_port = self._ssh_endpoint(data)
@@ -624,6 +625,7 @@ class RunPodConnector(CloudConnector):
                 "image": data.get("image"),
                 "location": data.get("dataCenterId"),
                 "container_uptime_seconds": container_uptime,
+                "provider_state": provider_state or "UNKNOWN",
             },
         )
 

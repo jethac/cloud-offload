@@ -1862,13 +1862,28 @@ def test_a_paid_starting_pod_emits_elapsed_feedback_before_registration(tmp_path
     )
     dispatcher = long_idle_dispatcher(config, queue)
     dispatcher.launched_at["pod-1"] = utc_now() - timedelta(seconds=35)
+    dispatcher.active_instances["pod-1"].metadata = {
+        "provider_state": "RUNNING https://private.invalid/token"
+    }
 
     dispatcher._check_unregistered_workers()
 
-    event = queue.list_events(job.id)[-1]["event"]
+    events = [item["event"] for item in queue.list_events(job.id)]
+    diagnostic = next(
+        item for item in events if item["type"] == "provider_startup_observation"
+    )
+    assert diagnostic["startup_phases"] == {
+        "allocation": {"state": "confirmed", "provider_state": "UNKNOWN"},
+        "image_pull": {"state": "unknown"},
+        "container_start": {"state": "unknown"},
+        "runner_callback": {"state": "unknown"},
+        "comfyui_readiness": {"state": "unknown"},
+    }
+    event = events[-1]
     assert event["type"] == "runner_starting_progress"
     assert 34 <= event["elapsed_seconds"] <= 36
-    assert "pulling the pinned image" in event["message"]
+    assert event["message"] == "Waiting for runner callback and ComfyUI readiness"
+    assert "private" not in json.dumps(events).lower()
     assert "pod-1" in dispatcher.active_instances
 
 
