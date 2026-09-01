@@ -495,8 +495,9 @@ def test_provider_rate_overrides_zero_journal_rate_before_readiness_cost_guard()
         {
             "provider": "runpod",
             "instance_id": "pod-rate",
-            "hourly_rate": 3600,
-            "source": "journal",
+                "hourly_rate": 3600,
+                "source": "journal",
+                "lease_id": "lease-rate",
         }
     ]
     assert driver.cancelled == {"job-1"}
@@ -530,6 +531,57 @@ def test_known_running_pod_never_keeps_a_zero_cost_rate():
     assert result["resources"][0]["source"] == "provider_inventory_conservative"
 
 
+@pytest.mark.parametrize("ownership_proved", [True, False, "lookup_error"])
+def test_missing_event_lease_is_resolved_authoritatively_or_charged_as_unknown(ownership_proved):
+    class LeaseResolverDriver(FakeDriver):
+        def resolve_resource_identity(self, job_id, provider, instance_id):
+            if ownership_proved == "lookup_error":
+                raise ConnectionError("unsafe provider details")
+            if ownership_proved is True:
+                return {"job_id": job_id, "provider": provider,
+                        "instance_id": instance_id, "lease_id": "lease-authoritative"}
+            return None
+
+    waiting = successful_script("pod-missing-lease")
+    for step in waiting.steps:
+        for item in step.get("events", []):
+            item["resources"].pop("lease_id", None)
+    plan = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+    driver = LeaseResolverDriver({"cold": waiting})
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+    result = scorecard["results"][0]
+
+    if ownership_proved is True:
+        assert driver.termination_attempts == [("runpod", "pod-missing-lease")]
+        assert result["resources"][0]["lease_id"] == "lease-authoritative"
+    else:
+        assert driver.termination_attempts == []
+        assert result["orphaned_resources"][0]["ownership_state"] == "unknown"
+        assert scorecard["estimated_compute_cost_upper_usd"] == plan.limits.max_total_cost_usd
+        assert scorecard["passed"] is False
+
+
+def test_worker_with_current_lease_but_wrong_pod_never_proves_readiness():
+    phases = _initial_startup_phases()
+    observation = InstanceObservation(
+        id="pod-current", provider="runpod", hourly_rate=0.5,
+        status="running", managed=True,
+    )
+
+    _observe_startup_phases(
+        phases,
+        {"runpod": {"pod-current": observation}},
+        [{"worker_id": "pod-wrong", "provider": "runpod", "status": "active",
+          "lease_id": "lease-current"}],
+        [],
+        {("runpod", "pod-current"): "lease-current"},
+    )
+
+    assert phases["runner_callback"] == {"state": "unknown"}
+    assert phases["comfyui_readiness"] == {"state": "unknown"}
+
+
 def test_startup_diagnostics_keep_authoritative_provider_facts_and_mark_gaps_unknown():
     class StartupDriver(FakeDriver):
         def inventory(self, providers):
@@ -553,7 +605,7 @@ def test_startup_diagnostics_keep_authoritative_provider_facts_and_mark_gaps_unk
                 return []
             return [
                 {
-                    "worker_id": "worker-random-not-pod-id",
+                    "worker_id": "pod-phase",
                     "provider": "runpod",
                     "status": "starting",
                     "lease_id": "lease-phase",
@@ -748,7 +800,29 @@ def test_exception_and_support_evidence_is_redacted_before_atomic_publication(tm
     assert json.loads(encoded)["results"][0]["harness_error"] == "RuntimeError"
 
 
-@pytest.mark.parametrize("boundary", ["inventory", "terminate", "sleep", "verify"])
+def test_support_projection_drops_arbitrary_cloud_text_aws_keys_unc_paths_and_urls(tmp_path):
+    class HostileBundleDriver(FakeDriver):
+        def support_bundle(self, job_id):
+            return {
+                "schema": "cloud-offload.support-bundle.v1",
+                "job": {"id": job_id, "detail": "arbitrary provider payload"},
+                "events": [{"sequence": 1, "type": "runner_starting",
+                            "detail": "AKIAABCDEFGHIJKLMNOP",
+                            "path": r"\\server\private\model",
+                            "url": "https://user:token@example.invalid/x"}],
+            }
+
+    plan = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+    scorecard = BenchmarkRunner(
+        HostileBundleDriver({"cold": successful_script("pod-safe-bundle")})
+    ).run(plan)
+    encoded = write_scorecard(tmp_path / "scorecard.json", scorecard).read_text()
+
+    for forbidden in ("AKIA", "server", "example.invalid", "arbitrary provider payload", "token"):
+        assert forbidden not in encoded
+
+
+@pytest.mark.parametrize("boundary", ["clock", "inventory", "terminate", "sleep", "verify"])
 def test_interrupt_at_each_cleanup_boundary_retries_exact_pod_and_publishes_abort(boundary):
     class CleanupInterruptDriver(FakeDriver):
         cleanup_started = False
@@ -758,6 +832,12 @@ def test_interrupt_at_each_cleanup_boundary_retries_exact_pod_and_publishes_abor
         def support_bundle(self, job_id):
             self.cleanup_started = True
             return super().support_bundle(job_id)
+
+        def monotonic(self):
+            if self.cleanup_started and boundary == "clock" and not self.injected:
+                self.injected = True
+                raise KeyboardInterrupt
+            return super().monotonic()
 
         def inventory(self, providers):
             if self.cleanup_started:
@@ -790,6 +870,28 @@ def test_interrupt_at_each_cleanup_boundary_retries_exact_pod_and_publishes_abor
     assert driver.submit_calls == ["cold"]
     assert ("runpod", "pod-cleanup") in driver.terminated
     assert scorecard["orphaned_resources"] == []
+
+
+def test_keyboard_interrupt_in_failure_cleanup_hook_still_cleans_exact_pod():
+    class HookStopDriver(FakeDriver):
+        def run_hook(self, injection, context):
+            if context["CLOUD_OFFLOAD_BENCHMARK_HOOK_STAGE"] == "cleanup":
+                raise KeyboardInterrupt
+            return super().run_hook(injection, context)
+
+    definition = scenario(
+        "failure", "failure",
+        failure={"kind": "restart", "before_submit": True,
+                 "hook_argv": [sys.executable, "safe-hook.py"]},
+    )
+    driver = HookStopDriver({"failure": successful_script("pod-hook-stop")})
+    scorecard = BenchmarkRunner(driver).run(
+        BenchmarkPlan.from_dict(plan_dict([definition]))
+    )
+
+    assert scorecard["campaign_abort"] == "operator_interrupt:KeyboardInterrupt"
+    assert driver.termination_attempts == [("runpod", "pod-hook-stop")]
+    assert scorecard["cleanup_proof"] == {"state": "confirmed"}
 def test_scenario_cost_limit_cancels_and_still_removes_the_pod():
     expensive = successful_script("pod-expensive", rate=3600)
     expensive.steps[1]["snapshot"] = {
@@ -1337,6 +1439,35 @@ def test_coordinator_driver_restores_the_exact_prepared_storage_object():
     }
     assert state["prepared_storage"] == original
     assert posts[-1] == original
+
+
+def test_production_submit_rechecks_absolute_deadline_after_long_preflight(monkeypatch):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    calls = []
+    clock = {"now": 0.0}
+    monkeypatch.setattr("cloud_offload.benchmark.time.monotonic", lambda: clock["now"])
+
+    def preflight(scenario, request_payload):
+        clock["now"] = 10.0
+        return {
+            "status": "ready", "preflight_id": "preflight-1",
+            "manifest_digest": "sha256:" + "a" * 64,
+            "recommendation": {"candidate_id": "candidate-1"},
+        }
+
+    driver._ready_preflight = preflight
+    driver._request = lambda *args, **kwargs: calls.append((args, kwargs))
+    driver.configure_submission_guard(absolute_deadline=2.0, max_cost_usd=0.5)
+    definition = BenchmarkPlan.from_dict(
+        plan_dict([scenario("cold", "cold")])
+    ).scenarios[0]
+
+    with pytest.raises(TimeoutError):
+        driver.submit(definition)
+
+    assert calls == []
 
 
 def test_coordinator_driver_refuses_to_overwrite_a_concurrent_config_change():

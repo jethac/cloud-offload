@@ -637,12 +637,19 @@ def _observe_startup_phases(
         str((item.get("resources") or {}).get("lease_id") or item.get("lease_id") or "")
         for item in events
     } - {""}
-    matching_workers = [
-        item
-        for item in workers
-        if str(item.get("worker_id") or "") in managed_ids
-        or str(item.get("lease_id") or "") in lease_ids
-    ]
+    matching_workers = []
+    for item in workers:
+        provider = str(item.get("provider") or "")
+        worker_id = str(
+            item.get("instance_id") or item.get("pod_id") or item.get("worker_id") or ""
+        )
+        key = (provider, worker_id)
+        worker_lease = str(item.get("lease_id") or "")
+        expected_lease = (identities or {}).get(key)
+        if key in (identities or {}) and (
+            not worker_lease or worker_lease == expected_lease
+        ):
+            matching_workers.append(item)
     if matching_workers:
         phases["runner_callback"] = {"state": "confirmed"}
     ready_event = any(
@@ -783,6 +790,11 @@ class BenchmarkRunner:
         except Exception as exc:  # noqa: BLE001 - a missing audit is a failed audit
             final_audit_error = type(exc).__name__
             orphaned = []
+        unknown_paid_resources = [
+            item
+            for result in results
+            for item in result.get("unknown_paid_resources") or []
+        ]
         passed = (
             campaign_abort is None
             and not orphaned
@@ -800,7 +812,7 @@ class BenchmarkRunner:
             "estimated_compute_cost_upper_usd": round(
                 (
                     plan.limits.max_total_cost_usd
-                    if orphaned or final_audit_error
+                    if orphaned or unknown_paid_resources or final_audit_error
                     else estimated_total
                 ),
                 6,
@@ -827,7 +839,7 @@ class BenchmarkRunner:
             "orphaned_resources": [
                 {"provider": provider, "instance_id": instance}
                 for provider, instance in orphaned
-            ],
+            ] + unknown_paid_resources,
         }
         return scorecard
 
@@ -903,6 +915,7 @@ class BenchmarkRunner:
         cursor = 0
         resources: dict[tuple[str, str], _ResourceMeter] = {}
         identities: dict[tuple[str, str], str] = {}
+        unverified_resources: dict[tuple[str, str], dict[str, Any]] = {}
         last_provider = plan.providers[0]
         last_rate = 0.0
         job_id: str | None = None
@@ -943,6 +956,17 @@ class BenchmarkRunner:
             ):
                 limit_triggered = "runner_readiness_timeout"
                 raise _PreSubmitLimit
+            guard = getattr(self.driver, "configure_submission_guard", None)
+            if callable(guard):
+                guard(
+                    absolute_deadline=(
+                        started + plan.limits.runner_readiness_timeout_seconds
+                    ),
+                    max_cost_usd=min(
+                        plan.limits.max_scenario_cost_usd,
+                        float(plan.limits.max_runner_readiness_cost_usd or 0),
+                    ),
+                )
             job_id = self.driver.submit(scenario)
             receipt_reader = getattr(self.driver, "submission_receipt", None)
             if callable(receipt_reader):
@@ -969,6 +993,43 @@ class BenchmarkRunner:
                         or item.get("lease_id")
                         or ""
                     )
+                    if instance_id and not lease_id:
+                        key = (provider, str(instance_id))
+                        unverified_resources[key] = {
+                            "provider": provider,
+                            "instance_id": str(instance_id),
+                            "hourly_rate": max(
+                                float(
+                                    unverified_resources.get(key, {}).get(
+                                        "hourly_rate", 0
+                                    )
+                                ),
+                                last_rate,
+                            ),
+                            "ownership_state": "unknown",
+                            "provider_absent": False,
+                            "termination_attempts": 0,
+                        }
+                        resolver = getattr(
+                            self.driver, "resolve_resource_identity", None
+                        )
+                        try:
+                            proof = (
+                                resolver(job_id, provider, str(instance_id))
+                                if callable(resolver)
+                                else None
+                            )
+                        except Exception:  # failed proof remains unknown and paid
+                            proof = None
+                        if (
+                            isinstance(proof, dict)
+                            and str(proof.get("job_id") or "") == job_id
+                            and str(proof.get("provider") or "") == provider
+                            and str(proof.get("instance_id") or "")
+                            == str(instance_id)
+                            and str(proof.get("lease_id") or "")
+                        ):
+                            lease_id = str(proof["lease_id"])
                     if instance_id and lease_id:
                         key = (provider, str(instance_id))
                         if (
@@ -978,6 +1039,7 @@ class BenchmarkRunner:
                         ):
                             continue
                         identities[key] = lease_id
+                        unverified_resources.pop(key, None)
                         meter = resources.get(key)
                         if meter is None:
                             resources[key] = _ResourceMeter(
@@ -993,6 +1055,23 @@ class BenchmarkRunner:
                         else:
                             meter.last_seen = now
                             meter.hourly_rate = max(meter.hourly_rate, last_rate)
+                    elif instance_id:
+                        key = (provider, str(instance_id))
+                        unverified_resources[key] = {
+                            "provider": provider,
+                            "instance_id": str(instance_id),
+                            "hourly_rate": max(
+                                float(
+                                    unverified_resources.get(key, {}).get(
+                                        "hourly_rate", 0
+                                    )
+                                ),
+                                last_rate,
+                            ),
+                            "ownership_state": "unknown",
+                            "provider_absent": False,
+                            "termination_attempts": 0,
+                        }
 
                 current_inventory = (
                     self.driver.inventory(plan.providers)
@@ -1029,6 +1108,13 @@ class BenchmarkRunner:
                                     / max(plan.limits.poll_seconds, 0.001)
                                 )
                                 meter.source = "provider_inventory_conservative"
+                    for key, unknown in unverified_resources.items():
+                        observation = current_inventory.get(key[0], {}).get(key[1])
+                        if observation is not None:
+                            unknown["hourly_rate"] = max(
+                                float(unknown.get("hourly_rate") or 0),
+                                observation.hourly_rate,
+                            )
 
                 try:
                     current_workers = self.driver.active_workers(plan.providers)
@@ -1116,7 +1202,9 @@ class BenchmarkRunner:
         finally:
             if job_id:
                 try:
-                    support_bundle = self.driver.support_bundle(job_id)
+                    support_bundle = _project_support_bundle(
+                        self.driver.support_bundle(job_id)
+                    )
                 except (KeyboardInterrupt, SystemExit) as exc:
                     fatal_error = fatal_error or exc
                     abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
@@ -1137,6 +1225,16 @@ class BenchmarkRunner:
                         resources=resources,
                     ),
                 )
+            except (KeyboardInterrupt, SystemExit) as exc:
+                fatal_error = fatal_error or exc
+                abort_reason = abort_reason or (
+                    f"operator_interrupt:{type(exc).__name__}"
+                )
+                failure_cleanup = {
+                    "exit_code": None,
+                    "error_type": type(exc).__name__,
+                    "output_omitted": True,
+                }
             except Exception as exc:  # noqa: BLE001 - cleanup must remain visible
                 failure_cleanup = {
                     "exit_code": None,
@@ -1171,7 +1269,12 @@ class BenchmarkRunner:
             abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
         except Exception:  # noqa: BLE001
             pass
-        active_completed = self.driver.monotonic()
+        try:
+            active_completed = self.driver.monotonic()
+        except (KeyboardInterrupt, SystemExit) as exc:
+            fatal_error = fatal_error or exc
+            abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
+            active_completed = started
         cleanup_started = active_completed
         cleanup = self._cleanup_resources(
             plan.providers,
@@ -1197,12 +1300,17 @@ class BenchmarkRunner:
                 "restored": False,
                 "error_type": type(exc).__name__,
             }
-        completed = self.driver.monotonic()
+        try:
+            completed = self.driver.monotonic()
+        except (KeyboardInterrupt, SystemExit) as exc:
+            fatal_error = fatal_error or exc
+            abort_reason = abort_reason or f"operator_interrupt:{type(exc).__name__}"
+            completed = active_completed
         cleanup_duration = max(0.0, completed - cleanup_started)
         estimated_cost = self._estimated_cost(resources, completed)
         orphaned_resources = [
             item for item in cleanup if not item.get("provider_absent")
-        ]
+        ] + list(unverified_resources.values())
         if orphaned_resources:
             estimated_cost = max(estimated_cost, plan.limits.max_scenario_cost_usd)
         if fatal_error is None and job_id and status not in TERMINAL_STATUSES:
@@ -1265,6 +1373,7 @@ class BenchmarkRunner:
                     "instance_id": meter.id,
                     "hourly_rate": meter.hourly_rate,
                     "source": meter.source,
+                    "lease_id": meter.lease_id,
                 }
                 for meter in sorted(
                     resources.values(), key=lambda item: (item.provider, item.id)
@@ -1278,6 +1387,7 @@ class BenchmarkRunner:
             "startup_phases": startup_phases,
             "cleanup": cleanup,
             "orphaned_resources": orphaned_resources,
+            "unknown_paid_resources": list(unverified_resources.values()),
             "support_bundle": support_bundle,
             "submission_receipt": submission_receipt,
         }
@@ -1436,6 +1546,15 @@ class BenchmarkRunner:
     ) -> list[dict[str, Any]]:
         inventory_error = None
         cleanup_interrupt: str | None = None
+        last_clock = 0.0
+
+        def cleanup_now() -> float:
+            nonlocal cleanup_interrupt, last_clock
+            try:
+                last_clock = max(last_clock, float(self.driver.monotonic()))
+            except (KeyboardInterrupt, SystemExit) as exc:
+                cleanup_interrupt = cleanup_interrupt or type(exc).__name__
+            return last_clock
         try:
             current = self.driver.inventory(providers)
         except (KeyboardInterrupt, SystemExit) as exc:
@@ -1459,14 +1578,14 @@ class BenchmarkRunner:
             for key in candidates
             if key not in baseline_ids
         }
-        deadline = self.driver.monotonic() + timeout_seconds
+        deadline = cleanup_now() + timeout_seconds
         # The attempt bound remains effective even when an interrupt prevents
         # the injected clock/sleep function from advancing.
         attempts_remaining = max(2, math.ceil(timeout_seconds) + 2)
         while (
             receipts
             and attempts_remaining > 0
-            and self.driver.monotonic() <= deadline
+            and cleanup_now() <= deadline
         ):
             attempts_remaining -= 1
             try:
@@ -1596,6 +1715,14 @@ class CoordinatorBenchmarkDriver:
         self.allow_hooks = allow_hooks
         self._prepared_storage_restore: dict[str, dict[str, dict[str, Any]]] = {}
         self._submission_receipts: dict[str, dict[str, Any]] = {}
+        self._submission_deadline: float | None = None
+        self._submission_cost_budget: float | None = None
+
+    def configure_submission_guard(
+        self, *, absolute_deadline: float, max_cost_usd: float
+    ) -> None:
+        self._submission_deadline = float(absolute_deadline)
+        self._submission_cost_budget = max(0.0, float(max_cost_usd))
 
     def _request(
         self,
@@ -1830,6 +1957,29 @@ class CoordinatorBenchmarkDriver:
                     "confirmation_action": "start_now",
                 }
             )
+        # This is the final local instruction before the provider-starting
+        # coordinator POST. A long preflight cannot bypass the campaign guard.
+        if (
+            self._submission_deadline is not None
+            and time.monotonic() >= self._submission_deadline
+        ):
+            raise TimeoutError("runner_readiness_deadline")
+        if self._submission_cost_budget is not None and self._submission_cost_budget <= 0:
+            raise RuntimeError("runner_readiness_cost_budget")
+        recommendation = preflight.get("recommendation") or {} if scenario.endpoint == "/api/partitions" else {}
+        quoted_cost = recommendation.get("estimated_cost_usd")
+        if quoted_cost is None and recommendation.get("hourly_rate") is not None:
+            quoted_cost = (
+                float(recommendation["hourly_rate"])
+                * scenario.timeout_seconds
+                / 3600
+            )
+        if (
+            self._submission_cost_budget is not None
+            and quoted_cost is not None
+            and float(quoted_cost) > self._submission_cost_budget
+        ):
+            raise RuntimeError("runner_readiness_cost_budget")
         response = self._request(
             "POST",
             scenario.endpoint,
@@ -1887,6 +2037,39 @@ class CoordinatorBenchmarkDriver:
                 submission_receipt["expected_model"] = expected_model
             self._submission_receipts[job_id] = submission_receipt
         return job_id
+
+    def resolve_resource_identity(
+        self, job_id: str, provider: str, instance_id: str
+    ) -> dict[str, str] | None:
+        """Prove the current job, lease, provider, and Pod as one identity."""
+
+        response = self._request(
+            "GET", f"/api/jobs/{job_id}", retry_safe=True, timeout=30
+        )
+        response.raise_for_status()
+        job = response.json()
+        params = job.get("params") or {}
+        lease_id = str(params.get("lease_id") or "")
+        expected_instance = str(
+            params.get("worker_instance_id")
+            or params.get("pod_id")
+            or job.get("worker_id")
+            or ""
+        )
+        expected_provider = str(params.get("provider") or provider)
+        if (
+            str(job.get("id") or job_id) != job_id
+            or not lease_id
+            or expected_provider != provider
+            or expected_instance != instance_id
+        ):
+            return None
+        return {
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "provider": provider,
+            "instance_id": instance_id,
+        }
 
     def submission_receipt(self, job_id: str) -> dict[str, Any] | None:
         receipt = self._submission_receipts.get(job_id)
@@ -2075,33 +2258,78 @@ class CoordinatorBenchmarkDriver:
         }
 
 
-_SENSITIVE_KEY = re.compile(
-    r"(?:token|secret|password|credential|authorization|command|argv|environment|env_value|private_path|url)$",
-    re.IGNORECASE,
-)
-_UNSAFE_TEXT = re.compile(
-    r"(?:https?://|[A-Za-z]:\\|/(?:home|Users|private|tmp)/|"
-    r"\b(?:SECRET|BEARER|HF_TOKEN|API_KEY|PASSWORD)\b|"
-    r"(?:token|secret|password|authorization)\s*[=:])",
-    re.IGNORECASE,
-)
+_PUBLIC_TEXT_KEYS = {
+    "schema", "name", "cache_state", "state", "provider_state", "provider",
+    "instance_id", "lease_id", "job_id", "status", "source", "type", "phase",
+    "kind", "abort_reason", "campaign_abort", "limit_triggered", "harness_error",
+    "error", "error_type", "inventory_error", "cleanup_interrupt", "requested_policy",
+    "previous_policy", "restored_policy", "profile", "image_digest", "region",
+    "profile_fingerprint", "manifest_id", "volume_id", "datacenter_id",
+    "matrix_stop_reason", "duration_basis", "ownership_state", "failure_kind",
+    "preflight_status", "expected_model", "request_digest", "test_set_digest",
+    "benchmark_plan_digest", "benchmark_scorecard_digest", "started_at", "completed_at",
+    "observed_at", "created_at", "dependency_failure", "failure_codes", "providers",
+    "expected_statuses", "allowed_regions", "missing_canaries", "canaries",
+}
+_PUBLIC_TEXT = re.compile(r"[A-Za-z0-9_.:+@/-]{1,256}\Z")
+_DROP = object()
+_SUPPORT_EVENT_TYPES = {
+    "allocation_started", "provider_request_completed", "runner_starting",
+    "runner_ready", "job_status_changed", "executed", "cancellation_requested",
+    "lease_revoked", "cache_artifact_quarantined", "cache_mount_ready",
+}
 
 
-def _sanitize_public_evidence(value: Any) -> Any:
-    """Return a finite public projection with no credentials or private paths."""
+def _project_support_bundle(value: Any) -> dict[str, Any] | None:
+    """Project support data to a small, explicit evidence schema."""
 
+    if not isinstance(value, dict) or value.get("schema") != "cloud-offload.support-bundle.v1":
+        return None
+    projected: dict[str, Any] = {"schema": "cloud-offload.support-bundle.v1"}
+    job = value.get("job") or {}
+    job_id = str(job.get("id") or "") if isinstance(job, dict) else ""
+    if _PUBLIC_TEXT.fullmatch(job_id):
+        projected["job"] = {"id": job_id}
+    events = []
+    for item in value.get("events") or []:
+        if not isinstance(item, dict):
+            continue
+        event_type = str(item.get("type") or "")
+        if event_type not in _SUPPORT_EVENT_TYPES:
+            continue
+        event = {"type": event_type}
+        if isinstance(item.get("sequence"), int):
+            event["sequence"] = item["sequence"]
+        phase = str(item.get("phase") or "")
+        if phase and _PUBLIC_TEXT.fullmatch(phase):
+            event["phase"] = phase
+        events.append(event)
+    projected["events"] = events
+    return projected
+
+
+def _sanitize_public_evidence(value: Any, key: str | None = None) -> Any:
+    """Apply an explicit scalar allowlist to the published scorecard schema."""
     if isinstance(value, dict):
-        return {
-            str(key): _sanitize_public_evidence(item)
-            for key, item in value.items()
-            if not _SENSITIVE_KEY.search(str(key))
-        }
+        projected = {}
+        for child_key, item in value.items():
+            child_key = str(child_key)
+            child = _sanitize_public_evidence(item, child_key)
+            if child is not _DROP:
+                projected[child_key] = child
+        return projected
     if isinstance(value, list):
-        return [_sanitize_public_evidence(item) for item in value]
+        return [
+            item
+            for child in value
+            if (item := _sanitize_public_evidence(child, key)) is not _DROP
+        ]
     if isinstance(value, tuple):
-        return [_sanitize_public_evidence(item) for item in value]
-    if isinstance(value, str) and _UNSAFE_TEXT.search(value):
-        return "[redacted]"
+        return _sanitize_public_evidence(list(value), key)
+    if isinstance(value, str):
+        if key in _PUBLIC_TEXT_KEYS and _PUBLIC_TEXT.fullmatch(value):
+            return value
+        return _DROP
     return value
 
 

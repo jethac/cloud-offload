@@ -229,6 +229,12 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
   lease ID, provider, and exact provider instance ID. Startup facts and cleanup
   use only that identity. A concurrent managed Pod is not inferred to belong to
   the campaign and is never terminated by an inventory difference.
+- If a Pod event omits its lease, the harness queries the current job record and
+  accepts the Pod only when the job, lease, provider, and instance all match. If
+  that proof is not available, the Pod is an unknown paid resource: no delete is
+  attempted, the release is blocked, and the campaign cost ceiling is charged.
+- Worker readiness needs the exact attributed Pod. A worker with the current
+  lease but a different Pod ID cannot prove a callback or ComfyUI readiness.
 - Cleanup retries are limited by both elapsed time and attempt count. An
   interrupt at inventory, termination, wait, or final verification causes an
   aborted receipt. The exact attributed Pod is either proved absent or recorded
@@ -244,6 +250,19 @@ scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
 - A nonzero provider inventory rate overrides a zero journal rate. If a running
   attributed Pod has no known rate, the harness assigns a nonzero
   ceiling-derived rate. It never accounts a known running campaign Pod at zero.
+- The production submission driver receives an absolute startup deadline and a
+  cost budget. It checks both after preflight and immediately before the
+  provider-starting POST. A slow preflight therefore cannot start a Pod after a
+  startup-only validation limit has expired.
+- Published scorecards use explicit field and finite-value projections. Support
+  bundles keep only their schema, job ID, and approved event facts. Provider
+  detail text, commands, URLs, paths, environment data, and exception messages
+  are not publication fields.
+- An exception in replay, storage checks, or another post-submit release step
+  uses the same durable scorecard audit as an operator stop. Exact attributed
+  Pods receive bounded cleanup. Unknown ownership or ongoing spend charges the
+  conservative release ceiling; a normal exception cannot publish a zero-cost,
+  zero-duration, no-mutation receipt without proof.
 - Startup evidence separates provider allocation, image pull, container start,
   runner callback, and ComfyUI readiness. `unknown` means the provider or
   coordinator did not prove that phase. In particular, RunPod REST v2 does not

@@ -26,6 +26,7 @@ from cloud_offload.benchmark import (
     BenchmarkRunner,
     CoordinatorBenchmarkDriver,
     SCORECARD_SCHEMA,
+    _ResourceMeter,
     write_scorecard,
 )
 from cloud_offload.config import (
@@ -942,7 +943,9 @@ class ReleaseExecutor:
                     index, case, exc, matrix_started=matrix_started
                 )
             except Exception as exc:
-                receipt = _harness_failure_receipt(index, case, exc)
+                receipt = self._release_interrupt_receipt(
+                    index, case, exc, matrix_started=matrix_started
+                )
             ledger["matrices"].append(receipt)
             update_ledger(ledger, self.plan)
             _atomic_json(self.ledger_path, ledger)
@@ -970,7 +973,11 @@ class ReleaseExecutor:
     ) -> dict[str, Any]:
         """Publish finite failure evidence if an interrupt escapes the runner."""
 
-        reason = f"operator_interrupt:{type(exc).__name__}"
+        reason = (
+            f"operator_interrupt:{type(exc).__name__}"
+            if isinstance(exc, (KeyboardInterrupt, SystemExit))
+            else f"release_harness_error:{type(exc).__name__}"
+        )
         now = _utc_now()
         matrix_dir = self.output_dir / f"matrix-{index:04d}-{case.name}"
         scorecard_path = matrix_dir / "benchmark-scorecard.json"
@@ -995,6 +1002,7 @@ class ReleaseExecutor:
             }
 
         cleanup_error: str | None = None
+        cleanup_receipts: list[dict[str, Any]] = []
         orphans: list[dict[str, str]] = []
         try:
             driver = CoordinatorBenchmarkDriver(
@@ -1004,13 +1012,47 @@ class ReleaseExecutor:
                 case.benchmark_plan.providers,
                 allow_hooks=self.allow_hooks,
             )
+            attributed = {
+                (str(item.get("provider") or ""), str(item.get("instance_id") or "")): _ResourceMeter(
+                    id=str(item.get("instance_id") or ""),
+                    provider=str(item.get("provider") or ""),
+                    hourly_rate=float(item.get("hourly_rate") or 0),
+                    first_seen=matrix_started or time.monotonic(),
+                    last_seen=time.monotonic(),
+                    source="release_fallback",
+                    lease_id=str(item.get("lease_id") or "") or None,
+                )
+                for result in scorecard.get("results") or []
+                for item in result.get("resources") or []
+                if item.get("provider") and item.get("instance_id") and item.get("lease_id")
+            }
+            if attributed:
+                cleanup_receipts = BenchmarkRunner(driver)._cleanup_resources(
+                    case.benchmark_plan.providers,
+                    {provider: {} for provider in case.benchmark_plan.providers},
+                    attributed,
+                    case.benchmark_plan.limits.cleanup_timeout_seconds,
+                    include_untracked=False,
+                )
             final_inventory = driver.inventory(case.benchmark_plan.providers)
-            orphans = [
-                {"provider": provider, "instance_id": instance.id}
-                for provider, instances in final_inventory.items()
-                for instance in instances.values()
-                if instance.managed
-            ]
+            if detailed_evidence_available:
+                orphans = [
+                    {"provider": provider, "instance_id": instance_id}
+                    for provider, instance_id in attributed
+                    if instance_id in final_inventory.get(provider, {})
+                ]
+                orphans.extend(
+                    dict(item)
+                    for result in scorecard.get("results") or []
+                    for item in result.get("unknown_paid_resources") or []
+                )
+            else:
+                orphans = [
+                    {"provider": provider, "instance_id": instance.id}
+                    for provider, instances in final_inventory.items()
+                    for instance in instances.values()
+                    if instance.managed
+                ]
         except Exception as cleanup_exc:  # noqa: BLE001
             cleanup_error = type(cleanup_exc).__name__
 
@@ -1032,7 +1074,8 @@ class ReleaseExecutor:
                 "completed_at": now,
                 "passed": False,
                 "campaign_abort": reason,
-                "final_cleanup": list(scorecard.get("final_cleanup") or []),
+                "final_cleanup": list(scorecard.get("final_cleanup") or [])
+                + cleanup_receipts,
                 "final_audit_error": cleanup_error,
                 "orphaned_resources": orphans,
                 "cleanup_proof": {"state": cleanup_state},
@@ -1072,7 +1115,9 @@ class ReleaseExecutor:
             "duration_basis": duration_basis,
             "passed": False,
             "failure_codes": failure_codes,
-            "matrix_stop_reason": reason,
+            "matrix_stop_reason": (
+                reason if reason.startswith("operator_interrupt:") else None
+            ),
             "estimated_compute_cost_upper_usd": round(estimated_cost, 6),
             "ongoing_orphan_cost": ongoing_orphan_cost,
             "provider_mutation": "unknown",

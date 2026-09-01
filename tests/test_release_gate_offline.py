@@ -581,6 +581,36 @@ def test_interrupt_fallback_never_trusts_an_older_lower_scorecard_or_clock(offli
     assert published["campaign_abort"] == "operator_interrupt:KeyboardInterrupt"
 
 
+@pytest.mark.parametrize("failure_site", ["replay", "storage"])
+def test_paid_matrix_postcheck_exception_uses_durable_conservative_audit(
+    offline, monkeypatch, failure_site
+):
+    plan, world, executor, _, output_dir = offline
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(
+            "AKIAABCDEFGHIJKLMNOP https://user:token@example.invalid/ "
+            r"\\server\private\artifact"
+        )
+
+    target = "_replay_probe" if failure_site == "replay" else "_storage_budget_receipt"
+    monkeypatch.setattr(release_gate, target, fail)
+
+    ledger = executor().run(max_matrices=1)
+    receipt = ledger["matrices"][0]
+
+    assert receipt["passed"] is False
+    assert receipt["provider_mutation"] == "unknown"
+    assert receipt["estimated_compute_cost_upper_usd"] >= plan.limits.max_matrix_cost_usd
+    assert receipt["duration_seconds"] >= plan.limits.max_matrix_seconds
+    assert receipt["failure_codes"] == ["release_harness_error:RuntimeError"]
+    encoded = json.dumps(ledger) + next(
+        output_dir.glob("matrix-*/benchmark-scorecard.json")
+    ).read_text()
+    for forbidden in ("AKIA", "example.invalid", "server", "token"):
+        assert forbidden not in encoded
+
+
 def test_release_fallback_does_not_delete_unattributed_managed_resource(
     offline, monkeypatch
 ):
