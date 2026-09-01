@@ -26,6 +26,7 @@ def test_overlay_copies_current_entrypoint_and_makes_it_executable():
         "/opt/cloud-offload/entrypoint.sh" in dockerfile
     )
     assert "chmod +x /opt/cloud-offload/entrypoint.sh" in dockerfile
+    assert ".cloud-offload-source-modes.json" in dockerfile
 
 
 def test_context_contains_exact_git_blobs_modes_and_symlinks(tmp_path):
@@ -37,8 +38,10 @@ def test_context_contains_exact_git_blobs_modes_and_symlinks(tmp_path):
     _git(repo, "config", "core.autocrlf", "true")
     (repo / "entrypoint.sh").write_bytes(b"#!/bin/bash\nexit 0\n")
     (repo / "entrypoint.sh").chmod(0o755)
+    (repo / "sub").mkdir()
     try:
         os.symlink("entrypoint.sh", repo / "current-entrypoint.sh")
+        os.symlink("../entrypoint.sh", repo / "sub" / "current-entrypoint.sh")
     except OSError as exc:
         pytest.fail(f"symlink support is required for clean image contexts: {exc}")
     _git(repo, "add", ".")
@@ -55,6 +58,7 @@ def test_context_contains_exact_git_blobs_modes_and_symlinks(tmp_path):
     assert prepare_context(repo, revision, destination) == (
         "current-entrypoint.sh",
         "entrypoint.sh",
+        "sub/current-entrypoint.sh",
     )
     entries = {entry.path: entry for entry in tree_entries(repo, revision)}
     for path, entry in entries.items():
@@ -70,6 +74,35 @@ def test_context_contains_exact_git_blobs_modes_and_symlinks(tmp_path):
             if os.name != "nt":
                 assert stat.S_IMODE(target.stat().st_mode) == stat.S_IMODE(entry.mode)
     assert (destination / "entrypoint.sh").read_bytes().startswith(b"#!/bin/bash\n")
+    assert os.readlink(destination / "sub/current-entrypoint.sh") == "../entrypoint.sh"
+
+
+@pytest.mark.parametrize("link", [
+    "../../outside",
+    "/outside",
+    r"C:\\outside",
+    r"\\\\server\\share\\outside",
+])
+def test_context_rejects_unsafe_symlink_targets(tmp_path, link):
+    from scripts.build_worker_image import prepare_context
+
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "--quiet")
+    (repo / "entrypoint.sh").write_bytes(b"#!/bin/bash\nexit 0\n")
+    (repo / "sub").mkdir()
+    os.symlink(link, repo / "sub" / "current")
+    _git(repo, "add", ".")
+    env = os.environ | {
+        "GIT_AUTHOR_NAME": "image-test",
+        "GIT_AUTHOR_EMAIL": "image-test@example.invalid",
+        "GIT_COMMITTER_NAME": "image-test",
+        "GIT_COMMITTER_EMAIL": "image-test@example.invalid",
+    }
+    subprocess.run(["git", "-C", str(repo), "commit", "--quiet", "-m", "fixture"], check=True, env=env)
+    revision = _git(repo, "rev-parse", "HEAD").strip()
+    with pytest.raises(ValueError, match="symlink target"):
+        prepare_context(repo, revision, tmp_path / "context")
 
 
 def test_context_rejects_unsafe_git_tree_paths(tmp_path, monkeypatch):
@@ -134,6 +167,14 @@ def test_local_image_has_revision_label_and_exact_entrypoint_bytes(tmp_path):
     active = _docker_cp_file(tmp_path, "/opt/cloud-offload/entrypoint.sh", "active-entrypoint.sh")
     assert active.read_bytes() == _blob_bytes(ROOT, entry.oid)
     assert active.read_bytes().startswith(b"#!/bin/bash\n")
+    active_mode = subprocess.check_output(
+        [
+            "docker", "run", "--rm", "--entrypoint", "python", IMAGE, "-c",
+            "import os, stat; print(stat.S_IMODE(os.stat('/opt/cloud-offload/entrypoint.sh').st_mode))",
+        ],
+        text=True,
+    ).strip()
+    assert int(active_mode) & stat.S_IXUSR
 
 
 @pytest.mark.skipif(not IMAGE, reason="set CLOUD_OFFLOAD_TEST_IMAGE for image inspection")
@@ -155,6 +196,21 @@ def test_local_image_source_tree_matches_exact_blobs_and_intended_omissions(tmp_
     }
     assert set(actual) == set(entries) - ignored
     assert set(actual) >= {"cloud_offload/__init__.py", "cloud_offload/worker.py", "pyproject.toml"}
+    mode_output = subprocess.check_output(
+        [
+            "docker", "run", "--rm", "--entrypoint", "python", IMAGE, "-c",
+            "import json, os, stat; from pathlib import Path; root=Path('/opt/cloud-offload/source'); print(json.dumps({p.relative_to(root).as_posix(): {'mode': stat.S_IMODE(os.lstat(p).st_mode), 'symlink': p.is_symlink()} for p in root.rglob('*') if p.is_file() or p.is_symlink()}, sort_keys=True))",
+        ],
+        text=True,
+    )
+    modes = json.loads(mode_output)
+    assert set(modes) == set(actual)
+    for path in actual:
+        entry = entries[path]
+        assert modes[path]["symlink"] is False
+        assert modes[path]["mode"] == stat.S_IMODE(entry.mode)
+    assert modes["pyproject.toml"]["mode"] == 0o644
+    assert modes["scripts/build_worker_image.py"]["mode"] == 0o644
     for path in actual:
         target = source / path
         entry = entries[path]

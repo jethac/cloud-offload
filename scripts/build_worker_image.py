@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -18,6 +19,9 @@ class TreeEntry:
     mode: int
     object_type: str
     oid: str
+
+
+MODE_MANIFEST_NAME = ".cloud-offload-source-modes.json"
 
 
 def _git(repo_root: Path, *args: str, text: bool = True) -> str | bytes:
@@ -92,12 +96,18 @@ def _blob_bytes(repo_root: Path, oid: str) -> bytes:
 
 def _link_target(destination: Path, entry: TreeEntry, raw: bytes) -> str:
     link = raw.decode("utf-8", errors="surrogateescape")
-    if not link or "\x00" in link or "\\" in link:
+    pure = PurePosixPath(link)
+    # Git symlink blobs are path text, not filesystem paths. Keep that text
+    # byte-for-byte while resolving it only for the containment check.
+    if not link or "\x00" in link or "\\" in link or pure.is_absolute():
         raise ValueError(f"unsafe symlink target: {entry.path!r}")
-    target = _safe_target(destination, str(PurePosixPath(entry.path).parent / link))
+    if ":" in link.split("/", 1)[0]:
+        raise ValueError(f"unsafe symlink target: {entry.path!r}")
+    parent = destination / Path(*PurePosixPath(entry.path).parent.parts)
+    target = (parent / Path(*pure.parts)).resolve(strict=False)
     if not _inside(destination, target):
         raise ValueError(f"unsafe symlink target: {entry.path!r}")
-    return os.path.relpath(target, (destination / Path(*PurePosixPath(entry.path).parts)).parent)
+    return link
 
 
 def _materialize_entry(repo_root: Path, destination: Path, entry: TreeEntry) -> None:
@@ -152,6 +162,25 @@ def prepare_context(repo_root: Path, revision: str, destination: Path) -> tuple[
         raise
 
 
+def write_mode_manifest(repo_root: Path, revision: str, destination: Path) -> Path:
+    """Write generated mode metadata from the exact commit tree."""
+
+    repo_root = Path(repo_root).resolve()
+    destination = Path(destination).resolve()
+    entries = tree_entries(repo_root, revision)
+    manifest_path = destination / MODE_MANIFEST_NAME
+    if manifest_path.exists():
+        raise ValueError(f"mode manifest collides with source tree: {manifest_path}")
+    payload = {
+        "revision": _commit_revision(repo_root, revision),
+        "files": [{"mode": entry.mode, "path": entry.path} for entry in entries],
+    }
+    manifest_path.write_bytes(
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    )
+    return manifest_path
+
+
 def build_image(repo_root: Path, revision: str, tag: str) -> tuple[str, ...]:
     """Build a tag from a temporary exact-blob context and remove the context."""
 
@@ -160,6 +189,7 @@ def build_image(repo_root: Path, revision: str, tag: str) -> tuple[str, ...]:
     with tempfile.TemporaryDirectory(prefix="cloud-offload-image-") as temp_dir:
         context = Path(temp_dir) / "context"
         manifest = prepare_context(repo_root, commit, context)
+        write_mode_manifest(repo_root, commit, context)
         subprocess.run(
             [
                 "docker", "buildx", "build", "--progress", "plain",
