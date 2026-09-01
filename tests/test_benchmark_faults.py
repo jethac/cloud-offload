@@ -345,23 +345,31 @@ def test_process_exists_uses_native_windows_probe(monkeypatch):
     assert _process_exists(456) is False
 
 
+@pytest.mark.parametrize(
+    ("host", "url", "expected_bind_host"),
+    [
+        ("127.0.0.1", "http://127.0.0.1:11435", "127.0.0.1"),
+        ("::1", "http://[::1]:11435", "::1"),
+        ("localhost", "http://localhost:11435", "127.0.0.1"),
+    ],
+)
 def test_restart_replays_and_cancels_through_replacement_coordinator(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, host, url, expected_bind_host
 ):
-    old = FakeRestartClient(111)
-    replacement = FakeRestartClient(222, status="running")
+    old = FakeRestartClient(111, base_url=url)
+    replacement = FakeRestartClient(222, status="running", base_url=url)
     service_reads = iter(
         [
             {
-                "url": "http://127.0.0.1:11435",
-                "host": "127.0.0.1",
+                "url": url,
+                "host": host,
                 "port": 11435,
                 "pid": 111,
                 "auth_required": False,
             },
             {
-                "url": "http://127.0.0.1:11435",
-                "host": "127.0.0.1",
+                "url": url,
+                "host": host,
                 "port": 11435,
                 "pid": 222,
                 "auth_required": False,
@@ -404,6 +412,8 @@ def test_restart_replays_and_cancels_through_replacement_coordinator(
     }
     assert replacement.posts == [("/api/jobs/job-restart/cancel", {})]
     assert len(launches) == 1
+    command = launches[0][0][0]
+    assert command[command.index("--host") + 1] == expected_bind_host
 
 
 def test_restart_preserves_anonymous_auth_for_all_benchmark_harness_routes(
@@ -533,6 +543,7 @@ def test_restart_preserves_required_auth_under_inherited_anonymous_environment(
         {"url": "http://127.0.0.1:11436"},
         {"__remove__": "host"},
         {"host": "example.com", "url": "http://example.com:11435"},
+        {"host": "127.example.com", "url": "http://127.example.com:11435"},
         {"host": "localhost", "url": "http://127.0.0.1:11435"},
         {"pid": "111"},
         {"__remove__": "auth_required"},
@@ -547,6 +558,7 @@ def test_restart_preserves_required_auth_under_inherited_anonymous_environment(
         "url-port-mismatch",
         "missing-host",
         "non-local-host",
+        "dns-name-with-loopback-prefix",
         "url-host-mismatch",
         "malformed-pid",
         "missing-auth-contract",
@@ -590,7 +602,15 @@ def test_restart_rejects_invalid_discovery_before_process_termination(
     monkeypatch.setattr(benchmark_faults, "CONFIG_DIR", tmp_path)
 
     with pytest.raises((RuntimeError, benchmark_faults.ServiceConfigError, ValueError)):
-        restart_coordinator(FakeRestartClient(111), "job-restart")
+        restart_coordinator(
+            FakeRestartClient(
+                111,
+                auth_required=service.get("auth_required"),
+                token=service.get("token"),
+                base_url=str(service.get("url") or ""),
+            ),
+            "job-restart",
+        )
 
     assert kills == []
     assert launches == []

@@ -942,11 +942,11 @@ def _validated_restart_service(
         url_port = parsed.port
     except ValueError as exc:
         raise RuntimeError("Restart canary service URL has an invalid port") from exc
-    normalized_host = host.strip().lower()
+    source_host = host.strip().lower()
     if (
         parsed.scheme != "http"
-        or not is_local_host(normalized_host)
-        or parsed.hostname != normalized_host
+        or not is_local_host(source_host)
+        or parsed.hostname != source_host
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}
@@ -974,7 +974,8 @@ def _validated_restart_service(
         or client_service.get("token") != token
     ):
         raise RuntimeError("Restart canary client does not match service discovery")
-    return normalized_host, port, pid, auth_required
+    bind_host = "127.0.0.1" if source_host == "localhost" else source_host
+    return bind_host, port, pid, auth_required
 
 
 def restart_coordinator(client: CoordinatorFaultClient, job_id: str) -> dict[str, Any]:

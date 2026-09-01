@@ -25,9 +25,15 @@ hostile inherited anonymous flag.
 
 Before SIGTERM, the restart hook now validates the exact local HTTP host, the
 integer port and URL match, the PID, the auth value and readable token, and the
-existing client's URL/auth contract. Parameterized tests prove that 12 invalid
+existing client's URL/auth contract. Parameterized tests prove that 13 invalid
 contracts cause zero SIGTERM calls and zero replacement launches. Strict
 service discovery also rejects a raw string port before normalization.
+
+The local-host check parses IP literals instead of trusting a `127.` text
+prefix. It accepts IPv4 127.0.0.0/8, IPv6 `::1`, and the exact name
+`localhost`. The restart command converts `localhost` to `127.0.0.1` before
+launch, so it does not do a DNS lookup. A `127.example.com` discovery contract
+is rejected before SIGTERM.
 
 ## Storage-policy inspection
 
@@ -38,8 +44,8 @@ continued to return policy `smart`. This PR does not change that separate path.
 
 ## Verification
 
-- Focused restart and service tests: 35 passed.
-- Full repository suite: 814 passed, 6 skipped.
+- Focused restart and service tests: 39 passed.
+- Full repository suite: 818 passed, 6 skipped.
 - Python byte-code compile check: passed.
 - Ruff: not installed and not configured by the repository.
 - MyPy: the repository has no MyPy configuration; an informational full run

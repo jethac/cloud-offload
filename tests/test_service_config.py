@@ -12,6 +12,7 @@ from cloud_offload.service_config import (
     SERVICE_NAME,
     ServiceConfigError,
     choose_service_port,
+    is_local_host,
     normalize_service_url,
     read_service_info,
     reject_ollama_port,
@@ -39,6 +40,14 @@ def test_bind_host_requires_allow_lan_for_non_localhost():
     with pytest.raises(ServiceConfigError, match="allow-lan"):
         validate_bind_host("0.0.0.0")
     validate_bind_host("0.0.0.0", allow_lan=True)  # explicit opt-in
+
+
+def test_local_host_check_rejects_dns_names_that_only_start_with_127():
+    assert is_local_host("127.0.0.1") is True
+    assert is_local_host("127.255.255.255") is True
+    assert is_local_host("::1") is True
+    assert is_local_host("localhost") is True
+    assert is_local_host("127.example.com") is False
 
 
 def test_service_info_round_trip(tmp_path):

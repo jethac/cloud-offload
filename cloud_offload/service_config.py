@@ -7,6 +7,7 @@ import os
 import secrets
 import socket
 from datetime import datetime, timezone
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -49,8 +50,16 @@ def default_token_file() -> Path:
 
 
 def is_local_host(host: str) -> bool:
-    host = (host or "").lower()
-    return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
+    normalized = (host or "").strip().lower()
+    if normalized == "localhost":
+        return True
+    try:
+        address = ip_address(normalized)
+    except ValueError:
+        return False
+    if isinstance(address, IPv4Address):
+        return address.packed[0] == 127
+    return isinstance(address, IPv6Address) and address == IPv6Address("::1")
 
 
 def validate_bind_host(host: str, allow_lan: bool = False) -> None:
