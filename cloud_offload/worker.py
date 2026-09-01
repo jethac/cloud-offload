@@ -1611,6 +1611,8 @@ class Worker:
                 profile_fingerprint=profile,
                 producer={
                     "image_digest": self.cache_runtime.get("image_digest", ""),
+                    "job_id": str(job.id) if job else "",
+                    "lease_id": str(getattr(job, "params", {}).get("lease_id") or "") if job else "",
                     "cloud_offload_version": VERSION,
                     "python_abi": self.cache_runtime.get("python_abi", ""),
                     "platform": self.cache_runtime.get("platform", ""),
@@ -1852,6 +1854,8 @@ class Worker:
                 profile_fingerprint=profile,
                 producer={
                     "image_digest": self.cache_runtime.get("image_digest", ""),
+                    "job_id": str(job.id) if job else "",
+                    "lease_id": str(getattr(job, "params", {}).get("lease_id") or "") if job else "",
                     "cloud_offload_version": VERSION,
                     "python_abi": self.cache_runtime.get("python_abi", ""),
                     "platform": self.cache_runtime.get("platform", ""),
@@ -2620,6 +2624,8 @@ class Worker:
             profile_fingerprint=profile,
             producer={
                 "image_digest": self.cache_runtime.get("image_digest", ""),
+                "job_id": str(job.id) if job else "",
+                "lease_id": str(getattr(job, "params", {}).get("lease_id") or "") if job else "",
                 "cloud_offload_version": VERSION,
                 "python_abi": self.cache_runtime.get("python_abi", ""),
                 "platform": self.cache_runtime.get("platform", ""),

@@ -26,6 +26,7 @@ from cloud_offload.cache_scheduler import (
 )
 from cloud_offload.config import CloudConfig, estimate_runpod_storage_monthly
 from cloud_offload.prepared_state import (
+    INDEX_SCHEMA,
     CacheCorruptionError,
     CacheMountError,
     TRUST_RECEIPT_SCHEMA,
@@ -1000,8 +1001,96 @@ def test_coordinator_overwrites_worker_timestamp_and_authority_fields():
     assert proposal["producer"] == {
         "image_digest": "sha256:" + "a" * 64,
         "cloud_offload_version": server.VERSION,
+        "job_id": "",
+        "lease_id": "",
+        "worker_id": "",
     }
     assert proposal["cache_volume_id"] == "cache-volume"
+
+
+def test_signed_worker_manifest_keeps_coordinator_job_lease_context_for_m7_proof(tmp_path):
+    from cloud_offload.benchmark import CoordinatorBenchmarkDriver
+
+    content = b"cold-cache-model"
+    artifact = portable_artifact(content)
+    profile = fingerprint({"profile": "authority-e2e"})
+    config = dispatcher_config(tmp_path, policy())
+    job = SimpleNamespace(
+        id="cold-job",
+        worker_id="worker-authenticated",
+        params={
+            "runtime_profile": "comfy",
+            "lease_id": "cold-lease",
+            "cache_volume_id": "cache-volume",
+            "cache_provider_volume_id": "provider-volume",
+            "prepared_requirement": {
+                "profile_fingerprint": profile,
+                "artifacts": [{"digest": artifact["digest"], "policy": {"tenant": "default", "cacheable": True}}],
+            },
+        },
+    )
+    proposal = {
+        "schema": "cloud-offload.prepared-state.v1",
+        "profile_fingerprint": profile,
+        "created_at": "2999-01-01T00:00:00Z",
+        "producer": {"job_id": "forged-job", "lease_id": "forged-lease", "worker_id": "forged-worker"},
+        "artifacts": [artifact],
+    }
+    server._validate_manifest_proposal(config, proposal, job=job, volume_id="cache-volume")
+    assert proposal["producer"] == {
+        "image_digest": "sha256:" + "a" * 64,
+        "cloud_offload_version": server.VERSION,
+        "job_id": "cold-job",
+        "lease_id": "cold-lease",
+        "worker_id": "worker-authenticated",
+    }
+    signed = server._prepared_manifest_signer(config).sign(proposal)
+
+    registry = CacheRegistry(config.queue_db_path)
+    volume = registry.upsert_volume(
+        provider="runpod", provider_volume_id="provider-volume", datacenter_id="US-MD-1",
+        ownership="adopted", capacity_bytes=1024, policy={}, volume_id="cache-volume",
+    )
+    registry.reconcile_index(
+        volume.id,
+        {"schema": INDEX_SCHEMA, "generation": "generation-1", "manifests": [signed]},
+        manifest_documents={signed["manifest_id"]: signed},
+    )
+    driver = CoordinatorBenchmarkDriver("http://coordinator", None, config, ())
+    driver._submission_receipts["cold-job"] = {
+        "profile_fingerprint": profile,
+        "image_digest": "sha256:" + "a" * 64,
+        "expected_model": "comfyui-partition-v1",
+        "allowed_regions": ["US-MD-1"],
+        "region": "US-MD-1",
+    }
+    unrelated = dict(signed)
+    unrelated["manifest_id"] = "sha256:" + "u" * 64
+    unrelated["producer"] = {**signed["producer"], "job_id": "other-job"}
+
+    def request(method, path, **kwargs):
+        if path == "/api/jobs/cold-job":
+            return SimpleNamespace(
+                    json=lambda: {"id": "cold-job", "model": "comfyui-partition-v1", "params": {
+                    "lease_id": "cold-lease", "cache_volume_id": "cache-volume",
+                    "cache_datacenter_id": "US-MD-1",
+                }},
+                raise_for_status=lambda: None,
+            )
+        assert path == "/api/cache/manifests"
+        return SimpleNamespace(
+            json=lambda: {"manifests": [unrelated, *registry.query_manifests(
+                profile_fingerprint=profile, datacenter_id="US-MD-1"
+            )]},
+            raise_for_status=lambda: None,
+        )
+
+    driver._request = request
+    result = driver.base_manifest({
+        "job_id": "cold-job", "started_at": "2000-01-01T00:00:00+00:00",
+        "submission_receipt": driver.submission_receipt("cold-job"),
+    })
+    assert result["manifest_id"] == signed["manifest_id"]
 
 
 def test_huggingface_xet_metadata_is_downloaded_and_byte_hashed(monkeypatch, tmp_path):

@@ -16,12 +16,34 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+
+def _set_explicit_home_before_config_import() -> None:
+    """Make an explicit release/serve home win before config imports."""
+    if len(sys.argv) < 2 or sys.argv[1] not in {"serve", "release"}:
+        return
+    arguments = sys.argv[2:]
+    for index, argument in enumerate(arguments):
+        if argument == "--home" and index + 1 < len(arguments):
+            home = arguments[index + 1]
+        elif argument.startswith("--home="):
+            home = argument.split("=", 1)[1]
+        else:
+            continue
+        if home:
+            os.environ["CLOUD_OFFLOAD_HOME"] = str(Path(home).resolve())
+            return
+
+
+_set_explicit_home_before_config_import()
+
 from cloud_offload.config import CONFIG_DIR
 
 
-def setup_logging(name: str = "cloud-offload", level=logging.INFO):
+def setup_logging(
+    name: str = "cloud-offload", level=logging.INFO, *, home: str | Path | None = None
+):
     """Configure logging to both console and a dated log file."""
-    log_dir = CONFIG_DIR / "logs"
+    log_dir = Path(home).resolve() / "logs" if home else CONFIG_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"{name}_{datetime.now().strftime('%Y%m%d')}.log"
 
@@ -94,6 +116,13 @@ def _build_parser() -> tuple[
     )
     serve_parser.add_argument("--tls-cert", help="TLS certificate for HTTPS")
     serve_parser.add_argument("--tls-key", help="TLS private key for HTTPS")
+    serve_parser.add_argument("--config", help="Path to the coordinator config")
+    serve_parser.add_argument(
+        "--home", help="Explicit isolated coordinator home for M7 startup"
+    )
+    serve_parser.add_argument(
+        "--release-plan", help="Validated release plan required for isolated M7 startup"
+    )
 
     worker_parser = subparsers.add_parser("worker", help="Run as a cloud worker")
     worker_parser.add_argument("--config", help="Path to config file")
@@ -190,6 +219,9 @@ def _build_parser() -> tuple[
     )
     release_run.add_argument("--config", help="Path to Cloud Offload config")
     release_run.add_argument(
+        "--home", help="Explicit isolated coordinator home; requires a bootstrap receipt"
+    )
+    release_run.add_argument(
         "--max-matrices", type=int, help="Stop after this many new matrices"
     )
     release_run.add_argument(
@@ -201,6 +233,18 @@ def _build_parser() -> tuple[
         "--allow-hooks",
         action="store_true",
         help="Allow the reviewed storage, corruption, and restart canaries",
+    )
+    release_bootstrap = release_sub.add_parser(
+        "bootstrap-artifacts",
+        help="Verify and import private benchmark input artifacts before startup",
+    )
+    release_bootstrap.add_argument("--plan", required=True, help="Release plan JSON")
+    release_bootstrap.add_argument(
+        "--source-root", required=True, help="Read-only content-addressed source root"
+    )
+    release_bootstrap.add_argument("--config", help="Isolated Cloud Offload config")
+    release_bootstrap.add_argument(
+        "--home", required=True, help="Explicit isolated coordinator home"
     )
 
     benchmark_hook = subparsers.add_parser(
@@ -227,7 +271,45 @@ def main():
     args = parser.parse_args()
 
     if args.command == "serve":
-        log_file = setup_logging("coordinator")
+        isolated_config = None
+        isolated_plan = None
+        if any((args.config, args.home, args.release_plan)):
+            if not all((args.config, args.home, args.release_plan)):
+                print(
+                    "Isolated M7 serve requires --config, --home, and --release-plan.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            from cloud_offload.artifact_bootstrap import (
+                ArtifactBootstrapError,
+                config_artifact_store,
+                config_digest,
+                declared_input_artifacts,
+                verify_bootstrap_receipt,
+            )
+            from cloud_offload.config import CloudConfig
+            from cloud_offload.release_gate import ReleasePlan
+
+            try:
+                isolated_config = CloudConfig.from_file(args.config, home=args.home)
+                isolated_plan = ReleasePlan.load(args.release_plan)
+                declarations = declared_input_artifacts(
+                    (case.benchmark_plan_digest, case.benchmark_plan)
+                    for case in isolated_plan.cases
+                )
+                destination = config_artifact_store(isolated_config, args.home)
+                verify_bootstrap_receipt(
+                    destination,
+                    declarations,
+                    release_plan_digest=getattr(
+                        isolated_plan, "source_digest", "0" * 64
+                    ),
+                    config_digest=config_digest(isolated_config, destination),
+                )
+            except (ArtifactBootstrapError, OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"Isolated M7 startup refused: {exc}", file=sys.stderr)
+                raise SystemExit(2) from exc
+        log_file = setup_logging("coordinator", home=args.home)
         logger = logging.getLogger("cloud-offload")
         port_label = args.port if args.port not in {None, 0} else "auto"
         logger.info(f"Starting Cloud Offload coordinator on {args.host}:{port_label}")
@@ -246,6 +328,7 @@ def main():
                 require_auth=args.require_auth,
                 tls_cert=args.tls_cert,
                 tls_key=args.tls_key,
+                config=isolated_config,
             )
         except ServiceConfigError as exc:
             logger.error(str(exc))
@@ -400,9 +483,7 @@ def main():
             from cloud_offload.service_config import discover_service_info
 
             config = (
-                CloudConfig.from_file(args.config)
-                if args.config
-                else CloudConfig.load()
+                CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
             )
             try:
                 service = discover_service_info(require_healthy=True)
@@ -456,6 +537,50 @@ def main():
                 print(f"Invalid release ledger: {exc}", file=sys.stderr)
                 raise SystemExit(2) from exc
             print(json.dumps(ledger, indent=2, sort_keys=True))
+        elif args.release_command == "bootstrap-artifacts":
+            from cloud_offload.artifact_bootstrap import (
+                ArtifactBootstrapError,
+                config_artifact_store,
+                config_digest,
+                declared_input_artifacts,
+                import_declared_artifacts,
+            )
+            from cloud_offload.config import CloudConfig
+            try:
+                config = CloudConfig.from_file(args.config, home=args.home) if args.config else CloudConfig.load(resolve_secrets=False)
+                destination = config_artifact_store(config, args.home)
+                declarations = declared_input_artifacts(
+                    (case.benchmark_plan_digest, case.benchmark_plan)
+                    for case in plan.cases
+                )
+                records = import_declared_artifacts(
+                    args.source_root,
+                    destination,
+                    declarations,
+                    release_plan_digest=getattr(plan, "source_digest", "0" * 64),
+                    config_digest=config_digest(config, destination),
+                )
+            except (OSError, ValueError, ArtifactBootstrapError) as exc:
+                print(f"Artifact bootstrap stopped safely: {exc}", file=sys.stderr)
+                raise SystemExit(2) from exc
+            print(
+                json.dumps(
+                    {
+                        "artifact_count": len(records),
+                        "artifacts": [
+                            {
+                                "digest": item.digest,
+                                "size": item.size,
+                                "roles": list(item.roles),
+                                "already_present": item.already_present,
+                            }
+                            for item in records
+                        ],
+                    },
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(0)
         elif args.release_command == "run":
             if not args.confirm_spend:
                 print(
@@ -469,15 +594,42 @@ def main():
             if args.max_matrices is not None and args.max_matrices <= 0:
                 print("--max-matrices must be positive", file=sys.stderr)
                 raise SystemExit(2)
-            setup_logging("release")
+            from cloud_offload.config import CloudConfig
+            isolated_config = None
+            if args.home:
+                if not args.config:
+                    print("Isolated M7 release run requires --config.", file=sys.stderr)
+                    raise SystemExit(2)
+                from cloud_offload.artifact_bootstrap import (
+                    ArtifactBootstrapError,
+                    config_artifact_store,
+                    config_digest,
+                    declared_input_artifacts,
+                    verify_bootstrap_receipt,
+                )
+                try:
+                    isolated_config = CloudConfig.from_file(args.config, home=args.home)
+                    destination = config_artifact_store(isolated_config, args.home)
+                    declarations = declared_input_artifacts(
+                        (case.benchmark_plan_digest, case.benchmark_plan)
+                        for case in plan.cases
+                    )
+                    verify_bootstrap_receipt(
+                        destination,
+                        declarations,
+                        release_plan_digest=getattr(plan, "source_digest", "0" * 64),
+                        config_digest=config_digest(isolated_config, destination),
+                    )
+                except (ArtifactBootstrapError, OSError, ValueError, json.JSONDecodeError) as exc:
+                    print(f"Isolated M7 release startup refused: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from exc
+            setup_logging("release", home=args.home)
             load_plugins()
             from cloud_offload.config import CloudConfig
             from cloud_offload.service_config import discover_service_info
 
-            config = (
-                CloudConfig.from_file(args.config)
-                if args.config
-                else CloudConfig.load()
+            config = isolated_config or (
+                CloudConfig.from_file(args.config) if args.config else CloudConfig.load()
             )
             try:
                 service = discover_service_info(require_healthy=True)

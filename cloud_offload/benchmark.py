@@ -357,7 +357,14 @@ class BenchmarkPlan:
 
     @classmethod
     def load(cls, path: str | Path) -> "BenchmarkPlan":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        payload = json.loads(Path(path).read_bytes())
+        if not isinstance(payload, dict):
+            raise ValueError("benchmark plan must contain a JSON object")
+        return cls.from_dict(payload)
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> "BenchmarkPlan":
+        payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise ValueError("benchmark plan must contain a JSON object")
         return cls.from_dict(payload)
@@ -559,6 +566,7 @@ class BenchmarkRunner:
         results: list[dict[str, Any]] = []
         estimated_total = 0.0
         campaign_abort: str | None = None
+        cold_base_manifest_ready = False
         for scenario in plan.scenarios:
             elapsed = self.driver.monotonic() - campaign_started
             if elapsed >= plan.limits.max_campaign_seconds:
@@ -572,14 +580,37 @@ class BenchmarkRunner:
             ):
                 campaign_abort = "fresh_worker_quiescence_timeout"
                 break
-            result = self._run_scenario(
-                plan,
-                scenario,
-                baseline,
-                campaign_started,
-                estimated_total,
-            )
+            if (
+                scenario.failure
+                and scenario.failure.kind == "corruption"
+                and not cold_base_manifest_ready
+            ):
+                result = self._dependent_failure_result(
+                    scenario,
+                    "corruption requires a verified base manifest from the cache registry",
+                )
+            else:
+                result = self._run_scenario(
+                    plan,
+                    scenario,
+                    baseline,
+                    campaign_started,
+                    estimated_total,
+                )
             results.append(result)
+            if scenario.cache_state == "cold":
+                base_manifest = None
+                if result.get("passed"):
+                    checker = getattr(self.driver, "base_manifest", None)
+                    if callable(checker):
+                        try:
+                            base_manifest = checker(result)
+                        except Exception:  # noqa: BLE001 - absent registry proof fails closed
+                            base_manifest = None
+                    result["base_manifest_identity"] = base_manifest
+                cold_base_manifest_ready = bool(result.get("passed")) and bool(
+                    base_manifest
+                )
             estimated_total += float(result["estimated_compute_cost_upper_usd"])
             if result.get("orphaned_resources"):
                 campaign_abort = "orphan_cleanup_failed"
@@ -645,6 +676,50 @@ class BenchmarkRunner:
             ],
         }
         return scorecard
+
+    @staticmethod
+    def _dependent_failure_result(
+        scenario: BenchmarkScenario, reason: str
+    ) -> dict[str, Any]:
+        """Record a dependent canary failure without running its hook."""
+
+        now = _utc_now()
+        return {
+            "schema": SCENARIO_SCHEMA,
+            "name": scenario.name,
+            "cache_state": scenario.cache_state,
+            "request_digest": _canonical_digest(scenario.request),
+            "started_at": now,
+            "completed_at": now,
+            "duration_seconds": 0.0,
+            "resource_closure_seconds": 0.0,
+            "cancellation_to_provider_absence_seconds": None,
+            "revocation_to_provider_absence_seconds": None,
+            "job_id": None,
+            "status": None,
+            "expected_statuses": list(scenario.expected_statuses),
+            "passed": False,
+            "fresh_instance_required": scenario.fresh_instance,
+            "fresh_instance_observed": False,
+            "scenario_preparation": None,
+            "scenario_restoration": None,
+            "event_count": 0,
+            "event_cursor": 0,
+            "phase_durations_seconds": {},
+            "preparation_seconds": None,
+            "estimated_compute_cost_upper_usd": 0.0,
+            "resources": [],
+            "orphaned_resources": [],
+            "failure_injection": {
+                "kind": scenario.failure.kind if scenario.failure else None,
+                "triggered": False,
+                "dependency_failure": reason,
+            },
+            "limit_triggered": None,
+            "harness_error": f"Dependency failure: {reason}",
+            "support_bundle": None,
+            "submission_receipt": None,
+        }
 
     def _wait_for_worker_quiescence(
         self, plan: BenchmarkPlan, campaign_started: float
@@ -1449,7 +1524,7 @@ class CoordinatorBenchmarkDriver:
             preparation = preflight.get("preparation") or {}
             candidates = preflight.get("candidates") or []
             selected_region = str(execution.get("region") or "") or None
-            self._submission_receipts[job_id] = {
+            submission_receipt = {
                 "schema": "cloud-offload.benchmark-submission-receipt.v1",
                 "preflight_status": str(preflight.get("status") or ""),
                 "profile": str(execution.get("profile") or ""),
@@ -1468,6 +1543,26 @@ class CoordinatorBenchmarkDriver:
                     for item in candidates
                 ),
             }
+            profile_fingerprint = str(execution.get("profile_fingerprint") or "")
+            if profile_fingerprint:
+                submission_receipt["profile_fingerprint"] = profile_fingerprint
+            expected_model = str(request_payload.get("model") or "")
+            if expected_model:
+                submission_receipt["expected_model"] = expected_model
+            expected_artifacts = sorted(
+                str(item).lower()
+                for item in (request_payload.get("input_artifacts") or {}).values()
+                if item
+            )
+            if expected_artifacts:
+                submission_receipt["expected_artifact_digests"] = expected_artifacts
+            expected_model = str(
+                request_payload.get("model")
+                or ("comfyui-partition-v1" if scenario.endpoint == "/api/partitions" else "")
+            )
+            if expected_model:
+                submission_receipt["expected_model"] = expected_model
+            self._submission_receipts[job_id] = submission_receipt
         return job_id
 
     def submission_receipt(self, job_id: str) -> dict[str, Any] | None:
@@ -1480,6 +1575,100 @@ class CoordinatorBenchmarkDriver:
         )
         response.raise_for_status()
         return response.json()
+
+    def base_manifest(self, cold_result: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the exact cache-registry manifest created by the cold run."""
+        receipt = cold_result.get("submission_receipt") or {}
+        job_id = str(cold_result.get("job_id") or "")
+        if not job_id:
+            return None
+        receipt_region = str(receipt.get("region") or "")
+        requested_regions = tuple(
+            str(item).strip() for item in (receipt.get("allowed_regions") or []) if str(item).strip()
+        )
+        started_at = _parse_timestamp(cold_result.get("started_at"))
+        job_response = self._request(
+            "GET", f"/api/jobs/{job_id}", retry_safe=True, timeout=30
+        )
+        job_response.raise_for_status()
+        job = job_response.json()
+        if str(job.get("id") or job_id) != job_id:
+            return None
+        params = job.get("params") or {}
+        lease_id = str(params.get("lease_id") or "")
+        volume_id = str(params.get("cache_volume_id") or "")
+        job_region = str(params.get("cache_datacenter_id") or "")
+        expected_model = str(receipt.get("expected_model") or "")
+        job_model = str(job.get("model") or "")
+        if (
+            not expected_model
+            or not job_model
+            or job_model != expected_model
+            or not receipt_region
+            or len(requested_regions) != 1
+            or requested_regions[0] != receipt_region
+            or not job_region
+            or job_region != receipt_region
+        ):
+            return None
+        region = receipt_region
+        profile_fingerprint = str(receipt.get("profile_fingerprint") or "")
+        image_digest = str(receipt.get("image_digest") or "")
+        if (
+            not lease_id
+            or not volume_id
+            or not region
+            or not profile_fingerprint
+            or not image_digest
+        ):
+            return None
+        response = self._request(
+            "GET",
+            "/api/cache/manifests",
+            retry_safe=True,
+            timeout=30,
+            params={
+                "datacenter_id": region,
+                "profile_fingerprint": profile_fingerprint,
+            },
+        )
+        response.raise_for_status()
+        manifests = response.json().get("manifests") or []
+        candidates = []
+        for manifest in manifests:
+            created_at = _parse_timestamp(manifest.get("created_at"))
+            if (
+                started_at is not None
+                and (created_at is None or created_at <= started_at)
+            ):
+                continue
+            manifest_id = str(manifest.get("manifest_id") or "")
+            producer = manifest.get("producer") or {}
+            if (
+                not manifest_id
+                or str(manifest.get("volume_id") or "") != volume_id
+                or str(manifest.get("datacenter_id") or "") != region
+                or str(manifest.get("profile_fingerprint") or "") != profile_fingerprint
+                or str(producer.get("job_id") or "") != job_id
+                or str(producer.get("lease_id") or "") != lease_id
+                or str(producer.get("image_digest") or "") != image_digest
+                or not str(producer.get("cloud_offload_version") or "")
+                or not manifest.get("artifacts")
+            ):
+                continue
+            candidates.append(manifest)
+        if len(candidates) != 1:
+            return None
+        selected = candidates[0]
+        return {
+            "manifest_id": str(selected["manifest_id"]),
+            "volume_id": volume_id,
+            "datacenter_id": region,
+            "profile_fingerprint": profile_fingerprint,
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "created_at": selected.get("created_at"),
+        }
 
     def snapshot(self, job_id: str) -> dict[str, Any]:
         response = self._request(

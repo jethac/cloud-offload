@@ -18,6 +18,8 @@ from cloud_offload.benchmark import (
 )
 from cloud_offload.config import CloudConfig
 from cloud_offload.benchmark_faults import CORRUPTION_NONCE_FIELD
+from cloud_offload.cache_registry import CacheRegistry
+from cloud_offload.prepared_state import INDEX_SCHEMA
 
 
 def event(
@@ -190,6 +192,9 @@ class FakeDriver:
     def run_hook(self, injection, context):
         self.hooks.append((injection.kind, context))
         return {"exit_code": 0, "duration_seconds": 0.01, "output_omitted": True}
+
+    def base_manifest(self, cold_result):
+        return {"manifest_id": f"base-{cold_result['job_id']}"}
 
 
 def plan_dict(scenarios, **limit_overrides):
@@ -434,7 +439,7 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
     )
     selected["allowed_regions"] = ["EU-RO-1"]
     plan = BenchmarkPlan.from_dict(
-        plan_dict([selected])
+        plan_dict([scenario("cold", "cold"), selected])
     )
     script = successful_script("pod-corruption")
     script.steps[0]["events"].append(
@@ -448,16 +453,16 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
         )
     )
     script.steps[1]["events"][0]["sequence"] = 4
-    driver = FakeDriver({"corruption": script})
+    driver = FakeDriver({"cold": successful_script("pod-cold"), "corruption": script})
 
-    assets = plan.scenarios[0].request["partition"]["assets"]
+    assets = plan.scenarios[1].request["partition"]["assets"]
     assert len(assets) == 1
     assert assets[0]["filename"].startswith("cloud_offload_benchmark_canary_")
     assert len(assets[0][CORRUPTION_NONCE_FIELD]) == 32
-    assert plan.scenarios[0].failure.trigger_event == "cache_mount_ready"
+    assert plan.scenarios[1].failure.trigger_event == "cache_mount_ready"
 
     scorecard = BenchmarkRunner(driver).run(plan)
-    result = scorecard["results"][0]
+    result = scorecard["results"][1]
 
     assert scorecard["passed"] is True
     assert [
@@ -483,10 +488,163 @@ def test_two_phase_hook_prepares_before_submission_and_always_cleans_up():
         driver.hooks[0][1]["CLOUD_OFFLOAD_BENCHMARK_CANARY_NONCE"]
         == assets[0][CORRUPTION_NONCE_FIELD]
     )
-    assert driver.hooks[1][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == "job-1"
+    assert driver.hooks[1][1]["CLOUD_OFFLOAD_BENCHMARK_JOB_ID"] == "job-2"
     assert result["failure_injection"]["preparation_hook"]["exit_code"] == 0
     assert result["failure_injection"]["hook"]["exit_code"] == 0
     assert result["failure_injection"]["cleanup_hook"]["exit_code"] == 0
+
+
+def test_corruption_hook_runs_only_after_a_successful_cold_base_manifest():
+    class OrderedDriver(FakeDriver):
+        def __init__(self, scripts):
+            super().__init__(scripts)
+            self.cold_base_manifest_ready = False
+
+        def snapshot(self, job_id):
+            snapshot = super().snapshot(job_id)
+            if (
+                self.jobs[job_id]["scenario"].name == "cold"
+                and snapshot.get("status") == "completed"
+            ):
+                self.cold_base_manifest_ready = True
+            return snapshot
+
+        def run_hook(self, injection, context):
+            if injection.kind == "corruption":
+                assert self.cold_base_manifest_ready
+            return super().run_hook(injection, context)
+
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [
+                scenario("cold", "cold"),
+                scenario(
+                    "corruption",
+                    "failure",
+                    failure={
+                        "kind": "corruption",
+                        "before_submit": True,
+                        "hook_argv": ["corruption-canary"],
+                    },
+                ),
+            ]
+        )
+    )
+    driver = OrderedDriver(
+        {"cold": successful_script("pod-cold"), "corruption": successful_script("pod-corruption")}
+    )
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert driver.cold_base_manifest_ready
+    assert [kind for kind, _ in driver.hooks] == ["corruption", "corruption"]
+
+
+def test_corruption_requires_registry_manifest_identity_after_cold_pass(tmp_path):
+    class RegistryDriver(FakeDriver):
+        def __init__(self, scripts, registry):
+            super().__init__(scripts)
+            self.registry = registry
+            self.manifest_queries = []
+
+        def base_manifest(self, cold_result):
+            self.manifest_queries.append(cold_result["job_id"])
+            manifests = self.registry.query_manifests(datacenter_id="EU-RO-1")
+            return manifests[0] if len(manifests) == 1 else None
+
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [
+                scenario("cold", "cold"),
+                scenario(
+                    "corruption",
+                    "failure",
+                    failure={
+                        "kind": "corruption",
+                        "before_submit": True,
+                        "trigger_event": "executed",
+                        "hook_argv": ["corruption-canary"],
+                    },
+                ),
+            ]
+        )
+    )
+    registry = CacheRegistry(tmp_path / "cache.db")
+    volume = registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="provider-volume",
+        datacenter_id="EU-RO-1",
+        ownership="adopted",
+        capacity_bytes=1024,
+        policy={},
+        volume_id="volume-1",
+    )
+    registry.reconcile_index(
+        volume.id,
+        {
+            "schema": INDEX_SCHEMA,
+            "generation": "generation-1",
+            "manifests": [
+                {
+                    "manifest_id": "manifest-1",
+                    "profile_fingerprint": "profile-1",
+                    "created_at": "2026-07-29T00:00:01+00:00",
+                    "artifacts": [],
+                }
+            ],
+        },
+    )
+    driver = RegistryDriver(
+        {"cold": successful_script("pod-cold"), "corruption": successful_script("pod-corruption")},
+        registry=registry,
+    )
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert driver.manifest_queries == ["job-1"]
+    assert len(driver.hooks) == 3
+    assert [kind for kind, _ in driver.hooks] == ["corruption"] * 3
+    assert scorecard["results"][1]["passed"] is True
+
+
+def test_corruption_reports_dependency_failure_without_running_when_cold_fails():
+    class ColdFailureDriver(FakeDriver):
+        def submit(self, scenario):
+            if scenario.name == "cold":
+                raise RuntimeError("cold base manifest was not created")
+            return super().submit(scenario)
+
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [
+                scenario("cold", "cold"),
+                scenario(
+                    "corruption",
+                    "failure",
+                    failure={
+                        "kind": "corruption",
+                        "before_submit": True,
+                        "hook_argv": ["corruption-canary"],
+                    },
+                ),
+            ]
+        )
+    )
+    driver = ColdFailureDriver({"corruption": successful_script("pod-corruption")})
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    result = scorecard["results"][1]
+    assert driver.hooks == []
+    assert result["passed"] is False
+    assert result["failure_injection"]["triggered"] is False
+    assert result["failure_injection"]["dependency_failure"] == (
+        "corruption requires a verified base manifest from the cache registry"
+    )
+    assert result["harness_error"] == (
+        "Dependency failure: corruption requires a verified base manifest from "
+        "the cache registry"
+    )
 
 
 def test_corruption_observation_hook_has_a_longer_bounded_timeout():
@@ -520,11 +678,14 @@ def test_corruption_plan_load_creates_a_new_canary_for_each_campaign():
 def test_two_phase_hook_cleans_up_when_submission_never_creates_a_job():
     class BrokenSubmitDriver(FakeDriver):
         def submit(self, scenario):
-            raise RuntimeError("submission failed")
+            if scenario.name == "corruption":
+                raise RuntimeError("submission failed")
+            return super().submit(scenario)
 
     plan = BenchmarkPlan.from_dict(
         plan_dict(
             [
+                scenario("cold", "cold"),
                 scenario(
                     "corruption",
                     "failure",
@@ -537,9 +698,9 @@ def test_two_phase_hook_cleans_up_when_submission_never_creates_a_job():
             ]
         )
     )
-    driver = BrokenSubmitDriver({})
+    driver = BrokenSubmitDriver({"cold": successful_script("pod-cold")})
 
-    result = BenchmarkRunner(driver).run(plan)["results"][0]
+    result = BenchmarkRunner(driver).run(plan)["results"][1]
 
     assert result["passed"] is False
     assert [
@@ -797,6 +958,7 @@ def test_coordinator_driver_preflights_partition_before_submission():
         "preflight_status": "ready",
         "profile": "comfyui",
         "image_digest": "sha256:" + "c" * 64,
+        "expected_model": "comfyui-partition-v1",
         "provider": "runpod",
         "region": "US-MD-1",
         "allowed_regions": ["US-MD-1"],
@@ -805,6 +967,112 @@ def test_coordinator_driver_preflights_partition_before_submission():
         "preparation_coverage_percent": 0.0,
         "cold_fallback_available": True,
     }
+
+
+def test_coordinator_driver_accepts_only_manifest_bound_to_cold_job_and_lease():
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    profile = "sha256:" + "p" * 64
+    driver._submission_receipts["job-1"] = {
+        "profile_fingerprint": profile,
+        "image_digest": "sha256:" + "i" * 64,
+        "expected_model": "comfyui-partition-v1",
+        "allowed_regions": ["US-MD-1"],
+        "region": "US-MD-1",
+    }
+    valid = {
+        "manifest_id": "sha256:" + "m" * 64,
+        "profile_fingerprint": profile,
+        "created_at": "2026-08-01T00:00:02+00:00",
+        "producer": {
+            "job_id": "job-1", "lease_id": "lease-1",
+            "image_digest": "sha256:" + "i" * 64,
+            "cloud_offload_version": "test",
+        },
+        "artifacts": [{"digest": "sha256:" + "a" * 64, "size": 1}],
+        "volume_id": "volume-1",
+        "datacenter_id": "US-MD-1",
+    }
+    unrelated = {**valid, "manifest_id": "sha256:" + "u" * 64,
+                 "producer": {"job_id": "other", "lease_id": "other"}}
+
+    def request(method, path, **kwargs):
+        if path == "/api/jobs/job-1":
+            return FakeResponse({
+                "id": "job-1",
+                "params": {
+                    "lease_id": "lease-1",
+                    "cache_volume_id": "volume-1",
+                    "cache_datacenter_id": "US-MD-1",
+                },
+                "model": "comfyui-partition-v1",
+            })
+        assert path == "/api/cache/manifests"
+        return FakeResponse({"manifests": [unrelated, valid]})
+
+    driver._request = request
+    result = driver.base_manifest({
+        "job_id": "job-1",
+        "started_at": "2026-08-01T00:00:01+00:00",
+        "submission_receipt": driver.submission_receipt("job-1"),
+    })
+    assert result["manifest_id"] == valid["manifest_id"]
+    assert result["lease_id"] == "lease-1"
+
+
+@pytest.mark.parametrize(
+    ("job_model", "receipt_region", "job_region", "manifest_region"),
+    [
+        ("wrong-model", "US-MD-1", "US-MD-1", "US-MD-1"),
+        ("comfyui-partition-v1", "EU-RO-1", "US-MD-1", "US-MD-1"),
+        ("comfyui-partition-v1", "US-MD-1", "EU-RO-1", "EU-RO-1"),
+    ],
+)
+def test_base_manifest_rejects_model_or_region_identity_mismatch(
+    job_model, receipt_region, job_region, manifest_region
+):
+    driver = CoordinatorBenchmarkDriver(
+        "http://127.0.0.1:11435", None, CloudConfig(), ()
+    )
+    profile = "sha256:" + "p" * 64
+    image = "sha256:" + "i" * 64
+    driver._submission_receipts["job-1"] = {
+        "profile_fingerprint": profile,
+        "image_digest": image,
+        "expected_model": "comfyui-partition-v1",
+        "allowed_regions": [receipt_region],
+        "region": receipt_region,
+    }
+    manifest = {
+        "manifest_id": "sha256:" + "m" * 64,
+        "profile_fingerprint": profile,
+        "created_at": "2026-08-01T00:00:02+00:00",
+        "producer": {
+            "job_id": "job-1", "lease_id": "lease-1",
+            "image_digest": image, "cloud_offload_version": "test",
+        },
+        "artifacts": [{"digest": "sha256:" + "a" * 64, "size": 1}],
+        "volume_id": "volume-1",
+        "datacenter_id": manifest_region,
+    }
+
+    def request(method, path, **kwargs):
+        if path == "/api/jobs/job-1":
+            return FakeResponse({
+                "id": "job-1", "model": job_model,
+                "params": {
+                    "lease_id": "lease-1", "cache_volume_id": "volume-1",
+                    "cache_datacenter_id": job_region,
+                },
+            })
+        return FakeResponse({"manifests": [manifest]})
+
+    driver._request = request
+    assert driver.base_manifest({
+        "job_id": "job-1", "started_at": "2026-08-01T00:00:01+00:00",
+        "submission_receipt": driver.submission_receipt("job-1"),
+    }) is None
 
 
 def _ready_preflight_response():

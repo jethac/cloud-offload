@@ -66,6 +66,7 @@ MAX_PARTITION_ARTIFACT_BYTES = int(
 auth_required = False
 auth_token: str | None = None
 last_error: str | None = None
+_runtime_config: Any | None = None
 _config_write_lock = threading.RLock()
 _ANY_VOLUME_BINDING = object()
 _HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
@@ -286,6 +287,8 @@ async def add_request_id(request: Request, call_next):
 def _config(*, resolve_secrets: bool = True):
     from cloud_offload.config import CloudConfig
 
+    if _runtime_config is not None:
+        return _runtime_config
     return CloudConfig.load(resolve_secrets=resolve_secrets)
 
 
@@ -631,9 +634,16 @@ def _validate_manifest_proposal(
     from cloud_offload.prepared_state import utc_now
 
     proposal["created_at"] = utc_now()
+    # Worker-provided producer claims are untrusted.  The coordinator binds the
+    # signed identity to the authenticated job/lease context it owns.
+    lease_id = str(job.params.get("lease_id") or "")
+    worker_id = str(getattr(job, "worker_id", "") or "")
     proposal["producer"] = {
         "image_digest": image_digest,
         "cloud_offload_version": VERSION,
+        "job_id": str(getattr(job, "id", "") or ""),
+        "lease_id": lease_id,
+        "worker_id": worker_id,
     }
     proposal["cache_volume_id"] = str(volume_id)
     proposal["cache_provider_volume_id"] = str(
@@ -4460,6 +4470,7 @@ def serve(
     require_auth: bool = False,
     tls_cert: str | None = None,
     tls_key: str | None = None,
+    config: Any | None = None,
 ):
     """Start the Cloud Offload coordinator.
 
@@ -4473,6 +4484,9 @@ def serve(
     and clients then send their bearer tokens in the clear unless something in
     front — a tunnel or reverse proxy — is terminating TLS for you.
     """
+    global _runtime_config
+    if config is not None:
+        _runtime_config = config
     validate_bind_host(host, allow_lan=allow_lan)
     cert, key = _resolve_tls(tls_cert, tls_key)
     port = choose_service_port(host, port)

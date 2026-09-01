@@ -106,6 +106,53 @@ region via `allowed_regions`.
 
 ## Commands
 
+Before starting an isolated coordinator, import the boundary bundles referenced
+by the private benchmark plans into that coordinator's configured local artifact
+root. The source root is read-only; the command verifies each source digest and
+size, publishes through the same content-addressed `partition-artifacts/` layout
+used by `/api/artifacts`, and accepts only exact duplicate objects on repeat
+runs. Missing sources, digest/size mismatches, interrupted copies, and conflicting
+destination bytes stop the command without publishing a partial object. It emits
+only artifact digests, sizes, roles, and duplicate status—never source paths or
+credentials.
+
+```bash
+cloud-offload release bootstrap-artifacts \
+  --plan .runlogs/m7-release-plan.json \
+  --source-root /read-only/prior-cloud-offload/job_files \
+  --home /isolated/m7 \
+  --config /isolated/m7/config.json
+```
+
+The explicit `--home` makes a blank `storage_path` resolve to
+`/isolated/m7/job_files`; it is never resolved from the process-global home.
+The command writes a durable receipt bound to the release-plan digest, effective
+redacted config, destination, and every declared artifact. A receipt mismatch,
+missing receipt, or missing/mutated artifact refuses startup.
+
+Start the coordinator only through the receipt-enforcing isolated path:
+
+```bash
+cloud-offload serve \
+  --config /isolated/m7/config.json \
+  --home /isolated/m7 \
+  --release-plan .runlogs/m7-release-plan.json
+```
+
+Then run the release wrapper with the same enforced identity:
+
+```bash
+cloud-offload release run \
+  --plan .runlogs/m7-release-plan.json \
+  --ledger .runlogs/m7-ledger.json \
+  --output-dir .runlogs/m7 \
+  --config /isolated/m7/config.json \
+  --home /isolated/m7 \
+  --confirm-spend --allow-hooks
+```
+
+Do not repoint an isolated campaign at a prior mutable Cloud Offload home.
+
 Validate a plan (free, no credentials, no provider reads; prints only the
 redacted safe summary):
 
