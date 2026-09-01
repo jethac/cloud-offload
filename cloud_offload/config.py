@@ -58,6 +58,45 @@ READ_ONLY_CONFIG_FIELDS = frozenset(
     }
 )
 
+SECRET_CONFIG_FIELDS = frozenset(
+    {
+        "gcs_credentials",
+        "provider_credentials",
+        "runpod_api_key",
+        "vast_api_key",
+        "worker_token",
+    }
+)
+
+RESTART_REQUIRED_CONFIG_FIELDS = frozenset(
+    {
+        "connector_options",
+        "coordinator_url",
+        "enabled",
+        "ingress",
+        "poll_interval_seconds",
+        "provider",
+        "provider_order",
+        "queue_db_path",
+        "routing_policy",
+        "runpod_cloud_type",
+        "runpod_container_disk_gb",
+        "runpod_graphql_url",
+        "runpod_rest_url",
+        "runpod_volume_gb",
+        "scratch_dir",
+        "storage_path",
+        "storage_type",
+        "vast_api_url",
+        "worker_image_profile",
+        "worker_manifest_path",
+        "worker_models",
+        "worker_profile",
+        "worker_wheelhouse_sha256",
+        "worker_wheelhouse_url",
+    }
+)
+
 # Plaintext credential file written by versions before keychain storage. Kept
 # only so existing keys can be migrated out of it; nothing writes it now. The
 # credentials module reads this attribute, so tests can redirect it.

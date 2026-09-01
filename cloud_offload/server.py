@@ -1145,19 +1145,29 @@ def _persist_prepared_volume_binding(
         return True
 
 
+def _persisted_config_snapshot(config: Any, writable_fields: set[str]) -> Any:
+    """Overlay durable fields on live state without importing unrelated homes."""
+    config_path = _config_source_path(config)
+    data = _read_persisted_config(config_path)
+    target = (
+        data["cloud"]
+        if "cloud" in data and isinstance(data["cloud"], dict)
+        else data
+    )
+    durable = copy.deepcopy(config)
+    for field_name in writable_fields.intersection(target):
+        setattr(durable, field_name, copy.deepcopy(target[field_name]))
+    durable.__post_init__()
+    return durable
+
+
 @app.post("/api/config")
 async def update_config(updates: dict[str, Any] = Body(...)):
     """Persist non-secret configuration. Secrets come from the environment only."""
     global _runtime_config
-    secret_fields = {
-        "vast_api_key",
-        "runpod_api_key",
-        "worker_token",
-        "gcs_credentials",
-        # Connector credentials are written through /api/providers/{name}/credentials,
-        # which stores them outside config.json.
-        "provider_credentials",
-    }
+    from cloud_offload.config import SECRET_CONFIG_FIELDS
+
+    secret_fields = SECRET_CONFIG_FIELDS
     payload = updates.get("cloud", updates) if isinstance(updates, dict) else {}
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Config body must be a JSON object")
@@ -1191,11 +1201,15 @@ async def update_config(updates: dict[str, Any] = Body(...)):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    from cloud_offload.config import LIVE_RELOADABLE_CONFIG_FIELDS
+    from cloud_offload.config import (
+        LIVE_RELOADABLE_CONFIG_FIELDS,
+        RESTART_REQUIRED_CONFIG_FIELDS,
+    )
 
     with _config_write_lock:
         current = _config()
-        candidate = copy.deepcopy(current)
+        durable = _persisted_config_snapshot(current, writable_fields)
+        candidate = copy.deepcopy(durable)
         mutable_fields = writable_fields
         updated_fields = mutable_fields.intersection(payload)
         try:
@@ -1205,19 +1219,22 @@ async def update_config(updates: dict[str, Any] = Body(...)):
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        changed_fields = {
+        persistence_changed_fields = {
             field_name
             for field_name in updated_fields
-            if getattr(candidate, field_name) != getattr(current, field_name)
+            if getattr(candidate, field_name) != getattr(durable, field_name)
         }
         payload = {
             field_name: copy.deepcopy(getattr(candidate, field_name))
-            for field_name in changed_fields
+            for field_name in persistence_changed_fields
         }
-        applied_fields = changed_fields.intersection(
-            LIVE_RELOADABLE_CONFIG_FIELDS
-        )
-        pending_restart_fields = changed_fields - applied_fields
+        applied_fields = {
+            field_name
+            for field_name in updated_fields.intersection(
+                LIVE_RELOADABLE_CONFIG_FIELDS
+            )
+            if getattr(candidate, field_name) != getattr(current, field_name)
+        }
         live_candidate = copy.deepcopy(current)
         for field_name in applied_fields:
             setattr(
@@ -1228,6 +1245,11 @@ async def update_config(updates: dict[str, Any] = Body(...)):
         live_candidate.__post_init__()
         if payload:
             _persist_config_updates(payload, current)
+        pending_restart_fields = {
+            field_name
+            for field_name in RESTART_REQUIRED_CONFIG_FIELDS
+            if getattr(candidate, field_name) != getattr(live_candidate, field_name)
+        }
         if _runtime_config is not None:
             _runtime_config = live_candidate
             effective = live_candidate

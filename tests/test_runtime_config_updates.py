@@ -8,6 +8,51 @@ from cloud_offload import preflight, server
 from cloud_offload.config import CloudConfig
 
 
+STRUCTURAL_CONFIG_ALTERNATES = {
+    "connector_options": {"runpod": {"endpoint": "test"}},
+    "coordinator_url": "https://coordinator.test.invalid",
+    "enabled": True,
+    "ingress": "cloudflared",
+    "poll_interval_seconds": 11,
+    "provider": "vast.ai",
+    "provider_order": ["vast.ai", "runpod"],
+    "queue_db_path": "replacement.db",
+    "routing_policy": "cheapest",
+    "runpod_cloud_type": "COMMUNITY",
+    "runpod_container_disk_gb": 21,
+    "runpod_graphql_url": "https://graphql.test.invalid",
+    "runpod_rest_url": "https://rest.test.invalid",
+    "runpod_volume_gb": 10,
+    "scratch_dir": "replacement-scratch",
+    "storage_path": "replacement-storage",
+    "storage_type": "s3",
+    "vast_api_url": "https://vast.test.invalid",
+    "worker_image_profile": "replacement-image",
+    "worker_manifest_path": "replacement-runtime.json",
+    "worker_models": ["replacement-model"],
+    "worker_profile": "replacement-worker",
+    "worker_wheelhouse_sha256": "a" * 64,
+    "worker_wheelhouse_url": "https://wheelhouse.test.invalid/package.whl",
+}
+
+
+def test_every_writable_config_field_has_one_runtime_classification():
+    from cloud_offload.config import (
+        LIVE_RELOADABLE_CONFIG_FIELDS,
+        RESTART_REQUIRED_CONFIG_FIELDS,
+        SECRET_CONFIG_FIELDS,
+    )
+
+    writable = set(CloudConfig.__dataclass_fields__) - SECRET_CONFIG_FIELDS
+    assert LIVE_RELOADABLE_CONFIG_FIELDS.isdisjoint(
+        RESTART_REQUIRED_CONFIG_FIELDS
+    )
+    assert (
+        LIVE_RELOADABLE_CONFIG_FIELDS | RESTART_REQUIRED_CONFIG_FIELDS
+        == writable
+    )
+
+
 def _write_config(path, policy="smart"):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -375,3 +420,124 @@ def test_round_tripped_public_config_ignores_read_only_and_unchanged_fields(
         "coordinator_configured",
     ):
         assert field_name not in persisted
+
+
+def test_pending_queue_change_can_be_cancelled_before_restart(monkeypatch, tmp_path):
+    isolated_home = tmp_path / "isolated"
+    source = isolated_home / "config.json"
+    _write_config(source)
+    runtime = CloudConfig.from_file(source, home=isolated_home)
+    old_queue = runtime.queue_db_path
+    new_queue = str(isolated_home / "new.db")
+    monkeypatch.setattr(server, "_runtime_config", runtime)
+    monkeypatch.setattr(server, "auth_required", False)
+    client = TestClient(server.app)
+
+    pending = client.post("/api/config", json={"queue_db_path": new_queue})
+    cancelled = client.post("/api/config", json={"queue_db_path": old_queue})
+
+    assert pending.json()["pending_restart_fields"] == ["queue_db_path"]
+    assert pending.json()["restart_required"] is True
+    assert cancelled.status_code == 200
+    assert cancelled.json()["applied_fields"] == []
+    assert cancelled.json()["pending_restart_fields"] == []
+    assert cancelled.json()["restart_required"] is False
+    assert server._runtime_config.queue_db_path == old_queue
+    persisted = json.loads(source.read_text(encoding="utf-8"))["cloud"]
+    assert persisted["queue_db_path"] == old_queue
+    restarted = CloudConfig.from_file(source, home=isolated_home)
+    assert restarted.queue_db_path == old_queue
+
+
+@pytest.mark.parametrize(
+    "field_name,alternate",
+    sorted(STRUCTURAL_CONFIG_ALTERNATES.items()),
+)
+def test_every_structural_change_can_be_cancelled_before_restart(
+    monkeypatch, tmp_path, field_name, alternate
+):
+    from cloud_offload.config import RESTART_REQUIRED_CONFIG_FIELDS
+
+    assert set(STRUCTURAL_CONFIG_ALTERNATES) == set(RESTART_REQUIRED_CONFIG_FIELDS)
+    isolated_home = tmp_path / field_name
+    source = isolated_home / "config.json"
+    _write_config(source)
+    runtime = CloudConfig.from_file(source, home=isolated_home)
+    original = getattr(runtime, field_name)
+    monkeypatch.setattr(server, "_runtime_config", runtime)
+    monkeypatch.setattr(server, "auth_required", False)
+    client = TestClient(server.app)
+
+    pending = client.post("/api/config", json={field_name: alternate})
+    cancelled = client.post("/api/config", json={field_name: original})
+
+    assert pending.status_code == 200
+    assert field_name in pending.json()["pending_restart_fields"]
+    assert cancelled.status_code == 200
+    assert cancelled.json()["applied_fields"] == []
+    assert cancelled.json()["pending_restart_fields"] == []
+    assert cancelled.json()["restart_required"] is False
+    restarted = CloudConfig.from_file(source, home=isolated_home)
+    assert getattr(restarted, field_name) == original
+
+
+def test_live_update_is_retained_while_structural_change_is_pending_and_cancelled(
+    monkeypatch, tmp_path
+):
+    isolated_home = tmp_path / "isolated"
+    source = isolated_home / "config.json"
+    _write_config(source)
+    runtime = CloudConfig.from_file(source, home=isolated_home)
+    old_queue = runtime.queue_db_path
+    monkeypatch.setattr(server, "_runtime_config", runtime)
+    monkeypatch.setattr(server, "auth_required", False)
+    client = TestClient(server.app)
+
+    client.post(
+        "/api/config",
+        json={"queue_db_path": str(isolated_home / "new.db")},
+    )
+    live = client.post(
+        "/api/config", json={"prepared_storage": {"policy": "off"}}
+    )
+    cancelled = client.post("/api/config", json={"queue_db_path": old_queue})
+
+    assert live.json()["applied_fields"] == ["prepared_storage"]
+    assert live.json()["pending_restart_fields"] == ["queue_db_path"]
+    assert server._runtime_config.prepared_storage["policy"] == "off"
+    assert cancelled.json()["pending_restart_fields"] == []
+    assert cancelled.json()["restart_required"] is False
+    assert server._runtime_config.prepared_storage["policy"] == "off"
+    restarted = CloudConfig.from_file(source, home=isolated_home)
+    assert restarted.queue_db_path == old_queue
+    assert restarted.prepared_storage["policy"] == "off"
+
+
+def test_pending_cancellation_write_failure_keeps_durable_and_live_state_atomic(
+    monkeypatch, tmp_path
+):
+    isolated_home = tmp_path / "isolated"
+    source = isolated_home / "config.json"
+    _write_config(source)
+    runtime = CloudConfig.from_file(source, home=isolated_home)
+    old_queue = runtime.queue_db_path
+    new_queue = str(isolated_home / "new.db")
+    monkeypatch.setattr(server, "_runtime_config", runtime)
+    monkeypatch.setattr(server, "auth_required", False)
+    client = TestClient(server.app, raise_server_exceptions=False)
+    assert client.post(
+        "/api/config", json={"queue_db_path": new_queue}
+    ).status_code == 200
+    durable_before = source.read_bytes()
+
+    def fail_write(path, data):
+        raise OSError("test cancellation write failure")
+
+    monkeypatch.setattr(server, "_atomic_write_persisted_config", fail_write)
+    failed = client.post("/api/config", json={"queue_db_path": old_queue})
+
+    assert failed.status_code == 500
+    assert server._runtime_config.queue_db_path == old_queue
+    assert source.read_bytes() == durable_before
+    restarted = CloudConfig.from_file(source, home=isolated_home)
+    assert restarted.queue_db_path == new_queue
