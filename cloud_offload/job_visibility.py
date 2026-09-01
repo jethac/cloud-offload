@@ -54,6 +54,7 @@ EVENT_STAGES = {
     "provider_request_progress": "provisioning",
     "provider_request_completed": "provisioning",
     "provider_request_failed": "provisioning",
+    "provider_startup_observation": "worker_boot",
     "lease_created": "provisioning",
     "lease_bound": "provisioning",
     "lease_job_attached": "provisioning",
@@ -114,6 +115,7 @@ EVENT_LABELS = {
     "provider_request_progress": "GPU request is in progress",
     "provider_request_completed": "GPU allocated",
     "provider_request_failed": "GPU request failed",
+    "provider_startup_observation": "Cloud worker startup state updated",
     "provisioning_failed": "GPU start failed; retry is pending",
     "lease_created": "GPU resource lease created",
     "lease_bound": "GPU resource lease is active",
@@ -585,6 +587,41 @@ def _safe_event_summaries(events: list[dict[str, Any]], limit: int = 16) -> list
             item["verification_bytes"] = int(max(0, verification_bytes))
         if event.get("background_sampled") is True:
             item["background_sampled"] = True
+        if event_type == "provider_startup_observation":
+            raw_phases = event.get("startup_phases")
+            raw_phases = raw_phases if isinstance(raw_phases, dict) else {}
+            safe_phases: dict[str, dict[str, str]] = {}
+            for phase in (
+                "allocation",
+                "image_pull",
+                "container_start",
+                "runner_callback",
+                "comfyui_readiness",
+            ):
+                raw_phase = raw_phases.get(phase)
+                raw_phase = raw_phase if isinstance(raw_phase, dict) else {}
+                state = str(raw_phase.get("state") or "unknown")
+                if state not in {"unknown", "confirmed", "not_started", "failed"}:
+                    state = "unknown"
+                safe_phase = {"state": state}
+                if phase == "allocation":
+                    provider_state = str(
+                        raw_phase.get("provider_state") or "UNKNOWN"
+                    ).upper()
+                    if provider_state not in {
+                        "PROVISIONING",
+                        "STARTING",
+                        "RUNNING",
+                        "EXITED",
+                        "ERROR",
+                        "TERMINATED",
+                        "UNKNOWN",
+                        "MIXED",
+                    }:
+                        provider_state = "UNKNOWN"
+                    safe_phase["provider_state"] = provider_state
+                safe_phases[phase] = safe_phase
+            item["startup_phases"] = safe_phases
         summaries.append(item)
     return summaries[-max(1, int(limit)) :]
 

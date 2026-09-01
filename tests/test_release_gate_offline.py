@@ -12,6 +12,7 @@ import sys
 import pytest
 
 import cloud_offload.release_gate as release_gate
+from cloud_offload.benchmark import InstanceObservation
 from cloud_offload.config import CloudConfig
 from cloud_offload.release_gate import (
     RELEASE_PLAN_SCHEMA,
@@ -153,6 +154,14 @@ class FakeWorld:
             scorecard["orphaned_resources"] = [
                 {"provider": "runpod", "instance_id": "orphan-1"}
             ]
+        elif outcome == "interrupt":
+            scorecard["passed"] = False
+            scorecard["campaign_abort"] = "operator_interrupt:KeyboardInterrupt"
+            scorecard["results"] = scorecard["results"][:1]
+            scorecard["results"][0]["passed"] = False
+            scorecard["results"][0]["abort_reason"] = (
+                "operator_interrupt:KeyboardInterrupt"
+            )
         return scorecard
 
 
@@ -176,6 +185,20 @@ class FakeDriver:
             "volumes": self.world.volumes,
             "policy": self.world.storage_policy,
         }
+
+    def inventory(self, providers):
+        return {provider: {} for provider in providers}
+
+    def terminate(self, provider, instance_id):
+        return True
+
+    @staticmethod
+    def monotonic():
+        return 0.0
+
+    @staticmethod
+    def sleep(seconds):
+        return None
 
 
 class FakeRunner:
@@ -477,3 +500,102 @@ def test_harness_crash_is_recorded_as_a_failed_matrix(offline):
     reloaded = load_ledger(ledger_path, plan)
     assert reloaded["consecutive_passes"] == 0
     assert len(reloaded["matrices"]) == 3
+
+
+def test_operator_interrupt_atomically_publishes_aborted_scorecard_and_ledger(offline):
+    plan, world, executor, ledger_path, output_dir = offline
+    world.outcomes = ["interrupt"]
+
+    ledger = executor().run(max_matrices=2)
+
+    assert ledger["last_stop_reason"] == "operator_interrupt:KeyboardInterrupt"
+    assert ledger["last_run_matrix_count"] == 1
+    assert len(ledger["matrices"]) == 1
+    receipt = ledger["matrices"][0]
+    assert receipt["passed"] is False
+    assert receipt["matrix_stop_reason"] == "operator_interrupt:KeyboardInterrupt"
+    scorecard_path = next(output_dir.glob("matrix-*/benchmark-scorecard.json"))
+    scorecard = json.loads(scorecard_path.read_text(encoding="utf-8"))
+    assert scorecard["campaign_abort"] == "operator_interrupt:KeyboardInterrupt"
+    assert scorecard["results"][0]["abort_reason"] == (
+        "operator_interrupt:KeyboardInterrupt"
+    )
+    assert not list(output_dir.rglob("*.tmp"))
+    encoded_ledger = ledger_path.read_text(encoding="utf-8")
+    assert SERVICE_TOKEN not in encoded_ledger
+    assert SERVICE_URL not in encoded_ledger
+    assert str(output_dir) not in encoded_ledger
+
+
+def test_release_layer_interrupt_still_writes_failed_cleanup_unknown_receipts(offline):
+    plan, world, executor, ledger_path, output_dir = offline
+
+    def interrupted(benchmark):
+        raise KeyboardInterrupt
+
+    world.scorecard = interrupted
+
+    ledger = executor().run(max_matrices=2)
+
+    assert ledger["last_stop_reason"] == "operator_interrupt:KeyboardInterrupt"
+    assert len(ledger["matrices"]) == 1
+    receipt = ledger["matrices"][0]
+    assert receipt["cleanup_proof"] == {"state": "confirmed"}
+    assert receipt["provider_mutation"] == "unknown"
+    assert receipt["estimated_compute_cost_upper_usd"] == (
+        plan.limits.max_matrix_cost_usd
+    )
+    assert receipt["duration_seconds"] == plan.limits.max_matrix_seconds
+    assert receipt["duration_basis"] == "matrix_limit_conservative"
+    assert receipt["failure_codes"] == ["operator_interrupt:KeyboardInterrupt"]
+    scorecard_path = next(output_dir.glob("matrix-*/benchmark-scorecard.json"))
+    scorecard = json.loads(scorecard_path.read_text(encoding="utf-8"))
+    assert scorecard["campaign_abort"] == "operator_interrupt:KeyboardInterrupt"
+    assert scorecard["cleanup_proof"] == {"state": "confirmed"}
+    assert not list(output_dir.rglob("*.tmp"))
+    encoded = ledger_path.read_text(encoding="utf-8")
+    assert SERVICE_TOKEN not in encoded
+    assert SERVICE_URL not in encoded
+    assert str(output_dir) not in encoded
+
+
+def test_release_fallback_does_not_delete_unattributed_managed_resource(
+    offline, monkeypatch
+):
+    plan, world, executor, _, _ = offline
+    termination_calls = []
+
+    class ActiveFallbackDriver(FakeDriver):
+        def inventory(self, providers):
+            return {
+                "runpod": {
+                    "pod-unattributed": InstanceObservation(
+                        id="pod-unattributed",
+                        provider="runpod",
+                        hourly_rate=0.5,
+                        status="running",
+                        managed=True,
+                    )
+                }
+            }
+
+        def terminate(self, provider, instance_id):
+            termination_calls.append((provider, instance_id))
+            return True
+
+    monkeypatch.setattr(
+        release_gate,
+        "CoordinatorBenchmarkDriver",
+        lambda *args, **kwargs: ActiveFallbackDriver(world, *args, **kwargs),
+    )
+
+    def interrupted(benchmark):
+        raise KeyboardInterrupt
+
+    world.scorecard = interrupted
+    ledger = executor().run(max_matrices=1)
+
+    receipt = ledger["matrices"][0]
+    assert termination_calls == []
+    assert receipt["cleanup_proof"] == {"state": "failed"}
+    assert "cleanup_unverified" in receipt["failure_codes"]

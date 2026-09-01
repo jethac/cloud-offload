@@ -218,6 +218,43 @@ def test_active_stage_progress_changes_without_a_new_event(tmp_path):
     assert second["progress_basis"] == "stage_time_estimate"
 
 
+def test_startup_phase_observation_is_visible_but_only_finite_safe_fields_remain(tmp_path):
+    queue = JobQueue(tmp_path / "queue.db")
+    job = _visible_job(queue)
+    queue.append_event(
+        job.id,
+        {
+            "type": "provider_startup_observation",
+            "phase": "runner_starting",
+            "startup_phases": {
+                "allocation": {
+                    "state": "confirmed",
+                    "provider_state": "RUNNING",
+                    "private_path": "C:/private/startup.log",
+                },
+                "image_pull": {"state": "unknown", "token": "private-token"},
+                "container_start": {"state": "confirmed"},
+                "runner_callback": {"state": "unknown"},
+                "comfyui_readiness": {"state": "unknown"},
+            },
+        },
+    )
+
+    view = project_job_visibility(queue.get(job.id), queue.list_events(job.id))
+    summary = view["recent_events"][-1]
+
+    assert summary["type"] == "provider_startup_observation"
+    assert summary["stage"] == "worker_boot"
+    assert summary["startup_phases"] == {
+        "allocation": {"state": "confirmed", "provider_state": "RUNNING"},
+        "image_pull": {"state": "unknown"},
+        "container_start": {"state": "confirmed"},
+        "runner_callback": {"state": "unknown"},
+        "comfyui_readiness": {"state": "unknown"},
+    }
+    assert "private" not in json.dumps(summary).lower()
+
+
 def test_terminal_success_is_100_but_billing_waits_for_a_termination_receipt(tmp_path):
     queue = JobQueue(tmp_path / "queue.db")
     job = _visible_job(queue)

@@ -1803,11 +1803,63 @@ cloud-offload worker --poll 10
                 )
                 if self._job_profile_name(job, profiles) == profile_name
             ]
+            instance = self.active_instances.get(instance_id)
+            container_telemetry = (
+                self.connectors[provider_name].container_started(instance)
+                if instance is not None
+                else None
+            )
             last_feedback = self.runner_feedback_at.get(instance_id)
             if queued_jobs and (
                 last_feedback is None or now - last_feedback >= timedelta(seconds=10)
             ):
                 elapsed = round((now - launched_at).total_seconds(), 1)
+                raw_metadata = getattr(instance, "metadata", None)
+                metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+                provider_state = str(
+                    metadata.get("provider_state")
+                    or (instance.status if instance is not None else "unknown")
+                    or "unknown"
+                ).upper()
+                if provider_state not in {
+                    "PROVISIONING",
+                    "STARTING",
+                    "RUNNING",
+                    "EXITED",
+                    "ERROR",
+                    "TERMINATED",
+                    "UNKNOWN",
+                }:
+                    provider_state = "UNKNOWN"
+                container_state = (
+                    "confirmed"
+                    if container_telemetry is True
+                    else "not_started"
+                    if container_telemetry is False
+                    else "unknown"
+                )
+                self._publish_launch_event(
+                    queued_jobs,
+                    {
+                        "schema": "cloud-offload.phase-event.v1",
+                        "type": "provider_startup_observation",
+                        "phase": "runner_starting",
+                        "worker_instance_id": instance_id,
+                        "elapsed_seconds": elapsed,
+                        "startup_phases": {
+                            "allocation": {
+                                "state": "confirmed",
+                                "provider_state": provider_state,
+                            },
+                            # RunPod REST v2 does not publish an authoritative
+                            # image-pull state. Keep the gap explicit.
+                            "image_pull": {"state": "unknown"},
+                            "container_start": {"state": container_state},
+                            "runner_callback": {"state": "unknown"},
+                            "comfyui_readiness": {"state": "unknown"},
+                        },
+                    },
+                )
                 self._publish_launch_event(
                     queued_jobs,
                     {
@@ -1817,19 +1869,14 @@ cloud-offload worker --poll 10
                         "worker_instance_id": instance_id,
                         "elapsed_seconds": elapsed,
                         "overall_progress": 2,
-                        "message": (
-                            "RunPod is allocating the machine, pulling the pinned "
-                            "image, and starting ComfyUI"
-                        ),
+                        "message": "Waiting for runner callback and ComfyUI readiness",
                     },
                 )
                 self.runner_feedback_at[instance_id] = now
 
-            instance = self.active_instances.get(instance_id)
             if (
                 instance is not None
-                and self.connectors[provider_name].container_started(instance)
-                is False
+                and container_telemetry is False
                 and now - launched_at
                 > timedelta(seconds=RUNNER_CONTAINER_START_TIMEOUT_SECONDS)
             ):

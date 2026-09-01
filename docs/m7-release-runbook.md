@@ -69,6 +69,13 @@ cold and hot runs plus cancellation, provider, storage, corruption, and
 restart failure scenarios, with every scenario bound to exactly the case's
 region via `allowed_regions`.
 
+For the first startup-only paid validation, set the benchmark plan's
+`runner_readiness_timeout_seconds` and `max_runner_readiness_cost_usd` to a
+smaller explicit budget, for example 180 seconds and USD 0.05. These are
+scenario controls. They do not reduce the normal dispatcher's worker startup
+policy. The readiness clock includes preparation and submission time. Provider
+cleanup and config restore are measured separately and remain mandatory.
+
 ### Worked example
 
 ```json
@@ -184,7 +191,8 @@ cloud-offload release status \
 
 `release run` exits zero when it stops for a good reason
 (`release_passed`, `release_already_passed`, `requested_matrix_limit`) and
-non-zero for `matrix_failed`, `total_cost_limit`, or `total_runtime_limit`.
+non-zero for `matrix_failed`, `total_cost_limit`, `total_runtime_limit`, a
+scenario limit, or `operator_interrupt:KeyboardInterrupt` / `SystemExit`.
 
 ## The ledger and `.runlogs/`
 
@@ -212,6 +220,19 @@ non-zero for `matrix_failed`, `total_cost_limit`, or `total_runtime_limit`.
   window. Precheck failures (wrong revision, dirty tree, failed contract
   tests, image-digest mismatch) are recorded as failed matrices too, but cost
   $0 because they stop before any provider call.
+- The first failed or interrupted scenario stops before the next scenario can
+  submit a job. An operator interrupt still cancels the current job, verifies
+  provider absence, atomically writes the aborted scorecard, and atomically
+  appends its redacted receipt to the ledger. The ledger's `last_stop_reason`
+  names the exact safe interrupt or limit code.
+- If an interrupt escapes before the benchmark can retain resource attribution,
+  the release fallback performs a read-only provider audit. It never deletes an
+  unattributed resource. It marks cleanup failed when a managed resource remains
+  and charges the matrix time and cost ceilings as conservative evidence.
+- Startup evidence separates provider allocation, image pull, container start,
+  runner callback, and ComfyUI readiness. `unknown` means the provider or
+  coordinator did not prove that phase. In particular, RunPod REST v2 does not
+  expose an authoritative image-pull phase.
 - To **resume**, rerun the same `release run` command with the same plan and
   ledger. Passed history is kept; the gate needs 30 *trailing* passes, and
   that trailing window alone must cover every case, profile, and region.

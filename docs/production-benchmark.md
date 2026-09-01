@@ -13,6 +13,7 @@ Every plan must declare finite positive ceilings for:
 - estimated compute cost per scenario;
 - total campaign runtime;
 - scenario runtime;
+- runner readiness runtime and compute cost;
 - cleanup verification time; and
 - the time allowed for a terminated worker heartbeat to age out before the next
   fresh-Pod scenario.
@@ -52,7 +53,9 @@ A plan uses `cloud-offload.benchmark-plan.v1`:
     "max_campaign_seconds": 3600,
     "poll_seconds": 2,
     "cleanup_timeout_seconds": 90,
-    "fresh_worker_timeout_seconds": 120
+    "fresh_worker_timeout_seconds": 120,
+    "runner_readiness_timeout_seconds": 180,
+    "max_runner_readiness_cost_usd": 0.05
   },
   "scenarios": [
     {
@@ -109,6 +112,21 @@ general performance setting.
 
 The request body remains local in the plan. Validation and scorecards include
 only its canonical SHA-256 digest, never the workflow, prompt, or input values.
+
+`runner_readiness_timeout_seconds` defaults to 300 seconds. Its clock starts at
+the start of the scenario, before preparation and submission, and stops when an
+active worker or `runner_ready` event proves that ComfyUI is ready. The readiness
+cost ceiling defaults to `max_scenario_cost_usd`. A startup-only validation can
+set both values lower, as in the example, without changing the dispatcher's
+normal one-hour runner-registration policy. `scenario_active_seconds` measures
+this same start through terminal state or cancellation request. The scenario
+`duration_seconds` also includes verified provider cleanup and config restore.
+
+The scorecard records five startup facts: allocation, image pull, container
+start, runner callback, and ComfyUI readiness. It uses only normalized provider
+state, container uptime telemetry, and worker status. A phase is `unknown` when
+the provider API cannot prove it. RunPod REST v2 does not publish a separate
+image-pull state, so the harness never infers one from `RUNNING`.
 
 ## Failure injection
 
@@ -194,6 +212,14 @@ commands. A passing process exits zero. A failed scenario, untriggered injection
 budget circuit breaker, missing fresh Pod, or orphaned provider resource writes a
 failed scorecard and exits non-zero.
 
+The first unexpected scenario failure, limit, or operator interrupt stops the
+matrix before another submission. `KeyboardInterrupt` and `SystemExit` request
+job cancellation, run exact provider cleanup, restore scenario policy, and then
+atomically publish an aborted scorecard. The release controller atomically adds
+the matching safe stop reason, completed-scenario facts, cost, and cleanup proof
+to its ledger. Exception messages, commands, tokens, URLs, and local paths do not
+enter that interrupt receipt.
+
 ## Milestone 7 release controller
 
 One benchmark campaign is not a production release claim. The M7 controller
@@ -278,6 +304,7 @@ cleanup and budget receipts, and explicit pass or failure codes.
 - cold, hot, and failure scenario results;
 - lifecycle/event cursor and redacted support bundle;
 - phase durations from observed JobEventV2 timestamps;
+- safe provider startup facts with explicit unknown phases;
 - provider, Pod ID, rate, and attribution source;
 - conservative compute-cost estimate;
 - failure-trigger receipt;

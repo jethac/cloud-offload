@@ -465,6 +465,8 @@ def test_runpod_reports_whether_the_container_actually_started():
 
     assert connector.container_started(stalled) is False
     assert connector.container_started(started) is True
+    assert stalled.metadata["provider_state"] == "RUNNING"
+    assert started.metadata["provider_state"] == "RUNNING"
 
 
 def test_runpod_absent_runtime_telemetry_is_unknown_not_stalled():

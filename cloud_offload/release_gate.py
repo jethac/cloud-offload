@@ -51,6 +51,21 @@ REQUIRED_CANARIES = frozenset(
         "regional_fallback",
     }
 )
+SAFE_CAMPAIGN_STOP_REASONS = frozenset(
+    {
+        "campaign_runtime_limit",
+        "campaign_cost_limit",
+        "fresh_worker_quiescence_timeout",
+        "orphan_cleanup_failed",
+        "scenario_cost_limit",
+        "scenario_timeout",
+        "runner_readiness_timeout",
+        "runner_readiness_cost_limit",
+        "unexpected_scenario_failure",
+        "operator_interrupt:KeyboardInterrupt",
+        "operator_interrupt:SystemExit",
+    }
+)
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40,64}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
@@ -921,6 +936,8 @@ class ReleaseExecutor:
             self._require_reviewed_hooks(case)
             try:
                 receipt = self._run_matrix(index, case)
+            except (KeyboardInterrupt, SystemExit) as exc:
+                receipt = self._release_interrupt_receipt(index, case, exc)
             except Exception as exc:
                 receipt = _harness_failure_receipt(index, case, exc)
             ledger["matrices"].append(receipt)
@@ -928,7 +945,9 @@ class ReleaseExecutor:
             _atomic_json(self.ledger_path, ledger)
             executed += 1
             if not receipt["passed"]:
-                stop_reason = "matrix_failed"
+                stop_reason = str(
+                    receipt.get("matrix_stop_reason") or "matrix_failed"
+                )
                 break
         if ledger.get("passed") and stop_reason != "release_already_passed":
             stop_reason = "release_passed"
@@ -937,6 +956,108 @@ class ReleaseExecutor:
         ledger["updated_at"] = _utc_now()
         _atomic_json(self.ledger_path, ledger)
         return ledger
+
+    def _release_interrupt_receipt(
+        self, index: int, case: ReleaseCase, exc: BaseException
+    ) -> dict[str, Any]:
+        """Publish finite failure evidence if an interrupt escapes the runner."""
+
+        reason = f"operator_interrupt:{type(exc).__name__}"
+        now = _utc_now()
+        matrix_dir = self.output_dir / f"matrix-{index:04d}-{case.name}"
+        scorecard_path = matrix_dir / "benchmark-scorecard.json"
+        scorecard: dict[str, Any] | None = None
+        if scorecard_path.exists():
+            try:
+                candidate = json.loads(scorecard_path.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict) and candidate.get("schema") == SCORECARD_SCHEMA:
+                    scorecard = candidate
+            except (OSError, ValueError):
+                scorecard = None
+        detailed_evidence_available = scorecard is not None
+        if scorecard is None:
+            scorecard = {
+                "schema": SCORECARD_SCHEMA,
+                "started_at": now,
+                "plan": case.benchmark_plan.safe_summary(),
+                "estimated_compute_cost_upper_usd": self.plan.limits.max_matrix_cost_usd,
+                "results": [],
+                "distributions": {},
+                "final_cleanup": [],
+            }
+
+        cleanup_error: str | None = None
+        orphans: list[dict[str, str]] = []
+        try:
+            driver = CoordinatorBenchmarkDriver(
+                self.service["url"],
+                self.service.get("token"),
+                self.config,
+                case.benchmark_plan.providers,
+                allow_hooks=self.allow_hooks,
+            )
+            final_inventory = driver.inventory(case.benchmark_plan.providers)
+            orphans = [
+                {"provider": provider, "instance_id": instance.id}
+                for provider, instances in final_inventory.items()
+                for instance in instances.values()
+                if instance.managed
+            ]
+        except Exception as cleanup_exc:  # noqa: BLE001
+            cleanup_error = type(cleanup_exc).__name__
+
+        cleanup_state = (
+            "confirmed" if cleanup_error is None and not orphans else "failed"
+        )
+        scorecard.update(
+            {
+                "completed_at": now,
+                "passed": False,
+                "campaign_abort": reason,
+                "final_cleanup": list(scorecard.get("final_cleanup") or []),
+                "final_audit_error": cleanup_error,
+                "orphaned_resources": orphans,
+                "cleanup_proof": {"state": cleanup_state},
+            }
+        )
+        scorecard_path = write_scorecard(scorecard_path, scorecard)
+        estimated_cost = float(
+            scorecard.get("estimated_compute_cost_upper_usd")
+            or self.plan.limits.max_matrix_cost_usd
+        )
+        if detailed_evidence_available:
+            estimated_duration = sum(
+                float(item.get("duration_seconds") or 0)
+                for item in scorecard.get("results") or []
+            )
+            duration_basis = "completed_scenarios"
+        else:
+            estimated_duration = self.plan.limits.max_matrix_seconds
+            duration_basis = "matrix_limit_conservative"
+        failure_codes = [reason]
+        if cleanup_state != "confirmed":
+            failure_codes.append("cleanup_unverified")
+        return {
+            "schema": RELEASE_MATRIX_SCHEMA,
+            "index": index,
+            "case": case.name,
+            "profile": case.profile,
+            "image_digest": case.image_digest,
+            "region": case.region,
+            "started_at": now,
+            "completed_at": now,
+            "duration_seconds": round(estimated_duration, 6),
+            "duration_basis": duration_basis,
+            "passed": False,
+            "failure_codes": failure_codes,
+            "matrix_stop_reason": reason,
+            "estimated_compute_cost_upper_usd": round(estimated_cost, 6),
+            "provider_mutation": "unknown",
+            "cleanup_proof": {"state": cleanup_state},
+            "detailed_scenario_evidence_available": detailed_evidence_available,
+            "benchmark_scorecard_digest": _file_digest(scorecard_path),
+            "benchmark_plan_digest": case.benchmark_plan_digest,
+        }
 
     def _require_reviewed_hooks(self, case: ReleaseCase) -> None:
         hook_scenarios = [
@@ -1008,6 +1129,10 @@ class ReleaseExecutor:
         if duration > self.plan.limits.max_matrix_seconds:
             failures.append("matrix_runtime_limit")
         passed = evaluation["passed"] and not failures
+        campaign_abort = str(scorecard.get("campaign_abort") or "")
+        matrix_stop_reason = (
+            campaign_abort if campaign_abort in SAFE_CAMPAIGN_STOP_REASONS else None
+        )
         return {
             "schema": RELEASE_MATRIX_SCHEMA,
             "index": index,
@@ -1019,6 +1144,7 @@ class ReleaseExecutor:
             "completed_at": _utc_now(),
             "duration_seconds": round(duration, 6),
             "passed": passed,
+            "matrix_stop_reason": matrix_stop_reason,
             "failure_codes": sorted(set(failures)),
             "repositories": repositories,
             "configured_profile": profile,
