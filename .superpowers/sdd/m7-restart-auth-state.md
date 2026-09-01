@@ -17,8 +17,17 @@ The regression test models the unchanged harness session across a replacement
 launch. Before the production change, it failed with `401 Unauthorized` on
 `/api/config`. The test covers all six route groups seen in the real log.
 
-The production change appends `--allow-anonymous-loopback` to the replacement
-command only when the discovered service has `auth_required: false`.
+The replacement now gets exactly one explicit auth-mode flag. Required-auth
+services get `--require-auth`; anonymous services get
+`--allow-anonymous-loopback`. The child environment drops conflicting inherited
+auth-policy flags. Tests prove both modes, including required auth under a
+hostile inherited anonymous flag.
+
+Before SIGTERM, the restart hook now validates the exact local HTTP host, the
+integer port and URL match, the PID, the auth value and readable token, and the
+existing client's URL/auth contract. Parameterized tests prove that 12 invalid
+contracts cause zero SIGTERM calls and zero replacement launches. Strict
+service discovery also rejects a raw string port before normalization.
 
 ## Storage-policy inspection
 
@@ -29,8 +38,8 @@ continued to return policy `smart`. This PR does not change that separate path.
 
 ## Verification
 
-- Focused restart and service tests: 21 passed.
-- Full repository suite: 800 passed, 6 skipped.
+- Focused restart and service tests: 35 passed.
+- Full repository suite: 814 passed, 6 skipped.
 - Python byte-code compile check: passed.
 - Ruff: not installed and not configured by the repository.
 - MyPy: the repository has no MyPy configuration; an informational full run

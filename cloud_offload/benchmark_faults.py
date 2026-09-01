@@ -925,17 +925,66 @@ def _process_exists(pid: int) -> bool:
     return True
 
 
+def _validated_restart_service(
+    info: dict[str, Any], client: CoordinatorFaultClient
+) -> tuple[str, int, int, bool]:
+    """Validate the exact local service contract before it can be signalled."""
+
+    url = info.get("url")
+    host = info.get("host")
+    port = info.get("port")
+    pid = info.get("pid")
+    auth_required = info.get("auth_required")
+    if not isinstance(url, str) or not isinstance(host, str):
+        raise RuntimeError("Restart canary needs a complete local service URL and host")
+    try:
+        parsed = urlparse(url)
+        url_port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("Restart canary service URL has an invalid port") from exc
+    normalized_host = host.strip().lower()
+    if (
+        parsed.scheme != "http"
+        or not is_local_host(normalized_host)
+        or parsed.hostname != normalized_host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("Restart canary supports only one exact local HTTP service")
+    if type(port) is not int or not 1 <= port <= 65535 or url_port != port:
+        raise RuntimeError("Restart canary service URL and port do not match")
+    if type(pid) is not int or pid <= 0:
+        raise RuntimeError("Restart canary service PID is invalid")
+    if type(auth_required) is not bool:
+        raise RuntimeError("Restart canary service auth contract is invalid")
+    token = info.get("token")
+    if auth_required and (not isinstance(token, str) or not token):
+        raise RuntimeError("Restart canary required-auth service has no readable token")
+
+    client_service = getattr(client, "service", None)
+    client_url = str(getattr(client, "base_url", "")).rstrip("/")
+    if (
+        not isinstance(client_service, dict)
+        or client_url != url.rstrip("/")
+        or client_service.get("auth_required") is not auth_required
+        or client_service.get("token") != token
+    ):
+        raise RuntimeError("Restart canary client does not match service discovery")
+    return normalized_host, port, pid, auth_required
+
+
 def restart_coordinator(client: CoordinatorFaultClient, job_id: str) -> dict[str, Any]:
     """Restart the exact discovered local coordinator and wait for health."""
 
-    info = read_service_info(require_healthy=True)
+    info = read_service_info(require_healthy=True, strict=True)
     if not info:
         raise ServiceConfigError("No healthy file-discovered coordinator to restart")
-    parsed = urlparse(str(info.get("url") or ""))
-    if parsed.scheme != "http" or not is_local_host(str(info.get("host") or "")):
-        raise RuntimeError("Restart canary supports only a local HTTP coordinator")
-    old_pid = int(info.get("pid") or 0)
-    if old_pid <= 0 or not _process_exists(old_pid):
+    host, port, old_pid, required_auth = _validated_restart_service(info, client)
+    if not _process_exists(old_pid):
         raise RuntimeError("Discovered coordinator PID is not running")
     health_pid = int(client.get("/api/health").get("pid") or 0)
     if health_pid != old_pid:
@@ -963,12 +1012,17 @@ def restart_coordinator(client: CoordinatorFaultClient, job_id: str) -> dict[str
         "cloud_offload",
         "serve",
         "--host",
-        str(info["host"]),
+        host,
         "--port",
-        str(info["port"]),
+        str(port),
     ]
-    if info.get("auth_required") is False:
+    if required_auth:
+        command.append("--require-auth")
+    else:
         command.append("--allow-anonymous-loopback")
+    environment = os.environ.copy()
+    environment.pop("CLOUD_OFFLOAD_REQUIRE_AUTH", None)
+    environment.pop("CLOUD_OFFLOAD_ALLOW_ANONYMOUS_LOOPBACK", None)
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
         process = subprocess.Popen(
@@ -976,13 +1030,14 @@ def restart_coordinator(client: CoordinatorFaultClient, job_id: str) -> dict[str
             cwd=Path.cwd(),
             stdout=stdout,
             stderr=stderr,
+            env=environment,
             start_new_session=True,
             creationflags=creationflags,
         )
 
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
-        current = read_service_info(require_healthy=True)
+        current = read_service_info(require_healthy=True, strict=True)
         if current and int(current.get("pid") or 0) == process.pid:
             replacement = CoordinatorFaultClient(current)
             if int(replacement.get("/api/health").get("pid") or 0) == process.pid:

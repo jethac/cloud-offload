@@ -226,7 +226,12 @@ def write_service_info(
     return service_path
 
 
-def read_service_info(path: Path | None = None, *, require_healthy: bool = False) -> dict[str, Any] | None:
+def read_service_info(
+    path: Path | None = None,
+    *,
+    require_healthy: bool = False,
+    strict: bool = False,
+) -> dict[str, Any] | None:
     service_path = path or default_service_file()
     try:
         payload = json.loads(service_path.read_text(encoding="utf-8"))
@@ -235,6 +240,8 @@ def read_service_info(path: Path | None = None, *, require_healthy: bool = False
 
     url = payload.get("url")
     port = payload.get("port")
+    if strict and type(port) is not int:
+        raise ServiceConfigError(f"{service_path} port must be an integer")
     if isinstance(port, str) and port.isdigit():
         port = int(port)
     if isinstance(port, int):

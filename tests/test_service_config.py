@@ -1,5 +1,7 @@
-import pytest
+import json
 import os
+
+import pytest
 from fastapi.testclient import TestClient
 
 from cloud_offload import server
@@ -47,6 +49,25 @@ def test_service_info_round_trip(tmp_path):
     assert info["url"] == "http://127.0.0.1:11435"
     assert info["port"] == 11435
     assert info["version"]
+
+
+def test_strict_service_info_rejects_a_string_port(tmp_path):
+    service_file = tmp_path / "service.json"
+    service_file.write_text(
+        json.dumps(
+            {
+                "url": "http://127.0.0.1:11435",
+                "host": "127.0.0.1",
+                "port": "11435",
+                "pid": 111,
+                "auth_required": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ServiceConfigError, match="integer"):
+        read_service_info(service_file, strict=True)
 
 
 def test_health_endpoint_reports_service_name():
