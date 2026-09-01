@@ -11,8 +11,10 @@ COPY . /opt/cloud-offload/source
 # (platform, python_abi); it must track the source revision being installed,
 # not whatever the pinned base was built from.
 COPY deploy/runtime-profiles/comfyui/runtime-profile.json /opt/cloud-offload/runtime-profile.json
+COPY deploy/runtime-profiles/comfyui/entrypoint.sh /opt/cloud-offload/entrypoint.sh
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps \
     "/opt/cloud-offload/source[cloud]" \
-    && python -c "from cloud_offload.worker import Worker; assert hasattr(Worker, '_initialize_prepared_cache')"
+    && python -c "from cloud_offload.worker import Worker; assert hasattr(Worker, '_initialize_prepared_cache')" \
+    && chmod +x /opt/cloud-offload/entrypoint.sh
 
 LABEL org.opencontainers.image.revision="${CLOUD_OFFLOAD_SOURCE_REVISION}"
