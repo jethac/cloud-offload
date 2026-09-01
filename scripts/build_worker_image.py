@@ -74,6 +74,16 @@ def tracked_manifest(repo_root: Path, revision: str) -> tuple[str, ...]:
     return tuple(entry.path for entry in tree_entries(repo_root, revision))
 
 
+def _reject_reserved_manifest_entries(entries: tuple[TreeEntry, ...]) -> None:
+    for entry in entries:
+        if entry.path == MODE_MANIFEST_NAME or entry.path.startswith(
+            MODE_MANIFEST_NAME + "/"
+        ):
+            raise ValueError(
+                f"reserved mode manifest path is tracked: {entry.path!r}"
+            )
+
+
 def _inside(root: Path, candidate: Path) -> bool:
     try:
         candidate.relative_to(root)
@@ -142,6 +152,7 @@ def prepare_context(repo_root: Path, revision: str, destination: Path) -> tuple[
         raise ValueError(f"build context already exists: {destination}")
 
     entries = tree_entries(repo_root, revision)
+    _reject_reserved_manifest_entries(entries)
     destination.mkdir(parents=True)
     try:
         for entry in entries:
@@ -168,16 +179,25 @@ def write_mode_manifest(repo_root: Path, revision: str, destination: Path) -> Pa
     repo_root = Path(repo_root).resolve()
     destination = Path(destination).resolve()
     entries = tree_entries(repo_root, revision)
+    _reject_reserved_manifest_entries(entries)
     manifest_path = destination / MODE_MANIFEST_NAME
-    if manifest_path.exists():
+    if os.path.lexists(manifest_path):
         raise ValueError(f"mode manifest collides with source tree: {manifest_path}")
     payload = {
         "revision": _commit_revision(repo_root, revision),
         "files": [{"mode": entry.mode, "path": entry.path} for entry in entries],
     }
-    manifest_path.write_bytes(
-        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
     )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(manifest_path, flags, 0o644)
+    except FileExistsError as exc:
+        raise ValueError(f"mode manifest collides with source tree: {manifest_path}") from exc
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(raw)
     return manifest_path
 
 

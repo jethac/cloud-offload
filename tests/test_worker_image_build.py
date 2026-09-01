@@ -117,6 +117,34 @@ def test_context_rejects_unsafe_git_tree_paths(tmp_path, monkeypatch):
         build_worker_image.prepare_context(ROOT, "HEAD", tmp_path / "context")
 
 
+@pytest.mark.parametrize("collision", ["broken-symlink", "regular", "directory"])
+def test_context_rejects_reserved_mode_manifest_collisions(tmp_path, collision):
+    from scripts.build_worker_image import MODE_MANIFEST_NAME, prepare_context
+
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "--quiet")
+    reserved = repo / MODE_MANIFEST_NAME
+    if collision == "broken-symlink":
+        os.symlink("missing-target", reserved)
+    elif collision == "regular":
+        reserved.write_bytes(b"attacker-controlled")
+    else:
+        (reserved / "child.txt").parent.mkdir()
+        (reserved / "child.txt").write_bytes(b"attacker-controlled")
+    _git(repo, "add", ".")
+    env = os.environ | {
+        "GIT_AUTHOR_NAME": "image-test",
+        "GIT_AUTHOR_EMAIL": "image-test@example.invalid",
+        "GIT_COMMITTER_NAME": "image-test",
+        "GIT_COMMITTER_EMAIL": "image-test@example.invalid",
+    }
+    subprocess.run(["git", "-C", str(repo), "commit", "--quiet", "-m", "fixture"], check=True, env=env)
+    revision = _git(repo, "rev-parse", "HEAD").strip()
+    with pytest.raises(ValueError, match="reserved mode manifest"):
+        prepare_context(repo, revision, tmp_path / "context")
+
+
 def test_context_is_contained_and_disjoint_from_source(tmp_path):
     from scripts.build_worker_image import prepare_context
 
