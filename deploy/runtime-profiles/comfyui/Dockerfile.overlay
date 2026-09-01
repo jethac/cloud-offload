@@ -6,6 +6,10 @@ FROM ${BASE_IMAGE}
 
 ARG CLOUD_OFFLOAD_SOURCE_REVISION=working-tree
 
+# The pinned base may contain source/build artifacts from the image that
+# produced it. Start with an empty destination so the overlay cannot inherit
+# untracked files even when its build context is clean.
+RUN rm -rf /opt/cloud-offload/source
 COPY . /opt/cloud-offload/source
 # The capability manifest carries the runner's declared runtime identity
 # (platform, python_abi); it must track the source revision being installed,
@@ -14,6 +18,9 @@ COPY deploy/runtime-profiles/comfyui/runtime-profile.json /opt/cloud-offload/run
 COPY deploy/runtime-profiles/comfyui/entrypoint.sh /opt/cloud-offload/entrypoint.sh
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps \
     "/opt/cloud-offload/source[cloud]" \
+    && rm -rf /opt/cloud-offload/source/build \
+        /opt/cloud-offload/source/.ruff_cache \
+        /opt/cloud-offload/source/*.egg-info \
     && python -c "from cloud_offload.worker import Worker; assert hasattr(Worker, '_initialize_prepared_cache')" \
     && chmod +x /opt/cloud-offload/entrypoint.sh
 
