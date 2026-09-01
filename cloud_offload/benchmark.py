@@ -580,7 +580,7 @@ class BenchmarkRunner:
             ):
                 result = self._dependent_failure_result(
                     scenario,
-                    "corruption requires a successful cold scenario that created a base manifest",
+                    "corruption requires a verified base manifest from the cache registry",
                 )
             else:
                 result = self._run_scenario(
@@ -592,7 +592,18 @@ class BenchmarkRunner:
                 )
             results.append(result)
             if scenario.cache_state == "cold":
-                cold_base_manifest_ready = bool(result.get("passed"))
+                base_manifest = None
+                if result.get("passed"):
+                    checker = getattr(self.driver, "base_manifest", None)
+                    if callable(checker):
+                        try:
+                            base_manifest = checker(result)
+                        except Exception:  # noqa: BLE001 - absent registry proof fails closed
+                            base_manifest = None
+                    result["base_manifest_identity"] = base_manifest
+                cold_base_manifest_ready = bool(result.get("passed")) and bool(
+                    base_manifest
+                )
             estimated_total += float(result["estimated_compute_cost_upper_usd"])
             if result.get("orphaned_resources"):
                 campaign_abort = "orphan_cleanup_failed"
@@ -1537,6 +1548,35 @@ class CoordinatorBenchmarkDriver:
         )
         response.raise_for_status()
         return response.json()
+
+    def base_manifest(self, cold_result: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the exact cache-registry manifest created by the cold run."""
+        receipt = cold_result.get("submission_receipt") or {}
+        region = str(receipt.get("region") or "")
+        started_at = _parse_timestamp(cold_result.get("started_at"))
+        response = self._request(
+            "GET",
+            "/api/cache/manifests",
+            retry_safe=True,
+            timeout=30,
+            params={"datacenter_id": region} if region else None,
+        )
+        response.raise_for_status()
+        manifests = response.json().get("manifests") or []
+        candidates = []
+        for manifest in manifests:
+            created_at = _parse_timestamp(manifest.get("created_at"))
+            if started_at is not None and (created_at is None or created_at < started_at):
+                continue
+            candidates.append(manifest)
+        if len(candidates) != 1:
+            return None
+        selected = candidates[0]
+        return {
+            "manifest_id": str(selected.get("manifest_id") or ""),
+            "volume_id": str(selected.get("volume_id") or ""),
+            "datacenter_id": str(selected.get("datacenter_id") or region),
+        }
 
     def snapshot(self, job_id: str) -> dict[str, Any]:
         response = self._request(

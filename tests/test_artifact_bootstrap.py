@@ -11,8 +11,11 @@ import pytest
 from cloud_offload.artifact_bootstrap import (
     ArtifactBootstrapError,
     DeclaredArtifact,
+    bootstrap_receipt_path,
+    config_artifact_store,
     declared_input_artifacts,
     import_declared_artifacts,
+    verify_bootstrap_receipt,
 )
 from cloud_offload.cache_registry import CacheRegistry
 from cloud_offload.config import CloudConfig
@@ -43,13 +46,21 @@ def _declared(first: str, second: str, *, first_size: int | None = None):
     ]
 
 
-def test_imports_declared_artifacts_atomically_and_is_idempotent(tmp_path):
+def test_imports_declared_artifacts_atomically_and_is_idempotent(tmp_path, monkeypatch):
     source_root = tmp_path / "source"
     destination_root = tmp_path / "isolated" / "job_files"
     first = _bundle(source_root, b"first-bundle")
     second = _bundle(source_root, b"second-bundle")
     unrelated = _bundle(source_root, b"not-declared")
 
+    uploads = []
+    original_upload = LocalStorage.upload
+
+    def record_upload(storage, local_path, remote_key):
+        uploads.append(remote_key)
+        return original_upload(storage, local_path, remote_key)
+
+    monkeypatch.setattr(LocalStorage, "upload", record_upload)
     imported = import_declared_artifacts(
         source_root, destination_root, _declared(first, second)
     )
@@ -61,6 +72,7 @@ def test_imports_declared_artifacts_atomically_and_is_idempotent(tmp_path):
         target = destination_root / partition_artifact_key(digest)
         assert target.read_bytes() == content
     assert not (destination_root / partition_artifact_key(unrelated)).exists()
+    assert uploads == [partition_artifact_key(first), partition_artifact_key(second)]
 
     repeated = import_declared_artifacts(
         source_root, destination_root, _declared(first, second)
@@ -172,6 +184,22 @@ def test_declared_input_artifacts_aggregate_roles_from_benchmark_plans(tmp_path)
     ]
 
 
+def test_declared_artifacts_bind_to_loaded_benchmark_plan_digest(tmp_path):
+    digest = "a" * 64
+    plan = {
+        "scenarios": [
+            {
+                "request": {
+                    "input_artifacts": {"input_0000": digest},
+                    "partition": {"inputs": [{"key": "input_0000", "target_input": "image"}]},
+                }
+            }
+        ]
+    }
+    declarations = declared_input_artifacts([("b" * 64, plan)])
+    assert declarations[0].plan_digests == ("b" * 64,)
+
+
 def test_imported_artifacts_clear_preflight_input_blockers_without_real_provider(tmp_path, monkeypatch):
     source_root = tmp_path / "source"
     isolated_root = tmp_path / "isolated" / "job_files"
@@ -249,6 +277,7 @@ def test_release_bootstrap_cli_imports_only_plan_inputs(tmp_path, monkeypatch, c
     from cloud_offload import __main__
 
     source_root = tmp_path / "source"
+    isolated_home = tmp_path / "isolated"
     destination_root = tmp_path / "isolated" / "job_files"
     first = _bundle(source_root, b"first-bundle")
     second = _bundle(source_root, b"second-bundle")
@@ -299,7 +328,12 @@ def test_release_bootstrap_cli_imports_only_plan_inputs(tmp_path, monkeypatch, c
     monkeypatch.setattr(
         "cloud_offload.release_gate.ReleasePlan.load",
         lambda _: SimpleNamespace(
-            cases=[SimpleNamespace(benchmark_plan_path=benchmark)]
+            cases=[
+                SimpleNamespace(
+                    benchmark_plan_digest="a" * 64,
+                    benchmark_plan=json.loads(benchmark.read_text(encoding="utf-8")),
+                )
+            ]
         ),
     )
 
@@ -316,6 +350,8 @@ def test_release_bootstrap_cli_imports_only_plan_inputs(tmp_path, monkeypatch, c
             str(source_root),
             "--config",
             str(config),
+            "--home",
+            str(isolated_home),
         ],
     )
     with pytest.raises(SystemExit) as exit_info:
@@ -325,3 +361,148 @@ def test_release_bootstrap_cli_imports_only_plan_inputs(tmp_path, monkeypatch, c
     assert payload["artifact_count"] == 2
     assert {item["digest"] for item in payload["artifacts"]} == {first, second}
     assert all("path" not in item for item in payload["artifacts"])
+
+
+def test_config_artifact_store_uses_explicit_isolated_home_not_process_global(
+    tmp_path, monkeypatch
+):
+    import cloud_offload.config as config_module
+
+    process_home = tmp_path / "process-home"
+    isolated_home = tmp_path / "isolated-home"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"cloud": {"storage_type": "local", "storage_path": ""}})
+    )
+    monkeypatch.setattr(config_module, "CONFIG_DIR", process_home)
+
+    config = CloudConfig.from_file(config_path)
+    assert config.storage_path == str(process_home / "job_files")
+    isolated_config = CloudConfig.from_file(config_path, home=isolated_home)
+    assert config_artifact_store(isolated_config, isolated_home) == (
+        isolated_home / "job_files"
+    ).resolve()
+    assert process_home not in config_artifact_store(isolated_config, isolated_home).parents
+
+
+def test_bootstrap_receipt_rejects_missing_or_mismatched_destination_and_plan(
+    tmp_path,
+):
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "isolated" / "job_files"
+    digest = _bundle(source_root, b"receipt-bundle")
+    declaration = DeclaredArtifact(digest=digest, expected_size=14, roles=("input_0000:image",))
+    records = import_declared_artifacts(
+        source_root,
+        destination_root,
+        [declaration],
+        release_plan_digest="a" * 64,
+        config_digest="b" * 64,
+    )
+    assert records[0].size == 14
+    receipt = bootstrap_receipt_path(destination_root)
+    assert receipt.is_file()
+    verify_bootstrap_receipt(
+        destination_root,
+        [declaration],
+        release_plan_digest="a" * 64,
+        config_digest="b" * 64,
+    )
+    with pytest.raises(ArtifactBootstrapError, match="receipt mismatch"):
+        verify_bootstrap_receipt(
+            destination_root,
+            [declaration],
+            release_plan_digest="c" * 64,
+            config_digest="b" * 64,
+        )
+    (destination_root / partition_artifact_key(digest)).write_bytes(b"tampered")
+    with pytest.raises(ArtifactBootstrapError, match="destination artifact mismatch"):
+        verify_bootstrap_receipt(
+            destination_root,
+            [declaration],
+            release_plan_digest="a" * 64,
+            config_digest="b" * 64,
+        )
+    receipt.unlink()
+    with pytest.raises(ArtifactBootstrapError, match="receipt is missing"):
+        verify_bootstrap_receipt(
+            destination_root,
+            [declaration],
+            release_plan_digest="a" * 64,
+            config_digest="b" * 64,
+        )
+
+
+def test_bootstrap_is_failure_atomic_when_receipt_publication_fails(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    first = _bundle(source_root, b"first-atomic")
+    second = _bundle(source_root, b"second-atomic")
+    monkeypatch.setattr(
+        "cloud_offload.artifact_bootstrap._write_receipt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("receipt interrupted")),
+    )
+    with pytest.raises(ArtifactBootstrapError, match="receipt publication failed"):
+        import_declared_artifacts(
+            source_root,
+            destination_root,
+            [
+                DeclaredArtifact(digest=first, roles=("input_0000:image",)),
+                DeclaredArtifact(digest=second, roles=("input_0001:images",)),
+            ],
+            release_plan_digest="a" * 64,
+            config_digest="b" * 64,
+        )
+    assert not list(destination_root.glob("partition-artifacts/**/*.part"))
+    assert not bootstrap_receipt_path(destination_root).exists()
+
+
+def test_bootstrap_enforces_normal_partition_upload_size_limit(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    digest = _bundle(source_root, b"too-large")
+    monkeypatch.setattr("cloud_offload.artifact_bootstrap.MAX_PARTITION_ARTIFACT_BYTES", 1)
+    with pytest.raises(ArtifactBootstrapError, match="size limit"):
+        import_declared_artifacts(
+            source_root,
+            tmp_path / "destination",
+            [DeclaredArtifact(digest=digest, roles=("input_0000:image",))],
+            release_plan_digest="a" * 64,
+            config_digest="b" * 64,
+        )
+
+
+def test_isolated_serve_refuses_to_start_without_matching_bootstrap_receipt(
+    tmp_path, monkeypatch, capsys
+):
+    from cloud_offload import __main__
+
+    home = tmp_path / "isolated"
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"cloud": {"storage_type": "local"}}))
+    plan = tmp_path / "release.json"
+    plan.write_text("{}")
+    monkeypatch.setattr(
+        "cloud_offload.release_gate.ReleasePlan.load",
+        lambda _: SimpleNamespace(cases=[]),
+    )
+    started = []
+    monkeypatch.setattr("cloud_offload.server.serve", lambda **kwargs: started.append(kwargs))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cloud-offload",
+            "serve",
+            "--config",
+            str(config),
+            "--home",
+            str(home),
+            "--release-plan",
+            str(plan),
+        ],
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        __main__.main()
+    assert exit_info.value.code == 2
+    assert "receipt is missing" in capsys.readouterr().err
+    assert started == []

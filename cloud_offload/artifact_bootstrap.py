@@ -1,4 +1,4 @@
-"""Fail-closed bootstrap for content-addressed partition input artifacts."""
+"""Fail-closed bootstrap and startup receipt for M7 partition artifacts."""
 
 from __future__ import annotations
 
@@ -11,11 +11,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from cloud_offload.storage import partition_artifact_key
+from cloud_offload.storage import LocalStorage, partition_artifact_key
+
+
+MAX_PARTITION_ARTIFACT_BYTES = int(
+    os.environ.get("CLOUD_OFFLOAD_MAX_PARTITION_ARTIFACT_BYTES", str(2 * 1024 * 1024 * 1024))
+)
+RECEIPT_SCHEMA = "cloud-offload.m7-artifact-bootstrap-receipt.v1"
+RECEIPT_NAME = ".m7-artifact-bootstrap-receipt.json"
 
 
 class ArtifactBootstrapError(RuntimeError):
-    """The declared artifact could not be verified or imported safely."""
+    """The declared artifact set could not be verified or committed safely."""
 
 
 @dataclass(frozen=True)
@@ -25,13 +32,18 @@ class DeclaredArtifact:
     digest: str
     expected_size: int | None = None
     roles: tuple[str, ...] = ()
+    plan_digests: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        digest = _normalize_digest(self.digest)
-        object.__setattr__(self, "digest", digest)
+        object.__setattr__(self, "digest", _normalize_digest(self.digest))
         if self.expected_size is not None and int(self.expected_size) < 0:
             raise ValueError("expected_size must not be negative")
         object.__setattr__(self, "roles", tuple(sorted({str(role) for role in self.roles})))
+        object.__setattr__(
+            self,
+            "plan_digests",
+            tuple(sorted({_normalize_plan_digest(item) for item in self.plan_digests})),
+        )
 
 
 @dataclass(frozen=True)
@@ -40,12 +52,27 @@ class ImportedArtifact:
     size: int
     roles: tuple[str, ...]
     already_present: bool
+    plan_digests: tuple[str, ...] = ()
 
 
 def _normalize_digest(value: str) -> str:
     digest = str(value).strip().lower()
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise ValueError(f"Invalid artifact digest: {value!r}")
+    return digest
+
+
+def _normalize_plan_digest(value: str) -> str:
+    digest = str(value).strip().lower()
+    if digest.startswith("sha256:"):
+        digest = digest[7:]
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError(f"Invalid benchmark plan digest: {value!r}")
+    return digest
+
+
+def file_digest(path: str | Path) -> str:
+    digest, _ = _hash_file(Path(path))
     return digest
 
 
@@ -62,97 +89,283 @@ def _hash_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _source_path(source_root: Path, digest: str) -> Path:
-    return source_root / Path(partition_artifact_key(digest))
+def _source_path(root: Path, digest: str) -> Path:
+    return root / Path(partition_artifact_key(digest))
+
+
+def bootstrap_receipt_path(destination_root: str | Path) -> Path:
+    return Path(destination_root).resolve() / RECEIPT_NAME
+
+
+def config_artifact_store(config: Any, isolated_home: str | Path) -> Path:
+    """Resolve the exact local store for an explicitly isolated config/home."""
+    home = Path(isolated_home).resolve()
+    if str(getattr(config, "storage_type", "local")).strip().lower() != "local":
+        raise ArtifactBootstrapError("M7 bootstrap requires local artifact storage")
+    configured = str(getattr(config, "storage_path", "") or "").strip()
+    if not configured:
+        return (home / "job_files").resolve()
+    configured_path = Path(configured).expanduser()
+    if not configured_path.is_absolute():
+        configured_path = home / configured_path
+    destination = configured_path.resolve()
+    try:
+        destination.relative_to(home)
+    except ValueError as exc:
+        raise ArtifactBootstrapError(
+            "configured artifact store is outside the isolated home"
+        ) from exc
+    return destination
+
+
+def _value(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
 
 
 def declared_input_artifacts(
-    benchmark_plans: Iterable[str | Path | dict[str, Any]],
+    benchmark_plans: Iterable[Any],
 ) -> list[DeclaredArtifact]:
-    """Extract unique input IDs and workflow roles from private benchmark plans."""
-
-    collected: dict[str, set[str]] = {}
-    for plan_source in benchmark_plans:
-        if isinstance(plan_source, (str, Path)):
-            plan = json.loads(Path(plan_source).read_text(encoding="utf-8"))
-        else:
-            plan = plan_source
-        for scenario in plan.get("scenarios") or []:
-            request = scenario.get("request") or {}
-            input_artifacts = request.get("input_artifacts") or {}
-            partition = request.get("partition") or {}
+    """Extract declarations from already-loaded plans without reparsing files."""
+    collected: dict[str, dict[str, set[str]]] = {}
+    for entry in benchmark_plans:
+        plan_digest = None
+        plan = entry
+        if isinstance(entry, tuple) and len(entry) == 2:
+            plan_digest, plan = entry
+        if isinstance(plan, (str, Path)):
+            plan = json.loads(Path(plan).read_text(encoding="utf-8"))
+        for scenario in _value(plan, "scenarios", []) or []:
+            request = _value(scenario, "request", {}) or {}
+            input_artifacts = _value(request, "input_artifacts", {}) or {}
+            partition = _value(request, "partition", {}) or {}
             roles = {
-                str(item.get("key")): str(
-                    item.get("target_input") or item.get("name") or item.get("key")
+                str(_value(item, "key")): str(
+                    _value(item, "target_input")
+                    or _value(item, "name")
+                    or _value(item, "key")
                 )
-                for item in partition.get("inputs") or []
-                if isinstance(item, dict) and item.get("key")
+                for item in (_value(partition, "inputs", []) or [])
+                if _value(item, "key")
             }
             for boundary, raw_digest in input_artifacts.items():
                 digest = _normalize_digest(raw_digest)
                 role = f"{boundary}:{roles.get(str(boundary), str(boundary))}"
-                collected.setdefault(digest, set()).add(role)
+                record = collected.setdefault(digest, {"roles": set(), "plans": set()})
+                record["roles"].add(role)
+                if plan_digest:
+                    record["plans"].add(_normalize_plan_digest(plan_digest))
     return [
-        DeclaredArtifact(digest=digest, roles=tuple(sorted(roles)))
-        for digest, roles in sorted(collected.items())
+        DeclaredArtifact(
+            digest=digest,
+            roles=tuple(sorted(record["roles"])),
+            plan_digests=tuple(sorted(record["plans"])),
+        )
+        for digest, record in sorted(collected.items())
     ]
+
+
+def _receipt_payload(
+    destination_root: Path,
+    declarations: list[DeclaredArtifact],
+    *,
+    release_plan_digest: str,
+    config_digest: str,
+) -> dict[str, Any]:
+    return {
+        "schema": RECEIPT_SCHEMA,
+        "release_plan_digest": _normalize_plan_digest(release_plan_digest),
+        "config_digest": _normalize_plan_digest(config_digest),
+        "destination": str(destination_root.resolve()),
+        "artifacts": [
+            {
+                "digest": item.digest,
+                "size": item.expected_size,
+                "roles": list(item.roles),
+                "plan_digests": list(item.plan_digests),
+            }
+            for item in declarations
+        ],
+    }
+
+
+def config_digest(config: Any, destination_root: str | Path) -> str:
+    """Digest the redacted effective config plus the exact destination."""
+    payload = {
+        "config": config.to_dict() if hasattr(config, "to_dict") else {},
+        "destination": str(Path(destination_root).resolve()),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_receipt(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _verify_destination(destination_root: Path, declaration: DeclaredArtifact, size: int) -> None:
+    target = _source_path(destination_root, declaration.digest)
+    if not target.is_file():
+        raise ArtifactBootstrapError(f"destination artifact is missing: {declaration.digest}")
+    target_digest, target_size = _hash_file(target)
+    if target_digest != declaration.digest or target_size != size:
+        raise ArtifactBootstrapError(f"destination artifact mismatch: {declaration.digest}")
 
 
 def import_declared_artifacts(
     source_root: str | Path,
     destination_root: str | Path,
     declarations: Iterable[DeclaredArtifact],
+    *,
+    release_plan_digest: str | None = None,
+    config_digest: str | None = None,
 ) -> list[ImportedArtifact]:
-    """Verify and atomically copy declared artifacts into a local artifact store.
+    """Validate all sources, stage all bytes, then atomically publish one receipt."""
+    source_root = Path(source_root).resolve()
+    destination_root = Path(destination_root).resolve()
+    declarations = [DeclaredArtifact(**item.__dict__) if not isinstance(item, DeclaredArtifact) else item for item in declarations]
+    if release_plan_digest is None:
+        release_plan_digest = "0" * 64
+    if config_digest is None:
+        config_digest = "0" * 64
+    receipt_path = bootstrap_receipt_path(destination_root)
 
-    Existing exact bytes are accepted as an idempotent import. Any missing source,
-    source digest/size mismatch, interrupted copy, or conflicting destination is a
-    hard failure and leaves no partial destination object.
-    """
-
-    source_root = Path(source_root)
-    destination_root = Path(destination_root)
-    imported: list[ImportedArtifact] = []
+    source_records: list[tuple[DeclaredArtifact, Path, int]] = []
     for declaration in declarations:
-        digest = _normalize_digest(declaration.digest)
-        expected_size = declaration.expected_size
-        source = _source_path(source_root, digest)
+        source = _source_path(source_root, declaration.digest)
         if not source.is_file():
-            raise ArtifactBootstrapError(f"source artifact is missing: {digest}")
+            raise ArtifactBootstrapError(f"source artifact is missing: {declaration.digest}")
         source_digest, source_size = _hash_file(source)
-        if source_digest != digest:
-            raise ArtifactBootstrapError(f"source digest mismatch: {digest}")
-        if expected_size is not None and source_size != int(expected_size):
-            raise ArtifactBootstrapError(f"source size mismatch: {digest}")
+        if source_size > MAX_PARTITION_ARTIFACT_BYTES:
+            raise ArtifactBootstrapError(f"artifact exceeds upload size limit: {declaration.digest}")
+        if source_digest != declaration.digest:
+            raise ArtifactBootstrapError(f"source digest mismatch: {declaration.digest}")
+        if declaration.expected_size is not None and source_size != int(declaration.expected_size):
+            raise ArtifactBootstrapError(f"source size mismatch: {declaration.digest}")
+        source_records.append((declaration, source, source_size))
 
-        target = _source_path(destination_root, digest)
-        if target.exists():
-            if not target.is_file():
-                raise ArtifactBootstrapError(f"destination artifact mismatch: {digest}")
-            target_digest, target_size = _hash_file(target)
-            if target_digest != digest or target_size != source_size:
-                raise ArtifactBootstrapError(f"destination artifact mismatch: {digest}")
-            imported.append(
-                ImportedArtifact(digest, source_size, declaration.roles, True)
-            )
-            continue
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    receipt_declarations = [
+        DeclaredArtifact(
+            digest=declaration.digest,
+            expected_size=source_size,
+            roles=declaration.roles,
+            plan_digests=declaration.plan_digests,
+        )
+        for declaration, _, source_size in source_records
+    ]
+    receipt_payload = _receipt_payload(
+        destination_root,
+        receipt_declarations,
+        release_plan_digest=release_plan_digest,
+        config_digest=config_digest,
+    )
+    if receipt_path.exists():
         try:
-            shutil.copyfile(source, temporary)
-            copied_digest, copied_size = _hash_file(temporary)
-            if copied_digest != digest or copied_size != source_size:
-                raise ArtifactBootstrapError(f"copied artifact verification failed: {digest}")
-            os.replace(temporary, target)
-            final_digest, final_size = _hash_file(target)
-            if final_digest != digest or final_size != source_size:
-                raise ArtifactBootstrapError(f"destination artifact verification failed: {digest}")
-        except ArtifactBootstrapError:
-            temporary.unlink(missing_ok=True)
-            raise
-        except OSError as exc:
-            temporary.unlink(missing_ok=True)
-            raise ArtifactBootstrapError(f"copy failed: {digest}") from exc
-        imported.append(ImportedArtifact(digest, source_size, declaration.roles, False))
-    return imported
+            existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ArtifactBootstrapError("bootstrap receipt is unreadable") from exc
+        if existing != receipt_payload:
+            raise ArtifactBootstrapError("bootstrap receipt mismatch")
+
+    destination_root.mkdir(parents=True, exist_ok=True)
+    staging_root = destination_root.parent / f".{destination_root.name}.m7-stage-{uuid.uuid4().hex}"
+    staging_root.mkdir(parents=True, exist_ok=False)
+    new_targets: list[Path] = []
+    records: list[ImportedArtifact] = []
+    try:
+        for declaration, source, source_size in source_records:
+            target = _source_path(destination_root, declaration.digest)
+            if target.exists():
+                _verify_destination(destination_root, declaration, source_size)
+                records.append(
+                    ImportedArtifact(
+                        declaration.digest,
+                        source_size,
+                        declaration.roles,
+                        True,
+                        declaration.plan_digests,
+                    )
+                )
+                continue
+            staged = _source_path(staging_root, declaration.digest)
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copyfile(source, staged)
+            except OSError as exc:
+                raise ArtifactBootstrapError(
+                    f"copy failed: {declaration.digest}"
+                ) from exc
+            copied_digest, copied_size = _hash_file(staged)
+            if copied_digest != declaration.digest or copied_size != source_size:
+                raise ArtifactBootstrapError(f"staged artifact verification failed: {declaration.digest}")
+
+        storage = LocalStorage(destination_root)
+        for declaration, _, source_size in source_records:
+            target = _source_path(destination_root, declaration.digest)
+            if target.exists():
+                continue
+            staged = _source_path(staging_root, declaration.digest)
+            new_targets.append(target)
+            storage.upload(staged, partition_artifact_key(declaration.digest))
+            _verify_destination(destination_root, declaration, source_size)
+            records.append(
+                ImportedArtifact(
+                    declaration.digest,
+                    source_size,
+                    declaration.roles,
+                    False,
+                    declaration.plan_digests,
+                )
+            )
+        _write_receipt(receipt_path, receipt_payload)
+        return records
+    except ArtifactBootstrapError:
+        for target in new_targets:
+            target.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        for target in new_targets:
+            target.unlink(missing_ok=True)
+        raise ArtifactBootstrapError("receipt publication failed") from exc
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def verify_bootstrap_receipt(
+    destination_root: str | Path,
+    declarations: Iterable[DeclaredArtifact],
+    *,
+    release_plan_digest: str,
+    config_digest: str,
+) -> dict[str, Any]:
+    destination_root = Path(destination_root).resolve()
+    path = bootstrap_receipt_path(destination_root)
+    if not path.is_file():
+        raise ArtifactBootstrapError("bootstrap receipt is missing")
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArtifactBootstrapError("bootstrap receipt is unreadable") from exc
+    expected = _receipt_payload(
+        destination_root,
+        list(declarations),
+        release_plan_digest=release_plan_digest,
+        config_digest=config_digest,
+    )
+    if actual != expected:
+        raise ArtifactBootstrapError("bootstrap receipt mismatch")
+    for item in expected["artifacts"]:
+        declaration = DeclaredArtifact(
+            digest=item["digest"],
+            expected_size=item["size"],
+            roles=tuple(item["roles"]),
+            plan_digests=tuple(item["plan_digests"]),
+        )
+        _verify_destination(destination_root, declaration, int(item["size"]))
+    return actual

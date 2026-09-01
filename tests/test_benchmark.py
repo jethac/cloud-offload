@@ -18,6 +18,8 @@ from cloud_offload.benchmark import (
 )
 from cloud_offload.config import CloudConfig
 from cloud_offload.benchmark_faults import CORRUPTION_NONCE_FIELD
+from cloud_offload.cache_registry import CacheRegistry
+from cloud_offload.prepared_state import INDEX_SCHEMA
 
 
 def event(
@@ -190,6 +192,9 @@ class FakeDriver:
     def run_hook(self, injection, context):
         self.hooks.append((injection.kind, context))
         return {"exit_code": 0, "duration_seconds": 0.01, "output_omitted": True}
+
+    def base_manifest(self, cold_result):
+        return {"manifest_id": f"base-{cold_result['job_id']}"}
 
 
 def plan_dict(scenarios, **limit_overrides):
@@ -535,6 +540,73 @@ def test_corruption_hook_runs_only_after_a_successful_cold_base_manifest():
     assert [kind for kind, _ in driver.hooks] == ["corruption", "corruption"]
 
 
+def test_corruption_requires_registry_manifest_identity_after_cold_pass(tmp_path):
+    class RegistryDriver(FakeDriver):
+        def __init__(self, scripts, registry):
+            super().__init__(scripts)
+            self.registry = registry
+            self.manifest_queries = []
+
+        def base_manifest(self, cold_result):
+            self.manifest_queries.append(cold_result["job_id"])
+            manifests = self.registry.query_manifests(datacenter_id="EU-RO-1")
+            return manifests[0] if len(manifests) == 1 else None
+
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [
+                scenario("cold", "cold"),
+                scenario(
+                    "corruption",
+                    "failure",
+                    failure={
+                        "kind": "corruption",
+                        "before_submit": True,
+                        "trigger_event": "executed",
+                        "hook_argv": ["corruption-canary"],
+                    },
+                ),
+            ]
+        )
+    )
+    registry = CacheRegistry(tmp_path / "cache.db")
+    volume = registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="provider-volume",
+        datacenter_id="EU-RO-1",
+        ownership="adopted",
+        capacity_bytes=1024,
+        policy={},
+        volume_id="volume-1",
+    )
+    registry.reconcile_index(
+        volume.id,
+        {
+            "schema": INDEX_SCHEMA,
+            "generation": "generation-1",
+            "manifests": [
+                {
+                    "manifest_id": "manifest-1",
+                    "profile_fingerprint": "profile-1",
+                    "created_at": "2026-07-29T00:00:01+00:00",
+                    "artifacts": [],
+                }
+            ],
+        },
+    )
+    driver = RegistryDriver(
+        {"cold": successful_script("pod-cold"), "corruption": successful_script("pod-corruption")},
+        registry=registry,
+    )
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert driver.manifest_queries == ["job-1"]
+    assert len(driver.hooks) == 3
+    assert [kind for kind, _ in driver.hooks] == ["corruption"] * 3
+    assert scorecard["results"][1]["passed"] is True
+
+
 def test_corruption_reports_dependency_failure_without_running_when_cold_fails():
     class ColdFailureDriver(FakeDriver):
         def submit(self, scenario):
@@ -567,11 +639,11 @@ def test_corruption_reports_dependency_failure_without_running_when_cold_fails()
     assert result["passed"] is False
     assert result["failure_injection"]["triggered"] is False
     assert result["failure_injection"]["dependency_failure"] == (
-        "corruption requires a successful cold scenario that created a base manifest"
+        "corruption requires a verified base manifest from the cache registry"
     )
     assert result["harness_error"] == (
-        "Dependency failure: corruption requires a successful cold scenario "
-        "that created a base manifest"
+        "Dependency failure: corruption requires a verified base manifest from "
+        "the cache registry"
     )
 
 

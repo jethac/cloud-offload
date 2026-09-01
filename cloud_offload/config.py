@@ -573,11 +573,22 @@ class CloudConfig:
         self.prepared_storage = normalized_prepared_storage(self.prepared_storage)
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "CloudConfig":
-        """Load config from JSON file (top-level fields, or nested under 'cloud')."""
+    def from_file(
+        cls, path: str | Path, *, home: str | Path | None = None
+    ) -> "CloudConfig":
+        """Load config, optionally deriving blank paths inside an explicit home."""
         with open(path) as f:
             data = json.load(f)
         cloud_data = data.get("cloud", data)
+        if home is not None:
+            cloud_data = dict(cloud_data)
+            isolated_home = Path(home).resolve()
+            if not str(cloud_data.get("storage_path") or "").strip():
+                cloud_data["storage_path"] = str(isolated_home / "job_files")
+            if not str(cloud_data.get("queue_db_path") or "").strip():
+                cloud_data["queue_db_path"] = str(isolated_home / "jobs.db")
+            if not str(cloud_data.get("scratch_dir") or "").strip():
+                cloud_data["scratch_dir"] = str(isolated_home / "scratch")
         allowed = {item.name for item in fields(cls)}
         config = cls(**{key: value for key, value in cloud_data.items() if key in allowed})
         # Runtime services may refresh mutable policy while they run. Keep the
