@@ -70,18 +70,6 @@ _runtime_config: Any | None = None
 _config_write_lock = threading.RLock()
 _ANY_VOLUME_BINDING = object()
 _HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
-_PREFLIGHT_POLICY_CONFIG_FIELDS = {
-    "max_hourly_rate",
-    "max_total_job_cost",
-    "max_job_runtime_seconds",
-    "recommendation_policy",
-    "rental_confirmation",
-    "confirmation_countdown_seconds",
-    "allowed_regions",
-    "material_price_change_percent",
-    "material_cost_change_percent",
-    "lease_ttl_seconds",
-}
 
 
 # === Request/Response Models ===
@@ -1090,10 +1078,12 @@ def _atomic_write_persisted_config(path: Path, data: dict[str, Any]) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _persist_config_updates(payload: dict[str, Any]) -> None:
+def _persist_config_updates(payload: dict[str, Any], config: Any | None = None) -> None:
     from cloud_offload.config import CONFIG_DIR
 
-    config_path = CONFIG_DIR / "config.json"
+    config = config or _config(resolve_secrets=False)
+    source_path = getattr(config, "_source_path", None)
+    config_path = Path(source_path) if source_path else CONFIG_DIR / "config.json"
     with _config_write_lock:
         data = _read_persisted_config(config_path)
         if "cloud" in data and isinstance(data["cloud"], dict):
@@ -1141,6 +1131,7 @@ def _persist_prepared_volume_binding(
 @app.post("/api/config")
 async def update_config(updates: dict[str, Any] = Body(...)):
     """Persist non-secret configuration. Secrets come from the environment only."""
+    global _runtime_config
     secret_fields = {
         "vast_api_key",
         "runpod_api_key",
@@ -1168,23 +1159,33 @@ async def update_config(updates: dict[str, Any] = Body(...)):
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    validated_fields = _PREFLIGHT_POLICY_CONFIG_FIELDS.intersection(payload)
-    if "scratch_dir" in payload:
-        validated_fields.add("scratch_dir")
-    if validated_fields:
+
+    with _config_write_lock:
+        current = _config(resolve_secrets=False)
+        candidate = copy.deepcopy(current)
+        mutable_fields = (
+            set(getattr(candidate, "__dataclass_fields__", {})) - secret_fields
+        )
+        updated_fields = mutable_fields.intersection(payload)
         try:
-            validated = _config(resolve_secrets=False)
-            for field_name in validated_fields:
-                setattr(validated, field_name, payload[field_name])
-            validated.__post_init__()
-            for field_name in validated_fields:
-                payload[field_name] = getattr(validated, field_name)
+            for field_name in updated_fields:
+                setattr(candidate, field_name, copy.deepcopy(payload[field_name]))
+            candidate.__post_init__()
+            for field_name in updated_fields:
+                payload[field_name] = copy.deepcopy(
+                    getattr(candidate, field_name)
+                )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _persist_config_updates(payload)
+        _persist_config_updates(payload, current)
+        if _runtime_config is not None:
+            _runtime_config = candidate
+            effective = candidate
+        else:
+            effective = _config()
 
-    return {"status": "updated", "config": _config().to_dict()}
+    return {"status": "updated", "config": effective.to_dict()}
 
 
 @app.get("/api/providers")
