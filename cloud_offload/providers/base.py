@@ -141,6 +141,19 @@ class CloudConnector(ABC):
     def list_instances(self) -> list[Instance]:
         """List all active instances for this provider."""
 
+    def list_instances_until(
+        self,
+        *,
+        absolute_deadline: float,
+        timeout_budget: float | None = None,
+    ) -> list[Instance]:
+        """List active instances with a caller deadline when supported.
+
+        Existing third-party connectors stay compatible. A connector that can
+        control its transport timeout should override this method.
+        """
+        return self.list_instances()
+
     def find_cheapest(
         self,
         gpu_type: str | None = None,

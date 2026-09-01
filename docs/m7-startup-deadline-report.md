@@ -25,9 +25,16 @@ start another poll after the deadline.
 
 Coordinator HTTP retries divide the positive remaining time between connect and
 read timeouts. Provider-inventory and HTTP retries check time before each attempt
-and before each backoff. Cleanup always sends one termination request for every
-exact known paid resource; only retries, waits, and absence proof are deadline
-bounded.
+and before each backoff. The provider-inventory deadline passes through the
+connector interface into the RunPod HTTP connect/read allocation. Connectors
+that do not yet control transport timeouts keep the compatible interface.
+
+Worker-quiescence uses only the deadline-aware active-worker adapter. Cleanup
+uses only deadline-aware provider inventory for its initial read and its proof
+reads. Cleanup always sends one termination request for every exact known paid
+resource. The deadline limits all later termination attempts, waits, and absence
+proof. The bounded cleanup receipt is also the final audit, so the campaign does
+not start a second unbounded provider read after cleanup.
 
 ## Safety behavior
 
@@ -43,4 +50,7 @@ bounded.
 Fake-clock tests cover zero and negative remaining time, a short final retry,
 slow blocking calls, clock jumps, bounded connect/read allocation,
 request-timeout propagation, cancellation, and mandatory first termination.
-These deterministic tests use no provider or credential service.
+The tests also use the real Coordinator and RunPod connector paths with a fake
+HTTP transport. They prove that the transport timeout is not larger than the
+positive remaining deadline. These deterministic tests use no provider or
+credential service.

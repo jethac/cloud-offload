@@ -789,17 +789,19 @@ class BenchmarkRunner:
             campaign_abort = campaign_abort or (
                 f"operator_interrupt:{final_cleanup_interrupt}"
             )
-        final_audit_error = None
-        try:
-            final_inventory = self.driver.inventory(plan.providers)
-            orphaned = sorted(set(campaign_resources) & _managed_ids(final_inventory))
-        except (KeyboardInterrupt, SystemExit) as exc:
-            campaign_abort = campaign_abort or f"operator_interrupt:{type(exc).__name__}"
-            final_audit_error = type(exc).__name__
-            orphaned = sorted(campaign_resources)
-        except Exception as exc:  # noqa: BLE001 - a missing audit is a failed audit
-            final_audit_error = type(exc).__name__
-            orphaned = []
+        # The cleanup receipt is the bounded final provider audit. Do not start
+        # a second unbounded provider read after its proof deadline.
+        orphaned = sorted(
+            (str(item["provider"]), str(item["instance_id"]))
+            for item in final_cleanup
+            if not item.get("provider_absent")
+        )
+        audit_errors = [
+            str(item["inventory_error"])
+            for item in final_cleanup
+            if item.get("inventory_error")
+        ]
+        final_audit_error = audit_errors[0] if audit_errors else None
         unknown_paid_resources = [
             item
             for result in results
@@ -908,9 +910,17 @@ class BenchmarkRunner:
             campaign_started + plan.limits.max_campaign_seconds,
             self.driver.monotonic() + plan.limits.fresh_worker_timeout_seconds,
         )
-        while self.driver.active_workers(plan.providers):
+        guarded = getattr(self.driver, "active_workers_until", None)
+        if not callable(guarded):
+            raise TimeoutError("deadline_aware_worker_inventory_required")
+        while True:
             if self.driver.monotonic() >= deadline:
                 return False
+            workers = guarded(plan.providers, absolute_deadline=deadline)
+            if self.driver.monotonic() >= deadline:
+                return False
+            if not workers:
+                return True
             remaining = deadline - self.driver.monotonic()
             if remaining <= 0:
                 return False
@@ -1370,10 +1380,27 @@ class BenchmarkRunner:
 
         # Capture the last provider and worker facts before deletion. A failed
         # read leaves an explicit unknown value and cannot block cleanup.
+        final_observation_deadline = min(
+            readiness_deadline,
+            started + scenario.timeout_seconds,
+            campaign_started + plan.limits.max_campaign_seconds,
+        )
         try:
-            final_startup_inventory = self.driver.inventory(plan.providers)
+            if self.driver.monotonic() >= final_observation_deadline:
+                raise TimeoutError("operation_deadline")
+            final_startup_inventory = self._deadline_call(
+                "inventory",
+                plan.providers,
+                absolute_deadline=final_observation_deadline,
+            )
             try:
-                final_startup_workers = self.driver.active_workers(plan.providers)
+                if self.driver.monotonic() >= final_observation_deadline:
+                    raise TimeoutError("operation_deadline")
+                final_startup_workers = self._deadline_call(
+                    "active_workers",
+                    plan.providers,
+                    absolute_deadline=final_observation_deadline,
+                )
             except Exception:  # noqa: BLE001
                 final_startup_workers = []
             _observe_startup_phases(
@@ -1680,8 +1707,12 @@ class BenchmarkRunner:
             except (KeyboardInterrupt, SystemExit) as exc:
                 cleanup_interrupt = cleanup_interrupt or type(exc).__name__
             return last_clock
+        deadline = cleanup_now() + timeout_seconds
+        guarded_inventory = getattr(self.driver, "inventory_until", None)
+        if not callable(guarded_inventory):
+            raise TimeoutError("deadline_aware_provider_inventory_required")
         try:
-            current = self.driver.inventory(providers)
+            current = guarded_inventory(providers, absolute_deadline=deadline)
         except (KeyboardInterrupt, SystemExit) as exc:
             current = {provider: {} for provider in providers}
             inventory_error = type(exc).__name__
@@ -1706,7 +1737,6 @@ class BenchmarkRunner:
             for key in candidates
             if key not in baseline_ids
         }
-        deadline = cleanup_now() + timeout_seconds
         # Every exact paid resource gets one termination request. The deadline
         # limits retries and proof waits, but never suppresses this first stop.
         for key, receipt in receipts.items():
@@ -1728,11 +1758,11 @@ class BenchmarkRunner:
         while (
             receipts
             and attempts_remaining > 0
-            and cleanup_now() <= deadline
+            and cleanup_now() < deadline
         ):
             attempts_remaining -= 1
             try:
-                inventory = self.driver.inventory(providers)
+                inventory = guarded_inventory(providers, absolute_deadline=deadline)
                 inventory_error = None
             except (KeyboardInterrupt, SystemExit) as exc:
                 inventory = {provider: {} for provider in providers}
@@ -1741,6 +1771,9 @@ class BenchmarkRunner:
             except Exception as exc:  # noqa: BLE001
                 inventory = {provider: {} for provider in providers}
                 inventory_error = type(exc).__name__
+            if cleanup_now() >= deadline:
+                inventory_error = "TimeoutError"
+                break
             pending = []
             for key, receipt in receipts.items():
                 if inventory_error is None and key[1] not in inventory.get(key[0], {}):
@@ -1769,12 +1802,14 @@ class BenchmarkRunner:
         try:
             if cleanup_now() >= deadline:
                 raise TimeoutError("cleanup_deadline")
-            inventory = self.driver.inventory(providers)
+            inventory = guarded_inventory(providers, absolute_deadline=deadline)
             inventory_error = None
         except (KeyboardInterrupt, SystemExit) as exc:
             cleanup_interrupt = cleanup_interrupt or type(exc).__name__
             try:
-                inventory = self.driver.inventory(providers)
+                if cleanup_now() >= deadline:
+                    raise TimeoutError("cleanup_deadline")
+                inventory = guarded_inventory(providers, absolute_deadline=deadline)
                 inventory_error = None
             except BaseException as retry_exc:  # final bounded proof attempt
                 inventory = {provider: {} for provider in providers}
@@ -1933,7 +1968,15 @@ class CoordinatorBenchmarkDriver:
                 if remaining <= 0:
                     raise TimeoutError("provider_inventory_deadline")
                 try:
-                    instances = self.connectors[provider].list_instances()
+                    connector = self.connectors[provider]
+                    guarded = getattr(connector, "list_instances_until", None)
+                    if callable(guarded):
+                        instances = guarded(
+                            absolute_deadline=deadline,
+                            timeout_budget=remaining,
+                        )
+                    else:
+                        instances = connector.list_instances()
                     break
                 except Exception:  # noqa: BLE001 - bounded provider retry
                     remaining = deadline - time.monotonic()

@@ -113,12 +113,18 @@ class FakeDriver:
             result[key[0]][item["id"]] = observation
         return result
 
+    def inventory_until(self, providers, *, absolute_deadline):
+        return self.inventory(providers)
+
     def active_workers(self, providers):
         return (
             [{"provider": "runpod", "worker_id": "stale-worker"}]
             if self.clock < self.active_until
             else []
         )
+
+    def active_workers_until(self, providers, *, absolute_deadline):
+        return self.active_workers(providers)
 
     def prepare_scenario(self, scenario):
         previous = self.prepared_storage_policy
@@ -1935,6 +1941,9 @@ def test_cleanup_deadline_never_suppresses_first_exact_termination():
                 }
             }
 
+        def inventory_until(self, providers, *, absolute_deadline):
+            return self.inventory(providers)
+
         def terminate(self, provider, instance_id):
             self.termination_calls.append((provider, instance_id))
             self.clock = 10.0
@@ -1957,6 +1966,166 @@ def test_cleanup_deadline_never_suppresses_first_exact_termination():
     assert receipt["termination_attempts"] == 1
     assert receipt["provider_absent"] is False
     assert receipt["inventory_error"] == "TimeoutError"
+
+
+def test_worker_quiescence_uses_deadline_aware_worker_call_and_stops_after_overrun():
+    class SlowWorkerDriver:
+        clock = 0.0
+        guarded_calls = []
+        sleeps = []
+
+        def monotonic(self):
+            return self.clock
+
+        def active_workers(self, providers):
+            raise AssertionError("deadline-bound worker wait used the plain method")
+
+        def active_workers_until(self, providers, *, absolute_deadline):
+            self.guarded_calls.append((providers, absolute_deadline))
+            self.clock = 30.0
+            return [{"provider": "runpod", "worker_id": "paid-worker"}]
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+
+    driver = SlowWorkerDriver()
+    plan = BenchmarkPlan.from_dict(
+        plan_dict(
+            [scenario("cold", "cold")],
+            fresh_worker_timeout_seconds=1,
+            max_campaign_seconds=10,
+        )
+    )
+
+    assert BenchmarkRunner(driver)._wait_for_worker_quiescence(plan, 0.0) is False
+    assert driver.guarded_calls == [(('runpod',), 1.0)]
+    assert driver.sleeps == []
+
+
+def test_cleanup_clamps_initial_inventory_and_does_not_prove_after_overrun():
+    class SlowCleanupDriver:
+        clock = 0.0
+        guarded_calls = []
+        termination_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory(self, providers):
+            raise AssertionError("deadline-bound cleanup used the plain method")
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            self.guarded_calls.append((providers, absolute_deadline))
+            self.clock = 30.0
+            return {
+                "runpod": {
+                    "pod-paid": InstanceObservation(
+                        id="pod-paid", provider="runpod", hourly_rate=1,
+                        status="running", managed=True,
+                    )
+                }
+            }
+
+        def terminate(self, provider, instance_id):
+            self.termination_calls.append((provider, instance_id))
+            return True
+
+        def sleep(self, seconds):
+            raise AssertionError("cleanup cannot wait after its deadline")
+
+    driver = SlowCleanupDriver()
+    meter = _ResourceMeter(
+        id="pod-paid", provider="runpod", hourly_rate=1,
+        first_seen=0, last_seen=0, source="journal", lease_id="lease-paid",
+    )
+
+    receipt = BenchmarkRunner(driver)._cleanup_resources(
+        ("runpod",), {"runpod": {}}, {("runpod", "pod-paid"): meter}, 1,
+        include_untracked=False,
+    )[0]
+
+    assert driver.guarded_calls == [(('runpod',), 1.0)]
+    assert driver.termination_calls == [("runpod", "pod-paid")]
+    assert receipt["termination_attempts"] == 1
+    assert receipt["provider_absent"] is False
+    assert receipt["inventory_error"] == "TimeoutError"
+
+
+def test_cleanup_does_not_retry_termination_after_slow_proof_crosses_deadline():
+    class SlowProofDriver:
+        clock = 0.0
+        inventory_calls = 0
+        termination_calls = []
+
+        def monotonic(self):
+            return self.clock
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            self.inventory_calls += 1
+            if self.inventory_calls == 2:
+                self.clock = 30.0
+            return {
+                "runpod": {
+                    "pod-paid": InstanceObservation(
+                        id="pod-paid", provider="runpod", hourly_rate=1,
+                        status="running", managed=True,
+                    )
+                }
+            }
+
+        def terminate(self, provider, instance_id):
+            self.termination_calls.append((provider, instance_id))
+            return True
+
+        def sleep(self, seconds):
+            raise AssertionError("cleanup cannot wait after its deadline")
+
+    driver = SlowProofDriver()
+    meter = _ResourceMeter(
+        id="pod-paid", provider="runpod", hourly_rate=1,
+        first_seen=0, last_seen=0, source="journal", lease_id="lease-paid",
+    )
+
+    receipt = BenchmarkRunner(driver)._cleanup_resources(
+        ("runpod",), {"runpod": {}}, {("runpod", "pod-paid"): meter}, 1,
+        include_untracked=False,
+    )[0]
+
+    assert driver.inventory_calls == 2
+    assert driver.termination_calls == [("runpod", "pod-paid")]
+    assert receipt["provider_absent"] is False
+    assert receipt["inventory_error"] == "TimeoutError"
+
+
+def test_paid_scenario_uses_only_deadline_aware_inventory_and_worker_reads():
+    class DeadlineOnlyDriver(FakeDriver):
+        plain_paid_inventory_calls = 0
+        plain_worker_calls = 0
+
+        def inventory(self, providers):
+            if self.current_job is not None:
+                self.plain_paid_inventory_calls += 1
+                raise AssertionError("paid inventory read has no deadline")
+            return FakeDriver.inventory(self, providers)
+
+        def inventory_until(self, providers, *, absolute_deadline):
+            return FakeDriver.inventory(self, providers)
+
+        def active_workers(self, providers):
+            self.plain_worker_calls += 1
+            raise AssertionError("worker read has no deadline")
+
+        def active_workers_until(self, providers, *, absolute_deadline):
+            return FakeDriver.active_workers(self, providers)
+
+    driver = DeadlineOnlyDriver({"cold": successful_script("pod-deadline")})
+    plan = BenchmarkPlan.from_dict(plan_dict([scenario("cold", "cold")]))
+
+    scorecard = BenchmarkRunner(driver).run(plan)
+
+    assert scorecard["results"][0]["passed"] is True
+    assert driver.plain_paid_inventory_calls == 0
+    assert driver.plain_worker_calls == 0
 
 
 def test_real_preflight_server_rejects_both_workload_shapes(monkeypatch, tmp_path):

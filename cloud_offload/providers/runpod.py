@@ -151,11 +151,12 @@ class RunPodConnector(CloudConnector):
         return payload.get("data", {})
 
     def _rest(self, method: str, endpoint: str, **kwargs) -> Any:
+        timeout = kwargs.pop("timeout", 30)
         response = self.http.request(
             method,
             f"{self.rest_url}/{endpoint.lstrip('/')}",
             headers=self._headers,
-            timeout=30,
+            timeout=timeout,
             **kwargs,
         )
         status_code = int(getattr(response, "status_code", 0) or 0)
@@ -468,6 +469,35 @@ class RunPodConnector(CloudConnector):
             for pod in pods
             if pod.get("gpu")
             and (instance := self._parse_instance(pod)).status in {"pending", "running"}
+        ]
+
+    def list_instances_until(
+        self,
+        *,
+        absolute_deadline: float,
+        timeout_budget: float | None = None,
+    ) -> list[Instance]:
+        """List active pods without letting the HTTP call exceed the budget."""
+        remaining = float(absolute_deadline) - time.monotonic()
+        if timeout_budget is not None:
+            remaining = min(remaining, float(timeout_budget))
+        if remaining <= 0:
+            raise TimeoutError("provider_inventory_deadline")
+        attempt_total = min(30.0, remaining)
+        connect_timeout = min(5.0, attempt_total / 2)
+        read_timeout = attempt_total - connect_timeout
+        pods = (
+            self._rest(
+                "GET", "pods", timeout=(connect_timeout, read_timeout)
+            )
+            or {}
+        ).get("pods") or []
+        return [
+            instance
+            for pod in pods
+            if pod.get("gpu")
+            and (instance := self._parse_instance(pod)).status
+            in {"pending", "running"}
         ]
 
     @staticmethod
