@@ -460,6 +460,30 @@ def test_bootstrap_is_failure_atomic_when_receipt_publication_fails(tmp_path, mo
     assert not bootstrap_receipt_path(destination_root).exists()
 
 
+def test_bootstrap_rejects_zero_declared_artifacts_before_staging_or_receipt(tmp_path):
+    destination_root = tmp_path / "destination"
+    with pytest.raises(ArtifactBootstrapError, match="no declared artifacts"):
+        import_declared_artifacts(tmp_path / "source", destination_root, [])
+    assert not destination_root.exists()
+    assert not bootstrap_receipt_path(destination_root).exists()
+
+
+def test_verification_rejects_a_legacy_empty_receipt(tmp_path):
+    destination_root = tmp_path / "destination"
+    destination_root.mkdir()
+    bootstrap_receipt_path(destination_root).write_text(json.dumps({
+        "schema": "cloud-offload.m7-artifact-bootstrap-receipt.v1",
+        "release_plan_digest": "0" * 64,
+        "config_digest": "0" * 64,
+        "destination": str(destination_root.resolve()),
+        "artifacts": [],
+    }))
+    with pytest.raises(ArtifactBootstrapError, match="no declared artifacts"):
+        verify_bootstrap_receipt(
+            destination_root, [], release_plan_digest="0" * 64, config_digest="0" * 64
+        )
+
+
 def test_bootstrap_enforces_normal_partition_upload_size_limit(tmp_path, monkeypatch):
     source_root = tmp_path / "source"
     digest = _bundle(source_root, b"too-large")

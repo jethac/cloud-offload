@@ -232,6 +232,8 @@ def import_declared_artifacts(
     source_root = Path(source_root).resolve()
     destination_root = Path(destination_root).resolve()
     declarations = [DeclaredArtifact(**item.__dict__) if not isinstance(item, DeclaredArtifact) else item for item in declarations]
+    if not declarations:
+        raise ArtifactBootstrapError("no declared artifacts")
     if release_plan_digest is None:
         release_plan_digest = "0" * 64
     if config_digest is None:
@@ -351,6 +353,8 @@ def verify_bootstrap_receipt(
         item if isinstance(item, DeclaredArtifact) else DeclaredArtifact(**item.__dict__)
         for item in declarations
     ]
+    if not declarations:
+        raise ArtifactBootstrapError("no declared artifacts")
     actual_artifacts = actual.get("artifacts") if isinstance(actual, dict) else None
     if not isinstance(actual_artifacts, list) or len(actual_artifacts) != len(declarations):
         raise ArtifactBootstrapError("bootstrap receipt mismatch")

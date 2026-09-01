@@ -1590,7 +1590,14 @@ class CoordinatorBenchmarkDriver:
         volume_id = str(params.get("cache_volume_id") or "")
         region = str(params.get("cache_datacenter_id") or region)
         profile_fingerprint = str(receipt.get("profile_fingerprint") or "")
-        if not lease_id or not volume_id or not region or not profile_fingerprint:
+        image_digest = str(receipt.get("image_digest") or "")
+        if (
+            not lease_id
+            or not volume_id
+            or not region
+            or not profile_fingerprint
+            or not image_digest
+        ):
             return None
         response = self._request(
             "GET",
@@ -1621,6 +1628,8 @@ class CoordinatorBenchmarkDriver:
                 or str(manifest.get("profile_fingerprint") or "") != profile_fingerprint
                 or str(producer.get("job_id") or "") != job_id
                 or str(producer.get("lease_id") or "") != lease_id
+                or str(producer.get("image_digest") or "") != image_digest
+                or not str(producer.get("cloud_offload_version") or "")
                 or not manifest.get("artifacts")
             ):
                 continue

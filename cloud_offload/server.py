@@ -634,9 +634,16 @@ def _validate_manifest_proposal(
     from cloud_offload.prepared_state import utc_now
 
     proposal["created_at"] = utc_now()
+    # Worker-provided producer claims are untrusted.  The coordinator binds the
+    # signed identity to the authenticated job/lease context it owns.
+    lease_id = str(job.params.get("lease_id") or "")
+    worker_id = str(getattr(job, "worker_id", "") or "")
     proposal["producer"] = {
         "image_digest": image_digest,
         "cloud_offload_version": VERSION,
+        "job_id": str(getattr(job, "id", "") or ""),
+        "lease_id": lease_id,
+        "worker_id": worker_id,
     }
     proposal["cache_volume_id"] = str(volume_id)
     proposal["cache_provider_volume_id"] = str(

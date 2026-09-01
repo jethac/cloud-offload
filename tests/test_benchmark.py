@@ -975,13 +975,18 @@ def test_coordinator_driver_accepts_only_manifest_bound_to_cold_job_and_lease():
     profile = "sha256:" + "p" * 64
     driver._submission_receipts["job-1"] = {
         "profile_fingerprint": profile,
+        "image_digest": "sha256:" + "i" * 64,
         "region": "US-MD-1",
     }
     valid = {
         "manifest_id": "sha256:" + "m" * 64,
         "profile_fingerprint": profile,
         "created_at": "2026-08-01T00:00:02+00:00",
-        "producer": {"job_id": "job-1", "lease_id": "lease-1"},
+        "producer": {
+            "job_id": "job-1", "lease_id": "lease-1",
+            "image_digest": "sha256:" + "i" * 64,
+            "cloud_offload_version": "test",
+        },
         "artifacts": [{"digest": "sha256:" + "a" * 64, "size": 1}],
         "volume_id": "volume-1",
         "datacenter_id": "US-MD-1",
