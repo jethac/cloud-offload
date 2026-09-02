@@ -2,8 +2,7 @@
 
 Base: `origin/main` at `343d905c49c992565718c336c2b6dceba11c3601`.
 
-Head: `feat/task11-plan-protocol` (exact commit is reported by final
-verification).
+Head: `feat/task11-plan-protocol` at `3939f85d2641f8f1819ada28802f31bd13b0f033`.
 The worktree is `B:/lab/cloud-offload/.worktrees/task11-plan`.
 PR: [#110](https://github.com/jethac/cloud-offload/pull/110), open and
 non-draft, base `main`, head `feat/task11-plan-protocol`. The branch remains
