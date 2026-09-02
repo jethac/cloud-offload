@@ -3286,10 +3286,21 @@ async def preflight_plan(request: PlanPreflightRequest):
     if not offers:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
     offer = offers[0]
+    try:
+        hourly_rate = float(offer.get("hourly_rate"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail="Candidate quote is invalid") from exc
+    if not math.isfinite(hourly_rate) or hourly_rate <= 0:
+        raise HTTPException(status_code=409, detail="Candidate quote is invalid")
     now = datetime.now(timezone.utc)
     expires = now + timedelta(seconds=600)
     candidate_id = "candidate-" + hashlib.sha256(str(offer.get("id", "offline-offer")).encode()).hexdigest()[:16]
-    candidate = {"candidate_id": candidate_id, "provider": request.provider, "offer_id": str(offer.get("id") or offer.get("offer_id")), "gpu_type": str(offer.get("gpu_type") or "unknown"), "gpu_ram_gb": int(offer.get("gpu_ram_gb") or 0), "region": str(offer.get("region") or "unknown"), "hourly_rate": float(offer.get("hourly_rate") or 0.0), "estimate": {"total_job_cost_usd": [0.01, 0.01]}, "storage": {"region": str(offer.get("region") or "unknown"), "persistent": False}}
+    region = str(offer.get("region") or "unknown")
+    if request.allowed_regions and region not in request.allowed_regions:
+        raise HTTPException(status_code=409, detail="Candidate region is outside the policy")
+    candidate = {"candidate_id": candidate_id, "provider": request.provider, "offer_id": str(offer.get("id") or offer.get("offer_id")), "gpu_type": str(offer.get("gpu_type") or "unknown"), "gpu_ram_gb": int(offer.get("gpu_ram_gb") or 0), "region": region, "hourly_rate": hourly_rate, "estimate": {"total_job_cost_usd": [0.01, 0.01]}, "storage": {"region": region, "persistent": False}}
+    if request.max_total_job_cost is not None and request.max_total_job_cost < 0.01:
+        raise HTTPException(status_code=409, detail="Candidate quote exceeds the cost policy")
     report = {"schema": "cloud-offload.plan-preflight.v1", "preflight_id": str(uuid.uuid4()), "plan_digest": plan["plan_digest"], "status": "ready", "created_at": now.isoformat().replace("+00:00", "Z"), "expires_at": expires.isoformat().replace("+00:00", "Z"), "plan": public_plan_summary(plan), "candidate_id": candidate_id, "candidates": [candidate], "quote": {"quote_id": str(uuid.uuid4()), "plan_digest": plan["plan_digest"], "candidate_id": candidate_id, "provider": request.provider, "region": candidate["region"], "storage": candidate["storage"], "hourly_rate": candidate["hourly_rate"], "total_cost_usd": {"min": 0.01, "max": 0.01}, "expires_at": expires.isoformat().replace("+00:00", "Z"), "coordinator": "cloud-offload"}, "warnings": [], "unknowns": []}
     _plan_store(config).preflight(plan, report)
     return report
@@ -3298,7 +3309,7 @@ async def preflight_plan(request: PlanPreflightRequest):
 @app.post("/api/plans", status_code=202)
 async def submit_plan(request: PlanSubmitRequest, http_request: Request):
     """Submit one exactly-bound plan with atomic idempotency."""
-    from cloud_offload.plan_protocol import PlanError, validate_cloud_plan
+    from cloud_offload.plan_protocol import PlanError, canonical_bytes, public_plan_summary, validate_cloud_plan
     from cloud_offload.queue import JobStatus
 
     key = http_request.headers.get("Idempotency-Key")
@@ -3315,13 +3326,19 @@ async def submit_plan(request: PlanSubmitRequest, http_request: Request):
     config, queue = _queue()
     store = _plan_store(config)
     job_id = str(uuid.uuid4())
+    request_binding = {"plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "provider": request.provider, "input_artifacts": request.input_artifacts, "timeout_seconds": request.timeout_seconds, "confirmation_action": request.confirmation_action, "client_request_id": request.client_request_id}
+    request_digest = "sha256:" + hashlib.sha256(canonical_bytes(request_binding)).hexdigest()
     try:
-        job_id, replay = store.submit(plan=plan, preflight_id=request.preflight_id, candidate_id=request.candidate_id, key=key, job_id=job_id)
+        job_id, replay = store.submit(plan=plan, preflight_id=request.preflight_id, candidate_id=request.candidate_id, key=key, request_digest=request_digest, job_id=job_id)
     except PlanError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if replay is not None:
         return {"job_id": job_id, "status": "submitting", "plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "replayed": True}
-    queue.create(model="comfyui-plan", input_path="artifacts://comfyui-plan", params={"plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "client_request_id": key}, request={"kind": "comfy.workflow.plan.v1", "plan": plan, "input_artifacts": request.input_artifacts, "timeout_seconds": 3600}, provider=request.provider, status=JobStatus.QUEUED, job_id=job_id)
+    try:
+        queue.create(model="comfyui-plan", input_path="artifacts://comfyui-plan", params={"plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "client_request_id": key, "request_digest": request_digest}, request={"kind": "comfy.workflow.plan.v1", "plan": public_plan_summary(plan), "input_artifacts": {str(k): str(v) for k, v in request.input_artifacts.items()}, "timeout_seconds": request.timeout_seconds}, provider=request.provider, status=JobStatus.QUEUED, job_id=job_id)
+    except Exception:
+        store.abort_submit(plan["plan_digest"], job_id)
+        raise
     return {"job_id": job_id, "status": "submitting", "plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "replayed": False}
 
 

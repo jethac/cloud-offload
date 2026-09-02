@@ -165,14 +165,24 @@ class PlanProtocolStore:
     def __init__(self, path: str):
         self.path = str(path)
         with sqlite3.connect(self.path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS cloud_plans (plan_digest TEXT PRIMARY KEY, plan_json TEXT NOT NULL, preflight_json TEXT NOT NULL, job_id TEXT, idempotency_key TEXT UNIQUE, state TEXT NOT NULL, closure_json TEXT)")
+            db.execute("CREATE TABLE IF NOT EXISTS cloud_plans (plan_digest TEXT PRIMARY KEY, plan_json TEXT NOT NULL, preflight_json TEXT NOT NULL, job_id TEXT, idempotency_key TEXT UNIQUE, request_digest TEXT, state TEXT NOT NULL, closure_json TEXT)")
+            columns = {str(row[1]) for row in db.execute("PRAGMA table_info(cloud_plans)")}
+            if "request_digest" not in columns:
+                db.execute("ALTER TABLE cloud_plans ADD COLUMN request_digest TEXT")
 
     def preflight(self, plan: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
         validate_cloud_plan(plan)
         with sqlite3.connect(self.path) as db:
             prior = db.execute("SELECT preflight_json FROM cloud_plans WHERE plan_digest=?", (plan["plan_digest"],)).fetchone()
             if prior:
-                return json.loads(prior[0])
+                cached = json.loads(prior[0])
+                try:
+                    expiry = datetime.fromisoformat(str(cached.get("expires_at") or "").replace("Z", "+00:00"))
+                    if expiry > datetime.now(timezone.utc):
+                        return cached
+                except ValueError:
+                    pass
+                db.execute("DELETE FROM cloud_plans WHERE plan_digest=?", (plan["plan_digest"],))
             db.execute("INSERT OR REPLACE INTO cloud_plans(plan_digest,plan_json,preflight_json,state) VALUES(?,?,?,?)", (plan["plan_digest"], json.dumps(public_plan_summary(plan), sort_keys=True), json.dumps(report, sort_keys=True), "preflighted"))
         return report
 
@@ -193,22 +203,24 @@ class PlanProtocolStore:
             db.execute("UPDATE cloud_plans SET state='submitted',job_id=COALESCE(job_id,?) WHERE plan_digest=? AND state='submitting'", (job_id, plan_digest))
         return self.get(plan_digest)
 
-    def submit(self, *, plan: dict[str, Any], preflight_id: str, candidate_id: str, key: str, job_id: str) -> tuple[str, dict[str, Any] | None]:
+    def submit(self, *, plan: dict[str, Any], preflight_id: str, candidate_id: str, key: str, request_digest: str, job_id: str) -> tuple[str, dict[str, Any] | None]:
         digest = plan["plan_digest"]
         with sqlite3.connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
-            prior = db.execute("SELECT job_id,plan_digest,preflight_json FROM cloud_plans WHERE idempotency_key=?", (key,)).fetchone()
+            prior = db.execute("SELECT job_id,plan_digest,preflight_json,request_digest FROM cloud_plans WHERE idempotency_key=?", (key,)).fetchone()
             if prior and prior[1] != digest:
                 raise PlanError("idempotency key conflicts with a different plan")
             if prior and prior[0]:
+                if not prior[3] or prior[3] != request_digest:
+                    raise PlanError("idempotency key conflicts with a different request")
                 return prior[0], json.loads(prior[2])
-            row = db.execute("SELECT plan_digest,job_id,idempotency_key,preflight_json,state FROM cloud_plans WHERE plan_digest=?", (digest,)).fetchone()
+            row = db.execute("SELECT plan_digest,job_id,idempotency_key,preflight_json,state,request_digest FROM cloud_plans WHERE plan_digest=?", (digest,)).fetchone()
             if row and row[2] and row[2] != key:
                 raise PlanError("idempotency key conflicts with this plan")
             if row and row[1]:
-                if row[2] == key:
+                if row[2] == key and row[5] == request_digest:
                     return row[1], json.loads(row[3])
-                raise PlanError("plan was already submitted")
+                raise PlanError("plan was already submitted with different request data")
             if not row:
                 raise PlanError("accepted preflight is required")
             report = json.loads(row[3])
@@ -222,8 +234,12 @@ class PlanProtocolStore:
                 raise PlanError("preflight quote expiry is invalid") from exc
             if candidate_id not in {str(c.get("candidate_id")) for c in report.get("candidates", [])} and report.get("candidate_id") != candidate_id:
                 raise PlanError("candidate binding is invalid")
-            db.execute("UPDATE cloud_plans SET job_id=?,idempotency_key=?,state=? WHERE plan_digest=?", (job_id, key, "submitting", digest))
+            db.execute("UPDATE cloud_plans SET job_id=?,idempotency_key=?,request_digest=?,state=? WHERE plan_digest=?", (job_id, key, request_digest, "submitting", digest))
             return job_id, None
+
+    def abort_submit(self, plan_digest: str, job_id: str) -> None:
+        with sqlite3.connect(self.path) as db:
+            db.execute("DELETE FROM cloud_plans WHERE plan_digest=? AND job_id=? AND state='submitting'", (plan_digest, job_id))
 
     def close(self, digest: str, receipt: dict[str, Any]) -> None:
         with sqlite3.connect(self.path) as db:

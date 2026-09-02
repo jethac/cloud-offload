@@ -38,6 +38,6 @@ def test_plan_store_survives_restart(tmp_path):
     value = plan()
     report = {"preflight_id": "pf", "status": "ready", "expires_at": "2999-01-01T00:00:00Z", "candidates": [{"candidate_id": "c"}]}
     store.preflight(value, report)
-    assert store.submit(plan=value, preflight_id="pf", candidate_id="c", key="k", job_id="job")[0] == "job"
+    assert store.submit(plan=value, preflight_id="pf", candidate_id="c", key="k", request_digest="d", job_id="job")[0] == "job"
     reopened = PlanProtocolStore(str(tmp_path / "state.db"))
-    assert reopened.submit(plan=value, preflight_id="pf", candidate_id="c", key="k", job_id="new")[0] == "job"
+    assert reopened.submit(plan=value, preflight_id="pf", candidate_id="c", key="k", request_digest="d", job_id="new")[0] == "job"
