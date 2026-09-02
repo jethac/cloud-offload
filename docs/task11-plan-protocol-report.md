@@ -2,13 +2,12 @@
 
 Base: `origin/main` at `343d905c49c992565718c336c2b6dceba11c3601`.
 
-Head: `feat/task11-plan-protocol` (post-review fix commit; exact remote SHA is
-reported by final verification).
+Head: `feat/task11-plan-protocol` (exact commit is reported by final
+verification).
 The worktree is `B:/lab/cloud-offload/.worktrees/task11-plan`.
 PR: [#110](https://github.com/jethac/cloud-offload/pull/110), open and
-non-draft, base `main`, head `feat/task11-plan-protocol`. At report time CI
-checks `test (3.10)` and `test (3.12)` were in progress; GitHub reported
-`UNSTABLE` until they finish. The branch is clean after commit.
+non-draft, base `main`, head `feat/task11-plan-protocol`. The branch remains
+unmerged; final verification records the exact local and remote commit state.
 
 Routes added:
 
@@ -19,16 +18,25 @@ Routes added:
   `Idempotency-Key == client_request_id`; same-key replay returns the first job
   identity; different-body conflict returns 409.
 
-SQLite authority: `cloud_plans` stores the safe plan summary, preflight quote,
-job identity, idempotency key, lifecycle state, and closure receipt. The
-offline connector returns one deterministic candidate and records zero launch,
-termination, and network calls.
+SQLite authority: `cloud_plans` stores only the safe plan summary, preflight
+quote, opaque idempotency digest, job identity, lifecycle state, and closure
+receipt. `cloud_plan_authority` is a separate private table for the complete
+accepted plan, candidate, input, and request binding. Both tables carry the
+explicit `cloud-offload.plan-authority.v2` schema marker. An older development
+table fails closed; it is not altered or interpreted as the new schema. This
+protocol has not shipped on `main`, so no production table migration is needed.
+Acceptance and queue-job creation use one `BEGIN IMMEDIATE` transaction on the
+same database, including the first journal event; injected `BaseException`
+therefore rolls both writes back. Terminal result/failure/cancellation closure
+is likewise synchronized with the queue row. The queue boundary independently
+validates the already-redacted plan and preflight projections before opening a
+write transaction. The offline connector returns one deterministic candidate
+and records zero launch, termination, and network calls.
 
 Verification:
 
-- Focused protocol, route, and offline proof tests: `10 passed`.
-- Existing preflight/workflow/visibility/queue tests: `144 passed`.
-- Full suite after review fixes: `955 passed, 6 skipped`.
+- Focused protocol, route, review, rescue, and offline proof tests: `83 passed`.
+- Full suite: `1,025 passed, 6 skipped`.
 - Ruff: clean for changed files. Full-repository Ruff retains 16 pre-existing
   diagnostics outside this change.
 - Compile: clean.
@@ -38,14 +46,16 @@ Verification:
   `plan_protocol.py` module reports no diagnostics. The repository has no
   configured MyPy baseline gate, so this remains a documented blocker.
 
-Offline proof hash from the deterministic store loopback:
-`sha256:cc781c4215fcdc43ac0e7e44d34452d73ee7e46389f5346017235db8b12d512e`.
-The proof records one job, one accepted submit, one closure receipt, monotonic
-cursor `[1, 2, 3]`, and zero provider launches, terminations, or network calls.
+Offline proof hash from the deterministic HTTP/TestClient loopback:
+`sha256:91082b5aef02e454b368fc0779398ea2affe92bbcd0db19a35c749e409b3f8da`.
+The independently recomputed proof records one job, one accepted submit, one
+closure receipt, monotonic cursor `[1, 2, 3]`, and zero provider launches,
+terminations, or network calls.
 
-Review fixes also bind every submit field to a canonical request digest, keep
-full plan data out of public queue records, expire and replace stale preflights,
-and remove an authority reservation when queue insertion fails.
+The review rescue binds every submit field and the idempotency header to a
+canonical request digest, keeps full plan data out of every public queue/status/
+event/support/result projection, refreshes only unused expired preflights, and
+never deletes an authority row when a submission or terminal write fails.
 
 Scope note: this foundation does not close a GitHub issue or a provider-
-dependent Megumi item. It does not merge, push, or open a PR.
+dependent Megumi item. It does not merge the pull request.

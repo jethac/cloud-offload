@@ -28,5 +28,5 @@ def test_cancellation_and_unknown_submit_are_monotonic(tmp_path):
     store.submit(plan=value, preflight_id="pf", candidate_id="c", key="request-1", request_digest="d", job_id="job-1")
     assert store.reconcile_unknown_submit(value["plan_digest"])["state"] == "submitted"
     assert store.cancel(value["plan_digest"])["state"] == "cancelling"
-    store.close(value["plan_digest"], {"receipt_id": "r"})
+    store.close(value["plan_digest"], {"receipt_id": "r", "provider_resource_absent": True})
     assert store.cancel(value["plan_digest"])["state"] == "terminal"
