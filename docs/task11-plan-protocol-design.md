@@ -18,4 +18,3 @@ Public responses contain identifiers, safe state, bounded pricing facts,
 regions, storage facts, event cursors, and validated result metadata only. They
 do not contain workflow graphs, prompts, local paths, credentials, signed URLs,
 provider response bodies, or private exception text.
-
