@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -70,6 +71,7 @@ _runtime_config: Any | None = None
 _config_write_lock = threading.RLock()
 _ANY_VOLUME_BINDING = object()
 _HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
+_IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 # === Request/Response Models ===
@@ -386,6 +388,171 @@ def _plan_connector(provider: str, config: Any):
     from cloud_offload.plan_protocol import OfflineConnector
 
     return OfflineConnector()
+
+
+def _raw_idempotency_key(http_request: Request, body_value: Any) -> str:
+    """Require one uncombined, valid header with exact body binding."""
+
+    values = http_request.headers.getlist("Idempotency-Key")
+    if len(values) != 1:
+        raise HTTPException(
+            status_code=409, detail="Exactly one Idempotency-Key header is required"
+        )
+    key = values[0]
+    if (
+        not isinstance(key, str)
+        or not _IDEMPOTENCY_KEY.fullmatch(key)
+        or "," in key
+        or key != body_value
+    ):
+        raise HTTPException(
+            status_code=409, detail="Idempotency-Key must equal client_request_id"
+        )
+    return key
+
+
+def _normalized_runner_value(value: Any) -> str:
+    """Normalize an advertised runner identity for exact comparison."""
+
+    return "".join(character for character in str(value).casefold() if character.isalnum())
+
+
+def _offer_capabilities(offer: dict[str, Any]) -> set[str] | None:
+    """Read an optional provider capability declaration without trusting it."""
+
+    declared: set[str] = set()
+    found = False
+    for field in ("capabilities", "models", "node_packs", "workflows"):
+        value = offer.get(field)
+        if value is None:
+            continue
+        found = True
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            return set()
+        declared.update(item.strip().casefold() for item in value)
+    return declared if found else None
+
+
+def _configured_runner_profile(config: Any, name: str) -> dict[str, Any] | None:
+    try:
+        from cloud_offload.profiles import configured_worker_profiles
+
+        profiles = configured_worker_profiles(config)
+    except (TypeError, ValueError):
+        return None
+    return profiles.get(name) or next(
+        (profile for profile in profiles.values() if name in profile.get("models", [])),
+        None,
+    )
+
+
+def _plan_stage_matches_offer(
+    stage: dict[str, Any], offer: dict[str, Any], config: Any
+) -> bool:
+    """Check every runner requirement against one immutable offer."""
+
+    runner = stage.get("runner")
+    if not isinstance(runner, dict):
+        return False
+    required_profile = str(runner.get("profile") or "").strip()
+    advertised_profile = offer.get("profile")
+    if advertised_profile is None:
+        advertised_profile = offer.get("runtime_profile", offer.get("worker_profile"))
+    # Existing connectors may predate profile metadata.  A configured profile
+    # is still required to be advertised; unconfigured legacy profiles cannot
+    # be compared and are handled by the production readiness engine.
+    if advertised_profile is None:
+        if _configured_runner_profile(config, required_profile) is not None:
+            return False
+    elif not isinstance(advertised_profile, str) or advertised_profile.strip() != required_profile:
+        return False
+
+    requested_gpu = str(runner.get("gpu_type") or "any").strip()
+    if requested_gpu.casefold() not in {"", "any"}:
+        offered_gpu = offer.get("gpu_type")
+        offered_model = offer.get("model")
+        if not isinstance(offered_gpu, str) and not isinstance(offered_model, str):
+            return False
+        choices = {
+            _normalized_runner_value(item)
+            for item in (offered_gpu, offered_model)
+            if isinstance(item, str) and item.strip()
+        }
+        if _normalized_runner_value(requested_gpu) not in choices:
+            return False
+
+    minimum_ram = runner.get("min_gpu_ram_gb", 0)
+    offered_ram_raw = offer.get("gpu_ram_gb")
+    if isinstance(offered_ram_raw, bool) or not isinstance(offered_ram_raw, (int, float)):
+        return False
+    try:
+        offered_ram = float(offered_ram_raw)
+        required_ram = float(minimum_ram or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(offered_ram) or offered_ram < required_ram:
+        return False
+
+    capabilities = _offer_capabilities(offer)
+    if capabilities is not None:
+        required_capability = (
+            "comfyui-workflow" if stage.get("kind") == "workflow" else None
+        )
+        if required_capability and required_capability not in capabilities:
+            return False
+        configured = _configured_runner_profile(config, required_profile)
+        if configured:
+            required = {
+                str(item).casefold() for item in configured.get("models", [])
+            }
+            if not required <= capabilities:
+                return False
+    return True
+
+
+def _run_plan_workflow_readiness(
+    *,
+    plan: dict[str, Any],
+    bound_inputs: dict[str, str],
+    request: Any,
+    config: Any,
+    connector: Any,
+) -> bool:
+    """Run the production workflow readiness engine for every workflow stage."""
+
+    workflow_stages = [
+        stage for stage in plan["stages"] if stage.get("kind") == "workflow"
+    ]
+    if not workflow_stages:
+        return True
+    from cloud_offload.preflight import build_workflow_preflight, finite_report
+    from cloud_offload.storage import create_storage
+
+    for stage in workflow_stages:
+        try:
+            report = build_workflow_preflight(
+                config=config,
+                capsule=stage["capsule"],
+                input_artifacts=bound_inputs,
+                provider=request.provider,
+                recommendation_policy=request.recommendation_policy,
+                max_hourly_rate=request.max_hourly_rate,
+                max_total_job_cost=request.max_total_job_cost,
+                allowed_regions=request.allowed_regions,
+                storage=create_storage(config),
+                cache_registry=_cache_registry(config),
+                worker_auth_configured=_worker_auth_configured(config),
+                connector_factory=lambda _provider, _config: connector,
+            )
+        except Exception:
+            return False
+        if not isinstance(report, dict) or not finite_report(report):
+            return False
+        if report.get("status") != "ready" or report.get("blockers"):
+            return False
+    return True
 
 
 def _plan_job_digest(job: Any) -> str | None:
@@ -3523,11 +3690,11 @@ async def preflight_plan(request: PlanPreflightRequest):
     try:
         plan = validate_cloud_plan(request.plan)
     except (PlanError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Plan is invalid") from exc
     try:
         bound_inputs = normalize_input_bindings(plan, request.input_artifacts)
     except PlanError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Plan inputs are invalid") from exc
     config = _config(resolve_secrets=False)
     store = _plan_store(config)
     request_binding = {
@@ -3556,6 +3723,14 @@ async def preflight_plan(request: PlanPreflightRequest):
     except Exception as exc:
         raise HTTPException(status_code=409, detail="No compatible candidate is available") from exc
     if not offers:
+        raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    if not _run_plan_workflow_readiness(
+        plan=plan,
+        bound_inputs=bound_inputs,
+        request=request,
+        config=config,
+        connector=connector,
+    ):
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
     candidates: list[dict[str, Any]] = []
     offer_ids: set[str] = set()
@@ -3614,6 +3789,8 @@ async def preflight_plan(request: PlanPreflightRequest):
             ):
                 raise HTTPException(status_code=409, detail="Candidate storage id is invalid")
         if offer_residency != plan["policy"]["residency"]:
+            continue
+        if any(not _plan_stage_matches_offer(stage, offer, config) for stage in plan["stages"]):
             continue
         candidate = {
             "candidate_id": "candidate-" + hashlib.sha256(
@@ -3712,26 +3889,17 @@ async def submit_plan(request: PlanSubmitRequest, http_request: Request):
         public_preflight_report,
         validate_cloud_plan,
     )
-    key = http_request.headers.get("Idempotency-Key")
-    # FastAPI injects headers through the request parameter below; retain body
-    # equality as a hard guard even for direct function calls.
-    if (
-        not key
-        or not key.strip()
-        or len(key) > 128
-        or key != request.client_request_id
-    ):
-        raise HTTPException(status_code=409, detail="Idempotency-Key must equal client_request_id")
+    key = _raw_idempotency_key(http_request, request.client_request_id)
     try:
         plan = validate_cloud_plan(request.plan)
     except (PlanError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Plan is invalid") from exc
     if request.plan_digest != plan["plan_digest"]:
         raise HTTPException(status_code=409, detail="plan_digest does not match plan")
     try:
         bound_inputs = normalize_input_bindings(plan, request.input_artifacts)
     except PlanError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail="Plan inputs are invalid") from exc
     config, queue = _queue()
     store = _plan_store(config)
     try:

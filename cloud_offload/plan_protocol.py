@@ -746,7 +746,7 @@ def validate_public_preflight_projection(
     candidate_id = _safe_opaque(report.get("candidate_id"), "public candidate id")
     if candidate_id != expected_candidate_id:
         raise PlanError("public preflight candidate binding is invalid")
-    candidates = report.get("candidates")
+    candidates: Any = report.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         raise PlanError("public preflight candidates are invalid")
     seen: set[str] = set()
@@ -814,6 +814,149 @@ def validate_public_preflight_projection(
     if report.get("warnings") != [] or report.get("unknowns") != []:
         raise PlanError("public preflight diagnostics are invalid")
     return report
+
+
+def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
+    """Validate and rebuild a cached public preflight without stored extras.
+
+    HTTP preflights use the complete projection.  The compact form remains
+    supported for the legacy direct store API, but both forms are rebuilt from
+    an allow-list so a SQLite edit can never become an HTTP response.
+    """
+
+    if not isinstance(report, dict):
+        raise PlanError("stored preflight is corrupt")
+    full_fields = {
+        "schema", "preflight_id", "plan_digest", "status", "created_at",
+        "expires_at", "candidate_id", "candidates", "quote", "plan",
+        "warning_count", "unknown_count", "warnings", "unknowns",
+    }
+    if set(report) == full_fields:
+        validate_public_preflight_projection(
+            report,
+            expected_plan_digest=str(report["plan_digest"]),
+            expected_preflight_id=str(report["preflight_id"]),
+            expected_candidate_id=str(report["candidate_id"]),
+        )
+        def storage_copy(value: dict[str, Any]) -> dict[str, Any]:
+            result = {"region": str(value["region"]), "persistent": bool(value["persistent"])}
+            if "storage_id" in value:
+                result["storage_id"] = str(value["storage_id"])
+            return result
+
+        candidates: list[dict[str, Any]] = [
+            {
+                **{
+                    field: item[field]
+                    for field in ("candidate_id", "offer_id", "region", "residency", "hourly_rate", "gpu_ram_gb")
+                },
+                "storage": storage_copy(item["storage"]),
+            }
+            for item in report["candidates"]
+        ]
+        quote = dict(report["quote"])
+        quote["storage"] = storage_copy(report["quote"]["storage"])
+        quote["total_cost_usd"] = dict(report["quote"]["total_cost_usd"])
+        plan = {
+            "schema": SCHEMA,
+            "plan_digest": report["plan"]["plan_digest"],
+            "stage_count": report["plan"]["stage_count"],
+            "stages": [
+                {"id": stage["id"], "kind": stage["kind"], "depends_on": list(stage["depends_on"])}
+                for stage in report["plan"]["stages"]
+            ],
+            "residency": report["plan"]["residency"],
+        }
+        return {
+            "schema": PREFLIGHT_SCHEMA,
+            "preflight_id": report["preflight_id"],
+            "plan_digest": report["plan_digest"],
+            "status": report["status"],
+            "created_at": report["created_at"],
+            "expires_at": report["expires_at"],
+            "candidate_id": report["candidate_id"],
+            "candidates": candidates,
+            "quote": quote,
+            "plan": plan,
+            "warning_count": report["warning_count"],
+            "unknown_count": report["unknown_count"],
+            "warnings": [],
+            "unknowns": [],
+        }
+
+    compact_fields = {
+        "schema", "preflight_id", "plan_digest", "status", "created_at",
+        "expires_at", "candidate_id", "candidates", "warning_count",
+        "unknown_count", "warnings", "unknowns",
+    }
+    required = {"schema", "preflight_id", "plan_digest", "status", "expires_at", "candidate_id", "candidates"}
+    if set(report) - compact_fields or not required <= set(report):
+        raise PlanError("stored preflight is corrupt")
+    if report.get("schema") != PREFLIGHT_SCHEMA or report.get("status") not in {"ready", "accepted"}:
+        raise PlanError("stored preflight is corrupt")
+    _safe_opaque(report.get("preflight_id"), "stored preflight id")
+    _digest(report.get("plan_digest"), "stored preflight digest")
+    _parse_expiry(report.get("expires_at"))
+    if "created_at" in report:
+        _parse_expiry(report["created_at"])
+    compact_candidates: Any = report.get("candidates")
+    if not isinstance(compact_candidates, list) or not compact_candidates:
+        raise PlanError("stored preflight is corrupt")
+    safe_candidates: list[dict[str, Any]] = []
+    for item in compact_candidates:
+        if not isinstance(item, dict):
+            raise PlanError("stored preflight is corrupt")
+        allowed_candidate = {
+            "candidate_id", "offer_id", "region", "residency", "hourly_rate",
+            "gpu_ram_gb", "storage",
+        }
+        if set(item) - allowed_candidate:
+            raise PlanError("stored preflight is corrupt")
+        item_id = _safe_opaque(item.get("candidate_id"), "stored candidate id")
+        offer_id = _digest(item.get("offer_id"), "stored offer id")
+        region = _digest(item.get("region"), "stored candidate region")
+        if item.get("residency") not in {"cloud", "on-prem"}:
+            raise PlanError("stored preflight is corrupt")
+        hourly_rate = _finite_number(
+            item.get("hourly_rate"), "stored hourly rate", minimum=0.000001
+        )
+        storage = _validate_public_storage(item.get("storage"), "stored candidate storage")
+        if storage["region"] != region:
+            raise PlanError("stored preflight is corrupt")
+        normalized: dict[str, Any] = {
+            "candidate_id": item_id,
+            "offer_id": offer_id,
+            "region": region,
+            "residency": item["residency"],
+            "hourly_rate": hourly_rate,
+            "storage": storage,
+        }
+        if "gpu_ram_gb" in item:
+            normalized["gpu_ram_gb"] = _finite_number(
+                item["gpu_ram_gb"], "stored gpu ram", minimum=0.0
+            )
+        safe_candidates.append(normalized)
+    candidate_id = _safe_opaque(report.get("candidate_id"), "stored preflight candidate id")
+    if candidate_id not in {item["candidate_id"] for item in safe_candidates}:
+        raise PlanError("stored preflight is corrupt")
+    result = {
+        "schema": PREFLIGHT_SCHEMA,
+        "preflight_id": report["preflight_id"],
+        "plan_digest": report["plan_digest"],
+        "status": report["status"],
+        "expires_at": report["expires_at"],
+        "candidate_id": candidate_id,
+        "candidates": safe_candidates,
+    }
+    for field in ("created_at", "warning_count", "unknown_count", "warnings", "unknowns"):
+        if field in report:
+            value = report[field]
+            if field in {"warnings", "unknowns"} and value != []:
+                raise PlanError("stored preflight is corrupt")
+            if field.endswith("_count") and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise PlanError("stored preflight is corrupt")
+            result[field] = value
+    return result
 
 
 def validate_result_manifest(manifest: dict[str, Any], *, expected_job_id: str | None = None, expected_lease_id: str | None = None) -> dict[str, Any]:
@@ -1151,20 +1294,20 @@ class PlanProtocolStore:
                 state = str(prior[3])
                 # Never treat an unreadable expiry as a cache miss: doing so
                 # could erase a live authority or accept an unbounded quote.
-                prior_report = _json_load(prior[1], "stored preflight")
-                if not isinstance(prior_report, dict):
-                    raise PlanError("stored preflight is corrupt")
+                prior_report = reproject_public_preflight(
+                    _json_load(prior[1], "stored preflight")
+                )
                 prior_expiry = _parse_expiry(prior_report.get("expires_at"))
                 # Active and terminal records are immutable.  A matching
                 # request gets the exact stored report; a changed request is
                 # a conflict, never a replacement.
                 if state != "preflighted" or prior[2] is not None:
                     if (request_digest and previous_request == request_digest) or request_digest is None:
-                        return _json_load(prior[1], "stored preflight")
+                        return prior_report
                     raise PlanError("plan authority is already active")
                 if prior_expiry > datetime.now(timezone.utc):
                     if (request_digest and previous_request == request_digest) or request_digest is None:
-                        return _json_load(prior[1], "stored preflight")
+                        return prior_report
                     raise PlanError("preflight request conflicts with stored quote")
                 # An expired, unused row is refreshed in-place.  It is never
                 # deleted, so a concurrent submit cannot lose its authority.
@@ -1193,9 +1336,18 @@ class PlanProtocolStore:
             row = self._row(db, plan_digest)
         if not row:
             return None
+        try:
+            safe_preflight = reproject_public_preflight(
+                _json_load(row[1], "stored preflight")
+            )
+        except PlanError:
+            # Status and lifecycle reads must remain safe when a damaged
+            # cached quote is found.  The caller sees no cached values and
+            # can reconcile or refresh it; the authority row is not deleted.
+            safe_preflight = None
         return {
             "plan": _json_load(row[0], "stored plan"),
-            "preflight": _json_load(row[1], "stored preflight"),
+            "preflight": safe_preflight,
             "job_id": row[2],
             "state": row[3],
             "closure": _json_load(row[4], "stored closure") if row[4] else None,
@@ -1233,9 +1385,9 @@ class PlanProtocolStore:
             row = self._row(db, plan_digest)
         if not row:
             return None
-        report = _json_load(row[1], "stored preflight")
-        if not isinstance(report, dict):
-            raise PlanError("stored preflight is corrupt")
+        report = reproject_public_preflight(
+            _json_load(row[1], "stored preflight")
+        )
         # An active or terminal authority is immutable.  If the caller is
         # replaying the exact accepted preflight, return its stored response
         # without probing offers again; a different binding is a conflict.
@@ -1279,19 +1431,23 @@ class PlanProtocolStore:
                 if prior[1] != digest or prior[3] != request_digest:
                     raise PlanError("idempotency key conflicts with a different request")
                 if prior[0]:
-                    return str(prior[0]), _json_load(prior[2], "stored preflight")
+                    return str(prior[0]), reproject_public_preflight(
+                        _json_load(prior[2], "stored preflight")
+                    )
             row = self._row(db, digest)
             if not row:
                 raise PlanError("accepted preflight is required")
             if row[2] is not None:
                 if row[5] == request_digest and row[3] not in _TERMINAL_STATES:
-                    return str(row[2]), _json_load(row[1], "stored preflight")
+                    return str(row[2]), reproject_public_preflight(
+                        _json_load(row[1], "stored preflight")
+                    )
                 raise PlanError("plan was already submitted with different request data")
             if row[3] != "preflighted":
                 raise PlanError("plan authority is not preflighted")
-            report = _json_load(row[1], "stored preflight")
-            if not isinstance(report, dict):
-                raise PlanError("stored preflight is corrupt")
+            report = reproject_public_preflight(
+                _json_load(row[1], "stored preflight")
+            )
             if report.get("preflight_id") != preflight_id or candidate_id != report.get("candidate_id"):
                 raise PlanError("accepted preflight binding is invalid")
             if _parse_expiry(report.get("expires_at")) <= datetime.now(timezone.utc):

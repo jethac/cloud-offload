@@ -11,11 +11,12 @@ unmerged; final verification records the exact local and remote commit state.
 
 Routes added:
 
-- `POST /api/plans/preflight`: strict `comfy.workflow.plan.v1`; returns
-  `cloud-offload.plan-preflight.v1`, a bound `sha256:` plan digest, one
-  candidate, bounded quote, region, storage facts, and expiry.
-- `POST /api/plans`: requires exact plan/preflight/candidate binding and
-  `Idempotency-Key == client_request_id`; same-key replay returns the first job
+- `POST /api/plans/preflight`: strict `comfy.workflow.plan.v1`; runs every
+  workflow stage through the production readiness engine and compares every
+  stage runner profile, GPU type/model, VRAM, and declared capability with the
+  offer before returning `cloud-offload.plan-preflight.v1`.
+- `POST /api/plans`: requires exactly one raw, valid `Idempotency-Key` header
+  whose value equals `client_request_id`; same-key replay returns the first job
   identity; different-body conflict returns 409.
 
 SQLite authority: `cloud_plans` stores only the safe plan summary, preflight
@@ -31,26 +32,29 @@ therefore rolls both writes back. Terminal result/failure/cancellation closure
 is likewise synchronized with the queue row. The queue boundary independently
 validates the already-redacted plan and preflight projections before opening a
 write transaction. The offline connector returns one deterministic candidate
-and records zero launch, termination, and network calls.
+and records zero launch, termination, and network calls. The offline proof
+reopens the SQLite store, replays the exact request, derives plan/job/submit/
+closure counts and the event cursor from SQLite and HTTP, and independently
+recomputes the proof hash; changing any fact fails verification. Cached public
+preflights are strictly validated and re-projected on every lookup, so extra,
+private, or corrupt fields fail closed.
 
 Verification:
 
-- Focused protocol, route, review, rescue, and offline proof tests: `83 passed`.
-- Full suite: `1,025 passed, 6 skipped`.
+- Focused protocol, route, review, rescue, and offline proof tests: `97 passed`.
+- Full suite: `1,039 passed, 6 skipped`.
 - Ruff: clean for changed files. Full-repository Ruff retains 16 pre-existing
   diagnostics outside this change.
 - Compile: clean.
-- MyPy: the exact base and changed `server.py` checks both report the same
-  pre-existing server/utility diagnostics (including the six
-  `providers/base.py` diagnostics when imports are followed); the new
-  `plan_protocol.py` module reports no diagnostics. The repository has no
-  configured MyPy baseline gate, so this remains a documented blocker.
+- MyPy: changed `plan_protocol.py` and `queue.py` add no diagnostics; the
+  changed server check retains the repository's existing imported-module
+  diagnostics. Full Ruff reports the same 16 pre-existing diagnostics outside
+  these files. The repository has no configured MyPy baseline gate.
 
-Offline proof hash from the deterministic HTTP/TestClient loopback:
-`sha256:91082b5aef02e454b368fc0779398ea2affe92bbcd0db19a35c749e409b3f8da`.
-The independently recomputed proof records one job, one accepted submit, one
-closure receipt, monotonic cursor `[1, 2, 3]`, and zero provider launches,
-terminations, or network calls.
+The deterministic HTTP/TestClient proof derives all counts from the reopened
+database and journal. It records zero provider launches, terminations, or
+network calls; the test recomputes its hash independently and rejects changed
+counts or cursors.
 
 The review rescue binds every submit field and the idempotency header to a
 canonical request digest, keeps full plan data out of every public queue/status/

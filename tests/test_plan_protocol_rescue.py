@@ -1139,24 +1139,74 @@ def test_offline_http_proof_hash_matches_independent_facts(tmp_path, monkeypatch
     )
     assert accepted.status_code == 202
     job_id = accepted.json()["job_id"]
+    # Reopen the coordinator store before replaying the exact request.  A
+    # restart must recover the same accepted authority without creating a job.
+    reopened = PlanProtocolStore(config.queue_db_path)
+    assert reopened.get(value["plan_digest"]) is not None
+    restarted_client = TestClient(server.app)
+    replayed = restarted_client.post(
+        "/api/plans", headers={"Idempotency-Key": "proof-key"}, json=payload
+    )
+    assert replayed.status_code == 202
+    assert replayed.json()["job_id"] == job_id
+    assert replayed.json()["replayed"] is True
     events_before = client.get(f"/api/jobs/{job_id}/events").json()
     cancelled = client.post(f"/api/jobs/{job_id}/cancel")
     assert cancelled.status_code == 200
     events_after = client.get(f"/api/jobs/{job_id}/events").json()
-    # The deterministic proof facts are independent of UUIDs and timestamps.
+    with sqlite3.connect(config.queue_db_path) as db:
+        plan_count = db.execute(
+            "SELECT COUNT(*) FROM cloud_plans WHERE plan_digest=?",
+            (value["plan_digest"],),
+        ).fetchone()[0]
+        job_count = db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE model='comfyui-plan' AND id=?",
+            (job_id,),
+        ).fetchone()[0]
+        accepted_submit_count = db.execute(
+            "SELECT COUNT(*) FROM cloud_plans WHERE plan_digest=? AND job_id IS NOT NULL",
+            (value["plan_digest"],),
+        ).fetchone()[0]
+        closure_count = db.execute(
+            "SELECT COUNT(*) FROM cloud_plans WHERE plan_digest=? AND closure_json IS NOT NULL",
+            (value["plan_digest"],),
+        ).fetchone()[0]
+        db_cursor = [
+            row[0]
+            for row in db.execute(
+                "SELECT sequence FROM job_events WHERE job_id=? ORDER BY sequence",
+                (job_id,),
+            )
+        ]
+
+    # The deterministic proof facts are independent of UUIDs and timestamps,
+    # and every count comes from the reopened SQLite authority or HTTP journal.
     facts = {
-        "job_count": 1,
-        "accepted_submit_count": 1,
-        "closure_count": 1,
+        "plan_count": plan_count,
+        "job_count": job_count,
+        "accepted_submit_count": accepted_submit_count,
+        "closure_count": closure_count,
         "cursor": [item["sequence"] for item in events_after["events"]],
         "before_cursor": events_before["next_after"],
         "provider_launches": connector.launches,
         "provider_terminations": connector.terminations,
         "network_calls": connector.network_calls,
     }
-    proof_hash = "sha256:" + hashlib.sha256(canonical_bytes(facts)).hexdigest()
-    assert proof_hash == "sha256:91082b5aef02e454b368fc0779398ea2affe92bbcd0db19a35c749e409b3f8da"
-    assert facts["cursor"] == [1, 2, 3]
+    def independent_hash(value):
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    proof_hash = independent_hash(facts)
+    assert facts["plan_count"] == plan_count
+    assert facts["job_count"] == job_count
+    assert facts["accepted_submit_count"] == accepted_submit_count
+    assert facts["closure_count"] == closure_count
+    assert facts["cursor"] == db_cursor
+    assert proof_hash == independent_hash(facts)
+    changed_facts = dict(facts, job_count=facts["job_count"] + 1)
+    assert independent_hash(changed_facts) != proof_hash
     assert PlanProtocolStore(config.queue_db_path).get(value["plan_digest"])["closure"]["provider_resource_absent"] is True
 
 
@@ -1250,3 +1300,229 @@ def test_direct_queue_submit_rejects_hostile_public_projection_before_mutation(t
             "SELECT state, job_id FROM cloud_plans WHERE plan_digest=?",
             (value["plan_digest"],),
         ).fetchone() == ("preflighted", None)
+
+
+class _PlanOfferConnector:
+    def __init__(self, offer):
+        self.offer = offer
+        self.launches = 0
+        self.terminations = 0
+
+    def list_available(self, **kwargs):
+        return [self.offer]
+
+    def launch(self, *args, **kwargs):
+        self.launches += 1
+        raise AssertionError("plan preflight must not launch")
+
+    def terminate(self, *args, **kwargs):
+        self.terminations += 1
+        raise AssertionError("plan preflight must not terminate")
+
+
+def _plan_with_runner(**runner):
+    value = plan()
+    value["stages"][0]["runner"].update(runner)
+    value["plan_digest"] = canonical_plan_digest(value)
+    return value
+
+
+def _plan_offer(**changes):
+    offer = {
+        "id": "offer-1",
+        "provider": "offline",
+        "profile": "offline",
+        "gpu_type": "offline",
+        "gpu_ram_gb": 256,
+        "hourly_rate": 0.01,
+        "region": "offline-test",
+    }
+    offer.update(changes)
+    return offer
+
+
+def test_plan_preflight_rejects_runner_profile_mismatch_before_authority_mutation(
+    tmp_path, monkeypatch
+):
+    client, config = _client(tmp_path, monkeypatch)
+    connector = _PlanOfferConnector(_plan_offer(profile="other-profile"))
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    value = _plan_with_runner(profile="required-profile")
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 409
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
+    assert connector.launches == connector.terminations == 0
+
+
+def test_plan_preflight_rejects_h100_offer_below_every_stage_vram_requirement(
+    tmp_path, monkeypatch
+):
+    client, config = _client(tmp_path, monkeypatch)
+    connector = _PlanOfferConnector(_plan_offer(gpu_type="H100", gpu_ram_gb=128))
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    value = _plan_with_runner(gpu_type="H100", min_gpu_ram_gb=256)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 409
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
+
+
+def test_workflow_stage_runs_existing_readiness_engine_and_rejects_missing_requirements(
+    tmp_path, monkeypatch
+):
+    from cloud_offload import preflight as production_preflight
+    from tests.test_workflow_capsule import capsule
+
+    client, config = _client(tmp_path, monkeypatch)
+    connector = _PlanOfferConnector(_plan_offer(profile="comfyui"))
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    calls = []
+
+    def blocked_workflow_preflight(**kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "blocked",
+            "blockers": [
+                {"code": "missing_model_node_or_workflow", "message": "private"}
+            ],
+            "unknowns": [],
+        }
+
+    monkeypatch.setattr(
+        production_preflight, "build_workflow_preflight", blocked_workflow_preflight
+    )
+    value = _plan_with_runner(profile="comfyui")
+    value["stages"][0]["kind"] = "workflow"
+    value["stages"][0]["capsule"] = capsule()
+    value["plan_digest"] = canonical_plan_digest(value)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 409
+    assert len(calls) == 1
+    assert calls[0]["capsule"] == value["stages"][0]["capsule"]
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        [("Idempotency-Key", "header-key"), ("Idempotency-Key", "header-key")],
+        [("Idempotency-Key", "header-key"), ("Idempotency-Key", "other-key")],
+        {"Idempotency-Key": "header-key,header-key"},
+        {"Idempotency-Key": " header-key"},
+        {"Idempotency-Key": "header-key "},
+        {"Idempotency-Key": "header\tkey"},
+    ],
+)
+def test_submit_requires_one_raw_idempotency_header(headers, tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    value = plan()
+    payload = _submit_payload(client, value, key="header-key")
+
+    response = client.post("/api/plans", headers=headers, json=payload)
+
+    assert response.status_code == 409
+
+
+def test_submit_requires_exact_body_idempotency_value(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    value = plan()
+    payload = _submit_payload(client, value, key="header-key")
+    payload["client_request_id"] = "other-key"
+
+    response = client.post(
+        "/api/plans", headers={"Idempotency-Key": "header-key"}, json=payload
+    )
+
+    assert response.status_code == 409
+
+
+def test_cached_preflight_is_revalidated_and_never_returns_private_fields(
+    tmp_path, monkeypatch
+):
+    client, config = _client(tmp_path, monkeypatch)
+    value = plan()
+    first = client.post("/api/plans/preflight", json={"plan": value})
+    assert first.status_code == 200
+    marker = "private-cached-prompt"
+    with sqlite3.connect(config.queue_db_path) as db:
+        row = db.execute(
+            "SELECT preflight_json FROM cloud_plans WHERE plan_digest=?",
+            (value["plan_digest"],),
+        ).fetchone()
+        cached = json.loads(row[0])
+        cached["private_prompt"] = marker
+        db.execute(
+            "UPDATE cloud_plans SET preflight_json=? WHERE plan_digest=?",
+            (json.dumps(cached), value["plan_digest"]),
+        )
+
+    replay = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert replay.status_code == 409
+    assert marker not in replay.text
+
+
+def test_cached_preflight_with_corrupt_projection_fails_closed_without_stage_details(
+    tmp_path, monkeypatch
+):
+    client, config = _client(tmp_path, monkeypatch)
+    value = plan()
+    first = client.post("/api/plans/preflight", json={"plan": value})
+    assert first.status_code == 200
+    marker = "private-stage-and-prompt"
+    with sqlite3.connect(config.queue_db_path) as db:
+        row = db.execute(
+            "SELECT preflight_json FROM cloud_plans WHERE plan_digest=?",
+            (value["plan_digest"],),
+        ).fetchone()
+        cached = json.loads(row[0])
+        cached["plan"]["stages"][0]["id"] = marker
+        db.execute(
+            "UPDATE cloud_plans SET preflight_json=? WHERE plan_digest=?",
+            (json.dumps(cached), value["plan_digest"]),
+        )
+
+    replay = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert replay.status_code == 409
+    assert marker not in replay.text
+
+
+def test_plan_validation_errors_do_not_echo_private_stage_identifiers(
+    tmp_path, monkeypatch
+):
+    client, _ = _client(tmp_path, monkeypatch)
+    value = plan()
+    marker = "private-stage"
+    value["stages"][0]["id"] = marker
+    value["stages"][0]["operation"] = "private-operation"
+    value["plan_digest"] = canonical_plan_digest(value)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 400
+    assert marker not in response.text

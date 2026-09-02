@@ -1423,6 +1423,7 @@ class JobQueue:
             _json_dump,
             _json_load,
             ensure_plan_schema,
+            reproject_public_preflight,
             validate_public_plan_summary,
             validate_public_preflight_projection,
         )
@@ -1479,7 +1480,9 @@ class JobQueue:
                 if existing[1] != plan_digest or existing[3] != request_digest:
                     raise PlanError("idempotency key conflicts with a different request")
                 if existing[0]:
-                    return str(existing[0]), True, _json_load(existing[2], "stored preflight")
+                    return str(existing[0]), True, reproject_public_preflight(
+                        _json_load(existing[2], "stored preflight")
+                    )
 
             row = conn.execute(
                 "SELECT plan_digest,plan_json,preflight_json,job_id,idempotency_key,request_digest,state FROM cloud_plans WHERE plan_digest = ?",
@@ -1493,9 +1496,9 @@ class JobQueue:
                 raise PlanError("plan was already submitted with different request data")
             if row[6] != "preflighted":
                 raise PlanError("plan authority is not preflighted")
-            stored = _json_load(row[2], "stored preflight")
-            if not isinstance(stored, dict):
-                raise PlanError("stored preflight is corrupt")
+            stored = reproject_public_preflight(
+                _json_load(row[2], "stored preflight")
+            )
             if stored.get("preflight_id") != preflight_id or stored.get("candidate_id") != candidate_id:
                 raise PlanError("accepted preflight binding is invalid")
             if _parse_expiry(stored.get("expires_at")) <= datetime.now(timezone.utc):
