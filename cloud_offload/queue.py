@@ -679,6 +679,36 @@ class JobQueue:
     ) -> dict[str, Any]:
         if not isinstance(event, dict) or not event.get("type"):
             raise ValueError("Job events require a non-empty type")
+        plan_row = conn.execute(
+            "SELECT model FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if plan_row and plan_row[0] == "comfyui-plan":
+            # The journal is itself part of the public plan projection.  Apply
+            # the finite event allow-list before persisting, even for trusted
+            # internal callers, so a malformed worker callback cannot leave a
+            # secret-bearing event in SQLite.
+            from cloud_offload.plan_protocol import public_plan_event
+
+            safe = public_plan_event({**event, "job_id": job_id})
+            normalized_event = {
+                "type": safe["type"],
+                "phase": safe["phase"],
+                "status": safe["status"],
+                **({"metrics": safe["metrics"]} if safe.get("metrics") else {}),
+            }
+            event = normalized_event
+            # Keep producer sequence numbers so retries replay the same
+            # journal row.  The producer identity is hashed before storage;
+            # the raw worker identity is not a public plan field.
+            raw_producer = str(producer_id or "coordinator:plan")
+            if raw_producer.startswith("worker:"):
+                from cloud_offload.plan_protocol import binding_digest
+
+                producer_id = "plan-worker:" + binding_digest(raw_producer).removeprefix("sha256:")[:32]
+            else:
+                producer_id = "coordinator:plan"
+            occurred_at = None
+            observed_at = None
         normalized_producer = str(producer_id or "coordinator").strip()
         if not normalized_producer or len(normalized_producer) > 256:
             raise ValueError("Job event producer_id must contain 1 to 256 characters")
@@ -691,6 +721,8 @@ class JobQueue:
             else:
                 normalized_event["phase_owner"] = "coordinator"
         if producer_sequence is not None:
+            if isinstance(producer_sequence, bool):
+                raise ValueError("Job event producer_sequence must be an integer")
             try:
                 producer_sequence = int(producer_sequence)
             except (TypeError, ValueError) as exc:
@@ -757,7 +789,7 @@ class JobQueue:
                 phase,
             ),
         )
-        sequence = int(cursor.lastrowid)
+        sequence = int(cursor.lastrowid or 0)
         row = conn.execute(
             """
             SELECT sequence, job_id, event_json, created_at,
@@ -1300,10 +1332,11 @@ class JobQueue:
         request: dict | None = None,
         provider: str | None = None,
         status: JobStatus = JobStatus.PENDING,
+        job_id: str | None = None,
     ) -> Job:
         """Create a new job."""
         job = Job(
-            id=str(uuid.uuid4()),
+            id=str(job_id or uuid.uuid4()),
             model=model,
             status=status,
             input_path=input_path,
@@ -1354,6 +1387,375 @@ class JobQueue:
                 occurred_at=job.created_at,
                 observed_at=job.created_at,
             )
+        return job
+
+    def submit_plan_atomic(
+        self,
+        *,
+        plan_digest: str,
+        preflight_id: str,
+        candidate_id: str,
+        idempotency_key: str,
+        request_digest: str,
+        job_id: str,
+        plan_public: dict,
+        preflight_public: dict,
+        request_binding: dict,
+        provider_digest: str | None = None,
+        candidate_digest: str | None = None,
+        input_digest: str | None = None,
+        timeout_seconds: int = 3600,
+        input_artifacts: dict[str, str] | None = None,
+    ) -> tuple[str, bool, dict]:
+        """Accept a plan and create its queue job in one SQLite transaction.
+
+        This is deliberately a queue API rather than a route-level sequence:
+        both tables and the initial event use this connection and therefore
+        commit or roll back together, including on ``BaseException``.  The
+        private plan remains in ``cloud_plan_authority``; only its projection
+        is written into the public job request.
+        """
+
+        from cloud_offload.plan_protocol import (
+            PlanError,
+            binding_digest,
+            _parse_expiry,
+            _json_dump,
+            _json_load,
+            ensure_plan_schema,
+            reproject_public_preflight,
+            validate_public_plan_summary,
+            validate_public_preflight_projection,
+        )
+
+        # This method is the last boundary before public queue persistence.
+        # The HTTP route validates its inputs, but direct callers must not be
+        # able to smuggle a full plan, path, prompt, token, or provider body
+        # into a public job row.
+        validate_public_plan_summary(plan_public, expected_digest=plan_digest)
+        validate_public_preflight_projection(
+            preflight_public,
+            expected_plan_digest=plan_digest,
+            expected_preflight_id=preflight_id,
+            expected_candidate_id=candidate_id,
+        )
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 128:
+            raise PlanError("idempotency key is invalid")
+        _parse_expiry(preflight_public["expires_at"])
+        if not isinstance(request_binding, dict):
+            raise PlanError("request binding is invalid")
+        _json_dump(request_binding)
+        from cloud_offload.plan_protocol import _digest, _safe_opaque
+
+        _digest(plan_digest, "plan digest")
+        _safe_opaque(preflight_id, "preflight id")
+        _safe_opaque(candidate_id, "candidate id")
+        _digest(request_digest, "request digest")
+        for label, value in (
+            ("provider digest", provider_digest),
+            ("candidate digest", candidate_digest),
+            ("input digest", input_digest),
+        ):
+            if value is not None:
+                _digest(value, label)
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 86400:
+            raise PlanError("timeout_seconds is invalid")
+        if input_artifacts is not None:
+            if not isinstance(input_artifacts, dict):
+                raise PlanError("input_artifacts is invalid")
+            for name, value in input_artifacts.items():
+                _safe_opaque(name, "input artifact name")
+                _digest(value, "input artifact digest")
+
+        stored_key = binding_digest(idempotency_key)
+        now = utc_now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            ensure_plan_schema(conn)
+            existing = conn.execute(
+                "SELECT job_id,plan_digest,preflight_json,request_digest,state FROM cloud_plans WHERE idempotency_key = ?",
+                (stored_key,),
+            ).fetchone()
+            if existing:
+                if existing[1] != plan_digest or existing[3] != request_digest:
+                    raise PlanError("idempotency key conflicts with a different request")
+                if existing[0]:
+                    return str(existing[0]), True, reproject_public_preflight(
+                        _json_load(existing[2], "stored preflight")
+                    )
+
+            row = conn.execute(
+                "SELECT plan_digest,plan_json,preflight_json,job_id,idempotency_key,request_digest,state FROM cloud_plans WHERE plan_digest = ?",
+                (plan_digest,),
+            ).fetchone()
+            if not row:
+                raise PlanError("accepted preflight is required")
+            if row[3] is not None:
+                if row[4] == stored_key and row[5] == request_digest:
+                    return str(row[3]), True, _json_load(row[2], "stored preflight")
+                raise PlanError("plan was already submitted with different request data")
+            if row[6] != "preflighted":
+                raise PlanError("plan authority is not preflighted")
+            stored = reproject_public_preflight(
+                _json_load(row[2], "stored preflight")
+            )
+            if stored.get("preflight_id") != preflight_id or stored.get("candidate_id") != candidate_id:
+                raise PlanError("accepted preflight binding is invalid")
+            if _parse_expiry(stored.get("expires_at")) <= datetime.now(timezone.utc):
+                raise PlanError("preflight quote has expired")
+
+            # Construct the queue row while the write lock is held.  The
+            # initial lifecycle event is part of the same transaction.
+            public_inputs = {
+                binding_digest(name): value
+                for name, value in (input_artifacts or {}).items()
+            }
+            job = Job(
+                id=str(job_id),
+                model="comfyui-plan",
+                status=JobStatus.QUEUED,
+                input_path="sha256:" + str(plan_digest).removeprefix("sha256:"),
+                params={
+                    "plan_digest": plan_digest,
+                    "preflight_id": preflight_id,
+                    "candidate_id": candidate_id,
+                    "request_digest": request_digest,
+                    "provider_digest": provider_digest,
+                },
+                request={
+                    "kind": "comfy.workflow.plan.v1",
+                    "plan": dict(plan_public),
+                    "input_artifacts": public_inputs,
+                    "timeout_seconds": int(timeout_seconds),
+                },
+                provider=None,
+            )
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    id, model, status, input_path, params,
+                    preview_path, result_path, created_at, updated_at,
+                    started_at, completed_at, error, worker_id,
+                    attempts, max_attempts, schema_version, request_json,
+                    provider, result_json, progress
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job.id, job.model, job.status.value, job.input_path,
+                    _json_dump(job.params), job.preview_path, job.result_path,
+                    job.created_at, job.updated_at, job.started_at,
+                    job.completed_at, job.error, job.worker_id, job.attempts,
+                    job.max_attempts, job.schema_version, _json_dump(job.request),
+                    job.provider, None, job.progress,
+                ),
+            )
+            self._append_event_in_transaction(
+                conn,
+                job.id,
+                _lifecycle_event(job, "job_created"),
+                producer_id="coordinator:job-queue",
+                occurred_at=job.created_at,
+                observed_at=job.created_at,
+            )
+            plan_update = conn.execute(
+                "UPDATE cloud_plans SET job_id=?,idempotency_key=?,request_digest=?,state='submitting',provider_digest=?,candidate_digest=?,input_digest=?,updated_at=? WHERE plan_digest=? AND state='preflighted' AND job_id IS NULL",
+                (job.id, stored_key, request_digest, provider_digest, candidate_digest, input_digest, now, plan_digest),
+            )
+            if plan_update.rowcount != 1:
+                raise PlanError("plan authority changed during submission")
+            authority_update = conn.execute(
+                "UPDATE cloud_plan_authority SET request_json=?,job_id=? WHERE plan_digest=?",
+                (_json_dump(request_binding), job.id, plan_digest),
+            )
+            if authority_update.rowcount != 1:
+                raise PlanError("private plan authority is missing")
+        return job.id, False, preflight_public
+
+    def cancel_plan_atomic(self, job_id: str, plan_digest: str, receipt: dict) -> Job | None:
+        """Close a plan cancellation and its queue state in one transaction."""
+
+        from cloud_offload.plan_protocol import PlanError, _json_dump, ensure_plan_schema, validate_closure_receipt
+
+        normalized_receipt = validate_closure_receipt(receipt)
+        now = utc_now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            ensure_plan_schema(conn)
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            job = self._row_to_job(row)
+            if job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.DEAD_LETTER}:
+                return job
+            previous_status = job.status
+            self._append_event_in_transaction(
+                conn,
+                job.id,
+                {"type": "cancellation_requested", "phase": _status_phase(job.status), "status": job.status.value},
+                producer_id="coordinator:job-queue",
+                occurred_at=now,
+                observed_at=now,
+            )
+            job.status = JobStatus.FAILED
+            # Plan jobs expose only the finite cancelled state; no free-text
+            # error is placed in their public queue projection.
+            job.error = None
+            job.completed_at = now
+            job.updated_at = now
+            self._write_job(conn, job)
+            self._append_event_in_transaction(
+                conn,
+                job.id,
+                _lifecycle_event(job, "job_status_changed", previous_status=previous_status),
+                producer_id="coordinator:job-queue",
+                occurred_at=now,
+                observed_at=now,
+            )
+            updated = conn.execute(
+                "UPDATE cloud_plans SET state='cancelled',closure_json=?,updated_at=? WHERE plan_digest=? AND job_id=? AND state NOT IN ('completed','cancelled','failed','terminal')",
+                (_json_dump(normalized_receipt), now, plan_digest, job_id),
+            )
+            if updated.rowcount != 1:
+                raise PlanError("plan cancellation authority is stale")
+        return job
+
+    def complete_plan_atomic(
+        self,
+        job_id: str,
+        plan_digest: str,
+        result: dict,
+        receipt: dict,
+    ) -> Job | None:
+        """Commit a plan result, queue terminal state, and closure together."""
+
+        from cloud_offload.plan_protocol import (
+            PlanError,
+            _json_dump,
+            ensure_plan_schema,
+            validate_closure_receipt,
+            validate_result_manifest,
+        )
+
+        normalized_result = validate_result_manifest(result, expected_job_id=job_id)
+        normalized_receipt = validate_closure_receipt(receipt)
+        if normalized_receipt["status"] != "completed":
+            raise PlanError("completed plan requires a completed closure receipt")
+        now = utc_now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            ensure_plan_schema(conn)
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            authority = conn.execute(
+                "SELECT state,job_id FROM cloud_plans WHERE plan_digest = ?",
+                (plan_digest,),
+            ).fetchone()
+            if not authority or authority[1] != job_id:
+                raise PlanError("plan completion authority is invalid")
+            job = self._row_to_job(row)
+            if job.status in {JobStatus.FAILED, JobStatus.DEAD_LETTER}:
+                return job
+            if job.status == JobStatus.COMPLETED:
+                if authority[0] not in {"completed", "cancelled", "failed", "terminal"}:
+                    conn.execute(
+                        "UPDATE cloud_plans SET state='completed',closure_json=?,updated_at=? WHERE plan_digest=? AND job_id=? AND state NOT IN ('cancelled','failed','terminal')",
+                        (_json_dump(normalized_receipt), now, plan_digest, job_id),
+                    )
+                return job
+            previous_status = job.status
+            job.status = JobStatus.COMPLETED
+            job.result = normalized_result
+            job.progress = 100
+            job.error = None
+            job.completed_at = now
+            job.updated_at = now
+            self._write_job(conn, job)
+            self._append_event_in_transaction(
+                conn,
+                job.id,
+                _lifecycle_event(job, "job_status_changed", previous_status=previous_status),
+                producer_id="coordinator:job-queue",
+                occurred_at=now,
+                observed_at=now,
+            )
+            updated = conn.execute(
+                "UPDATE cloud_plans SET state='completed',closure_json=?,updated_at=? WHERE plan_digest=? AND job_id=? AND state NOT IN ('cancelled','failed','terminal')",
+                (_json_dump(normalized_receipt), now, plan_digest, job_id),
+            )
+            if updated.rowcount != 1:
+                raise PlanError("plan completion authority is stale")
+        return job
+
+    def fail_plan_atomic(
+        self,
+        job_id: str,
+        plan_digest: str,
+        receipt: dict | None = None,
+    ) -> Job | None:
+        """Commit a plan retry/failure and its authority transition together."""
+
+        from cloud_offload.plan_protocol import PlanError, _json_dump, ensure_plan_schema, validate_closure_receipt
+
+        normalized_receipt = validate_closure_receipt(receipt) if receipt is not None else None
+        if normalized_receipt is not None and normalized_receipt["status"] != "failed":
+            raise PlanError("failed plan requires a failed closure receipt")
+        now = utc_now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            ensure_plan_schema(conn)
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            authority = conn.execute(
+                "SELECT state,job_id FROM cloud_plans WHERE plan_digest = ?",
+                (plan_digest,),
+            ).fetchone()
+            if not authority or authority[1] != job_id:
+                raise PlanError("plan failure authority is invalid")
+            job = self._row_to_job(row)
+            if job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.DEAD_LETTER}:
+                if job.status in {JobStatus.FAILED, JobStatus.DEAD_LETTER} and normalized_receipt is not None and authority[0] not in {"completed", "cancelled", "failed", "terminal"}:
+                    conn.execute(
+                        "UPDATE cloud_plans SET state='failed',closure_json=?,updated_at=? WHERE plan_digest=? AND job_id=? AND state NOT IN ('cancelled','completed','terminal')",
+                        (_json_dump(normalized_receipt), now, plan_digest, job_id),
+                    )
+                return job
+            previous_status = job.status
+            if job.attempts >= job.max_attempts:
+                job.status = JobStatus.DEAD_LETTER
+                job.completed_at = now
+                next_state = "failed"
+            else:
+                job.status = JobStatus.QUEUED
+                job.completed_at = None
+                next_state = "submitted"
+            job.error = None
+            job.worker_id = None
+            job.updated_at = now
+            self._write_job(conn, job)
+            self._append_event_in_transaction(
+                conn,
+                job.id,
+                _lifecycle_event(job, "job_status_changed", previous_status=previous_status),
+                producer_id="coordinator:job-queue",
+                occurred_at=now,
+                observed_at=now,
+            )
+            if next_state == "failed":
+                if normalized_receipt is None:
+                    raise PlanError("terminal plan failure requires a closure receipt")
+                updated = conn.execute(
+                    "UPDATE cloud_plans SET state='failed',closure_json=?,updated_at=? WHERE plan_digest=? AND job_id=? AND state NOT IN ('cancelled','completed','terminal')",
+                    (_json_dump(normalized_receipt), now, plan_digest, job_id),
+                )
+            else:
+                updated = conn.execute(
+                    "UPDATE cloud_plans SET state='submitted',updated_at=? WHERE plan_digest=? AND job_id=? AND state NOT IN ('cancelled','completed','failed','terminal')",
+                    (now, plan_digest, job_id),
+                )
+            if updated.rowcount != 1:
+                raise PlanError("plan failure authority is stale")
         return job
 
     def get(self, job_id: str) -> Job | None:
@@ -1592,13 +1994,18 @@ class JobQueue:
                     ),
                 )
             # Get job IDs to claim
-            provider_clause = " AND provider = ?" if provider else ""
+            provider_clause = ""
             models_clause = ""
             gpu_clause = ""
             cache_clause = ""
             values: list[Any] = [JobStatus.QUEUED.value]
             if provider:
-                values.append(provider)
+                # Plan jobs keep the provider name out of the queue row.  Use
+                # the private binding digest for provider-scoped claiming.
+                from cloud_offload.plan_protocol import binding_digest
+
+                provider_clause = " AND (provider = ? OR (model = 'comfyui-plan' AND provider IS NULL AND json_extract(params, '$.provider_digest') = ?))"
+                values.extend((provider, binding_digest(provider)))
             if models is not None:
                 if not models:
                     return []
@@ -1643,7 +2050,7 @@ class JobQueue:
             values.append(limit)
             rows = conn.execute(
                 f"""
-                SELECT id FROM jobs
+                SELECT id, model FROM jobs
                 WHERE status = ?
                 {provider_clause}
                 {models_clause}
@@ -1658,6 +2065,10 @@ class JobQueue:
             job_ids = [row[0] for row in rows]
             if not job_ids:
                 return []
+            if any(row[1] == "comfyui-plan" for row in rows):
+                from cloud_offload.plan_protocol import ensure_plan_schema
+
+                ensure_plan_schema(conn)
 
             # Claim them atomically
             claimed_at = utc_now().isoformat()
@@ -1701,6 +2112,13 @@ class JobQueue:
                     occurred_at=claimed_at,
                     observed_at=claimed_at,
                 )
+                if job.model == "comfyui-plan" and isinstance(job.params, dict):
+                    plan_digest = job.params.get("plan_digest")
+                    if isinstance(plan_digest, str):
+                        conn.execute(
+                            "UPDATE cloud_plans SET state='submitted',updated_at=? WHERE plan_digest=? AND job_id=? AND state='submitting'",
+                            (claimed_at, plan_digest, job.id),
+                        )
                 if lease is not None:
                     self._append_event_in_transaction(
                         conn,
@@ -1929,7 +2347,7 @@ class JobQueue:
             if ranked_phases
             else (latest[9] if latest and latest[9] else status)
         )
-        return {
+        result = {
             "schema": "cloud-offload.job-snapshot.v1",
             "job": job.to_dict(),
             "status": status,
@@ -1941,6 +2359,25 @@ class JobQueue:
             "last_event": _job_event_envelope(latest) if latest else None,
             "updated_at": lifecycle_row[2] if lifecycle_row else job.updated_at,
         }
+        if job.model == "comfyui-plan" and isinstance(job.params, dict):
+            from cloud_offload.plan_protocol import PlanProtocolStore, public_plan_event, public_plan_job
+
+            digest = job.params.get("plan_digest")
+            authority = PlanProtocolStore(str(self.db_path)).get(str(digest)) if digest else None
+            state = str(authority.get("state")) if authority else str(result["status"])
+            if state not in {"preflighted", "submitting", "submitted", "running", "cancelling", "cancelled", "completed", "failed", "terminal"}:
+                state = "terminal"
+            result["job"] = public_plan_job(
+                job,
+                state=state,
+                closure=authority.get("closure") if authority else None,
+            )
+            result["status"] = state
+            result["state_source"] = "plan_authority"
+            last_event = result.get("last_event")
+            if isinstance(last_event, dict):
+                result["last_event"] = public_plan_event(last_event)
+        return result
 
     def complete_job(self, job_id: str, result: dict) -> Job | None:
         """Store a completed worker result."""

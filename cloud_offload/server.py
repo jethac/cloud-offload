@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -70,6 +71,7 @@ _runtime_config: Any | None = None
 _config_write_lock = threading.RLock()
 _ANY_VOLUME_BINDING = object()
 _HF_SOURCE_DIGESTS: dict[tuple[str, str, str], str] = {}
+_IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 # === Request/Response Models ===
@@ -124,6 +126,26 @@ class PreflightRequest(BaseModel):
     max_hourly_rate: float | None = Field(default=None, gt=0)
     max_total_job_cost: float | None = Field(default=None, gt=0)
     allowed_regions: list[str] | None = None
+
+
+class PlanPreflightRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    plan: dict[str, Any]
+    input_artifacts: dict[str, str] = Field(default_factory=dict)
+    provider: str = "offline"
+    recommendation_policy: str = "balanced"
+    max_hourly_rate: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    max_total_job_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    allowed_regions: list[str] | None = None
+    timeout_seconds: int = Field(default=3600, ge=1, le=86400)
+
+
+class PlanSubmitRequest(PlanPreflightRequest):
+    preflight_id: str
+    plan_digest: str
+    candidate_id: str
+    confirmation_action: Literal["start_now", "countdown_elapsed", "policy_skip"]
+    client_request_id: str
 
 
 # === App Setup ===
@@ -211,11 +233,22 @@ async def handle_starlette_http_exception(
 
 @app.exception_handler(RequestValidationError)
 async def handle_validation_error(request: Request, exc: RequestValidationError):
+    # Pydantic's validation records include the offending ``input`` value.
+    # That value can contain a full plan, prompt, path, token, or provider
+    # body, so return only the location and stable error message.
+    safe_errors = [
+        {
+            key: value
+            for key, value in error.items()
+            if key not in {"input", "ctx"}
+        }
+        for error in exc.errors()
+    ]
     return error_response(
         422,
         "cloud_offload.validation_error",
         "Request validation failed",
-        {"errors": exc.errors()},
+        {"errors": safe_errors},
     )
 
 
@@ -338,6 +371,353 @@ def _preflight_store(config=None):
 
     config = config or _config(resolve_secrets=False)
     return PreflightStore(config.queue_db_path)
+
+
+def _plan_store(config=None):
+    from cloud_offload.plan_protocol import PlanProtocolStore
+
+    config = config or _config(resolve_secrets=False)
+    return PlanProtocolStore(config.queue_db_path)
+
+
+def _plan_connector(provider: str, config: Any):
+    """Return the injected plan connector; default is deterministic offline."""
+    factory = getattr(app.state, "plan_connector_factory", None)
+    if factory is not None:
+        return factory(provider, config)
+    from cloud_offload.plan_protocol import OfflineConnector
+
+    return OfflineConnector()
+
+
+def _raw_idempotency_key(http_request: Request, body_value: Any) -> str:
+    """Require one uncombined, valid header with exact body binding."""
+
+    values = http_request.headers.getlist("Idempotency-Key")
+    if len(values) != 1:
+        raise HTTPException(
+            status_code=409, detail="Exactly one Idempotency-Key header is required"
+        )
+    key = values[0]
+    if (
+        not isinstance(key, str)
+        or not _IDEMPOTENCY_KEY.fullmatch(key)
+        or "," in key
+        or key != body_value
+    ):
+        raise HTTPException(
+            status_code=409, detail="Idempotency-Key must equal client_request_id"
+        )
+    return key
+
+
+def _normalized_runner_value(value: Any) -> str:
+    """Normalize an advertised runner identity for exact comparison."""
+
+    return "".join(character for character in str(value).casefold() if character.isalnum())
+
+
+def _offer_capabilities(offer: dict[str, Any]) -> set[str] | None:
+    """Read an optional provider capability declaration without trusting it."""
+
+    declared: set[str] = set()
+    found = False
+    for field in ("capabilities", "models", "node_packs", "workflows"):
+        value = offer.get(field)
+        if value is None:
+            continue
+        found = True
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            return set()
+        declared.update(item.strip().casefold() for item in value)
+    return declared if found else None
+
+
+def _configured_runner_profile(config: Any, name: str) -> dict[str, Any] | None:
+    try:
+        from cloud_offload.profiles import configured_worker_profiles
+
+        profiles = configured_worker_profiles(config)
+    except (TypeError, ValueError):
+        return None
+    return profiles.get(name) or next(
+        (profile for profile in profiles.values() if name in profile.get("models", [])),
+        None,
+    )
+
+
+def _plan_stage_matches_offer(
+    stage: dict[str, Any], offer: dict[str, Any], config: Any
+) -> bool:
+    """Check every runner requirement against one immutable offer."""
+
+    runner = stage.get("runner")
+    if not isinstance(runner, dict):
+        return False
+    required_profile = str(runner.get("profile") or "").strip()
+    configured = _configured_runner_profile(config, required_profile)
+    advertised_profile = offer.get("profile")
+    if advertised_profile is None:
+        advertised_profile = offer.get("runtime_profile", offer.get("worker_profile"))
+    # The selected offer must prove the requested profile.  A local profile
+    # mapping cannot turn missing provider evidence into a match.
+    if advertised_profile is None or not isinstance(advertised_profile, str) or advertised_profile.strip() != required_profile:
+        return False
+
+    requested_gpu = str(runner.get("gpu_type") or "any").strip()
+    if requested_gpu.casefold() not in {"", "any"}:
+        offered_gpu = offer.get("gpu_type")
+        offered_model = offer.get("model")
+        if not isinstance(offered_gpu, str) and not isinstance(offered_model, str):
+            return False
+        choices = {
+            _normalized_runner_value(item)
+            for item in (offered_gpu, offered_model)
+            if isinstance(item, str) and item.strip()
+        }
+        if _normalized_runner_value(requested_gpu) not in choices:
+            return False
+
+    minimum_ram = runner.get("min_gpu_ram_gb", 0)
+    offered_ram_raw = offer.get("gpu_ram_gb")
+    if isinstance(offered_ram_raw, bool) or not isinstance(offered_ram_raw, (int, float)):
+        return False
+    try:
+        offered_ram = float(offered_ram_raw)
+        required_ram = float(minimum_ram or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(offered_ram) or offered_ram < required_ram:
+        return False
+
+    capabilities = _offer_capabilities(offer)
+    if capabilities is None and configured is not None and configured.get("models"):
+        return False
+    if capabilities is not None:
+        required_capability = (
+            "comfyui-workflow" if stage.get("kind") == "workflow" else None
+        )
+        if required_capability and required_capability not in capabilities:
+            return False
+        if configured:
+            required = {
+                str(item).casefold() for item in configured.get("models", [])
+            }
+            if not required <= capabilities:
+                return False
+    return True
+
+
+def _run_plan_workflow_readiness(
+    *,
+    plan: dict[str, Any],
+    bound_inputs: dict[str, str],
+    request: Any,
+    config: Any,
+    connector: Any,
+) -> bool:
+    """Run the production workflow readiness engine for every workflow stage."""
+
+    workflow_stages = [
+        stage for stage in plan["stages"] if stage.get("kind") == "workflow"
+    ]
+    if not workflow_stages:
+        return True
+    from cloud_offload.preflight import build_workflow_preflight, finite_report
+    from cloud_offload.storage import create_storage
+
+    for stage in workflow_stages:
+        try:
+            report = build_workflow_preflight(
+                config=config,
+                capsule=stage["capsule"],
+                input_artifacts=bound_inputs,
+                provider=request.provider,
+                recommendation_policy=request.recommendation_policy,
+                max_hourly_rate=request.max_hourly_rate,
+                max_total_job_cost=request.max_total_job_cost,
+                allowed_regions=request.allowed_regions,
+                storage=create_storage(config),
+                cache_registry=_cache_registry(config),
+                worker_auth_configured=_worker_auth_configured(config),
+                connector_factory=lambda _provider, _config: connector,
+            )
+        except Exception:
+            return False
+        if not isinstance(report, dict) or not finite_report(report):
+            return False
+        if report.get("status") != "ready" or report.get("blockers"):
+            return False
+    return True
+
+
+def _plan_job_digest(job: Any) -> str | None:
+    if getattr(job, "model", None) != "comfyui-plan":
+        return None
+    params = job.params if hasattr(job, "params") and isinstance(job.params, dict) else {}
+    digest = params.get("plan_digest")
+    return str(digest) if isinstance(digest, str) and digest.startswith("sha256:") else None
+
+
+def _sync_plan_job(job: Any, status: str) -> None:
+    from cloud_offload.plan_protocol import PlanError
+
+    digest = _plan_job_digest(job)
+    if not digest:
+        return
+    try:
+        _plan_store().sync_status(digest, str(job.id), status)
+    except PlanError:
+        # A stale worker callback must not turn a queue update into a 500.
+        logger.info("Ignored stale plan lifecycle callback for %s", digest)
+
+
+def _plan_public_record(job: Any) -> tuple[str, dict[str, Any] | None]:
+    """Load only the safe plan authority projection for an HTTP response."""
+
+    digest = _plan_job_digest(job)
+    if not digest:
+        return "failed", None
+    try:
+        record = _plan_store(_config(resolve_secrets=False)).get(digest)
+    except Exception:
+        # A malformed/private authority row must not turn a status read into a
+        # secret-bearing error response.  The queue state remains a safe fall-
+        # back until reconciliation repairs the authority.
+        record = None
+    fallback = getattr(getattr(job, "status", None), "value", "failed")
+    authority_state = record.get("state") if isinstance(record, dict) else None
+    if authority_state in {
+        "preflighted",
+        "submitting",
+        "submitted",
+        "running",
+        "cancelling",
+        "cancelled",
+        "completed",
+        "failed",
+        "terminal",
+    }:
+        fallback = authority_state
+    if fallback == "queued":
+        fallback = "submitting"
+    if fallback not in {"preflighted", "submitting", "submitted", "running", "cancelling", "cancelled", "completed", "failed", "terminal"}:
+        fallback = "failed"
+    return fallback, record
+
+
+def _public_job(job: Any) -> dict[str, Any]:
+    """Use the plan allow-list for plan jobs and legacy shape otherwise."""
+
+    digest = _plan_job_digest(job)
+    if not digest:
+        return job.to_dict()
+    from cloud_offload.plan_protocol import public_plan_job
+
+    state, record = _plan_public_record(job)
+    return public_plan_job(
+        job,
+        state=state,
+        closure=record.get("closure") if isinstance(record, dict) else None,
+    )
+
+
+def _public_plan_event(event: dict[str, Any]) -> dict[str, Any]:
+    from cloud_offload.plan_protocol import public_plan_event as project_event
+
+    return project_event(event)
+
+
+def _public_plan_snapshot(snapshot: dict[str, Any], job: Any) -> dict[str, Any]:
+    from cloud_offload.plan_protocol import _public_timestamp
+
+    state, record = _plan_public_record(job)
+    from cloud_offload.plan_protocol import public_plan_job
+
+    result = {
+        "schema": "cloud-offload.job-snapshot.v1",
+        "job": public_plan_job(
+            job,
+            state=state,
+            closure=record.get("closure") if isinstance(record, dict) else None,
+        ),
+        "status": state,
+        "state_source": "plan_authority",
+        "lifecycle_phase": snapshot.get("lifecycle_phase") if snapshot.get("lifecycle_phase") in {"readiness", "provisioning", "worker_boot", "dependency_preparation", "execution", "result_transfer", "resource_closure", "failure"} else "readiness",
+        "progress": max(0, min(100, int(snapshot.get("progress") or 0))),
+        "event_cursor": int(snapshot.get("event_cursor") or 0),
+        "event_count": int(snapshot.get("event_count") or 0),
+        "updated_at": _public_timestamp(snapshot.get("updated_at")),
+    }
+    if snapshot.get("last_event"):
+        result["last_event"] = _public_plan_event(snapshot["last_event"])
+    else:
+        result["last_event"] = None
+    return result
+
+
+def _public_plan_support_bundle(queue: Any, job: Any) -> dict[str, Any]:
+    """Build a plan support response without passing through raw Job fields."""
+
+    from cloud_offload.plan_protocol import public_plan_job
+
+    snapshot = queue.event_snapshot(job.id) or {}
+    events = queue.list_events(job.id, after=0, limit=1000)
+    state, record = _plan_public_record(job)
+    return {
+        "schema": "cloud-offload.support-bundle.v1",
+        "job": public_plan_job(
+            job,
+            state=state,
+            closure=record.get("closure") if isinstance(record, dict) else None,
+        ),
+        "snapshot": _public_plan_snapshot(snapshot, job),
+        "events": [_public_plan_event(item) for item in events],
+        "events_truncated": len(events) >= 1000,
+    }
+
+
+def _public_plan_visibility(queue: Any, job: Any) -> dict[str, Any]:
+    """Return a minimal visibility view for plans without resource metadata."""
+
+    from cloud_offload.plan_protocol import _public_timestamp
+
+    snapshot = queue.event_snapshot(job.id) or {}
+    state, _ = _plan_public_record(job)
+    phase = snapshot.get("lifecycle_phase")
+    phases = {
+        "readiness",
+        "provisioning",
+        "worker_boot",
+        "dependency_preparation",
+        "execution",
+        "result_transfer",
+        "resource_closure",
+        "failure",
+    }
+    if phase not in phases:
+        phase = "readiness"
+    events = queue.list_events(job.id, after=0, limit=1000)
+    return {
+        "schema": "cloud-offload.job-visibility.v1",
+        "job_id": job.id,
+        "status": state,
+        "terminal": state in {"cancelled", "completed", "failed", "terminal"},
+        "lifecycle_stage": phase,
+        "progress": max(0, min(100, int(snapshot.get("progress") or 0))),
+        "created_at": _public_timestamp(job.created_at),
+        "updated_at": _public_timestamp(snapshot.get("updated_at") or job.updated_at),
+        "completed_at": _public_timestamp(job.completed_at),
+        "cancellation": {
+            "requested": state in {"cancelling", "cancelled"},
+            "can_cancel": state not in {"cancelled", "completed", "failed", "terminal"},
+        },
+        "event_cursor": int(snapshot.get("event_cursor") or 0),
+        "event_count": int(snapshot.get("event_count") or 0),
+        "recent_events": [_public_plan_event(item) for item in events[-16:]],
+    }
 
 
 def _worker_auth_configured(config) -> bool:
@@ -3033,15 +3413,31 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50):
     _, queue = _queue()
     statuses = [JobStatus(status)] if status else list(JobStatus)
     jobs = queue.list_by_status(*statuses)[:limit]
-    return [job.to_dict() for job in jobs]
+    return [_public_job(job) for job in jobs]
 
 
 @app.get("/api/job-visibility")
 async def job_visibility(limit: int = 50, active_only: bool = False):
     """Return a safe, reloadable view for the Cloud Jobs user interface."""
-    from cloud_offload.job_visibility import visibility_page
+    from cloud_offload.job_visibility import project_job_visibility, visibility_page
 
     _, queue = _queue()
+    jobs = queue.list_recent(limit=limit, active_only=active_only)
+    if any(_plan_job_digest(job) for job in jobs):
+        generated = datetime.now(timezone.utc).isoformat()
+        return {
+            "schema": "cloud-offload.job-visibility.v1",
+            "generated_at": generated,
+            "jobs": [
+                _public_plan_visibility(queue, job)
+                if _plan_job_digest(job)
+                else project_job_visibility(
+                    job,
+                    queue.list_recent_events(job.id, limit=1000),
+                )
+                for job in jobs
+            ],
+        }
     return visibility_page(queue, limit=limit, active_only=active_only)
 
 
@@ -3054,6 +3450,8 @@ async def get_job_visibility(job_id: str):
     job = queue.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    if _plan_job_digest(job):
+        return _public_plan_visibility(queue, job)
     event_reader = getattr(queue, "list_recent_events", None)
     if not callable(event_reader):
         event_reader = queue.list_events
@@ -3147,6 +3545,11 @@ async def get_job_result_manifest(job_id: str):
     job = queue.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    if _plan_job_digest(job):
+        from cloud_offload.plan_protocol import public_plan_result_manifest
+
+        state, _ = _plan_public_record(job)
+        return public_plan_result_manifest(job, state=state)
     return _safe_result_manifest(job)
 
 
@@ -3157,7 +3560,7 @@ async def get_job(job_id: str):
     job = queue.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job.to_dict()
+    return _public_job(job)
 
 
 @app.get("/api/jobs/{job_id}/snapshot")
@@ -3167,6 +3570,9 @@ async def get_job_snapshot(job_id: str):
     snapshot = queue.event_snapshot(job_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    job = queue.get(job_id)
+    if job is not None and _plan_job_digest(job):
+        return _public_plan_snapshot(snapshot, job)
     return snapshot
 
 
@@ -3179,6 +3585,8 @@ async def get_job_support_bundle(job_id: str):
     job = queue.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    if _plan_job_digest(job):
+        return _public_plan_support_bundle(queue, job)
     return build_support_bundle(queue, job)
 
 
@@ -3186,6 +3594,7 @@ async def get_job_support_bundle(job_id: str):
 async def cancel_job(job_id: str):
     """Cancel a job."""
     from cloud_offload.queue import JobStatus
+    from cloud_offload.plan_protocol import PlanError
 
     _, queue = _queue()
     current = queue.get(job_id)
@@ -3196,7 +3605,42 @@ async def cancel_job(job_id: str):
             status_code=409, detail="Completed jobs cannot be cancelled"
         )
     if current.status in {JobStatus.FAILED, JobStatus.DEAD_LETTER}:
+        plan_digest = _plan_job_digest(current)
+        if plan_digest is not None:
+            try:
+                current = queue.fail_plan_atomic(
+                    current.id,
+                    plan_digest,
+                    {
+                        "receipt_id": "closure-" + plan_digest.removeprefix("sha256:")[:16],
+                        "status": "failed",
+                        "provider_resource_absent": True,
+                        "reason": "worker_failed",
+                    },
+                ) or current
+            except PlanError as exc:
+                raise HTTPException(status_code=409, detail="Plan failure closure is not valid") from exc
+            return _public_job(current)
         return current.to_dict()
+    plan_digest = _plan_job_digest(current)
+    if plan_digest:
+        # Queue state, authority state, and the absence receipt share one
+        # SQLite transaction.  Plan jobs have no provider resource to call.
+        try:
+            job = queue.cancel_plan_atomic(
+                current.id,
+                plan_digest,
+                {
+                    "receipt_id": "closure-" + plan_digest.removeprefix("sha256:")[:16],
+                    "status": "cancelled",
+                    "provider_resource_absent": True,
+                },
+            )
+        except PlanError as exc:
+            raise HTTPException(status_code=409, detail="Plan cancellation closure is not valid") from exc
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return _public_job(job)
     queue.append_event(
         job_id,
         {
@@ -3210,7 +3654,7 @@ async def cancel_job(job_id: str):
     job = queue.update_status(job_id, JobStatus.FAILED, error="Cancelled")
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job.to_dict()
+    return _public_job(job)
 
 
 @app.get("/api/jobs/{job_id}/events")
@@ -3220,10 +3664,327 @@ async def job_events(job_id: str, after: int = 0, limit: int = 250):
     if not queue.get(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
     events = queue.list_events(job_id, after=after, limit=limit)
+    job = queue.get(job_id)
+    if job is not None and _plan_job_digest(job):
+        events = [_public_plan_event(item) for item in events]
     return {
         "events": events,
         "next_after": events[-1]["sequence"] if events else max(0, int(after)),
     }
+
+
+@app.post("/api/plans/preflight")
+async def preflight_plan(request: PlanPreflightRequest):
+    """Validate one immutable plan and issue one safe, free quote."""
+    from cloud_offload.plan_protocol import (
+        PlanError,
+        binding_digest,
+        canonical_bytes,
+        normalize_input_bindings,
+        public_plan_summary,
+        validate_cloud_plan,
+    )
+
+    try:
+        plan = validate_cloud_plan(request.plan)
+    except (PlanError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Plan is invalid") from exc
+    try:
+        bound_inputs = normalize_input_bindings(plan, request.input_artifacts)
+    except PlanError as exc:
+        raise HTTPException(status_code=400, detail="Plan inputs are invalid") from exc
+    config = _config(resolve_secrets=False)
+    store = _plan_store(config)
+    request_binding = {
+        "plan": plan,
+        "input_artifacts": bound_inputs,
+        "provider": request.provider,
+        "recommendation_policy": request.recommendation_policy,
+        "max_hourly_rate": request.max_hourly_rate,
+        "max_total_job_cost": request.max_total_job_cost,
+        "allowed_regions": request.allowed_regions,
+        "timeout_seconds": request.timeout_seconds,
+    }
+    preflight_request_digest = binding_digest(request_binding)
+    try:
+        replay = store.lookup_preflight(plan["plan_digest"], preflight_request_digest)
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if replay is not None:
+        return replay
+    try:
+        connector = _plan_connector(request.provider, config)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="No compatible candidate is available") from exc
+    try:
+        offers = connector.list_available()
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="No compatible candidate is available") from exc
+    if not offers:
+        raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    if not _run_plan_workflow_readiness(
+        plan=plan,
+        bound_inputs=bound_inputs,
+        request=request,
+        config=config,
+        connector=connector,
+    ):
+        raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    candidates: list[dict[str, Any]] = []
+    offer_ids: set[str] = set()
+    for offer in offers:
+        if not isinstance(offer, dict):
+            raise HTTPException(status_code=409, detail="Candidate quote is invalid")
+        offer_id_value = offer.get("id") or offer.get("offer_id")
+        offer_id = offer_id_value if isinstance(offer_id_value, str) else ""
+        if not offer_id or offer_id in offer_ids:
+            raise HTTPException(status_code=409, detail="Candidate quote is invalid")
+        offer_ids.add(offer_id)
+        offer_provider = offer.get("provider")
+        if not isinstance(offer_provider, str) or offer_provider != request.provider:
+            raise HTTPException(status_code=409, detail="Candidate provider is outside the policy")
+        offer_residency = offer.get("residency", "cloud")
+        if offer_residency not in {"cloud", "on-prem"}:
+            raise HTTPException(status_code=409, detail="Candidate residency is invalid")
+        hourly_raw = offer.get("hourly_rate")
+        gpu_ram_raw = offer.get("gpu_ram_gb", 0)
+        region = offer.get("region")
+        gpu_type = offer.get("gpu_type", "unknown")
+        if (
+            isinstance(hourly_raw, bool)
+            or not isinstance(hourly_raw, (int, float))
+            or isinstance(gpu_ram_raw, bool)
+            or not isinstance(gpu_ram_raw, (int, float))
+            or not isinstance(region, str)
+            or not region
+            or not isinstance(gpu_type, str)
+            or not gpu_type.strip()
+        ):
+            raise HTTPException(status_code=409, detail="Candidate quote is invalid")
+        try:
+            hourly_rate = float(hourly_raw)
+            gpu_ram = float(gpu_ram_raw)
+        except (OverflowError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail="Candidate quote is invalid") from exc
+        if not math.isfinite(hourly_rate) or hourly_rate <= 0 or not math.isfinite(gpu_ram) or gpu_ram < 0:
+            raise HTTPException(status_code=409, detail="Candidate quote is invalid")
+        raw_storage = offer.get("storage")
+        storage: dict[str, Any] = {"region": region, "persistent": False}
+        if raw_storage is not None:
+            if not isinstance(raw_storage, dict) or set(raw_storage) - {"region", "persistent", "storage_id"}:
+                raise HTTPException(status_code=409, detail="Candidate storage is invalid")
+            if raw_storage.get("region") != region or not isinstance(raw_storage.get("persistent"), bool):
+                raise HTTPException(status_code=409, detail="Candidate storage binding is invalid")
+            storage = {
+                "region": region,
+                "persistent": raw_storage["persistent"],
+                **({"storage_id": raw_storage["storage_id"]} if "storage_id" in raw_storage else {}),
+            }
+            if "storage_id" in storage and (
+                not isinstance(storage["storage_id"], str)
+                or not storage["storage_id"].strip()
+                or len(storage["storage_id"]) > 128
+            ):
+                raise HTTPException(status_code=409, detail="Candidate storage id is invalid")
+        if offer_residency != plan["policy"]["residency"]:
+            continue
+        if any(not _plan_stage_matches_offer(stage, offer, config) for stage in plan["stages"]):
+            continue
+        candidate = {
+            "candidate_id": "candidate-" + hashlib.sha256(
+                canonical_bytes({"provider": request.provider, "offer_id": offer_id, "region": region})
+            ).hexdigest()[:16],
+            "provider": request.provider,
+            "residency": offer_residency,
+            "offer_id": offer_id,
+            "gpu_type": gpu_type,
+            "gpu_ram_gb": gpu_ram,
+            "region": region,
+            "hourly_rate": hourly_rate,
+            "estimate": {"total_job_cost_usd": [max(0.01, hourly_rate * request.timeout_seconds / 3600), max(0.01, hourly_rate * request.timeout_seconds / 3600)]},
+            "storage": storage,
+        }
+        candidates.append(candidate)
+    if not candidates:
+        raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=600)
+    selected_candidate: dict[str, Any] | None = None
+    had_region_match = False
+    rejected_for_cost = False
+    plan_limit = plan["policy"].get("max_cost_usd")
+    stage_limits = [stage.get("max_cost_usd") for stage in plan["stages"] if stage.get("max_cost_usd") is not None]
+    for item in candidates:
+        if not request.allowed_regions or item["region"] in request.allowed_regions:
+            had_region_match = True
+            item_cost = float(item["estimate"]["total_job_cost_usd"][1])
+            if (
+                request.max_hourly_rate is not None
+                and float(item["hourly_rate"]) > request.max_hourly_rate
+            ) or (
+                request.max_total_job_cost is not None
+                and item_cost > request.max_total_job_cost
+            ) or (plan_limit is not None and item_cost > float(plan_limit)) or (
+                stage_limits and any(item_cost > float(limit) for limit in stage_limits)
+            ):
+                rejected_for_cost = True
+                continue
+            selected_candidate = item
+            break
+    if selected_candidate is None:
+        if rejected_for_cost and had_region_match:
+            raise HTTPException(status_code=409, detail="Candidate quote exceeds the cost policy")
+        raise HTTPException(status_code=409, detail="Candidate region is outside the policy")
+    candidate = selected_candidate
+    total_cost = float(candidate["estimate"]["total_job_cost_usd"][1])
+    candidate_id = candidate["candidate_id"]
+    report = {
+        "schema": "cloud-offload.plan-preflight.v1",
+        "preflight_id": str(uuid.uuid4()),
+        "plan_digest": plan["plan_digest"],
+        "status": "ready",
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": expires.isoformat().replace("+00:00", "Z"),
+        "plan": public_plan_summary(plan),
+        "provider": request.provider,
+        "candidate_id": candidate_id,
+        "candidates": [candidate],
+        "quote": {
+            "quote_id": str(uuid.uuid4()),
+            "plan_digest": plan["plan_digest"],
+            "candidate_id": candidate_id,
+            "provider": request.provider,
+            "region": candidate["region"],
+            "storage": candidate["storage"],
+            "hourly_rate": candidate["hourly_rate"],
+            "total_cost_usd": {"min": total_cost, "max": total_cost},
+            "expires_at": expires.isoformat().replace("+00:00", "Z"),
+        },
+        "warnings": [],
+        "unknowns": [],
+    }
+    try:
+        return store.preflight(
+            plan,
+            report,
+            request_digest=preflight_request_digest,
+            provider_digest=binding_digest(request.provider),
+            candidate_digest=binding_digest(candidate),
+            input_digest=binding_digest(bound_inputs),
+        )
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/plans", status_code=202)
+async def submit_plan(request: PlanSubmitRequest, http_request: Request):
+    """Submit one exactly-bound plan with atomic idempotency."""
+    from cloud_offload.plan_protocol import (
+        PlanError,
+        binding_digest,
+        normalize_input_bindings,
+        public_plan_summary,
+        public_preflight_report,
+        validate_cloud_plan,
+    )
+    key = _raw_idempotency_key(http_request, request.client_request_id)
+    try:
+        plan = validate_cloud_plan(request.plan)
+    except (PlanError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Plan is invalid") from exc
+    if request.plan_digest != plan["plan_digest"]:
+        raise HTTPException(status_code=409, detail="plan_digest does not match plan")
+    try:
+        bound_inputs = normalize_input_bindings(plan, request.input_artifacts)
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail="Plan inputs are invalid") from exc
+    config, queue = _queue()
+    store = _plan_store(config)
+    try:
+        record = store.get(plan["plan_digest"])
+        private = store.private(plan["plan_digest"])
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail="stored plan authority is corrupt") from exc
+    if not record or not private:
+        raise HTTPException(status_code=409, detail="accepted preflight is required")
+    try:
+        private_plan = validate_cloud_plan(private["plan"])
+    except (KeyError, PlanError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail="stored plan authority is corrupt") from exc
+    if private_plan["plan_digest"] != plan["plan_digest"]:
+        raise HTTPException(status_code=409, detail="stored plan authority binding is invalid")
+    accepted = private["preflight"]
+    try:
+        accepted_public = public_preflight_report(accepted)
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail="accepted preflight is invalid") from exc
+    if accepted_public["plan_digest"] != plan["plan_digest"]:
+        raise HTTPException(status_code=409, detail="accepted preflight binding is invalid")
+    accepted_candidates = accepted.get("candidates") if isinstance(accepted, dict) else None
+    accepted_candidate = next((candidate for candidate in accepted_candidates or [] if str(candidate.get("candidate_id")) == request.candidate_id), None)
+    if accepted_candidate is None or accepted.get("preflight_id") != request.preflight_id:
+        raise HTTPException(status_code=409, detail="accepted preflight binding is invalid")
+    if private.get("provider_digest") != binding_digest(request.provider):
+        raise HTTPException(status_code=409, detail="provider binding is invalid")
+    if private.get("candidate_digest") != binding_digest(accepted_candidate):
+        raise HTTPException(status_code=409, detail="candidate binding is invalid")
+    if private.get("input_digest") != binding_digest(bound_inputs):
+        raise HTTPException(status_code=409, detail="input binding is invalid")
+    preflight_binding = {
+        "plan": plan,
+        "input_artifacts": bound_inputs,
+        "provider": request.provider,
+        "recommendation_policy": request.recommendation_policy,
+        "max_hourly_rate": request.max_hourly_rate,
+        "max_total_job_cost": request.max_total_job_cost,
+        "allowed_regions": request.allowed_regions,
+        "timeout_seconds": request.timeout_seconds,
+    }
+    if private.get("preflight_request_digest") != binding_digest(preflight_binding):
+        raise HTTPException(status_code=409, detail="request differs from accepted preflight")
+    request_binding = {
+        "plan": plan,
+        "preflight": accepted,
+        "preflight_id": request.preflight_id,
+        "candidate_id": request.candidate_id,
+        "provider": request.provider,
+        "input_artifacts": bound_inputs,
+        "recommendation_policy": request.recommendation_policy,
+        "max_hourly_rate": request.max_hourly_rate,
+        "max_total_job_cost": request.max_total_job_cost,
+        "allowed_regions": request.allowed_regions,
+        "timeout_seconds": request.timeout_seconds,
+        "confirmation_action": request.confirmation_action,
+        "client_request_id": request.client_request_id,
+        "Idempotency-Key": key,
+        "accepted_region": accepted_candidate.get("region"),
+        "accepted_residency": plan["policy"]["residency"],
+        "accepted_storage": accepted_candidate.get("storage"),
+        "accepted_cost": (accepted.get("quote") or {}).get("total_cost_usd"),
+        "accepted_expiry": accepted.get("expires_at"),
+    }
+    request_digest = binding_digest(request_binding)
+    job_id = str(uuid.uuid4())
+    try:
+        job_id, replay, _ = queue.submit_plan_atomic(
+            plan_digest=plan["plan_digest"],
+            preflight_id=request.preflight_id,
+            candidate_id=request.candidate_id,
+            idempotency_key=key,
+            request_digest=request_digest,
+            job_id=job_id,
+            plan_public=public_plan_summary(plan),
+            preflight_public=public_preflight_report(accepted),
+            request_binding=request_binding,
+            provider_digest=private.get("provider_digest"),
+            candidate_digest=private.get("candidate_digest"),
+            input_digest=private.get("input_digest"),
+            timeout_seconds=request.timeout_seconds,
+            input_artifacts=bound_inputs,
+        )
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"job_id": job_id, "status": "submitting", "plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "replayed": replay}
 
 
 @app.post("/api/preflight")
@@ -4090,7 +4851,7 @@ async def worker_claim(request: Request, payload: dict[str, Any] = Body(...)):
         )
     except (KeyError, PermissionError, ValueError) as exc:
         raise HTTPException(status_code=401, detail=str(exc))
-    return [job.to_dict() for job in jobs]
+    return [_public_job(job) for job in jobs]
 
 
 @app.post("/api/workers/status")
@@ -4449,7 +5210,7 @@ async def worker_upload_artifact(
 async def worker_job_status(job_id: str, request: Request):
     """Allow a worker to observe cancellation without exposing its ComfyUI port."""
     _, job = _authorize_worker_job(request, job_id)
-    return job.to_dict()
+    return _public_job(job)
 
 
 @app.post("/api/workers/jobs/{job_id}/running")
@@ -4457,7 +5218,10 @@ async def worker_running(job_id: str, request: Request):
     from cloud_offload.queue import JobStatus
 
     queue, job = _authorize_worker_job(request, job_id)
-    return queue.update_status(job.id, JobStatus.RUNNING, progress=10).to_dict()
+    updated = queue.update_status(job.id, JobStatus.RUNNING, progress=10)
+    if updated is not None:
+        _sync_plan_job(updated, "running")
+    return _public_job(updated)
 
 
 @app.post("/api/workers/jobs/{job_id}/progress")
@@ -4465,7 +5229,8 @@ async def worker_progress(
     job_id: str, request: Request, payload: dict[str, Any] = Body(...)
 ):
     queue, job = _authorize_worker_job(request, job_id)
-    return queue.set_progress(job.id, int(payload.get("progress", 0))).to_dict()
+    updated = queue.set_progress(job.id, int(payload.get("progress", 0)))
+    return _public_job(updated)
 
 
 @app.post("/api/workers/jobs/{job_id}/events")
@@ -4481,12 +5246,37 @@ async def worker_event(
         JobStatus.FAILED,
         JobStatus.DEAD_LETTER,
     }:
+        if _plan_job_digest(job):
+            return _public_job(job)
         return {"job_id": job.id, "ignored": True, "status": job.status.value}
     event = payload.get("event")
+    producer_id: str | None = None
+    producer_sequence: int | None = None
+    occurred_at: str | None = None
     if not isinstance(event, dict):
         raise HTTPException(status_code=400, detail="event object is required")
-    producer_id = payload.get("producer_id")
-    if producer_id and job.worker_id:
+    if _plan_job_digest(job):
+        # Plan worker events are intentionally reduced before persistence; the
+        # queue journal itself is a public projection and must not become a
+        # side channel for prompts, paths, provider bodies, or error text.
+        try:
+            safe_event = _public_plan_event({**event, "job_id": job.id})
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Plan event is invalid") from exc
+        event = {
+            "type": safe_event["type"],
+            "phase": safe_event["phase"],
+            "status": safe_event["status"],
+            **({"metrics": safe_event["metrics"]} if safe_event.get("metrics") else {}),
+        }
+        producer_id = str(payload.get("producer_id") or f"worker:{job.worker_id or 'legacy'}")
+        producer_sequence = payload.get("producer_sequence")
+        occurred_at = None
+    else:
+        producer_id = payload.get("producer_id")
+        producer_sequence = payload.get("producer_sequence")
+        occurred_at = payload.get("occurred_at")
+    if not _plan_job_digest(job) and producer_id and job.worker_id:
         expected_prefix = f"worker:{job.worker_id}:"
         if not str(producer_id).startswith(expected_prefix):
             raise HTTPException(
@@ -4494,13 +5284,16 @@ async def worker_event(
                 detail="Worker event producer does not match the claimed job",
             )
     try:
-        return queue.append_event(
+        event_result = queue.append_event(
             job.id,
             event,
             producer_id=str(producer_id or f"worker:{job.worker_id or 'legacy'}"),
-            producer_sequence=payload.get("producer_sequence"),
-            occurred_at=payload.get("occurred_at"),
+            producer_sequence=producer_sequence,
+            occurred_at=occurred_at,
         )
+        if _plan_job_digest(job):
+            return _public_plan_event(event_result)
+        return event_result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -4513,7 +5306,33 @@ async def worker_complete(
     result = payload.get("result")
     if not isinstance(result, dict):
         raise HTTPException(status_code=400, detail="result object is required")
-    return queue.complete_job(job.id, result).to_dict()
+    plan_digest = _plan_job_digest(job)
+    if plan_digest:
+        from cloud_offload.plan_protocol import PlanError, validate_result_manifest
+
+        try:
+            result = validate_result_manifest(result, expected_job_id=job.id)
+        except PlanError as exc:
+            raise HTTPException(status_code=400, detail="Result manifest is invalid") from exc
+    if plan_digest:
+        try:
+            completed = queue.complete_plan_atomic(
+                job.id,
+                plan_digest,
+                result,
+                {
+                    "receipt_id": "closure-" + plan_digest.removeprefix("sha256:")[:16],
+                    "status": "completed",
+                    "provider_resource_absent": True,
+                },
+            )
+        except PlanError as exc:
+            raise HTTPException(status_code=409, detail="Plan completion closure is not valid") from exc
+    else:
+        completed = queue.complete_job(job.id, result)
+    if completed is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _public_job(completed)
 
 
 @app.post("/api/workers/jobs/{job_id}/fail")
@@ -4521,7 +5340,34 @@ async def worker_fail(
     job_id: str, request: Request, payload: dict[str, Any] = Body(...)
 ):
     queue, job = _authorize_worker_job(request, job_id)
-    return queue.fail_job(job.id, str(payload.get("error", "Worker failed"))).to_dict()
+    from cloud_offload.plan_protocol import PlanError
+
+    plan_digest = _plan_job_digest(job)
+    if plan_digest:
+        try:
+            probe = queue.get(job.id)
+            terminal = bool(probe and probe.attempts >= probe.max_attempts)
+            updated = queue.fail_plan_atomic(
+                job.id,
+                plan_digest,
+                {
+                    "receipt_id": "closure-" + plan_digest.removeprefix("sha256:")[:16],
+                    "status": "failed",
+                    "provider_resource_absent": True,
+                    "reason": "worker_failed",
+                }
+                if terminal
+                else None,
+            )
+        except PlanError as exc:
+            raise HTTPException(status_code=409, detail="Plan failure closure is not valid") from exc
+    else:
+        failure_text = str(payload.get("error", "Worker failed"))
+        updated = queue.fail_job(job.id, failure_text)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    plan_digest = _plan_job_digest(updated)
+    return _public_job(updated)
 
 
 # === Main ===
