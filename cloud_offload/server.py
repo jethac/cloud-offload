@@ -126,6 +126,25 @@ class PreflightRequest(BaseModel):
     allowed_regions: list[str] | None = None
 
 
+class PlanPreflightRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    plan: dict[str, Any]
+    input_artifacts: dict[str, str] = Field(default_factory=dict)
+    provider: str = "offline"
+    recommendation_policy: str = "balanced"
+    max_total_job_cost: float | None = Field(default=None, gt=0)
+    allowed_regions: list[str] | None = None
+    timeout_seconds: int = Field(default=3600, ge=1, le=86400)
+
+
+class PlanSubmitRequest(PlanPreflightRequest):
+    preflight_id: str
+    plan_digest: str
+    candidate_id: str
+    confirmation_action: Literal["start_now", "countdown_elapsed", "policy_skip"]
+    client_request_id: str
+
+
 # === App Setup ===
 
 app = FastAPI(
@@ -338,6 +357,23 @@ def _preflight_store(config=None):
 
     config = config or _config(resolve_secrets=False)
     return PreflightStore(config.queue_db_path)
+
+
+def _plan_store(config=None):
+    from cloud_offload.plan_protocol import PlanProtocolStore
+
+    config = config or _config(resolve_secrets=False)
+    return PlanProtocolStore(config.queue_db_path)
+
+
+def _plan_connector(provider: str, config: Any):
+    """Return the injected plan connector; default is deterministic offline."""
+    factory = getattr(app.state, "plan_connector_factory", None)
+    if factory is not None:
+        return factory(provider, config)
+    from cloud_offload.plan_protocol import OfflineConnector
+
+    return OfflineConnector()
 
 
 def _worker_auth_configured(config) -> bool:
@@ -3224,6 +3260,69 @@ async def job_events(job_id: str, after: int = 0, limit: int = 250):
         "events": events,
         "next_after": events[-1]["sequence"] if events else max(0, int(after)),
     }
+
+
+@app.post("/api/plans/preflight")
+async def preflight_plan(request: PlanPreflightRequest):
+    """Validate one immutable plan and issue one safe, free quote."""
+    from cloud_offload.plan_protocol import PlanError, public_plan_summary, validate_cloud_plan
+
+    try:
+        plan = validate_cloud_plan(request.plan)
+    except (PlanError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    declared = {str(item["name"]): item for item in plan["input_artifacts"]}
+    if set(request.input_artifacts) - set(declared):
+        raise HTTPException(status_code=400, detail="input_artifacts contains an undeclared input")
+    for name, item in declared.items():
+        digest = request.input_artifacts.get(name) or item.get("sha256")
+        if not isinstance(digest, str) or not __import__("re").fullmatch(r"(?:sha256:)?[0-9a-f]{64}", digest):
+            raise HTTPException(status_code=400, detail=f"input artifact {name} has no valid identity")
+    if request.allowed_regions and plan["policy"]["residency"] == "cloud" and "offline-test" not in request.allowed_regions and request.provider == "offline":
+        raise HTTPException(status_code=409, detail="No candidate satisfies the region policy")
+    config = _config(resolve_secrets=False)
+    connector = _plan_connector(request.provider, config)
+    offers = connector.list_available()
+    if not offers:
+        raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    offer = offers[0]
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=600)
+    candidate_id = "candidate-" + hashlib.sha256(str(offer.get("id", "offline-offer")).encode()).hexdigest()[:16]
+    candidate = {"candidate_id": candidate_id, "provider": request.provider, "offer_id": str(offer.get("id") or offer.get("offer_id")), "gpu_type": str(offer.get("gpu_type") or "unknown"), "gpu_ram_gb": int(offer.get("gpu_ram_gb") or 0), "region": str(offer.get("region") or "unknown"), "hourly_rate": float(offer.get("hourly_rate") or 0.0), "estimate": {"total_job_cost_usd": [0.01, 0.01]}, "storage": {"region": str(offer.get("region") or "unknown"), "persistent": False}}
+    report = {"schema": "cloud-offload.plan-preflight.v1", "preflight_id": str(uuid.uuid4()), "plan_digest": plan["plan_digest"], "status": "ready", "created_at": now.isoformat().replace("+00:00", "Z"), "expires_at": expires.isoformat().replace("+00:00", "Z"), "plan": public_plan_summary(plan), "candidate_id": candidate_id, "candidates": [candidate], "quote": {"quote_id": str(uuid.uuid4()), "plan_digest": plan["plan_digest"], "candidate_id": candidate_id, "provider": request.provider, "region": candidate["region"], "storage": candidate["storage"], "hourly_rate": candidate["hourly_rate"], "total_cost_usd": {"min": 0.01, "max": 0.01}, "expires_at": expires.isoformat().replace("+00:00", "Z"), "coordinator": "cloud-offload"}, "warnings": [], "unknowns": []}
+    _plan_store(config).preflight(plan, report)
+    return report
+
+
+@app.post("/api/plans", status_code=202)
+async def submit_plan(request: PlanSubmitRequest, http_request: Request):
+    """Submit one exactly-bound plan with atomic idempotency."""
+    from cloud_offload.plan_protocol import PlanError, validate_cloud_plan
+    from cloud_offload.queue import JobStatus
+
+    key = http_request.headers.get("Idempotency-Key")
+    # FastAPI injects headers through the request parameter below; retain body
+    # equality as a hard guard even for direct function calls.
+    if not key or key != request.client_request_id:
+        raise HTTPException(status_code=409, detail="Idempotency-Key must equal client_request_id")
+    try:
+        plan = validate_cloud_plan(request.plan)
+    except (PlanError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.plan_digest != plan["plan_digest"]:
+        raise HTTPException(status_code=409, detail="plan_digest does not match plan")
+    config, queue = _queue()
+    store = _plan_store(config)
+    job_id = str(uuid.uuid4())
+    try:
+        job_id, replay = store.submit(plan=plan, preflight_id=request.preflight_id, candidate_id=request.candidate_id, key=key, job_id=job_id)
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if replay is not None:
+        return {"job_id": job_id, "status": "submitting", "plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "replayed": True}
+    queue.create(model="comfyui-plan", input_path="artifacts://comfyui-plan", params={"plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "client_request_id": key}, request={"kind": "comfy.workflow.plan.v1", "plan": plan, "input_artifacts": request.input_artifacts, "timeout_seconds": 3600}, provider=request.provider, status=JobStatus.QUEUED, job_id=job_id)
+    return {"job_id": job_id, "status": "submitting", "plan_digest": plan["plan_digest"], "preflight_id": request.preflight_id, "candidate_id": request.candidate_id, "replayed": False}
 
 
 @app.post("/api/preflight")

@@ -1300,10 +1300,11 @@ class JobQueue:
         request: dict | None = None,
         provider: str | None = None,
         status: JobStatus = JobStatus.PENDING,
+        job_id: str | None = None,
     ) -> Job:
         """Create a new job."""
         job = Job(
-            id=str(uuid.uuid4()),
+            id=str(job_id or uuid.uuid4()),
             model=model,
             status=status,
             input_path=input_path,
