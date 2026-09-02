@@ -43,8 +43,8 @@ private, or corrupt fields fail closed.
 
 Verification:
 
-- Focused protocol, route, review, rescue, and offline proof tests: `112 passed`.
-- Full suite: `1,054 passed, 6 skipped`.
+- Focused protocol, route, review, rescue, and offline proof tests: `118 passed`.
+- Full suite: `1,060 passed, 6 skipped`.
 - Ruff: clean for changed files. Full-repository Ruff retains 16 pre-existing
   diagnostics outside this change.
 - Compile: clean.

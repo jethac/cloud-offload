@@ -1422,7 +1422,9 @@ def test_plan_preflight_accepts_exact_configured_and_offer_profile(
             "min_gpu_ram_gb": 1,
         }
     }
-    connector = _PlanOfferConnector(_plan_offer(profile="configured-profile"))
+    connector = _PlanOfferConnector(
+        _plan_offer(profile="configured-profile", models=["comfyui-workflow"])
+    )
     monkeypatch.setattr(
         server.app.state,
         "plan_connector_factory",
@@ -1438,6 +1440,72 @@ def test_plan_preflight_accepts_exact_configured_and_offer_profile(
     assert response.status_code == 200, response.text
     with sqlite3.connect(config.queue_db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 1
+    assert connector.launches == connector.terminations == 0
+
+
+@pytest.mark.parametrize("stage_kind", ["tool", "validation", "document_commit"])
+def test_plan_preflight_rejects_configured_runner_without_offer_profile_evidence(
+    tmp_path, monkeypatch, stage_kind
+):
+    client, config = _client(tmp_path, monkeypatch)
+    config.worker_profiles = {
+        "configured-profile": {
+            "image": "registry.example/runner@sha256:" + "a" * 64,
+            "models": ["comfyui-workflow"],
+            "gpu_type": "offline",
+            "min_gpu_ram_gb": 1,
+        }
+    }
+    offer = _plan_offer()
+    offer.pop("profile")
+    connector = _PlanOfferConnector(offer)
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    value = _plan_with_runner(profile="configured-profile")
+    value["stages"][0]["kind"] = stage_kind
+    value["plan_digest"] = canonical_plan_digest(value)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 409
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
+    assert connector.launches == connector.terminations == 0
+
+
+@pytest.mark.parametrize("stage_kind", ["tool", "validation", "document_commit"])
+def test_plan_preflight_rejects_configured_runner_without_offer_capability_evidence(
+    tmp_path, monkeypatch, stage_kind
+):
+    client, config = _client(tmp_path, monkeypatch)
+    config.worker_profiles = {
+        "configured-profile": {
+            "image": "registry.example/runner@sha256:" + "a" * 64,
+            "models": ["comfyui-workflow"],
+            "gpu_type": "offline",
+            "min_gpu_ram_gb": 1,
+        }
+    }
+    connector = _PlanOfferConnector(_plan_offer(profile="configured-profile"))
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    value = _plan_with_runner(profile="configured-profile")
+    value["stages"][0]["kind"] = stage_kind
+    value["plan_digest"] = canonical_plan_digest(value)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 409
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
     assert connector.launches == connector.terminations == 0
 
 

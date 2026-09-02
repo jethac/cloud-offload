@@ -457,16 +457,13 @@ def _plan_stage_matches_offer(
     if not isinstance(runner, dict):
         return False
     required_profile = str(runner.get("profile") or "").strip()
+    configured = _configured_runner_profile(config, required_profile)
     advertised_profile = offer.get("profile")
     if advertised_profile is None:
         advertised_profile = offer.get("runtime_profile", offer.get("worker_profile"))
-    # A missing offer profile is only safe when the requested profile is a
-    # validated local mapping.  An unknown profile must never use missing
-    # provider metadata as a wildcard.
-    if advertised_profile is None:
-        if _configured_runner_profile(config, required_profile) is None:
-            return False
-    elif not isinstance(advertised_profile, str) or advertised_profile.strip() != required_profile:
+    # The selected offer must prove the requested profile.  A local profile
+    # mapping cannot turn missing provider evidence into a match.
+    if advertised_profile is None or not isinstance(advertised_profile, str) or advertised_profile.strip() != required_profile:
         return False
 
     requested_gpu = str(runner.get("gpu_type") or "any").strip()
@@ -496,13 +493,14 @@ def _plan_stage_matches_offer(
         return False
 
     capabilities = _offer_capabilities(offer)
+    if capabilities is None and configured is not None and configured.get("models"):
+        return False
     if capabilities is not None:
         required_capability = (
             "comfyui-workflow" if stage.get("kind") == "workflow" else None
         )
         if required_capability and required_capability not in capabilities:
             return False
-        configured = _configured_runner_profile(config, required_profile)
         if configured:
             required = {
                 str(item).casefold() for item in configured.get("models", [])
