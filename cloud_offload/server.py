@@ -510,6 +510,174 @@ def _plan_stage_matches_offer(
     return True
 
 
+def _plan_candidate_from_offer(
+    *, offer: dict[str, Any], request: Any, plan: dict[str, Any], config: Any
+) -> dict[str, Any] | None:
+    """Normalize one immutable offer into the exact candidate quote shape.
+
+    The candidate identity includes every provider-owned placement binding,
+    including durable storage.  Submit-time revalidation uses this same
+    normalizer so a catalog change cannot preserve an old candidate id.
+    ``ValueError`` means the provider returned malformed quote data; ``None``
+    means the offer is well-formed but outside the plan's hard requirements.
+    """
+
+    from cloud_offload.plan_protocol import canonical_bytes
+
+    if not isinstance(offer, dict):
+        raise ValueError("Candidate quote is invalid")
+    offer_id_value = offer.get("id") or offer.get("offer_id")
+    offer_id = offer_id_value if isinstance(offer_id_value, str) else ""
+    if not offer_id:
+        raise ValueError("Candidate quote is invalid")
+    offer_provider = offer.get("provider")
+    if not isinstance(offer_provider, str) or offer_provider != request.provider:
+        raise ValueError("Candidate provider is outside the policy")
+    offer_residency = offer.get("residency", "cloud")
+    if offer_residency not in {"cloud", "on-prem"}:
+        raise ValueError("Candidate residency is invalid")
+    hourly_raw = offer.get("hourly_rate")
+    gpu_ram_raw = offer.get("gpu_ram_gb", 0)
+    region = offer.get("region")
+    gpu_type = offer.get("gpu_type", "unknown")
+    if (
+        isinstance(hourly_raw, bool)
+        or not isinstance(hourly_raw, (int, float))
+        or isinstance(gpu_ram_raw, bool)
+        or not isinstance(gpu_ram_raw, (int, float))
+        or not isinstance(region, str)
+        or not region
+        or not isinstance(gpu_type, str)
+        or not gpu_type.strip()
+    ):
+        raise ValueError("Candidate quote is invalid")
+    try:
+        hourly_rate = float(hourly_raw)
+        gpu_ram = float(gpu_ram_raw)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("Candidate quote is invalid") from exc
+    if (
+        not math.isfinite(hourly_rate)
+        or hourly_rate <= 0
+        or not math.isfinite(gpu_ram)
+        or gpu_ram < 0
+    ):
+        raise ValueError("Candidate quote is invalid")
+
+    raw_storage = offer.get("storage")
+    storage: dict[str, Any] = {"region": region, "persistent": False}
+    if raw_storage is not None:
+        if not isinstance(raw_storage, dict) or set(raw_storage) - {
+            "region",
+            "persistent",
+            "storage_id",
+        }:
+            raise ValueError("Candidate storage is invalid")
+        if raw_storage.get("region") != region or not isinstance(
+            raw_storage.get("persistent"), bool
+        ):
+            raise ValueError("Candidate storage binding is invalid")
+        storage = {
+            "region": region,
+            "persistent": raw_storage["persistent"],
+            **(
+                {"storage_id": raw_storage["storage_id"]}
+                if "storage_id" in raw_storage
+                else {}
+            ),
+        }
+        if "storage_id" in storage and (
+            not isinstance(storage["storage_id"], str)
+            or not storage["storage_id"].strip()
+            or len(storage["storage_id"]) > 128
+        ):
+            raise ValueError("Candidate storage id is invalid")
+
+    if offer_residency != plan["policy"]["residency"]:
+        return None
+    if any(
+        not _plan_stage_matches_offer(stage, offer, config)
+        for stage in plan["stages"]
+    ):
+        return None
+
+    estimate = hourly_rate * request.timeout_seconds / 3600
+    return {
+        "candidate_id": "candidate-"
+        + hashlib.sha256(
+            canonical_bytes(
+                {
+                    "provider": request.provider,
+                    "offer_id": offer_id,
+                    "region": region,
+                    "storage": storage,
+                }
+            )
+        ).hexdigest()[:16],
+        "provider": request.provider,
+        "residency": offer_residency,
+        "offer_id": offer_id,
+        "gpu_type": gpu_type,
+        "gpu_ram_gb": gpu_ram,
+        "region": region,
+        "hourly_rate": hourly_rate,
+        "estimate": {"total_job_cost_usd": [max(0.01, estimate), max(0.01, estimate)]},
+        "storage": storage,
+    }
+
+
+def _revalidate_plan_candidate(
+    *,
+    request: Any,
+    plan: dict[str, Any],
+    config: Any,
+    accepted_candidate: dict[str, Any],
+) -> None:
+    """Require the accepted candidate to remain in the current provider catalog."""
+
+    from cloud_offload.plan_protocol import binding_digest
+
+    try:
+        connector = _plan_connector(request.provider, config)
+        offers = connector.list_available()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409, detail="No compatible candidate is available"
+        ) from exc
+    if not isinstance(offers, list) or not offers:
+        raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    try:
+        accepted_digest = binding_digest(accepted_candidate)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409, detail="accepted preflight binding is invalid"
+        ) from exc
+    offer_ids: set[str] = set()
+    for offer in offers:
+        try:
+            if not isinstance(offer, dict):
+                raise ValueError("Candidate quote is invalid")
+            offer_id = offer.get("id") or offer.get("offer_id")
+            if not isinstance(offer_id, str) or not offer_id or offer_id in offer_ids:
+                raise ValueError("Candidate quote is invalid")
+            offer_ids.add(offer_id)
+            current_candidate = _plan_candidate_from_offer(
+                offer=offer, request=request, plan=plan, config=config
+            )
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=409, detail="No compatible candidate is available"
+            ) from None
+        if current_candidate is None:
+            continue
+        if (
+            current_candidate["candidate_id"] == accepted_candidate.get("candidate_id")
+            and binding_digest(current_candidate) == accepted_digest
+        ):
+            return
+    raise HTTPException(status_code=409, detail="No compatible candidate is available")
+
+
 def _run_plan_workflow_readiness(
     *,
     plan: dict[str, Any],
@@ -3679,12 +3847,10 @@ async def preflight_plan(request: PlanPreflightRequest):
     from cloud_offload.plan_protocol import (
         PlanError,
         binding_digest,
-        canonical_bytes,
         normalize_input_bindings,
         public_plan_summary,
         validate_cloud_plan,
     )
-
     try:
         plan = validate_cloud_plan(request.plan)
     except (PlanError, ValueError) as exc:
@@ -3733,78 +3899,21 @@ async def preflight_plan(request: PlanPreflightRequest):
     candidates: list[dict[str, Any]] = []
     offer_ids: set[str] = set()
     for offer in offers:
-        if not isinstance(offer, dict):
-            raise HTTPException(status_code=409, detail="Candidate quote is invalid")
-        offer_id_value = offer.get("id") or offer.get("offer_id")
-        offer_id = offer_id_value if isinstance(offer_id_value, str) else ""
-        if not offer_id or offer_id in offer_ids:
-            raise HTTPException(status_code=409, detail="Candidate quote is invalid")
-        offer_ids.add(offer_id)
-        offer_provider = offer.get("provider")
-        if not isinstance(offer_provider, str) or offer_provider != request.provider:
-            raise HTTPException(status_code=409, detail="Candidate provider is outside the policy")
-        offer_residency = offer.get("residency", "cloud")
-        if offer_residency not in {"cloud", "on-prem"}:
-            raise HTTPException(status_code=409, detail="Candidate residency is invalid")
-        hourly_raw = offer.get("hourly_rate")
-        gpu_ram_raw = offer.get("gpu_ram_gb", 0)
-        region = offer.get("region")
-        gpu_type = offer.get("gpu_type", "unknown")
-        if (
-            isinstance(hourly_raw, bool)
-            or not isinstance(hourly_raw, (int, float))
-            or isinstance(gpu_ram_raw, bool)
-            or not isinstance(gpu_ram_raw, (int, float))
-            or not isinstance(region, str)
-            or not region
-            or not isinstance(gpu_type, str)
-            or not gpu_type.strip()
-        ):
-            raise HTTPException(status_code=409, detail="Candidate quote is invalid")
         try:
-            hourly_rate = float(hourly_raw)
-            gpu_ram = float(gpu_ram_raw)
-        except (OverflowError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail="Candidate quote is invalid") from exc
-        if not math.isfinite(hourly_rate) or hourly_rate <= 0 or not math.isfinite(gpu_ram) or gpu_ram < 0:
-            raise HTTPException(status_code=409, detail="Candidate quote is invalid")
-        raw_storage = offer.get("storage")
-        storage: dict[str, Any] = {"region": region, "persistent": False}
-        if raw_storage is not None:
-            if not isinstance(raw_storage, dict) or set(raw_storage) - {"region", "persistent", "storage_id"}:
-                raise HTTPException(status_code=409, detail="Candidate storage is invalid")
-            if raw_storage.get("region") != region or not isinstance(raw_storage.get("persistent"), bool):
-                raise HTTPException(status_code=409, detail="Candidate storage binding is invalid")
-            storage = {
-                "region": region,
-                "persistent": raw_storage["persistent"],
-                **({"storage_id": raw_storage["storage_id"]} if "storage_id" in raw_storage else {}),
-            }
-            if "storage_id" in storage and (
-                not isinstance(storage["storage_id"], str)
-                or not storage["storage_id"].strip()
-                or len(storage["storage_id"]) > 128
-            ):
-                raise HTTPException(status_code=409, detail="Candidate storage id is invalid")
-        if offer_residency != plan["policy"]["residency"]:
-            continue
-        if any(not _plan_stage_matches_offer(stage, offer, config) for stage in plan["stages"]):
-            continue
-        candidate = {
-            "candidate_id": "candidate-" + hashlib.sha256(
-                canonical_bytes({"provider": request.provider, "offer_id": offer_id, "region": region})
-            ).hexdigest()[:16],
-            "provider": request.provider,
-            "residency": offer_residency,
-            "offer_id": offer_id,
-            "gpu_type": gpu_type,
-            "gpu_ram_gb": gpu_ram,
-            "region": region,
-            "hourly_rate": hourly_rate,
-            "estimate": {"total_job_cost_usd": [max(0.01, hourly_rate * request.timeout_seconds / 3600), max(0.01, hourly_rate * request.timeout_seconds / 3600)]},
-            "storage": storage,
-        }
-        candidates.append(candidate)
+            if not isinstance(offer, dict):
+                raise ValueError("Candidate quote is invalid")
+            offer_id_value = offer.get("id") or offer.get("offer_id")
+            offer_id = offer_id_value if isinstance(offer_id_value, str) else ""
+            if not offer_id or offer_id in offer_ids:
+                raise ValueError("Candidate quote is invalid")
+            offer_ids.add(offer_id)
+            candidate = _plan_candidate_from_offer(
+                offer=offer, request=request, plan=plan, config=config
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if candidate is not None:
+            candidates.append(candidate)
     if not candidates:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
     now = datetime.now(timezone.utc)
@@ -3887,6 +3996,7 @@ async def submit_plan(request: PlanSubmitRequest, http_request: Request):
         public_preflight_report,
         validate_cloud_plan,
     )
+    from cloud_offload.queue import JobQueue
     key = _raw_idempotency_key(http_request, request.client_request_id)
     try:
         plan = validate_cloud_plan(request.plan)
@@ -3898,7 +4008,7 @@ async def submit_plan(request: PlanSubmitRequest, http_request: Request):
         bound_inputs = normalize_input_bindings(plan, request.input_artifacts)
     except PlanError as exc:
         raise HTTPException(status_code=409, detail="Plan inputs are invalid") from exc
-    config, queue = _queue()
+    config = _config()
     store = _plan_store(config)
     try:
         record = store.get(plan["plan_digest"])
@@ -3964,6 +4074,19 @@ async def submit_plan(request: PlanSubmitRequest, http_request: Request):
         "accepted_expiry": accepted.get("expires_at"),
     }
     request_digest = binding_digest(request_binding)
+    # A first submit is the last free boundary before queue/authority
+    # mutation.  Re-read the provider catalog and compare the complete
+    # normalized candidate, including durable storage.  Idempotent replays
+    # already have an authority/job binding and remain safe without a fresh
+    # provider read.
+    if private.get("job_id") is None:
+        _revalidate_plan_candidate(
+            request=request,
+            plan=private_plan,
+            config=config,
+            accepted_candidate=accepted_candidate,
+        )
+    queue = JobQueue(config.queue_db_path)
     job_id = str(uuid.uuid4())
     try:
         job_id, replay, _ = queue.submit_plan_atomic(
