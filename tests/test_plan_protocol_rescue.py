@@ -580,6 +580,7 @@ def test_preflight_selects_a_policy_compatible_candidate_not_first_offer(tmp_pat
                 {
                     "id": "expensive",
                     "provider": "offline",
+                    "profile": "offline",
                     "region": "offline-test",
                     "gpu_type": "test",
                     "gpu_ram_gb": 1,
@@ -588,6 +589,7 @@ def test_preflight_selects_a_policy_compatible_candidate_not_first_offer(tmp_pat
                 {
                     "id": "cheap",
                     "provider": "offline",
+                    "profile": "offline",
                     "region": "offline-test",
                     "gpu_type": "test",
                     "gpu_ram_gb": 1,
@@ -640,7 +642,7 @@ def test_preflight_replay_returns_exact_stored_report_without_second_offer_probe
     class Connector:
         def list_available(self):
             calls.append("offer")
-            return [{"id": "offer", "provider": "offline", "region": "offline-test", "gpu_type": "test", "gpu_ram_gb": 1, "hourly_rate": 0.01}]
+            return [{"id": "offer", "provider": "offline", "profile": "offline", "region": "offline-test", "gpu_type": "test", "gpu_ram_gb": 1, "hourly_rate": 0.01}]
 
     monkeypatch.setattr(server.app.state, "plan_connector_factory", lambda p, c: Connector(), raising=False)
     value = plan()
@@ -673,6 +675,13 @@ def test_all_plan_public_surfaces_are_allow_listed(tmp_path, monkeypatch):
     value["final_outputs"][0]["stage_id"] = marker + "-stage"
     value["final_outputs"][0]["output"] = marker + "-output"
     value["plan_digest"] = canonical_plan_digest(value)
+    connector = _PlanOfferConnector(_plan_offer(profile=marker + "-profile"))
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
     initial_preflight = client.post("/api/plans/preflight", json={"plan": value})
     assert initial_preflight.status_code == 200, initial_preflight.text
     preflight_body = initial_preflight.json()
@@ -768,6 +777,7 @@ def test_concurrent_preflight_replay_has_one_stored_identity(tmp_path, monkeypat
             return [{
                 "id": "offer-concurrent",
                 "provider": "offline",
+                "profile": "offline",
                 "region": "offline-test",
                 "gpu_type": "test",
                 "gpu_ram_gb": 1,
@@ -1359,6 +1369,75 @@ def test_plan_preflight_rejects_runner_profile_mismatch_before_authority_mutatio
     assert response.status_code == 409
     with sqlite3.connect(config.queue_db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
+    assert connector.launches == connector.terminations == 0
+
+
+@pytest.mark.parametrize("stage_kind", ["tool", "validation", "document_commit"])
+@pytest.mark.parametrize(
+    "partial_offer_metadata",
+    [
+        {},
+        {"profile": ""},
+        {"models": ["comfyui-workflow"]},
+        {"capabilities": ["comfyui-workflow"]},
+    ],
+    ids=["missing", "empty-profile", "models-only", "capabilities-only"],
+)
+def test_plan_preflight_rejects_unknown_runner_without_authoritative_offer_profile(
+    tmp_path, monkeypatch, stage_kind, partial_offer_metadata
+):
+    client, config = _client(tmp_path, monkeypatch)
+    offer = _plan_offer()
+    offer.pop("profile")
+    offer.update(partial_offer_metadata)
+    connector = _PlanOfferConnector(offer)
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    value = _plan_with_runner(profile="unknown-profile")
+    value["stages"][0]["kind"] = stage_kind
+    value["plan_digest"] = canonical_plan_digest(value)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 409
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
+    assert connector.launches == connector.terminations == 0
+
+
+@pytest.mark.parametrize("stage_kind", ["tool", "validation", "document_commit"])
+def test_plan_preflight_accepts_exact_configured_and_offer_profile(
+    tmp_path, monkeypatch, stage_kind
+):
+    client, config = _client(tmp_path, monkeypatch)
+    config.worker_profiles = {
+        "configured-profile": {
+            "image": "registry.example/runner@sha256:" + "a" * 64,
+            "models": ["comfyui-workflow"],
+            "gpu_type": "offline",
+            "min_gpu_ram_gb": 1,
+        }
+    }
+    connector = _PlanOfferConnector(_plan_offer(profile="configured-profile"))
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    value = _plan_with_runner(profile="configured-profile")
+    value["stages"][0]["kind"] = stage_kind
+    value["plan_digest"] = canonical_plan_digest(value)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 200, response.text
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 1
     assert connector.launches == connector.terminations == 0
 
 

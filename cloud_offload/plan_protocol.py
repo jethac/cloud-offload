@@ -1565,7 +1565,7 @@ class OfflineConnector:
         self.network_calls = 0
 
     def list_available(self, **_: Any) -> list[dict[str, Any]]:
-        return [{"id": "offline-offer", "offer_id": "offline-offer", "provider": "offline", "gpu_type": "offline", "gpu_ram_gb": 24, "hourly_rate": 0.01, "region": "offline-test"}]
+        return [{"id": "offline-offer", "offer_id": "offline-offer", "provider": "offline", "profile": "offline", "gpu_type": "offline", "gpu_ram_gb": 24, "hourly_rate": 0.01, "region": "offline-test"}]
 
     def launch(self, *args: Any, **kwargs: Any) -> None:
         self.launches += 1

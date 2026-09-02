@@ -14,7 +14,9 @@ Routes added:
 - `POST /api/plans/preflight`: strict `comfy.workflow.plan.v1`; runs every
   workflow stage through the production readiness engine and compares every
   stage runner profile, GPU type/model, VRAM, and declared capability with the
-  offer before returning `cloud-offload.plan-preflight.v1`.
+  offer before returning `cloud-offload.plan-preflight.v1`. An unknown stage
+  profile is rejected when the offer has no authoritative profile metadata;
+  only an exact validated local profile mapping can fill that gap.
 - `POST /api/plans`: requires exactly one raw, valid `Idempotency-Key` header
   whose value equals `client_request_id`; same-key replay returns the first job
   identity; different-body conflict returns 409.
@@ -41,8 +43,8 @@ private, or corrupt fields fail closed.
 
 Verification:
 
-- Focused protocol, route, review, rescue, and offline proof tests: `97 passed`.
-- Full suite: `1,039 passed, 6 skipped`.
+- Focused protocol, route, review, rescue, and offline proof tests: `112 passed`.
+- Full suite: `1,054 passed, 6 skipped`.
 - Ruff: clean for changed files. Full-repository Ruff retains 16 pre-existing
   diagnostics outside this change.
 - Compile: clean.

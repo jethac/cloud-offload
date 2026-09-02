@@ -460,11 +460,11 @@ def _plan_stage_matches_offer(
     advertised_profile = offer.get("profile")
     if advertised_profile is None:
         advertised_profile = offer.get("runtime_profile", offer.get("worker_profile"))
-    # Existing connectors may predate profile metadata.  A configured profile
-    # is still required to be advertised; unconfigured legacy profiles cannot
-    # be compared and are handled by the production readiness engine.
+    # A missing offer profile is only safe when the requested profile is a
+    # validated local mapping.  An unknown profile must never use missing
+    # provider metadata as a wildcard.
     if advertised_profile is None:
-        if _configured_runner_profile(config, required_profile) is not None:
+        if _configured_runner_profile(config, required_profile) is None:
             return False
     elif not isinstance(advertised_profile, str) or advertised_profile.strip() != required_profile:
         return False
