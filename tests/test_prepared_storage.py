@@ -3179,6 +3179,91 @@ def test_confirmed_prepared_launch_does_not_silently_fall_back_cold(tmp_path):
     assert all(placement is not None for placement in provider.launches)
 
 
+def test_confirmed_prepared_launch_rejects_provider_volume_replacement_before_mutation(
+    tmp_path,
+):
+    """A reused local registry id cannot redirect a confirmed launch."""
+    original = ProviderStorage("provider-a", "runpod", "cache-a", 100, "US-KS-2", True)
+    replacement = ProviderStorage("provider-b", "runpod", "cache-b", 100, "US-KS-2", True)
+    config = dispatcher_config(tmp_path, policy())
+    provider = PlacementProvider(volume=original)
+    provider.volumes = [original, replacement]
+    dispatcher = Dispatcher(config, provider=provider)
+    registered = dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="provider-a",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+        volume_id="volume-1",
+    )
+    confirmed = {
+        "candidate_id": "sha256:" + "c" * 64,
+        "provider": "runpod",
+        "offer_id": "gpu",
+        "gpu_type": "GPU",
+        "gpu_ram_gb": 24,
+        "hourly_rate": 0.4,
+        "region": "US-KS-2",
+        "prepared_volume_id": registered.id,
+        "prepared_provider_volume_id": "provider-a",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "request_policy": {"max_hourly_rate": 1.0},
+    }
+    job = dispatcher.queue.create(
+        "comfyui-workflow",
+        "inline://request",
+        params={"runtime_profile": "comfy", "preflight": confirmed},
+        request={"workflow": {}},
+        provider="runpod",
+        status=JobStatus.QUEUED,
+    )
+
+    # The local row is replaced while retaining its stable registry id.
+    dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="provider-b",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+        volume_id=registered.id,
+    )
+
+    instance = dispatcher._launch_worker("runpod", "comfy", [job])
+
+    assert instance is None
+    assert provider.launches == []
+    assert dispatcher.queue.get_lease(job.id) is None
+    assert dispatcher.queue.list_events(job.id) == [
+        event for event in dispatcher.queue.list_events(job.id)
+        if event["event"]["type"] == "job_created"
+    ]
+
+    # A deleted physical object is the same identity failure, even when the
+    # registry row still points at the old provider id.
+    dispatcher.cache_registry.upsert_volume(
+        provider="runpod",
+        provider_volume_id="provider-a",
+        datacenter_id="US-KS-2",
+        ownership="adopted",
+        capacity_bytes=100,
+        policy=config.prepared_storage,
+        volume_id=registered.id,
+    )
+    provider.volumes = []
+    deleted_instance = dispatcher._launch_worker("runpod", "comfy", [job])
+
+    assert deleted_instance is None
+    assert provider.launches == []
+    assert dispatcher.queue.get_lease(job.id) is None
+    assert dispatcher.queue.list_events(job.id) == [
+        event for event in dispatcher.queue.list_events(job.id)
+        if event["event"]["type"] == "job_created"
+    ]
+
+
 def test_rebound_strict_binding_fails_provisioning_instead_of_stale_launch(tmp_path):
     """Strict placement means exactly the configured volume, every launch.
 

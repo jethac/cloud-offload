@@ -76,3 +76,35 @@ The production workflow builder selected a complete 1,024-byte prepared volume (
 - No provider, BWS, RunPod API, network install, or paid mutation was used.
 
 Remaining concern: Sol must re-review the private/public storage identity projection and volume freshness semantics. No release or real-provider proof is claimed.
+
+## Round 4: exact prepared provider-volume identity
+
+Base: `081a3b09c666505ef870f2a1e1a7cf438bd83b57` (detached)
+
+### Finding and TDD evidence
+
+The previous round bound a prepared candidate to the stable local registry id, but not to the provider's physical volume id. A registry row could keep `volume-1` while its provider id changed from A to B; preflight would preserve only the local id and the dispatcher could attach B. The RED authority test accepted a hot report with the provider identity omitted, and the RED production-builder test showed that the provider identity was not carried through the candidate.
+
+### Implementation
+
+- `cloud_offload/preflight.py`: verify that the provider returns the exact requested physical id, provider, and datacenter before producing a prepared candidate. Bind both the local registry id and provider id into the candidate identity, candidate fields, execution plan, and deduplication key; cold candidates remain explicitly ephemeral.
+- `cloud_offload/server.py`: require paired local/provider identities for hot workflow readiness; bind both through normalized candidate ids, submit authority, confirmed launch records, replay, and restart state. Legacy public preflight responses hash both identifiers; private authority retains the exact values. Revalidation compares the stored digest witness to a fresh raw report and rejects provider-id, registry, region, provider, persistence, or storage drift before queue mutation.
+- `cloud_offload/plan_protocol.py`: allow, validate, and bind the paired identities in private candidates and cached/public projections, including the persistent storage binding, while keeping raw provider identifiers out of public responses.
+- `cloud_offload/dispatcher.py`: require the exact confirmed provider id for new prepared confirmations, or re-prove the current registry/provider object for legacy confirmations. The provider response must match id, provider, and datacenter exactly. Identity failures return before launch events, leases, queue-state mutation, cold substitution, or provider mutation.
+- `tests/test_plan_protocol_rescue.py` and `tests/test_prepared_storage.py`: add real production-builder/full-route regressions for provider-id projection, public redaction, submit/replay, stale first-submit rejection, registry replacement, provider-object replacement, and physical deletion. The adversarial dispatcher test verifies no launch, lease, or non-creation event on replacement/deletion.
+
+### Verification
+
+- RED identity gate: `2 failed` as expected before the authority/source changes; GREEN identity gate: `2 passed`.
+- Focused prepared-volume/authority tests: `12 passed`.
+- Affected Cloud suite (plan/protocol/preflight/routes/storage/dispatcher): `268 passed in 19.14s`.
+- Full Cloud Offload suite: `1094 passed, 6 skipped in 182.81s`.
+- Ruff on all changed source/tests: passed. Full-repository Ruff still reports 15 pre-existing errors in unrelated files.
+- `python -m compileall -q cloud_offload tests`: passed. `git diff --check`: passed.
+- Full MyPy remains a baseline failure (`108` errors across the repository); the changed-module no-incremental check reports `78` existing errors, with no new contract-specific failure isolated by the focused tests.
+- No provider, BWS, RunPod API, network install, or paid mutation was used.
+
+### Concerns
+
+- Legacy hot queue records created before the paired field existed cannot prove their historical provider id; the dispatcher re-proves the current exact provider object and refuses any substitution, while all new preflight-produced records carry the physical id.
+- This is a local/in-process provider-double proof only. No real provider or release proof is claimed. Full Ruff/MyPy baseline diagnostics remain for follow-up.

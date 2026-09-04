@@ -13,7 +13,7 @@ import secrets
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from cloud_offload.config import (
@@ -474,6 +474,28 @@ class Dispatcher:
                 requirements=requirements,
                 confirmed=confirmed,
             )
+            if (
+                placement_decision.action != "launch"
+                and placement_decision.reason in {
+                    "confirmed_prepared_volume_changed",
+                    "confirmed_prepared_provider_volume_changed",
+                    "confirmed_prepared_storage_changed",
+                    "confirmed_provider_volume_unavailable",
+                }
+                and (
+                    placement_decision.reason
+                    != "confirmed_prepared_volume_changed"
+                    or (confirmed and confirmed.get("prepared_provider_volume_id") is not None)
+                )
+            ):
+                # This is an identity failure, not a capacity failure. Do not
+                # publish an event, create a lease, or try a cold replacement:
+                # the confirmed physical object needs a fresh decision.
+                logger.error(
+                    "Refusing confirmed prepared launch for queued jobs: %s",
+                    placement_decision.reason,
+                )
+                return None
             self._publish_launch_event(
                 queued_jobs,
                 {
@@ -1299,6 +1321,35 @@ class Dispatcher:
             return PlacementDecision(
                 "unavailable", None, "confirmed_prepared_volume_changed", ()
             )
+        confirmed_provider_volume_id = confirmed.get("prepared_provider_volume_id")
+        # New confirmations carry the exact provider identity.  Development
+        # jobs created before that field existed are re-proved against the
+        # current registry row for compatibility; they never accept a caller
+        # supplied replacement.
+        if confirmed_provider_volume_id is not None:
+            if (
+                not isinstance(confirmed_provider_volume_id, str)
+                or not confirmed_provider_volume_id.strip()
+                or volume.provider_volume_id != confirmed_provider_volume_id
+            ):
+                return PlacementDecision(
+                    "unavailable", None, "confirmed_prepared_provider_volume_changed", ()
+                )
+        if volume.provider != provider_name:
+            return PlacementDecision(
+                "unavailable", None, "confirmed_prepared_provider_volume_changed", ()
+            )
+        confirmed_storage = confirmed.get("storage")
+        if confirmed_storage is not None:
+            expected_storage = {
+                "region": volume.datacenter_id,
+                "persistent": True,
+                "storage_id": volume.id,
+            }
+            if confirmed_storage != expected_storage:
+                return PlacementDecision(
+                    "unavailable", None, "confirmed_prepared_storage_changed", ()
+                )
         policy = str(self.config.prepared_storage.get("policy") or "")
         bound = str(self.config.prepared_storage.get("existing_volume_id") or "")
         if (
@@ -1306,6 +1357,14 @@ class Dispatcher:
             and bound
             and bound != volume.provider_volume_id
         ):
+            if (
+                confirmed.get("prepared_provider_volume_id") is not None
+                and confirmed.get("prepared_provider_volume_id")
+                != volume.provider_volume_id
+            ):
+                return PlacementDecision(
+                    "unavailable", None, "confirmed_prepared_provider_volume_changed", ()
+                )
             # Strict placement means "the configured volume decides". A quote
             # confirmed against a volume the config no longer binds must not
             # launch — unless the binding names a registered volume in another
@@ -1333,7 +1392,14 @@ class Dispatcher:
             actual = connector.get_storage(volume.provider_volume_id)
         except Exception:
             actual = None
-        if actual is None or actual.datacenter_id != volume.datacenter_id:
+        if (
+            actual is None
+            or not isinstance(volume.provider_volume_id, str)
+            or not volume.provider_volume_id.strip()
+            or getattr(actual, "id", None) != volume.provider_volume_id
+            or getattr(actual, "provider", None) != provider_name
+            or getattr(actual, "datacenter_id", None) != volume.datacenter_id
+        ):
             return PlacementDecision(
                 "unavailable", None, "confirmed_provider_volume_unavailable", ()
             )

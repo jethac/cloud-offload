@@ -1009,7 +1009,18 @@ def build_partition_preflight(
                             )
                         )
                         continue
-                    if actual is None or actual.datacenter_id != volume.datacenter_id:
+                    # A registry row is only useful when the provider returns
+                    # the exact physical object requested.  Do not let a
+                    # connector silently substitute another volume under the
+                    # same lookup call.
+                    if (
+                        actual is None
+                        or not isinstance(volume.provider_volume_id, str)
+                        or not volume.provider_volume_id.strip()
+                        or getattr(actual, "id", None) != volume.provider_volume_id
+                        or getattr(actual, "provider", None) != volume.provider
+                        or getattr(actual, "datacenter_id", None) != volume.datacenter_id
+                    ):
                         warnings.append(
                             _issue(
                                 "prepared_volume_unavailable",
@@ -1054,7 +1065,7 @@ def build_partition_preflight(
                             )
                         )
 
-            seen: set[tuple[str, str, str, str]] = set()
+            seen: set[tuple[str, str, str, str, str]] = set()
             for offer, volume, cached_bytes, complete in provider_candidates:
                 if (
                     volume is None
@@ -1084,6 +1095,7 @@ def build_partition_preflight(
                     safe["offer_id"],
                     str(region or ""),
                     volume.id if volume else "",
+                    volume.provider_volume_id if volume else "",
                 )
                 if identity in seen or not safe["offer_id"]:
                     continue
@@ -1141,6 +1153,10 @@ def build_partition_preflight(
                         "offer_id": safe["offer_id"],
                         "region": region,
                         "volume_id": volume.id if volume else None,
+                        "provider_volume_id": (
+                            volume.provider_volume_id if volume else None
+                        ),
+                        "persistent": bool(volume),
                     }
                 )
                 candidates.append(
@@ -1149,6 +1165,9 @@ def build_partition_preflight(
                         **safe,
                         "region": region,
                         "prepared_volume_id": volume.id if volume else None,
+                        "prepared_provider_volume_id": (
+                            volume.provider_volume_id if volume else None
+                        ),
                         "preparation_class": performance_class["preparation_class"],
                         "gpu_requirement": {
                             "requested_type": gpu_type or "any",
@@ -1307,6 +1326,9 @@ def build_partition_preflight(
             "offer_id": selected["offer_id"] if selected else None,
             "region": selected["region"] if selected else None,
             "prepared_volume_id": selected["prepared_volume_id"] if selected else None,
+            "prepared_provider_volume_id": (
+                selected["prepared_provider_volume_id"] if selected else None
+            ),
         },
         "preparation": (
             selected["preparation"]

@@ -373,6 +373,67 @@ def _preflight_store(config=None):
     return PreflightStore(config.queue_db_path)
 
 
+def _public_preflight_binding(value: Any) -> str:
+    """Return an opaque public form of a prepared-volume identifier."""
+
+    from cloud_offload.plan_protocol import canonical_bytes
+
+    return "sha256:" + hashlib.sha256(canonical_bytes(str(value))).hexdigest()
+
+
+def _public_partition_preflight(report: dict[str, Any]) -> dict[str, Any]:
+    """Redact prepared-volume identities in the legacy preflight response.
+
+    The production builder retains exact local and provider identities for the
+    coordinator's submit-time authority.  The legacy ``/api/preflight`` route
+    is public, so it stores and returns only opaque digests for those fields.
+    ``_revalidate_partition_preflight`` still receives the fresh raw builder
+    result and uses the redacted prior report as a comparison witness.
+    """
+
+    safe = copy.deepcopy(report)
+    for collection in (safe.get("candidates"),):
+        if not isinstance(collection, list):
+            continue
+        for candidate in collection:
+            if not isinstance(candidate, dict):
+                continue
+            for field in ("prepared_volume_id", "prepared_provider_volume_id"):
+                value = candidate.get(field)
+                if value is not None:
+                    candidate[field] = _public_preflight_binding(value)
+    execution = safe.get("execution_plan")
+    if isinstance(execution, dict):
+        for field in ("prepared_volume_id", "prepared_provider_volume_id"):
+            value = execution.get(field)
+            if value is not None:
+                execution[field] = _public_preflight_binding(value)
+    return safe
+
+
+def _preflight_identity_matches(previous: Any, current: Any) -> bool:
+    """Compare a stored opaque binding with a fresh raw or stored value."""
+
+    if previous == current:
+        return True
+    if not isinstance(previous, str) or not isinstance(current, str):
+        return False
+    return previous == _public_preflight_binding(current)
+
+
+def _preflight_storage_binding(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Build the explicit storage facts carried into a paid legacy job."""
+
+    local_id = candidate.get("prepared_volume_id")
+    result: dict[str, Any] = {
+        "region": candidate.get("region"),
+        "persistent": local_id is not None,
+    }
+    if local_id is not None:
+        result["storage_id"] = local_id
+    return result
+
+
 def _plan_store(config=None):
     from cloud_offload.plan_protocol import PlanProtocolStore
 
@@ -620,22 +681,30 @@ def _plan_candidate_from_offer(
 
 
 def _plan_candidate_id(
-    *, provider: str, offer_id: str, region: str, storage: dict[str, Any]
+    *,
+    provider: str,
+    offer_id: str,
+    region: str,
+    storage: dict[str, Any],
+    prepared_volume_id: str | None = None,
+    prepared_provider_volume_id: str | None = None,
 ) -> str:
     """Derive the quote identity from every provider-owned binding."""
 
     from cloud_offload.plan_protocol import canonical_bytes
 
-    return "candidate-" + hashlib.sha256(
-        canonical_bytes(
-            {
-                "provider": provider,
-                "offer_id": offer_id,
-                "region": region,
-                "storage": storage,
-            }
-        )
-    ).hexdigest()[:16]
+    identity: dict[str, Any] = {
+        "provider": provider,
+        "offer_id": offer_id,
+        "region": region,
+        "storage": storage,
+    }
+    # Keep the legacy cold identity stable, but make a prepared candidate
+    # depend on both the coordinator row and the physical provider object.
+    if prepared_volume_id is not None or prepared_provider_volume_id is not None:
+        identity["prepared_volume_id"] = prepared_volume_id
+        identity["prepared_provider_volume_id"] = prepared_provider_volume_id
+    return "candidate-" + hashlib.sha256(canonical_bytes(identity)).hexdigest()[:16]
 
 
 def _revalidate_plan_candidate(
@@ -719,6 +788,9 @@ def _workflow_placement(candidate: dict[str, Any]) -> dict[str, Any]:
         "offer_id": candidate.get("offer_id"),
         "region": candidate.get("region"),
         "prepared_volume_id": candidate.get("prepared_volume_id"),
+        "prepared_provider_volume_id": candidate.get(
+            "prepared_provider_volume_id"
+        ),
     }
 
 
@@ -747,9 +819,46 @@ def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
     selected = next(item for item in candidates if item.get("candidate_id") == selected_id)
     if not isinstance(selected, dict) or not isinstance(execution, dict) or not isinstance(preparation, dict):
         return None
-    if any(field not in selected for field in ("provider", "offer_id", "region", "prepared_volume_id")):
+    if any(
+        field not in selected
+        for field in ("provider", "offer_id", "region", "prepared_volume_id")
+    ):
         return None
-    if set(execution) != {"profile", "profile_fingerprint", "image_digest", "gpu_requirement", "container_disk_gb", "residency", "provider", "offer_id", "region", "prepared_volume_id"}:
+    execution_fields = {
+        "profile",
+        "profile_fingerprint",
+        "image_digest",
+        "gpu_requirement",
+        "container_disk_gb",
+        "residency",
+        "provider",
+        "offer_id",
+        "region",
+        "prepared_volume_id",
+        "prepared_provider_volume_id",
+    }
+    legacy_execution_fields = execution_fields - {"prepared_provider_volume_id"}
+    if set(execution) not in (legacy_execution_fields, execution_fields):
+        return None
+    prepared_volume_id = selected.get("prepared_volume_id")
+    prepared_provider_volume_id = selected.get("prepared_provider_volume_id")
+    # A cold candidate has no physical volume identity.  A prepared candidate
+    # must carry both halves of the binding; accepting only the local registry
+    # id would allow a registry replacement to redirect the launch.
+    if prepared_volume_id is not None and (
+        "prepared_provider_volume_id" not in selected
+        or prepared_provider_volume_id is None
+    ):
+        return None
+    if prepared_volume_id is None and prepared_provider_volume_id is not None:
+        return None
+    if prepared_volume_id is not None:
+        if any(
+            not isinstance(value, str) or not value.strip() or len(value) > 128
+            for value in (prepared_volume_id, prepared_provider_volume_id)
+        ):
+            return None
+    if "prepared_provider_volume_id" not in execution and prepared_volume_id is not None:
         return None
     required_preparation = {"required_bytes", "cached_bytes", "missing_bytes", "coverage_percent", "complete"}
     if set(preparation) != required_preparation or selected.get("preparation") != preparation:
@@ -787,14 +896,9 @@ def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
     placement = _workflow_placement(selected)
     if any(execution.get(field) != placement[field] for field in ("provider", "offer_id", "region")):
         return None
-    if execution.get("prepared_volume_id") != selected.get("prepared_volume_id"):
+    if execution.get("prepared_volume_id") != prepared_volume_id:
         return None
-    prepared_volume_id = selected.get("prepared_volume_id")
-    if prepared_volume_id is not None and (
-        not isinstance(prepared_volume_id, str)
-        or not prepared_volume_id.strip()
-        or len(prepared_volume_id) > 128
-    ):
+    if execution.get("prepared_provider_volume_id") != prepared_provider_volume_id:
         return None
     authoritative_storage = {
         "region": selected["region"],
@@ -827,8 +931,16 @@ def _bind_workflow_candidate(candidate: dict[str, Any], authority: dict[str, Any
         return None
     authoritative_placement = authority["placement"]
     candidate_volume = candidate.get("prepared_volume_id")
+    candidate_provider_volume = candidate.get("prepared_provider_volume_id")
     authoritative_volume = authoritative_placement.get("prepared_volume_id")
     if candidate_volume is not None and candidate_volume != authoritative_volume:
+        return None
+    authoritative_provider_volume = authoritative_placement.get(
+        "prepared_provider_volume_id"
+    )
+    if candidate_provider_volume is not None and candidate_provider_volume != authoritative_provider_volume:
+        return None
+    if candidate_volume is None and candidate_provider_volume is not None:
         return None
     authoritative_storage = authority.get("storage")
     if not isinstance(authoritative_storage, dict):
@@ -847,6 +959,9 @@ def _bind_workflow_candidate(candidate: dict[str, Any], authority: dict[str, Any
         return None
     bound = dict(candidate)
     bound["prepared_volume_id"] = authoritative_volume
+    bound["prepared_provider_volume_id"] = authoritative_placement.get(
+        "prepared_provider_volume_id"
+    )
     bound["storage"] = copy.deepcopy(authoritative_storage)
     if _workflow_placement(bound) != authoritative_placement:
         return None
@@ -855,6 +970,8 @@ def _bind_workflow_candidate(candidate: dict[str, Any], authority: dict[str, Any
         offer_id=str(bound["offer_id"]),
         region=str(bound["region"]),
         storage=bound["storage"],
+        prepared_volume_id=bound.get("prepared_volume_id"),
+        prepared_provider_volume_id=bound.get("prepared_provider_volume_id"),
     )
     bound["preparation"] = dict(authority["preparation"])
     return bound
@@ -4376,8 +4493,9 @@ async def preflight_partition(request: PreflightRequest):
             status_code=500,
             detail="Preflight produced a non-finite numeric value",
         )
-    await asyncio.to_thread(_preflight_store(config).put, report)
-    return report
+    public_report = _public_partition_preflight(report)
+    await asyncio.to_thread(_preflight_store(config).put, public_report)
+    return public_report
 
 
 def _report_candidate(
@@ -4405,8 +4523,20 @@ def _preflight_changes(
         "gpu_ram_gb",
         "region",
         "prepared_volume_id",
+        "prepared_provider_volume_id",
     )
-    changes = [field for field in fields if previous.get(field) != current.get(field)]
+    changes = [
+        field
+        for field in fields
+        if (
+            not _preflight_identity_matches(
+                previous.get(field), current.get(field)
+            )
+            if field
+            in {"prepared_volume_id", "prepared_provider_volume_id"}
+            else previous.get(field) != current.get(field)
+        )
+    ]
     if _relative_change_exceeds(
         previous.get("hourly_rate"),
         current.get("hourly_rate"),
@@ -4670,7 +4800,8 @@ def _revalidate_partition_preflight(
             }
         )
         current["confirmation"] = current_confirmation
-        store.put(current)
+        public_current = _public_partition_preflight(current)
+        store.put(public_current)
         return {
             "accepted": False,
             "code": "cloud_offload.preflight_changed",
@@ -4678,10 +4809,10 @@ def _revalidate_partition_preflight(
             "details": {
                 "action": "Review and confirm the revised preflight report.",
                 "changes": changes,
-                "revised_preflight": current,
+                "revised_preflight": public_current,
             },
         }
-    store.put(current)
+    store.put(_public_partition_preflight(current))
     return {
         "accepted": True,
         "report": current,
@@ -4809,6 +4940,10 @@ async def submit_workflow(request: WorkflowSubmitRequest):
         "hourly_rate": confirmed_candidate["hourly_rate"],
         "region": confirmed_candidate.get("region"),
         "prepared_volume_id": confirmed_candidate.get("prepared_volume_id"),
+        "prepared_provider_volume_id": confirmed_candidate.get(
+            "prepared_provider_volume_id"
+        ),
+        "storage": _preflight_storage_binding(confirmed_candidate),
         "preparation_class": confirmed_candidate.get("preparation_class"),
         "estimate": confirmed_candidate["estimate"],
         "request_policy": confirmed_report["request_policy"],
@@ -5087,6 +5222,10 @@ async def submit_partition(request: PartitionSubmitRequest):
         "hourly_rate": confirmed_candidate["hourly_rate"],
         "region": confirmed_candidate.get("region"),
         "prepared_volume_id": confirmed_candidate.get("prepared_volume_id"),
+        "prepared_provider_volume_id": confirmed_candidate.get(
+            "prepared_provider_volume_id"
+        ),
+        "storage": _preflight_storage_binding(confirmed_candidate),
         "preparation_class": confirmed_candidate.get("preparation_class"),
         "estimate": confirmed_candidate["estimate"],
         "request_policy": confirmed_report["request_policy"],

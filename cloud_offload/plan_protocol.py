@@ -533,7 +533,7 @@ def _safe_candidate(candidate: Any) -> dict[str, Any]:
     allowed = {
         "candidate_id", "offer_id", "id", "provider", "gpu_type", "gpu_ram_gb",
         "region", "residency", "hourly_rate", "estimate", "storage", "preparation",
-        "prepared_volume_id",
+        "prepared_volume_id", "prepared_provider_volume_id",
     }
     if set(candidate) - allowed:
         raise PlanError("candidate has unknown fields")
@@ -568,11 +568,25 @@ def _safe_candidate(candidate: Any) -> dict[str, Any]:
         prepared_volume_id = candidate["prepared_volume_id"]
         if prepared_volume_id is not None:
             _safe_opaque(prepared_volume_id, "prepared_volume_id")
+            prepared_provider_volume_id = candidate.get("prepared_provider_volume_id")
+            if prepared_provider_volume_id is None:
+                raise PlanError("candidate provider volume binding is missing")
+            _safe_opaque(
+                prepared_provider_volume_id, "prepared_provider_volume_id"
+            )
             if (
                 storage.get("persistent") is not True
                 or storage.get("storage_id") != prepared_volume_id
             ):
                 raise PlanError("candidate prepared volume binding is invalid")
+            result["prepared_volume_id"] = _public_opaque(prepared_volume_id)
+            result["prepared_provider_volume_id"] = _public_opaque(
+                prepared_provider_volume_id
+            )
+        elif candidate.get("prepared_provider_volume_id") is not None:
+            raise PlanError("candidate provider volume binding is invalid")
+    elif candidate.get("prepared_provider_volume_id") is not None:
+        raise PlanError("candidate provider volume binding is invalid")
     if "preparation" in candidate:
         result["preparation"] = _safe_preparation(candidate["preparation"], "candidate preparation")
     return result
@@ -826,7 +840,8 @@ def validate_public_preflight_projection(
             raise PlanError("public preflight candidate is invalid")
         candidate_allowed = {
             "candidate_id", "offer_id", "region", "residency", "hourly_rate",
-            "gpu_ram_gb", "storage", "preparation",
+            "gpu_ram_gb", "storage", "preparation", "prepared_volume_id",
+            "prepared_provider_volume_id",
         }
         if set(candidate) - candidate_allowed or "gpu_ram_gb" not in candidate:
             raise PlanError("public preflight candidate is invalid")
@@ -843,6 +858,21 @@ def validate_public_preflight_projection(
         storage = _validate_public_storage(candidate.get("storage"), "public candidate storage")
         if storage["region"] != region:
             raise PlanError("public candidate storage binding is invalid")
+        has_local = "prepared_volume_id" in candidate
+        has_provider = "prepared_provider_volume_id" in candidate
+        if has_local != has_provider:
+            raise PlanError("public candidate provider volume binding is invalid")
+        if has_local:
+            local_digest = _digest(
+                candidate.get("prepared_volume_id"),
+                "public prepared volume id",
+            )
+            _digest(
+                candidate.get("prepared_provider_volume_id"),
+                "public prepared provider volume id",
+            )
+            if storage.get("persistent") is not True or storage.get("storage_id") != local_digest:
+                raise PlanError("public candidate prepared volume binding is invalid")
         if "preparation" in candidate:
             _safe_preparation(candidate["preparation"], "public candidate preparation")
     if candidate_id not in seen:
@@ -929,6 +959,12 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
                     for field in ("candidate_id", "offer_id", "region", "residency", "hourly_rate", "gpu_ram_gb")
                 },
                 "storage": storage_copy(item["storage"]),
+                **({
+                    "prepared_volume_id": item["prepared_volume_id"],
+                    "prepared_provider_volume_id": item[
+                        "prepared_provider_volume_id"
+                    ],
+                } if "prepared_volume_id" in item else {}),
                 **({"preparation": dict(item["preparation"])} if "preparation" in item else {}),
             }
             for item in report["candidates"]
@@ -988,7 +1024,8 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
             raise PlanError("stored preflight is corrupt")
         allowed_candidate = {
             "candidate_id", "offer_id", "region", "residency", "hourly_rate",
-            "gpu_ram_gb", "storage", "preparation",
+            "gpu_ram_gb", "storage", "preparation", "prepared_volume_id",
+            "prepared_provider_volume_id",
         }
         if set(item) - allowed_candidate:
             raise PlanError("stored preflight is corrupt")
@@ -1003,6 +1040,15 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
         storage = _validate_public_storage(item.get("storage"), "stored candidate storage")
         if storage["region"] != region:
             raise PlanError("stored preflight is corrupt")
+        has_local = "prepared_volume_id" in item
+        has_provider = "prepared_provider_volume_id" in item
+        if has_local != has_provider:
+            raise PlanError("stored preflight is corrupt")
+        if has_local:
+            local_digest = _digest(item["prepared_volume_id"], "stored prepared volume id")
+            _digest(item["prepared_provider_volume_id"], "stored prepared provider volume id")
+            if storage.get("persistent") is not True or storage.get("storage_id") != local_digest:
+                raise PlanError("stored preflight is corrupt")
         normalized: dict[str, Any] = {
             "candidate_id": item_id,
             "offer_id": offer_id,
@@ -1011,6 +1057,12 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
             "hourly_rate": hourly_rate,
             "storage": storage,
         }
+        if has_local:
+            normalized["prepared_volume_id"] = local_digest
+            normalized["prepared_provider_volume_id"] = _digest(
+                item["prepared_provider_volume_id"],
+                "stored prepared provider volume id",
+            )
         if "gpu_ram_gb" in item:
             normalized["gpu_ram_gb"] = _finite_number(
                 item["gpu_ram_gb"], "stored gpu ram", minimum=0.0

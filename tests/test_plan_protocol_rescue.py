@@ -307,6 +307,60 @@ def test_public_preflight_hashes_storage_identifier(tmp_path):
     assert "private-storage-id" not in json.dumps(report)
 
 
+def test_legacy_preflight_projection_hashes_both_prepared_volume_identities():
+    report = {
+        "candidates": [
+            {
+                "prepared_volume_id": "volume-1",
+                "prepared_provider_volume_id": "provider-volume-a",
+            }
+        ],
+        "execution_plan": {
+            "prepared_volume_id": "volume-1",
+            "prepared_provider_volume_id": "provider-volume-a",
+        },
+    }
+
+    projected = server._public_partition_preflight(report)
+
+    encoded = json.dumps(projected)
+    assert "volume-1" not in encoded
+    assert "provider-volume-a" not in encoded
+    expected_local = "sha256:" + hashlib.sha256(
+        canonical_bytes("volume-1")
+    ).hexdigest()
+    expected_provider = "sha256:" + hashlib.sha256(
+        canonical_bytes("provider-volume-a")
+    ).hexdigest()
+    assert projected["candidates"][0] == {
+        "prepared_volume_id": expected_local,
+        "prepared_provider_volume_id": expected_provider,
+    }
+    assert projected["execution_plan"] == {
+        "prepared_volume_id": expected_local,
+        "prepared_provider_volume_id": expected_provider,
+    }
+
+
+def test_legacy_preflight_revalidation_detects_physical_volume_replacement():
+    previous = {
+        "prepared_volume_id": server._public_preflight_binding("volume-1"),
+        "prepared_provider_volume_id": server._public_preflight_binding(
+            "provider-volume-a"
+        ),
+    }
+    current = {
+        "prepared_volume_id": "volume-1",
+        "prepared_provider_volume_id": "provider-volume-a",
+    }
+
+    assert server._preflight_changes(previous, current, {}) == []
+    current["prepared_provider_volume_id"] = "provider-volume-b"
+    assert server._preflight_changes(previous, current, {}) == [
+        "prepared_provider_volume_id"
+    ]
+
+
 def test_public_preflight_rejects_preparation_status_without_bound_facts():
     from cloud_offload.plan_protocol import public_preflight_report
 
@@ -1771,6 +1825,7 @@ def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_an
     tmp_path, monkeypatch
 ):
     """The production readiness volume must not collapse to an ephemeral quote."""
+    from dataclasses import replace
     from types import SimpleNamespace
 
     from cloud_offload import preflight as production_preflight
@@ -1811,13 +1866,17 @@ def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_an
 
     class Registry:
         available = True
+        provider_volume_id = "provider-volume"
+
+        def _current_volume(self):
+            return replace(volume, provider_volume_id=self.provider_volume_id)
 
         def list_volumes(self, status=None):
-            return [volume] if self.available and status in {None, "ready"} else []
+            return [self._current_volume()] if self.available and status in {None, "ready"} else []
 
         def volume_coverage(self, required, **kwargs):
             return [{
-                "volume": volume,
+                "volume": self._current_volume(),
                 "cached_bytes": 1024,
                 "required_bytes": 1024,
                 "complete": True,
@@ -1826,8 +1885,11 @@ def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_an
 
     class PreparedConnector(_PlanOfferConnector):
         def get_storage(self, storage_id):
-            assert storage_id == "provider-volume"
-            return SimpleNamespace(datacenter_id="US-MD-1")
+            return SimpleNamespace(
+                id=storage_id,
+                provider="runpod",
+                datacenter_id="US-MD-1",
+            )
 
     connector = PreparedConnector(
         _plan_offer(
@@ -1900,6 +1962,20 @@ def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_an
         "persistent": True,
         "storage_id": "sha256:" + hashlib.sha256(canonical_bytes("volume-1")).hexdigest(),
     }
+    assert body["candidates"][0]["prepared_provider_volume_id"] == (
+        "sha256:" + hashlib.sha256(canonical_bytes("provider-volume")).hexdigest()
+    )
+    assert "provider-volume" not in response.text
+    preflight_replay = client.post(
+        "/api/plans/preflight",
+        json={
+            "plan": value,
+            "input_artifacts": {"source": "sha256:" + "a" * 64},
+            "provider": "runpod",
+        },
+    )
+    assert preflight_replay.status_code == 200, preflight_replay.text
+    assert preflight_replay.json() == body
     payload = {
         "plan": value,
         "preflight_id": body["preflight_id"],
@@ -1922,6 +1998,16 @@ def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_an
     with sqlite3.connect(config.queue_db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
     registry.available = True
+    registry.provider_volume_id = "provider-volume-b"
+    replaced_submit = client.post(
+        "/api/plans",
+        headers={"Idempotency-Key": "replaced-prepared-volume-key"},
+        json={**payload, "client_request_id": "replaced-prepared-volume-key"},
+    )
+    assert replaced_submit.status_code == 409, replaced_submit.text
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    registry.provider_volume_id = "provider-volume"
     submitted = client.post(
         "/api/plans",
         headers={"Idempotency-Key": "prepared-volume-key"},
@@ -1940,6 +2026,9 @@ def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_an
     private = PlanProtocolStore(config.queue_db_path).private(value["plan_digest"])
     assert private is not None
     assert private["preflight"]["candidates"][0]["prepared_volume_id"] == "volume-1"
+    assert private["preflight"]["candidates"][0]["prepared_provider_volume_id"] == (
+        "provider-volume"
+    )
     assert private["preflight"]["candidates"][0]["storage"] == {
         "region": "US-MD-1",
         "persistent": True,
@@ -1951,6 +2040,7 @@ def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_an
 def test_workflow_candidate_binding_rejects_mismatched_prepared_volume():
     report = _readiness_authority_report()
     report["candidates"][0]["prepared_volume_id"] = "volume-1"
+    report["candidates"][0]["prepared_provider_volume_id"] = "provider-volume-1"
     report["candidates"][0]["storage"] = {
         "region": "offline-test",
         "persistent": True,
@@ -1962,12 +2052,137 @@ def test_workflow_candidate_binding_rejects_mismatched_prepared_volume():
     )
     report["preparation"] = report["candidates"][0]["preparation"]
     report["execution_plan"]["prepared_volume_id"] = "volume-1"
+    report["execution_plan"]["prepared_provider_volume_id"] = "provider-volume-1"
     report["status"] = "ready"
     authority = server._workflow_readiness_authority(report)
     assert authority is not None, json.dumps(report, sort_keys=True)
     candidate = {**authority["candidate"], "candidate_id": "current-candidate"}
+    candidate["prepared_provider_volume_id"] = "provider-volume-2"
+    assert server._bind_workflow_candidate(candidate, authority) is None
     candidate["prepared_volume_id"] = "stale-volume"
     assert server._bind_workflow_candidate(candidate, authority) is None
+
+
+def test_workflow_readiness_requires_exact_provider_volume_identity():
+    """A local cache-volume id cannot stand in for its provider volume id."""
+    report = _readiness_authority_report()
+    preparation = {
+        "required_bytes": 0,
+        "cached_bytes": 0,
+        "missing_bytes": 0,
+        "coverage_percent": 100.0,
+        "complete": True,
+    }
+    report["status"] = "ready"
+    report["preparation"] = preparation
+    report["candidates"][0].update(
+        {
+            "prepared_volume_id": "volume-1",
+            "storage": {
+                "region": "offline-test",
+                "persistent": True,
+                "storage_id": "volume-1",
+            },
+            "preparation": preparation,
+        }
+    )
+    report["execution_plan"]["prepared_volume_id"] = "volume-1"
+    assert server._workflow_readiness_authority(report) is None
+
+
+def test_production_preflight_binds_provider_volume_identity(tmp_path, monkeypatch):
+    """A real production-builder report carries both volume identities."""
+    from types import SimpleNamespace
+
+    from cloud_offload import preflight as production_preflight
+    from cloud_offload.cache_registry import CacheVolume
+    from cloud_offload.preflight import build_partition_preflight
+    from cloud_offload.storage import LocalStorage
+    from tests.test_preflight import config_for_preflight, partition
+
+    config = config_for_preflight(tmp_path)
+    config.worker_profiles["comfyui"]["models"].append("comfyui-workflow")
+    config.__post_init__()
+    config.prepared_storage = {
+        "enabled": True,
+        "confirmed": True,
+        "provider": "runpod",
+        "policy": "smart",
+        "region": "US-MD-1",
+        "cold_fallback": "allow",
+        "managed_size_gb": 250,
+        "existing_volume_id": "provider-volume-a",
+        "max_monthly_storage_cost": None,
+        "tenant": "default",
+        "cache_private_assets": False,
+        "shadow_admission": True,
+    }
+    config.__post_init__()
+    volume = CacheVolume(
+        id="volume-1",
+        provider="runpod",
+        provider_volume_id="provider-volume-a",
+        datacenter_id="US-MD-1",
+        ownership="adopted",
+        status="ready",
+        capacity_bytes=250 * 1024**3,
+        inventory_generation="generation-1",
+        last_verified_at="2026-07-29T00:00:00Z",
+        policy=config.prepared_storage,
+        s3_compatible=True,
+    )
+
+    class Registry:
+        def list_volumes(self, status=None):
+            return [volume] if status in {None, "ready"} else []
+
+        def volume_coverage(self, required, **kwargs):
+            return [{
+                "volume": volume,
+                "cached_bytes": 0,
+                "required_bytes": 0,
+                "complete": True,
+                "manifest_ids": [],
+            }]
+
+    class Connector:
+        name = "runpod"
+
+        def get_storage(self, storage_id):
+            assert storage_id == "provider-volume-a"
+            return SimpleNamespace(
+                id="provider-volume-a",
+                provider="runpod",
+                datacenter_id="US-MD-1",
+            )
+
+        def list_available(self, **kwargs):
+            return [{
+                "id": "offer-1",
+                "provider": "runpod",
+                "gpu_type": "GPU",
+                "gpu_count": 1,
+                "gpu_ram_gb": 40,
+                "hourly_rate": 0.4,
+                "datacenter_ids": ["US-MD-1"],
+            }]
+
+    monkeypatch.setattr(production_preflight, "_storage_credentials_configured", lambda: True)
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        provider="runpod",
+        storage=LocalStorage(config.storage_path),
+        cache_registry=Registry(),
+        worker_auth_configured=True,
+        connector_factory=lambda _provider, _config: Connector(),
+    )
+
+    assert report["status"] == "ready"
+    candidate = next(item for item in report["candidates"] if item["prepared_volume_id"])
+    assert candidate["prepared_volume_id"] == "volume-1"
+    assert candidate["prepared_provider_volume_id"] == "provider-volume-a"
 
 
 def _readiness_authority_report() -> dict:
@@ -1985,6 +2200,7 @@ def _readiness_authority_report() -> dict:
         "region": "offline-test",
         "storage": {"region": "offline-test", "persistent": False},
         "prepared_volume_id": None,
+        "prepared_provider_volume_id": None,
         "preparation": preparation,
     }
     return {
@@ -2010,6 +2226,7 @@ def _readiness_authority_report() -> dict:
             "offer_id": "offer-1",
             "region": "offline-test",
             "prepared_volume_id": None,
+            "prepared_provider_volume_id": None,
         },
         "preparation": preparation,
     }
