@@ -307,6 +307,84 @@ def test_public_preflight_hashes_storage_identifier(tmp_path):
     assert "private-storage-id" not in json.dumps(report)
 
 
+def test_legacy_preflight_projection_hashes_both_prepared_volume_identities():
+    report = {
+        "candidates": [
+            {
+                "prepared_volume_id": "volume-1",
+                "prepared_provider_volume_id": "provider-volume-a",
+            }
+        ],
+        "execution_plan": {
+            "prepared_volume_id": "volume-1",
+            "prepared_provider_volume_id": "provider-volume-a",
+        },
+    }
+
+    projected = server._public_partition_preflight(report)
+
+    encoded = json.dumps(projected)
+    assert "volume-1" not in encoded
+    assert "provider-volume-a" not in encoded
+    expected_local = "sha256:" + hashlib.sha256(
+        canonical_bytes("volume-1")
+    ).hexdigest()
+    expected_provider = "sha256:" + hashlib.sha256(
+        canonical_bytes("provider-volume-a")
+    ).hexdigest()
+    assert projected["candidates"][0] == {
+        "prepared_volume_id": expected_local,
+        "prepared_provider_volume_id": expected_provider,
+    }
+    assert projected["execution_plan"] == {
+        "prepared_volume_id": expected_local,
+        "prepared_provider_volume_id": expected_provider,
+    }
+
+
+def test_legacy_preflight_revalidation_detects_physical_volume_replacement():
+    previous = {
+        "prepared_volume_id": server._public_preflight_binding("volume-1"),
+        "prepared_provider_volume_id": server._public_preflight_binding(
+            "provider-volume-a"
+        ),
+    }
+    current = {
+        "prepared_volume_id": "volume-1",
+        "prepared_provider_volume_id": "provider-volume-a",
+    }
+
+    assert server._preflight_changes(previous, current, {}) == []
+    current["prepared_provider_volume_id"] = "provider-volume-b"
+    assert server._preflight_changes(previous, current, {}) == [
+        "prepared_provider_volume_id"
+    ]
+
+
+def test_public_preflight_rejects_preparation_status_without_bound_facts():
+    from cloud_offload.plan_protocol import public_preflight_report
+
+    with pytest.raises(PlanError):
+        public_preflight_report(
+            {
+                "preflight_id": "missing-preparation",
+                "plan_digest": "sha256:" + "a" * 64,
+                "status": "ready_with_preparation",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "candidates": [
+                    {
+                        "candidate_id": "candidate",
+                        "offer_id": "offer",
+                        "region": "offline-test",
+                        "hourly_rate": 0.01,
+                        "gpu_ram_gb": 40,
+                        "storage": {"region": "offline-test", "persistent": False},
+                    }
+                ],
+            }
+        )
+
+
 def test_closure_reason_is_a_finite_code_not_private_error_text():
     from cloud_offload.plan_protocol import validate_closure_receipt
 
@@ -1570,6 +1648,676 @@ def test_workflow_stage_runs_existing_readiness_engine_and_rejects_missing_requi
     assert calls[0]["capsule"] == value["stages"][0]["capsule"]
     with sqlite3.connect(config.queue_db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
+
+
+def test_workflow_stage_accepts_readiness_with_preparation(
+    tmp_path, monkeypatch
+):
+    """A viable cold candidate may need model preparation before launch."""
+    from cloud_offload import preflight as production_preflight
+    from tests.test_workflow_capsule import capsule
+
+    client, config = _client(tmp_path, monkeypatch)
+    connector = _PlanOfferConnector(_plan_offer(profile="comfyui"))
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+
+    monkeypatch.setattr(
+        production_preflight,
+        "build_workflow_preflight",
+        lambda **kwargs: {
+            "schema": "cloud-offload.preflight.v1",
+            "status": "ready_with_preparation",
+            "blockers": [],
+            "unknowns": [],
+            "candidates": [{
+                "candidate_id": "readiness-candidate",
+                "provider": "offline",
+                "offer_id": "offer-1",
+                "region": "offline-test",
+                "storage": {"region": "offline-test", "persistent": False},
+                "prepared_volume_id": None,
+                "preparation": {
+                    "required_bytes": 10,
+                    "cached_bytes": 0,
+                    "missing_bytes": 10,
+                    "coverage_percent": 0.0,
+                    "complete": False,
+                },
+            }],
+            "recommendation": {
+                "policy": "balanced",
+                "candidate_id": "readiness-candidate",
+                "rank": 1,
+                "rationale": [],
+            },
+            "execution_plan": {
+                "profile": "comfyui",
+                "profile_fingerprint": "sha256:" + "a" * 64,
+                "image_digest": "sha256:" + "b" * 64,
+                "gpu_requirement": {"requested_type": "any", "minimum_vram_gb": 40},
+                "container_disk_gb": 1,
+                "residency": "cloud",
+                "provider": "offline",
+                "offer_id": "offer-1",
+                "region": "offline-test",
+                "prepared_volume_id": None,
+            },
+            "preparation": {
+                "required_bytes": 10,
+                "cached_bytes": 0,
+                "missing_bytes": 10,
+                "coverage_percent": 0.0,
+                "complete": False,
+            },
+        },
+    )
+    value = _plan_with_runner(profile="comfyui")
+    value["stages"][0]["kind"] = "workflow"
+    value["stages"][0]["capsule"] = capsule()
+    value["plan_digest"] = canonical_plan_digest(value)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ready_with_preparation"
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 1
+    assert connector.launches == connector.terminations == 0
+
+
+def test_workflow_stage_accepts_real_preflight_readiness_without_fabricated_storage(
+    tmp_path, monkeypatch
+):
+    """The route must accept the production report's ephemeral placement shape."""
+    from tests.test_workflow_capsule import capsule, workflow_config
+
+    config = workflow_config(tmp_path)
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    connector = _PlanOfferConnector(_plan_offer(profile="comfyui"))
+    connector.offer["location"] = "offline-test"
+    connector.offer["provider"] = "runpod"
+    connector.offer["capabilities"] = ["comfyui-partition-v1", "comfyui-workflow"]
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    observed_reports = []
+    original_authority = server._workflow_readiness_authority
+
+    def observe_authority(report):
+        observed_reports.append(copy.deepcopy(report))
+        return original_authority(report)
+
+    monkeypatch.setattr(server, "_workflow_readiness_authority", observe_authority)
+    value = _plan_with_runner(profile="comfyui")
+    value["stages"][0]["kind"] = "workflow"
+    value["stages"][0]["capsule"] = capsule(
+        inputs=[{"name": "source", "kind": "image"}]
+    )
+    value["stages"][0]["capsule"]["assets"] = [
+        {
+            "category": "checkpoints",
+            "filename": "model.safetensors",
+            "sha256": "b" * 64,
+            "size": 10,
+            "format": "safetensors",
+        }
+    ]
+    value["plan_digest"] = canonical_plan_digest(value)
+    from cloud_offload.cache_registry import CacheRegistry
+    from cloud_offload.preflight import build_workflow_preflight
+    from cloud_offload.storage import create_storage, partition_artifact_key
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"workflow-input")
+    storage = create_storage(config)
+    storage.upload(source, partition_artifact_key("a" * 64))
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"0123456789")
+    storage.upload(model, partition_artifact_key("b" * 64))
+
+    production_report = build_workflow_preflight(
+        config=config,
+        capsule=value["stages"][0]["capsule"],
+        input_artifacts={"source": "sha256:" + "a" * 64},
+        provider="runpod",
+        storage=storage,
+        cache_registry=CacheRegistry(config.queue_db_path),
+        worker_auth_configured=bool(config.worker_token),
+        connector_factory=lambda _provider, _config: connector,
+    )
+    assert production_report["blockers"] == [], json.dumps(
+        production_report, sort_keys=True
+    )
+
+    response = TestClient(server.app).post(
+        "/api/plans/preflight",
+        json={
+            "plan": value,
+            "input_artifacts": {"source": "sha256:" + "a" * 64},
+            "provider": "runpod",
+        },
+    )
+
+    assert observed_reports, f"production readiness was not evaluated: {response.status_code} {response.text}"
+    assert original_authority(observed_reports[0]) is not None, json.dumps(
+        observed_reports[0], sort_keys=True
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ready_with_preparation"
+    assert observed_reports and "storage" not in observed_reports[0]["candidates"][0]
+    assert body["candidates"][0]["storage"] == {
+        "region": body["candidates"][0]["storage"]["region"],
+        "persistent": False,
+    }
+    assert connector.launches == connector.terminations == 0
+
+
+def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_and_replay(
+    tmp_path, monkeypatch
+):
+    """The production readiness volume must not collapse to an ephemeral quote."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from cloud_offload import preflight as production_preflight
+    from cloud_offload.cache_registry import CacheVolume
+    from cloud_offload.preflight import build_workflow_preflight
+    from cloud_offload.storage import create_storage, partition_artifact_key
+    from tests.test_workflow_capsule import capsule, workflow_config
+
+    config = workflow_config(tmp_path)
+    config.prepared_storage = {
+        "enabled": True,
+        "confirmed": True,
+        "provider": "runpod",
+        "policy": "smart",
+        "region": "US-MD-1",
+        "cold_fallback": "allow",
+        "managed_size_gb": 250,
+        "existing_volume_id": "provider-volume",
+        "max_monthly_storage_cost": None,
+        "tenant": "default",
+        "cache_private_assets": False,
+        "shadow_admission": True,
+    }
+    config.__post_init__()
+    volume = CacheVolume(
+        id="volume-1",
+        provider="runpod",
+        provider_volume_id="provider-volume",
+        datacenter_id="US-MD-1",
+        ownership="adopted",
+        status="ready",
+        capacity_bytes=250 * 1024**3,
+        inventory_generation="generation-1",
+        last_verified_at="2026-07-29T00:00:00Z",
+        policy=config.prepared_storage,
+        s3_compatible=True,
+    )
+
+    class Registry:
+        available = True
+        provider_volume_id = "provider-volume"
+
+        def _current_volume(self):
+            return replace(volume, provider_volume_id=self.provider_volume_id)
+
+        def list_volumes(self, status=None):
+            return [self._current_volume()] if self.available and status in {None, "ready"} else []
+
+        def volume_coverage(self, required, **kwargs):
+            return [{
+                "volume": self._current_volume(),
+                "cached_bytes": 1024,
+                "required_bytes": 1024,
+                "complete": True,
+                "manifest_ids": ["sha256:" + "d" * 64],
+            }]
+
+    class PreparedConnector(_PlanOfferConnector):
+        def get_storage(self, storage_id):
+            return SimpleNamespace(
+                id=storage_id,
+                provider="runpod",
+                datacenter_id="US-MD-1",
+            )
+
+    connector = PreparedConnector(
+        _plan_offer(
+            profile="comfyui",
+            provider="runpod",
+            region="US-MD-1",
+            capabilities=["comfyui-partition-v1", "comfyui-workflow"],
+        )
+    )
+    registry = Registry()
+    monkeypatch.setattr(production_preflight, "_storage_credentials_configured", lambda: True)
+    monkeypatch.setattr(server, "_cache_registry", lambda _config: registry)
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+
+    value = _plan_with_runner(profile="comfyui")
+    value["stages"][0]["kind"] = "workflow"
+    value["stages"][0]["capsule"] = capsule(
+        inputs=[{"name": "source", "kind": "image"}]
+    )
+    value["stages"][0]["capsule"]["assets"] = [{
+        "category": "checkpoints",
+        "filename": "model.safetensors",
+        "sha256": "b" * 64,
+        "size": 1024,
+        "format": "safetensors",
+    }]
+    value["plan_digest"] = canonical_plan_digest(value)
+    storage = create_storage(config)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"workflow-input")
+    storage.upload(source, partition_artifact_key("a" * 64))
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"0" * 1024)
+    storage.upload(model, partition_artifact_key("b" * 64))
+
+    production_report = build_workflow_preflight(
+        config=config,
+        capsule=value["stages"][0]["capsule"],
+        input_artifacts={"source": "sha256:" + "a" * 64},
+        provider="runpod",
+        storage=storage,
+        cache_registry=registry,
+        worker_auth_configured=bool(config.worker_token),
+        connector_factory=lambda _provider, _config: connector,
+    )
+    assert production_report["status"] == "ready", json.dumps(production_report, sort_keys=True)
+    assert production_report["preparation"]["required_bytes"] == 1024
+    assert production_report["execution_plan"]["prepared_volume_id"] == "volume-1"
+
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/plans/preflight",
+        json={
+            "plan": value,
+            "input_artifacts": {"source": "sha256:" + "a" * 64},
+            "provider": "runpod",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["candidates"][0]["storage"] == {
+        "region": body["candidates"][0]["region"],
+        "persistent": True,
+        "storage_id": "sha256:" + hashlib.sha256(canonical_bytes("volume-1")).hexdigest(),
+    }
+    assert body["candidates"][0]["prepared_provider_volume_id"] == (
+        "sha256:" + hashlib.sha256(canonical_bytes("provider-volume")).hexdigest()
+    )
+    assert "provider-volume" not in response.text
+    preflight_replay = client.post(
+        "/api/plans/preflight",
+        json={
+            "plan": value,
+            "input_artifacts": {"source": "sha256:" + "a" * 64},
+            "provider": "runpod",
+        },
+    )
+    assert preflight_replay.status_code == 200, preflight_replay.text
+    assert preflight_replay.json() == body
+    payload = {
+        "plan": value,
+        "preflight_id": body["preflight_id"],
+        "plan_digest": value["plan_digest"],
+        "candidate_id": body["candidate_id"],
+        "confirmation_action": "start_now",
+        "client_request_id": "prepared-volume-key",
+        "input_artifacts": {"source": "sha256:" + "a" * 64},
+        "provider": "runpod",
+    }
+    registry.available = False
+    stale_payload = {**payload, "client_request_id": "stale-prepared-volume-key"}
+    stale_submit = client.post(
+        "/api/plans",
+        headers={"Idempotency-Key": "stale-prepared-volume-key"},
+        json=stale_payload,
+    )
+    assert stale_submit.status_code == 409, stale_submit.text
+    JobQueue(config.queue_db_path)
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    registry.available = True
+    registry.provider_volume_id = "provider-volume-b"
+    replaced_submit = client.post(
+        "/api/plans",
+        headers={"Idempotency-Key": "replaced-prepared-volume-key"},
+        json={**payload, "client_request_id": "replaced-prepared-volume-key"},
+    )
+    assert replaced_submit.status_code == 409, replaced_submit.text
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    registry.provider_volume_id = "provider-volume"
+    submitted = client.post(
+        "/api/plans",
+        headers={"Idempotency-Key": "prepared-volume-key"},
+        json=payload,
+    )
+    assert submitted.status_code == 202, submitted.text
+    replay = client.post(
+        "/api/plans",
+        headers={"Idempotency-Key": "prepared-volume-key"},
+        json=payload,
+    )
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["job_id"] == submitted.json()["job_id"]
+    assert replay.json()["candidate_id"] == submitted.json()["candidate_id"]
+    assert replay.json()["replayed"] is True
+    private = PlanProtocolStore(config.queue_db_path).private(value["plan_digest"])
+    assert private is not None
+    assert private["preflight"]["candidates"][0]["prepared_volume_id"] == "volume-1"
+    assert private["preflight"]["candidates"][0]["prepared_provider_volume_id"] == (
+        "provider-volume"
+    )
+    assert private["preflight"]["candidates"][0]["storage"] == {
+        "region": "US-MD-1",
+        "persistent": True,
+        "storage_id": "volume-1",
+    }
+    assert connector.launches == connector.terminations == 0
+
+
+def test_workflow_candidate_binding_rejects_mismatched_prepared_volume():
+    report = _readiness_authority_report()
+    report["candidates"][0]["prepared_volume_id"] = "volume-1"
+    report["candidates"][0]["prepared_provider_volume_id"] = "provider-volume-1"
+    report["candidates"][0]["storage"] = {
+        "region": "offline-test",
+        "persistent": True,
+        "storage_id": "volume-1",
+    }
+    report["candidates"][0]["preparation"]["complete"] = True
+    report["candidates"][0]["preparation"].update(
+        cached_bytes=10, missing_bytes=0, coverage_percent=100.0
+    )
+    report["preparation"] = report["candidates"][0]["preparation"]
+    report["execution_plan"]["prepared_volume_id"] = "volume-1"
+    report["execution_plan"]["prepared_provider_volume_id"] = "provider-volume-1"
+    report["status"] = "ready"
+    authority = server._workflow_readiness_authority(report)
+    assert authority is not None, json.dumps(report, sort_keys=True)
+    candidate = {**authority["candidate"], "candidate_id": "current-candidate"}
+    candidate["prepared_provider_volume_id"] = "provider-volume-2"
+    assert server._bind_workflow_candidate(candidate, authority) is None
+    candidate["prepared_volume_id"] = "stale-volume"
+    assert server._bind_workflow_candidate(candidate, authority) is None
+
+
+def test_workflow_readiness_requires_exact_provider_volume_identity():
+    """A local cache-volume id cannot stand in for its provider volume id."""
+    report = _readiness_authority_report()
+    preparation = {
+        "required_bytes": 0,
+        "cached_bytes": 0,
+        "missing_bytes": 0,
+        "coverage_percent": 100.0,
+        "complete": True,
+    }
+    report["status"] = "ready"
+    report["preparation"] = preparation
+    report["candidates"][0].update(
+        {
+            "prepared_volume_id": "volume-1",
+            "storage": {
+                "region": "offline-test",
+                "persistent": True,
+                "storage_id": "volume-1",
+            },
+            "preparation": preparation,
+        }
+    )
+    report["execution_plan"]["prepared_volume_id"] = "volume-1"
+    assert server._workflow_readiness_authority(report) is None
+
+
+def test_production_preflight_binds_provider_volume_identity(tmp_path, monkeypatch):
+    """A real production-builder report carries both volume identities."""
+    from types import SimpleNamespace
+
+    from cloud_offload import preflight as production_preflight
+    from cloud_offload.cache_registry import CacheVolume
+    from cloud_offload.preflight import build_partition_preflight
+    from cloud_offload.storage import LocalStorage
+    from tests.test_preflight import config_for_preflight, partition
+
+    config = config_for_preflight(tmp_path)
+    config.worker_profiles["comfyui"]["models"].append("comfyui-workflow")
+    config.__post_init__()
+    config.prepared_storage = {
+        "enabled": True,
+        "confirmed": True,
+        "provider": "runpod",
+        "policy": "smart",
+        "region": "US-MD-1",
+        "cold_fallback": "allow",
+        "managed_size_gb": 250,
+        "existing_volume_id": "provider-volume-a",
+        "max_monthly_storage_cost": None,
+        "tenant": "default",
+        "cache_private_assets": False,
+        "shadow_admission": True,
+    }
+    config.__post_init__()
+    volume = CacheVolume(
+        id="volume-1",
+        provider="runpod",
+        provider_volume_id="provider-volume-a",
+        datacenter_id="US-MD-1",
+        ownership="adopted",
+        status="ready",
+        capacity_bytes=250 * 1024**3,
+        inventory_generation="generation-1",
+        last_verified_at="2026-07-29T00:00:00Z",
+        policy=config.prepared_storage,
+        s3_compatible=True,
+    )
+
+    class Registry:
+        def list_volumes(self, status=None):
+            return [volume] if status in {None, "ready"} else []
+
+        def volume_coverage(self, required, **kwargs):
+            return [{
+                "volume": volume,
+                "cached_bytes": 0,
+                "required_bytes": 0,
+                "complete": True,
+                "manifest_ids": [],
+            }]
+
+    class Connector:
+        name = "runpod"
+
+        def get_storage(self, storage_id):
+            assert storage_id == "provider-volume-a"
+            return SimpleNamespace(
+                id="provider-volume-a",
+                provider="runpod",
+                datacenter_id="US-MD-1",
+            )
+
+        def list_available(self, **kwargs):
+            return [{
+                "id": "offer-1",
+                "provider": "runpod",
+                "gpu_type": "GPU",
+                "gpu_count": 1,
+                "gpu_ram_gb": 40,
+                "hourly_rate": 0.4,
+                "datacenter_ids": ["US-MD-1"],
+            }]
+
+    monkeypatch.setattr(production_preflight, "_storage_credentials_configured", lambda: True)
+    report = build_partition_preflight(
+        config=config,
+        partition=partition(),
+        input_artifacts={},
+        provider="runpod",
+        storage=LocalStorage(config.storage_path),
+        cache_registry=Registry(),
+        worker_auth_configured=True,
+        connector_factory=lambda _provider, _config: Connector(),
+    )
+
+    assert report["status"] == "ready"
+    candidate = next(item for item in report["candidates"] if item["prepared_volume_id"])
+    assert candidate["prepared_volume_id"] == "volume-1"
+    assert candidate["prepared_provider_volume_id"] == "provider-volume-a"
+
+
+def _readiness_authority_report() -> dict:
+    preparation = {
+        "required_bytes": 10,
+        "cached_bytes": 0,
+        "missing_bytes": 10,
+        "coverage_percent": 0.0,
+        "complete": False,
+    }
+    candidate = {
+        "candidate_id": "readiness-candidate",
+        "provider": "offline",
+        "offer_id": "offer-1",
+        "region": "offline-test",
+        "storage": {"region": "offline-test", "persistent": False},
+        "prepared_volume_id": None,
+        "prepared_provider_volume_id": None,
+        "preparation": preparation,
+    }
+    return {
+        "schema": "cloud-offload.preflight.v1",
+        "status": "ready_with_preparation",
+        "blockers": [],
+        "unknowns": [],
+        "candidates": [candidate],
+        "recommendation": {
+            "policy": "balanced",
+            "candidate_id": "readiness-candidate",
+            "rank": 1,
+            "rationale": [],
+        },
+        "execution_plan": {
+            "profile": "comfyui",
+            "profile_fingerprint": "sha256:" + "a" * 64,
+            "image_digest": "sha256:" + "b" * 64,
+            "gpu_requirement": {"requested_type": "any", "minimum_vram_gb": 40},
+            "container_disk_gb": 1,
+            "residency": "cloud",
+            "provider": "offline",
+            "offer_id": "offer-1",
+            "region": "offline-test",
+            "prepared_volume_id": None,
+            "prepared_provider_volume_id": None,
+        },
+        "preparation": preparation,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report["preparation"].update(coverage_percent=1.0),
+        lambda report: report["preparation"].update(coverage_percent=True),
+        lambda report: report["preparation"].update(coverage_percent=float("nan")),
+        lambda report: report["preparation"].update(coverage_percent=101.0),
+        lambda report: report["preparation"].update(complete=True),
+        lambda report: report.update(status="ready"),
+    ],
+)
+def test_workflow_readiness_authority_rejects_arithmetic_and_status_tampering(mutate):
+    report = _readiness_authority_report()
+    mutate(report)
+    assert server._workflow_readiness_authority(report) is None
+
+
+def test_workflow_readiness_authority_defines_zero_requirement_as_complete():
+    report = _readiness_authority_report()
+    preparation = {
+        "required_bytes": 0,
+        "cached_bytes": 0,
+        "missing_bytes": 0,
+        "coverage_percent": 100.0,
+        "complete": True,
+    }
+    report["status"] = "ready"
+    report["preparation"] = preparation
+    report["candidates"][0]["preparation"] = preparation
+    assert server._workflow_readiness_authority(report) is not None
+
+
+def test_cached_workflow_preparation_projection_rejects_status_tampering():
+    from cloud_offload.plan_protocol import PlanError, public_preflight_report, reproject_public_preflight
+
+    report = _readiness_authority_report()
+    report["schema"] = "cloud-offload.plan-preflight.v1"
+    report["candidates"][0].pop("prepared_volume_id")
+    report.update(
+        {
+            "preflight_id": "preflight-cache",
+            "plan_digest": "sha256:" + "a" * 64,
+            "expires_at": "2999-01-01T00:00:00Z",
+        }
+    )
+    cached = public_preflight_report(report)
+    assert reproject_public_preflight(cached)["status"] == "ready_with_preparation"
+    cached["status"] = "ready"
+    with pytest.raises(PlanError):
+        reproject_public_preflight(cached)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report["candidates"].clear(),
+        lambda report: report["recommendation"].update(candidate_id="missing"),
+        lambda report: report["candidates"][0].pop("preparation"),
+        lambda report: report["execution_plan"].update(offer_id="other-offer"),
+        lambda report: report["candidates"][0]["storage"].update(region="other-region"),
+        lambda report: report["preparation"].update(missing_bytes=9),
+        lambda report: report["candidates"].append(dict(report["candidates"][0], candidate_id="readiness-candidate")),
+        lambda report: report["preparation"].update(complete=True, missing_bytes=0),
+        lambda report: report["candidates"][0].pop("prepared_volume_id"),
+    ],
+)
+def test_workflow_readiness_authority_fails_closed_on_malformed_or_ambiguous_report(mutate):
+    report = _readiness_authority_report()
+    mutate(report)
+    assert server._workflow_readiness_authority(report) is None
+
+
+@pytest.mark.parametrize("field", ["offer_id", "storage"])
+def test_workflow_candidate_binding_rejects_independent_offer_or_storage(field):
+    report = _readiness_authority_report()
+    authority = server._workflow_readiness_authority(report)
+    assert authority is not None
+    candidate = {
+        **authority["candidate"],
+        "candidate_id": "current-candidate",
+    }
+    if field == "offer_id":
+        candidate[field] = "other-offer"
+    else:
+        candidate[field] = {"region": "offline-test", "persistent": True}
+    assert server._bind_workflow_candidate(candidate, authority) is None
 
 
 @pytest.mark.parametrize(

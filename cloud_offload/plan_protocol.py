@@ -486,12 +486,54 @@ def _parse_expiry(value: Any) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _safe_preparation(value: Any, label: str) -> dict[str, Any]:
+    """Validate bounded preparation facts retained in plan authority."""
+
+    fields = {"required_bytes", "cached_bytes", "missing_bytes", "coverage_percent", "complete"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise PlanError(f"{label} is invalid")
+    result: dict[str, Any] = {}
+    for field in ("required_bytes", "cached_bytes", "missing_bytes"):
+        item = value[field]
+        if isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= MAX_ARTIFACT_SIZE:
+            raise PlanError(f"{label}.{field} is invalid")
+        result[field] = item
+    if result["cached_bytes"] > result["required_bytes"] or result["missing_bytes"] != result["required_bytes"] - result["cached_bytes"]:
+        raise PlanError(f"{label} byte counts are inconsistent")
+    coverage = _finite_number(value["coverage_percent"], f"{label}.coverage_percent", minimum=0.0)
+    if coverage > 100.0:
+        raise PlanError(f"{label}.coverage_percent is invalid")
+    complete = value["complete"]
+    if not isinstance(complete, bool) or complete != (result["missing_bytes"] == 0):
+        raise PlanError(f"{label}.complete is invalid")
+    expected_coverage = (
+        100.0
+        if result["required_bytes"] == 0
+        else round(result["cached_bytes"] / result["required_bytes"] * 100.0, 3)
+    )
+    if coverage != expected_coverage:
+        raise PlanError(f"{label}.coverage_percent is inconsistent")
+    result["coverage_percent"] = coverage
+    result["complete"] = complete
+    return result
+
+
+def _validate_preflight_status(status: Any, preparation: dict[str, Any], label: str) -> None:
+    """Keep the public status bound to the authoritative preparation state."""
+
+    if status == "ready_with_preparation" and preparation["complete"]:
+        raise PlanError(f"{label} status is inconsistent")
+    if status == "ready" and not preparation["complete"]:
+        raise PlanError(f"{label} status is inconsistent")
+
+
 def _safe_candidate(candidate: Any) -> dict[str, Any]:
     if not isinstance(candidate, dict):
         raise PlanError("candidate is invalid")
     allowed = {
         "candidate_id", "offer_id", "id", "provider", "gpu_type", "gpu_ram_gb",
         "region", "residency", "hourly_rate", "estimate", "storage", "preparation",
+        "prepared_volume_id", "prepared_provider_volume_id",
     }
     if set(candidate) - allowed:
         raise PlanError("candidate has unknown fields")
@@ -522,6 +564,31 @@ def _safe_candidate(candidate: Any) -> dict[str, Any]:
         "persistent": storage["persistent"],
         **({"storage_id": _public_opaque(_safe_opaque(storage["storage_id"], "storage_id"))} if "storage_id" in storage else {}),
     }
+    if "prepared_volume_id" in candidate:
+        prepared_volume_id = candidate["prepared_volume_id"]
+        if prepared_volume_id is not None:
+            _safe_opaque(prepared_volume_id, "prepared_volume_id")
+            prepared_provider_volume_id = candidate.get("prepared_provider_volume_id")
+            if prepared_provider_volume_id is None:
+                raise PlanError("candidate provider volume binding is missing")
+            _safe_opaque(
+                prepared_provider_volume_id, "prepared_provider_volume_id"
+            )
+            if (
+                storage.get("persistent") is not True
+                or storage.get("storage_id") != prepared_volume_id
+            ):
+                raise PlanError("candidate prepared volume binding is invalid")
+            result["prepared_volume_id"] = _public_opaque(prepared_volume_id)
+            result["prepared_provider_volume_id"] = _public_opaque(
+                prepared_provider_volume_id
+            )
+        elif candidate.get("prepared_provider_volume_id") is not None:
+            raise PlanError("candidate provider volume binding is invalid")
+    elif candidate.get("prepared_provider_volume_id") is not None:
+        raise PlanError("candidate provider volume binding is invalid")
+    if "preparation" in candidate:
+        result["preparation"] = _safe_preparation(candidate["preparation"], "candidate preparation")
     return result
 
 
@@ -560,7 +627,7 @@ def public_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
     result["schema"] = PREFLIGHT_SCHEMA
     result["preflight_id"] = _safe_opaque(result.get("preflight_id"), "preflight_id")
     result["plan_digest"] = _digest(result.get("plan_digest"), "preflight plan_digest")
-    if result.get("status") not in {"ready", "accepted"}:
+    if result.get("status") not in {"ready", "ready_with_preparation", "accepted"}:
         raise PlanError("preflight status is invalid")
     _parse_expiry(result.get("expires_at"))
     if "created_at" in result:
@@ -575,6 +642,24 @@ def public_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
     if result["candidate_id"] not in {item["candidate_id"] for item in safe_candidates}:
         raise PlanError("preflight candidate binding is invalid")
     result["candidates"] = safe_candidates
+    selected_candidate = next(item for item in safe_candidates if item["candidate_id"] == result["candidate_id"])
+    preparation = source.get("preparation", selected_candidate.get("preparation"))
+    if preparation is None:
+        preparation = {
+            "required_bytes": 0,
+            "cached_bytes": 0,
+            "missing_bytes": 0,
+            "coverage_percent": 100.0,
+            "complete": True,
+        }
+    result["preparation"] = _safe_preparation(preparation, "preflight preparation")
+    _validate_preflight_status(result["status"], result["preparation"], "preflight")
+    if result["status"] == "ready_with_preparation" and (
+        "preparation" not in source or "preparation" not in selected_candidate
+    ):
+        raise PlanError("preparation authority is required")
+    if "preparation" in selected_candidate and selected_candidate["preparation"] != result["preparation"]:
+        raise PlanError("preflight preparation binding is invalid")
     if "quote" in source:
         quote = source["quote"]
         if not isinstance(quote, dict):
@@ -730,7 +815,7 @@ def validate_public_preflight_projection(
     allowed = {
         "schema", "preflight_id", "plan_digest", "status", "created_at",
         "expires_at", "candidate_id", "candidates", "quote", "plan",
-        "warning_count", "unknown_count", "warnings", "unknowns",
+        "warning_count", "unknown_count", "warnings", "unknowns", "preparation",
     }
     if set(report) != allowed or report.get("schema") != PREFLIGHT_SCHEMA:
         raise PlanError("public preflight projection is invalid")
@@ -739,7 +824,7 @@ def validate_public_preflight_projection(
     plan_digest = _digest(report.get("plan_digest"), "public preflight digest")
     if plan_digest != _digest(expected_plan_digest, "plan digest"):
         raise PlanError("public preflight projection binding is invalid")
-    if report.get("status") not in {"ready", "accepted"}:
+    if report.get("status") not in {"ready", "ready_with_preparation", "accepted"}:
         raise PlanError("public preflight status is invalid")
     _parse_expiry(report.get("created_at"))
     _parse_expiry(report.get("expires_at"))
@@ -755,7 +840,8 @@ def validate_public_preflight_projection(
             raise PlanError("public preflight candidate is invalid")
         candidate_allowed = {
             "candidate_id", "offer_id", "region", "residency", "hourly_rate",
-            "gpu_ram_gb", "storage",
+            "gpu_ram_gb", "storage", "preparation", "prepared_volume_id",
+            "prepared_provider_volume_id",
         }
         if set(candidate) - candidate_allowed or "gpu_ram_gb" not in candidate:
             raise PlanError("public preflight candidate is invalid")
@@ -772,8 +858,30 @@ def validate_public_preflight_projection(
         storage = _validate_public_storage(candidate.get("storage"), "public candidate storage")
         if storage["region"] != region:
             raise PlanError("public candidate storage binding is invalid")
+        has_local = "prepared_volume_id" in candidate
+        has_provider = "prepared_provider_volume_id" in candidate
+        if has_local != has_provider:
+            raise PlanError("public candidate provider volume binding is invalid")
+        if has_local:
+            local_digest = _digest(
+                candidate.get("prepared_volume_id"),
+                "public prepared volume id",
+            )
+            _digest(
+                candidate.get("prepared_provider_volume_id"),
+                "public prepared provider volume id",
+            )
+            if storage.get("persistent") is not True or storage.get("storage_id") != local_digest:
+                raise PlanError("public candidate prepared volume binding is invalid")
+        if "preparation" in candidate:
+            _safe_preparation(candidate["preparation"], "public candidate preparation")
     if candidate_id not in seen:
         raise PlanError("public preflight candidate binding is invalid")
+    public_preparation = _safe_preparation(report.get("preparation"), "public preflight preparation")
+    _validate_preflight_status(report.get("status"), public_preparation, "public preflight")
+    selected_public = next(item for item in candidates if item.get("candidate_id") == candidate_id)
+    if report.get("status") == "ready_with_preparation" and "preparation" not in selected_public:
+        raise PlanError("public preparation authority is missing")
 
     quote = report.get("quote")
     quote_allowed = {
@@ -829,7 +937,7 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
     full_fields = {
         "schema", "preflight_id", "plan_digest", "status", "created_at",
         "expires_at", "candidate_id", "candidates", "quote", "plan",
-        "warning_count", "unknown_count", "warnings", "unknowns",
+        "warning_count", "unknown_count", "warnings", "unknowns", "preparation",
     }
     if set(report) == full_fields:
         validate_public_preflight_projection(
@@ -851,6 +959,13 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
                     for field in ("candidate_id", "offer_id", "region", "residency", "hourly_rate", "gpu_ram_gb")
                 },
                 "storage": storage_copy(item["storage"]),
+                **({
+                    "prepared_volume_id": item["prepared_volume_id"],
+                    "prepared_provider_volume_id": item[
+                        "prepared_provider_volume_id"
+                    ],
+                } if "prepared_volume_id" in item else {}),
+                **({"preparation": dict(item["preparation"])} if "preparation" in item else {}),
             }
             for item in report["candidates"]
         ]
@@ -882,17 +997,18 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
             "unknown_count": report["unknown_count"],
             "warnings": [],
             "unknowns": [],
+            "preparation": dict(report["preparation"]),
         }
 
     compact_fields = {
         "schema", "preflight_id", "plan_digest", "status", "created_at",
         "expires_at", "candidate_id", "candidates", "warning_count",
-        "unknown_count", "warnings", "unknowns",
+        "unknown_count", "warnings", "unknowns", "preparation",
     }
     required = {"schema", "preflight_id", "plan_digest", "status", "expires_at", "candidate_id", "candidates"}
     if set(report) - compact_fields or not required <= set(report):
         raise PlanError("stored preflight is corrupt")
-    if report.get("schema") != PREFLIGHT_SCHEMA or report.get("status") not in {"ready", "accepted"}:
+    if report.get("schema") != PREFLIGHT_SCHEMA or report.get("status") not in {"ready", "ready_with_preparation", "accepted"}:
         raise PlanError("stored preflight is corrupt")
     _safe_opaque(report.get("preflight_id"), "stored preflight id")
     _digest(report.get("plan_digest"), "stored preflight digest")
@@ -908,7 +1024,8 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
             raise PlanError("stored preflight is corrupt")
         allowed_candidate = {
             "candidate_id", "offer_id", "region", "residency", "hourly_rate",
-            "gpu_ram_gb", "storage",
+            "gpu_ram_gb", "storage", "preparation", "prepared_volume_id",
+            "prepared_provider_volume_id",
         }
         if set(item) - allowed_candidate:
             raise PlanError("stored preflight is corrupt")
@@ -923,6 +1040,15 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
         storage = _validate_public_storage(item.get("storage"), "stored candidate storage")
         if storage["region"] != region:
             raise PlanError("stored preflight is corrupt")
+        has_local = "prepared_volume_id" in item
+        has_provider = "prepared_provider_volume_id" in item
+        if has_local != has_provider:
+            raise PlanError("stored preflight is corrupt")
+        if has_local:
+            local_digest = _digest(item["prepared_volume_id"], "stored prepared volume id")
+            _digest(item["prepared_provider_volume_id"], "stored prepared provider volume id")
+            if storage.get("persistent") is not True or storage.get("storage_id") != local_digest:
+                raise PlanError("stored preflight is corrupt")
         normalized: dict[str, Any] = {
             "candidate_id": item_id,
             "offer_id": offer_id,
@@ -931,10 +1057,18 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
             "hourly_rate": hourly_rate,
             "storage": storage,
         }
+        if has_local:
+            normalized["prepared_volume_id"] = local_digest
+            normalized["prepared_provider_volume_id"] = _digest(
+                item["prepared_provider_volume_id"],
+                "stored prepared provider volume id",
+            )
         if "gpu_ram_gb" in item:
             normalized["gpu_ram_gb"] = _finite_number(
                 item["gpu_ram_gb"], "stored gpu ram", minimum=0.0
             )
+        if "preparation" in item:
+            normalized["preparation"] = _safe_preparation(item["preparation"], "stored candidate preparation")
         safe_candidates.append(normalized)
     candidate_id = _safe_opaque(report.get("candidate_id"), "stored preflight candidate id")
     if candidate_id not in {item["candidate_id"] for item in safe_candidates}:
@@ -948,6 +1082,22 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
         "candidate_id": candidate_id,
         "candidates": safe_candidates,
     }
+    selected = next(item for item in safe_candidates if item["candidate_id"] == candidate_id)
+    result["preparation"] = _safe_preparation(
+        report.get("preparation", selected.get("preparation", {
+            "required_bytes": 0,
+            "cached_bytes": 0,
+            "missing_bytes": 0,
+            "coverage_percent": 100.0,
+            "complete": True,
+        })),
+        "stored preflight preparation",
+    )
+    _validate_preflight_status(result["status"], result["preparation"], "stored preflight")
+    if report.get("status") == "ready_with_preparation" and (
+        "preparation" not in report or "preparation" not in selected
+    ):
+        raise PlanError("stored preparation authority is missing")
     for field in ("created_at", "warning_count", "unknown_count", "warnings", "unknowns"):
         if field in report:
             value = report[field]

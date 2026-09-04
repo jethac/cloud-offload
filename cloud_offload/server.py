@@ -373,6 +373,67 @@ def _preflight_store(config=None):
     return PreflightStore(config.queue_db_path)
 
 
+def _public_preflight_binding(value: Any) -> str:
+    """Return an opaque public form of a prepared-volume identifier."""
+
+    from cloud_offload.plan_protocol import canonical_bytes
+
+    return "sha256:" + hashlib.sha256(canonical_bytes(str(value))).hexdigest()
+
+
+def _public_partition_preflight(report: dict[str, Any]) -> dict[str, Any]:
+    """Redact prepared-volume identities in the legacy preflight response.
+
+    The production builder retains exact local and provider identities for the
+    coordinator's submit-time authority.  The legacy ``/api/preflight`` route
+    is public, so it stores and returns only opaque digests for those fields.
+    ``_revalidate_partition_preflight`` still receives the fresh raw builder
+    result and uses the redacted prior report as a comparison witness.
+    """
+
+    safe = copy.deepcopy(report)
+    for collection in (safe.get("candidates"),):
+        if not isinstance(collection, list):
+            continue
+        for candidate in collection:
+            if not isinstance(candidate, dict):
+                continue
+            for field in ("prepared_volume_id", "prepared_provider_volume_id"):
+                value = candidate.get(field)
+                if value is not None:
+                    candidate[field] = _public_preflight_binding(value)
+    execution = safe.get("execution_plan")
+    if isinstance(execution, dict):
+        for field in ("prepared_volume_id", "prepared_provider_volume_id"):
+            value = execution.get(field)
+            if value is not None:
+                execution[field] = _public_preflight_binding(value)
+    return safe
+
+
+def _preflight_identity_matches(previous: Any, current: Any) -> bool:
+    """Compare a stored opaque binding with a fresh raw or stored value."""
+
+    if previous == current:
+        return True
+    if not isinstance(previous, str) or not isinstance(current, str):
+        return False
+    return previous == _public_preflight_binding(current)
+
+
+def _preflight_storage_binding(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Build the explicit storage facts carried into a paid legacy job."""
+
+    local_id = candidate.get("prepared_volume_id")
+    result: dict[str, Any] = {
+        "region": candidate.get("region"),
+        "persistent": local_id is not None,
+    }
+    if local_id is not None:
+        result["storage_id"] = local_id
+    return result
+
+
 def _plan_store(config=None):
     from cloud_offload.plan_protocol import PlanProtocolStore
 
@@ -522,8 +583,6 @@ def _plan_candidate_from_offer(
     means the offer is well-formed but outside the plan's hard requirements.
     """
 
-    from cloud_offload.plan_protocol import canonical_bytes
-
     if not isinstance(offer, dict):
         raise ValueError("Candidate quote is invalid")
     offer_id_value = offer.get("id") or offer.get("offer_id")
@@ -603,17 +662,12 @@ def _plan_candidate_from_offer(
 
     estimate = hourly_rate * request.timeout_seconds / 3600
     return {
-        "candidate_id": "candidate-"
-        + hashlib.sha256(
-            canonical_bytes(
-                {
-                    "provider": request.provider,
-                    "offer_id": offer_id,
-                    "region": region,
-                    "storage": storage,
-                }
-            )
-        ).hexdigest()[:16],
+        "candidate_id": _plan_candidate_id(
+            provider=request.provider,
+            offer_id=offer_id,
+            region=region,
+            storage=storage,
+        ),
         "provider": request.provider,
         "residency": offer_residency,
         "offer_id": offer_id,
@@ -626,12 +680,40 @@ def _plan_candidate_from_offer(
     }
 
 
+def _plan_candidate_id(
+    *,
+    provider: str,
+    offer_id: str,
+    region: str,
+    storage: dict[str, Any],
+    prepared_volume_id: str | None = None,
+    prepared_provider_volume_id: str | None = None,
+) -> str:
+    """Derive the quote identity from every provider-owned binding."""
+
+    from cloud_offload.plan_protocol import canonical_bytes
+
+    identity: dict[str, Any] = {
+        "provider": provider,
+        "offer_id": offer_id,
+        "region": region,
+        "storage": storage,
+    }
+    # Keep the legacy cold identity stable, but make a prepared candidate
+    # depend on both the coordinator row and the physical provider object.
+    if prepared_volume_id is not None or prepared_provider_volume_id is not None:
+        identity["prepared_volume_id"] = prepared_volume_id
+        identity["prepared_provider_volume_id"] = prepared_provider_volume_id
+    return "candidate-" + hashlib.sha256(canonical_bytes(identity)).hexdigest()[:16]
+
+
 def _revalidate_plan_candidate(
     *,
     request: Any,
     plan: dict[str, Any],
     config: Any,
     accepted_candidate: dict[str, Any],
+    bound_inputs: dict[str, str] | None = None,
 ) -> None:
     """Require the accepted candidate to remain in the current provider catalog."""
 
@@ -646,6 +728,17 @@ def _revalidate_plan_candidate(
         ) from exc
     if not isinstance(offers, list) or not offers:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    workflow_authority = None
+    if any(stage.get("kind") == "workflow" for stage in plan["stages"]):
+        workflow_authority = _run_plan_workflow_readiness(
+            plan=plan,
+            bound_inputs=bound_inputs or {},
+            request=request,
+            config=config,
+            connector=connector,
+        )
+        if workflow_authority is None:
+            raise HTTPException(status_code=409, detail="No compatible candidate is available")
     try:
         accepted_digest = binding_digest(accepted_candidate)
     except Exception as exc:
@@ -670,12 +763,218 @@ def _revalidate_plan_candidate(
             ) from None
         if current_candidate is None:
             continue
+        if workflow_authority is not None:
+            current_candidate = _bind_workflow_candidate(current_candidate, workflow_authority)
+            if current_candidate is None:
+                continue
         if (
             current_candidate["candidate_id"] == accepted_candidate.get("candidate_id")
             and binding_digest(current_candidate) == accepted_digest
         ):
             return
     raise HTTPException(status_code=409, detail="No compatible candidate is available")
+
+
+def _workflow_placement(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return provider-owned placement facts present in every readiness report.
+
+    Workflow preflight candidates intentionally do not invent a ``storage``
+    object for an ephemeral offer.  Storage remains bound by the complete
+    normalized candidate digest during submit-time revalidation.
+    """
+
+    return {
+        "provider": candidate.get("provider"),
+        "offer_id": candidate.get("offer_id"),
+        "region": candidate.get("region"),
+        "prepared_volume_id": candidate.get("prepared_volume_id"),
+        "prepared_provider_volume_id": candidate.get(
+            "prepared_provider_volume_id"
+        ),
+    }
+
+
+def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
+    """Validate one complete workflow readiness report and select its authority."""
+
+    if not isinstance(report, dict) or report.get("schema") != "cloud-offload.preflight.v1":
+        return None
+    status = report.get("status")
+    if status not in {"ready", "ready_with_preparation"} or report.get("blockers") != []:
+        return None
+    candidates = report.get("candidates")
+    recommendation = report.get("recommendation")
+    execution = report.get("execution_plan")
+    preparation = report.get("preparation")
+    if not isinstance(candidates, list) or not candidates or not isinstance(recommendation, dict):
+        return None
+    if set(recommendation) != {"policy", "candidate_id", "rank", "rationale"}:
+        return None
+    candidate_ids = [item.get("candidate_id") if isinstance(item, dict) else None for item in candidates]
+    if any(not isinstance(item, str) for item in candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
+        return None
+    selected_id = recommendation.get("candidate_id")
+    if not isinstance(selected_id, str) or candidate_ids.count(selected_id) != 1:
+        return None
+    selected = next(item for item in candidates if item.get("candidate_id") == selected_id)
+    if not isinstance(selected, dict) or not isinstance(execution, dict) or not isinstance(preparation, dict):
+        return None
+    if any(
+        field not in selected
+        for field in ("provider", "offer_id", "region", "prepared_volume_id")
+    ):
+        return None
+    execution_fields = {
+        "profile",
+        "profile_fingerprint",
+        "image_digest",
+        "gpu_requirement",
+        "container_disk_gb",
+        "residency",
+        "provider",
+        "offer_id",
+        "region",
+        "prepared_volume_id",
+        "prepared_provider_volume_id",
+    }
+    legacy_execution_fields = execution_fields - {"prepared_provider_volume_id"}
+    if set(execution) not in (legacy_execution_fields, execution_fields):
+        return None
+    prepared_volume_id = selected.get("prepared_volume_id")
+    prepared_provider_volume_id = selected.get("prepared_provider_volume_id")
+    # A cold candidate has no physical volume identity.  A prepared candidate
+    # must carry both halves of the binding; accepting only the local registry
+    # id would allow a registry replacement to redirect the launch.
+    if prepared_volume_id is not None and (
+        "prepared_provider_volume_id" not in selected
+        or prepared_provider_volume_id is None
+    ):
+        return None
+    if prepared_volume_id is None and prepared_provider_volume_id is not None:
+        return None
+    if prepared_volume_id is not None:
+        if any(
+            not isinstance(value, str) or not value.strip() or len(value) > 128
+            for value in (prepared_volume_id, prepared_provider_volume_id)
+        ):
+            return None
+    if "prepared_provider_volume_id" not in execution and prepared_volume_id is not None:
+        return None
+    required_preparation = {"required_bytes", "cached_bytes", "missing_bytes", "coverage_percent", "complete"}
+    if set(preparation) != required_preparation or selected.get("preparation") != preparation:
+        return None
+    try:
+        byte_values = [preparation[field] for field in ("required_bytes", "cached_bytes", "missing_bytes")]
+        if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in byte_values):
+            return None
+        if preparation["cached_bytes"] > preparation["required_bytes"] or preparation["missing_bytes"] != preparation["required_bytes"] - preparation["cached_bytes"]:
+            return None
+        coverage_raw = preparation["coverage_percent"]
+        if isinstance(coverage_raw, bool) or not isinstance(
+            coverage_raw, (int, float)
+        ):
+            return None
+        coverage = float(coverage_raw)
+        if not math.isfinite(coverage) or not 0 <= coverage <= 100:
+            return None
+        expected_coverage = (
+            100.0
+            if preparation["required_bytes"] == 0
+            else round(
+                preparation["cached_bytes"]
+                / preparation["required_bytes"]
+                * 100.0,
+                3,
+            )
+        )
+        if coverage != expected_coverage:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not isinstance(preparation["complete"], bool) or preparation["complete"] != (preparation["missing_bytes"] == 0):
+        return None
+    placement = _workflow_placement(selected)
+    if any(execution.get(field) != placement[field] for field in ("provider", "offer_id", "region")):
+        return None
+    if execution.get("prepared_volume_id") != prepared_volume_id:
+        return None
+    if execution.get("prepared_provider_volume_id") != prepared_provider_volume_id:
+        return None
+    authoritative_storage = {
+        "region": selected["region"],
+        "persistent": prepared_volume_id is not None,
+    }
+    if prepared_volume_id is not None:
+        authoritative_storage["storage_id"] = prepared_volume_id
+    storage = selected.get("storage")
+    if storage is not None and (
+        not isinstance(storage, dict)
+        or set(storage) - {"region", "persistent", "storage_id"}
+        or storage != authoritative_storage
+    ):
+        return None
+    if status == "ready_with_preparation" and preparation["complete"]:
+        return None
+    if status == "ready" and not preparation["complete"]:
+        return None
+    return {
+        "status": status,
+        "candidate": selected,
+        "placement": placement,
+        "storage": authoritative_storage,
+        "preparation": dict(preparation),
+    }
+
+
+def _bind_workflow_candidate(candidate: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(authority.get("placement"), dict):
+        return None
+    authoritative_placement = authority["placement"]
+    candidate_volume = candidate.get("prepared_volume_id")
+    candidate_provider_volume = candidate.get("prepared_provider_volume_id")
+    authoritative_volume = authoritative_placement.get("prepared_volume_id")
+    if candidate_volume is not None and candidate_volume != authoritative_volume:
+        return None
+    authoritative_provider_volume = authoritative_placement.get(
+        "prepared_provider_volume_id"
+    )
+    if candidate_provider_volume is not None and candidate_provider_volume != authoritative_provider_volume:
+        return None
+    if candidate_volume is None and candidate_provider_volume is not None:
+        return None
+    authoritative_storage = authority.get("storage")
+    if not isinstance(authoritative_storage, dict):
+        return None
+    candidate_storage = candidate.get("storage")
+    if (
+        not isinstance(candidate_storage, dict)
+        or set(candidate_storage) - {"region", "persistent", "storage_id"}
+        or candidate_storage.get("region") != candidate.get("region")
+        or not isinstance(candidate_storage.get("persistent"), bool)
+    ):
+        return None
+    if candidate_storage != authoritative_storage and (
+        candidate_storage.get("persistent") or "storage_id" in candidate_storage
+    ):
+        return None
+    bound = dict(candidate)
+    bound["prepared_volume_id"] = authoritative_volume
+    bound["prepared_provider_volume_id"] = authoritative_placement.get(
+        "prepared_provider_volume_id"
+    )
+    bound["storage"] = copy.deepcopy(authoritative_storage)
+    if _workflow_placement(bound) != authoritative_placement:
+        return None
+    bound["candidate_id"] = _plan_candidate_id(
+        provider=str(bound["provider"]),
+        offer_id=str(bound["offer_id"]),
+        region=str(bound["region"]),
+        storage=bound["storage"],
+        prepared_volume_id=bound.get("prepared_volume_id"),
+        prepared_provider_volume_id=bound.get("prepared_provider_volume_id"),
+    )
+    bound["preparation"] = dict(authority["preparation"])
+    return bound
 
 
 def _run_plan_workflow_readiness(
@@ -685,17 +984,18 @@ def _run_plan_workflow_readiness(
     request: Any,
     config: Any,
     connector: Any,
-) -> bool:
+) -> dict[str, Any] | None:
     """Run the production workflow readiness engine for every workflow stage."""
 
     workflow_stages = [
         stage for stage in plan["stages"] if stage.get("kind") == "workflow"
     ]
     if not workflow_stages:
-        return True
+        return None
     from cloud_offload.preflight import build_workflow_preflight, finite_report
     from cloud_offload.storage import create_storage
 
+    selected_authority: dict[str, Any] | None = None
     for stage in workflow_stages:
         try:
             report = build_workflow_preflight(
@@ -703,22 +1003,36 @@ def _run_plan_workflow_readiness(
                 capsule=stage["capsule"],
                 input_artifacts=bound_inputs,
                 provider=request.provider,
-                recommendation_policy=request.recommendation_policy,
-                max_hourly_rate=request.max_hourly_rate,
-                max_total_job_cost=request.max_total_job_cost,
-                allowed_regions=request.allowed_regions,
+                recommendation_policy=getattr(request, "recommendation_policy", None),
+                max_hourly_rate=getattr(request, "max_hourly_rate", None),
+                max_total_job_cost=getattr(request, "max_total_job_cost", None),
+                allowed_regions=getattr(request, "allowed_regions", None),
                 storage=create_storage(config),
                 cache_registry=_cache_registry(config),
                 worker_auth_configured=_worker_auth_configured(config),
                 connector_factory=lambda _provider, _config: connector,
             )
         except Exception:
-            return False
+            return None
         if not isinstance(report, dict) or not finite_report(report):
-            return False
-        if report.get("status") != "ready" or report.get("blockers"):
-            return False
-    return True
+            return None
+        # A cold but viable offer is ready for user confirmation even when
+        # declared model data still needs preparation before launch.
+        if report.get("status") not in {"ready", "ready_with_preparation"} or report.get(
+            "blockers"
+        ):
+            return None
+        authority = _workflow_readiness_authority(report)
+        if authority is None:
+            return None
+        if selected_authority is not None and (
+            authority["placement"] != selected_authority["placement"]
+            or authority["preparation"] != selected_authority["preparation"]
+            or authority["status"] != selected_authority["status"]
+        ):
+            return None
+        selected_authority = authority
+    return selected_authority
 
 
 def _plan_job_digest(job: Any) -> str | None:
@@ -3888,13 +4202,15 @@ async def preflight_plan(request: PlanPreflightRequest):
         raise HTTPException(status_code=409, detail="No compatible candidate is available") from exc
     if not offers:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
-    if not _run_plan_workflow_readiness(
+    workflow_authority = _run_plan_workflow_readiness(
         plan=plan,
         bound_inputs=bound_inputs,
         request=request,
         config=config,
         connector=connector,
-    ):
+    )
+    has_workflow_stage = any(stage.get("kind") == "workflow" for stage in plan["stages"])
+    if has_workflow_stage and workflow_authority is None:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
     candidates: list[dict[str, Any]] = []
     offer_ids: set[str] = set()
@@ -3916,6 +4232,14 @@ async def preflight_plan(request: PlanPreflightRequest):
             candidates.append(candidate)
     if not candidates:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    if workflow_authority is not None:
+        bound_candidates = [
+            _bind_workflow_candidate(item, workflow_authority)
+            for item in candidates
+        ]
+        candidates = [item for item in bound_candidates if item is not None]
+        if len(candidates) != 1:
+            raise HTTPException(status_code=409, detail="No compatible candidate is available")
     now = datetime.now(timezone.utc)
     expires = now + timedelta(seconds=600)
     selected_candidate: dict[str, Any] | None = None
@@ -3951,13 +4275,20 @@ async def preflight_plan(request: PlanPreflightRequest):
         "schema": "cloud-offload.plan-preflight.v1",
         "preflight_id": str(uuid.uuid4()),
         "plan_digest": plan["plan_digest"],
-        "status": "ready",
+        "status": workflow_authority["status"] if workflow_authority else "ready",
         "created_at": now.isoformat().replace("+00:00", "Z"),
         "expires_at": expires.isoformat().replace("+00:00", "Z"),
         "plan": public_plan_summary(plan),
         "provider": request.provider,
         "candidate_id": candidate_id,
         "candidates": [candidate],
+        "preparation": dict(candidate.get("preparation") or {
+            "required_bytes": 0,
+            "cached_bytes": 0,
+            "missing_bytes": 0,
+            "coverage_percent": 100.0,
+            "complete": True,
+        }),
         "quote": {
             "quote_id": str(uuid.uuid4()),
             "plan_digest": plan["plan_digest"],
@@ -4085,6 +4416,7 @@ async def submit_plan(request: PlanSubmitRequest, http_request: Request):
             plan=private_plan,
             config=config,
             accepted_candidate=accepted_candidate,
+            bound_inputs=bound_inputs,
         )
     queue = JobQueue(config.queue_db_path)
     job_id = str(uuid.uuid4())
@@ -4161,8 +4493,9 @@ async def preflight_partition(request: PreflightRequest):
             status_code=500,
             detail="Preflight produced a non-finite numeric value",
         )
-    await asyncio.to_thread(_preflight_store(config).put, report)
-    return report
+    public_report = _public_partition_preflight(report)
+    await asyncio.to_thread(_preflight_store(config).put, public_report)
+    return public_report
 
 
 def _report_candidate(
@@ -4190,8 +4523,20 @@ def _preflight_changes(
         "gpu_ram_gb",
         "region",
         "prepared_volume_id",
+        "prepared_provider_volume_id",
     )
-    changes = [field for field in fields if previous.get(field) != current.get(field)]
+    changes = [
+        field
+        for field in fields
+        if (
+            not _preflight_identity_matches(
+                previous.get(field), current.get(field)
+            )
+            if field
+            in {"prepared_volume_id", "prepared_provider_volume_id"}
+            else previous.get(field) != current.get(field)
+        )
+    ]
     if _relative_change_exceeds(
         previous.get("hourly_rate"),
         current.get("hourly_rate"),
@@ -4455,7 +4800,8 @@ def _revalidate_partition_preflight(
             }
         )
         current["confirmation"] = current_confirmation
-        store.put(current)
+        public_current = _public_partition_preflight(current)
+        store.put(public_current)
         return {
             "accepted": False,
             "code": "cloud_offload.preflight_changed",
@@ -4463,10 +4809,10 @@ def _revalidate_partition_preflight(
             "details": {
                 "action": "Review and confirm the revised preflight report.",
                 "changes": changes,
-                "revised_preflight": current,
+                "revised_preflight": public_current,
             },
         }
-    store.put(current)
+    store.put(_public_partition_preflight(current))
     return {
         "accepted": True,
         "report": current,
@@ -4594,6 +4940,10 @@ async def submit_workflow(request: WorkflowSubmitRequest):
         "hourly_rate": confirmed_candidate["hourly_rate"],
         "region": confirmed_candidate.get("region"),
         "prepared_volume_id": confirmed_candidate.get("prepared_volume_id"),
+        "prepared_provider_volume_id": confirmed_candidate.get(
+            "prepared_provider_volume_id"
+        ),
+        "storage": _preflight_storage_binding(confirmed_candidate),
         "preparation_class": confirmed_candidate.get("preparation_class"),
         "estimate": confirmed_candidate["estimate"],
         "request_policy": confirmed_report["request_policy"],
@@ -4872,6 +5222,10 @@ async def submit_partition(request: PartitionSubmitRequest):
         "hourly_rate": confirmed_candidate["hourly_rate"],
         "region": confirmed_candidate.get("region"),
         "prepared_volume_id": confirmed_candidate.get("prepared_volume_id"),
+        "prepared_provider_volume_id": confirmed_candidate.get(
+            "prepared_provider_volume_id"
+        ),
+        "storage": _preflight_storage_binding(confirmed_candidate),
         "preparation_class": confirmed_candidate.get("preparation_class"),
         "estimate": confirmed_candidate["estimate"],
         "request_policy": confirmed_report["request_policy"],
