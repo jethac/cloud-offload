@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 import json
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cloud_offload import preflight, server
@@ -1035,6 +1037,170 @@ def test_preflight_endpoint_returns_report(monkeypatch, tmp_path):
     assert response.json() == expected
     assert len(calls) == 1
     assert calls[0]["partition"]["partition_id"] == "part-1"
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_code"),
+    [
+        ("missing", "prepared_volume_unavailable"),
+        ("provider_id_substitution", "prepared_volume_unavailable"),
+        ("region_drift", "prepared_volume_unavailable"),
+        ("provider_drift", "prepared_volume_unavailable"),
+        ("persistence_drift", "prepared_volume_unavailable"),
+        ("exception", "prepared_volume_unverified"),
+        ("capacity_exception", "prepared_region_capacity_unknown"),
+    ],
+)
+def test_public_preflight_prepared_volume_diagnostics_are_redacted(
+    monkeypatch, tmp_path, drift, expected_code
+):
+    """Prepared-volume diagnostics never expose local/provider identities."""
+    config = config_for_preflight(tmp_path)
+    config.prepared_storage = {
+        "enabled": True,
+        "confirmed": True,
+        "provider": "runpod",
+        "policy": "smart",
+        "region": "PRIVATE-REGION",
+        "cold_fallback": "allow",
+        "managed_size_gb": 250,
+        "existing_volume_id": "PRIVATE-PROVIDER-VOLUME",
+        "max_monthly_storage_cost": None,
+        "tenant": "PRIVATE-TENANT",
+        "cache_private_assets": False,
+        "shadow_admission": True,
+    }
+    config.__post_init__()
+    local_id = "PRIVATE-LOCAL-VOLUME"
+    provider_id = "PRIVATE-PROVIDER-VOLUME"
+    volume = CacheVolume(
+        id=local_id,
+        provider="runpod",
+        provider_volume_id=("" if drift == "persistence_drift" else provider_id),
+        datacenter_id="PRIVATE-REGION",
+        ownership="adopted",
+        status="ready",
+        capacity_bytes=250 * 1024**3,
+        inventory_generation="PRIVATE-GENERATION",
+        last_verified_at="2026-07-29T00:00:00Z",
+        policy=config.prepared_storage,
+        s3_compatible=True,
+    )
+
+    class Registry:
+        def list_volumes(self, status=None):
+            return [volume] if status in {None, "ready"} else []
+
+        def volume_coverage(self, required, **kwargs):
+            return [{
+                "volume": volume,
+                "cached_bytes": 0,
+                "required_bytes": 0,
+                "complete": True,
+                "manifest_ids": [],
+            }]
+
+    class DiagnosticConnector(ReadOnlyConnector):
+        def list_available(
+            self,
+            gpu_type=None,
+            min_gpu_ram=None,
+            max_hourly_rate=None,
+            placement=None,
+        ):
+            if drift == "capacity_exception" and placement is not None:
+                raise RuntimeError(
+                    "PRIVATE-CREDENTIAL C:\\PRIVATE-REGISTRY\\capacity.db"
+                )
+            return super().list_available(
+                gpu_type=gpu_type,
+                min_gpu_ram=min_gpu_ram,
+                max_hourly_rate=max_hourly_rate,
+                placement=placement,
+            )
+
+        def get_storage(self, storage_id):
+            if drift == "exception":
+                raise RuntimeError(
+                    "PRIVATE-CREDENTIAL C:\\PRIVATE-REGISTRY\\cache.db"
+                )
+            if drift == "missing":
+                return None
+            if drift == "provider_id_substitution":
+                return SimpleNamespace(
+                    id="PRIVATE-PROVIDER-SUBSTITUTE",
+                    provider="runpod",
+                    datacenter_id="PRIVATE-REGION",
+                )
+            if drift == "region_drift":
+                return SimpleNamespace(
+                    id=storage_id,
+                    provider="runpod",
+                    datacenter_id="PRIVATE-OTHER-REGION",
+                )
+            if drift == "provider_drift":
+                return SimpleNamespace(
+                    id=storage_id,
+                    provider="PRIVATE-PROVIDER-NAME",
+                    datacenter_id="PRIVATE-REGION",
+                )
+            return SimpleNamespace(
+                id=storage_id,
+                provider="runpod",
+                datacenter_id="PRIVATE-REGION",
+            )
+
+    connector = DiagnosticConnector()
+    registry = Registry()
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(server, "_cache_registry", lambda _config: registry)
+    monkeypatch.setattr(preflight, "_storage_credentials_configured", lambda: True)
+    monkeypatch.setattr(
+        preflight,
+        "create_connector",
+        lambda provider, config: connector,
+    )
+
+    response = TestClient(server.app).post(
+        "/api/preflight",
+        json={"partition": partition(), "provider": "runpod"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    diagnostics = [
+        item
+        for item in [*body["warnings"], *body["unknowns"]]
+        if item.get("code") == expected_code
+    ]
+    assert len(diagnostics) == 1, body
+    diagnostic = diagnostics[0]
+    assert diagnostic["message"]
+    assert diagnostic["action"]
+    assert body["status"] == "ready"
+    assert body["recommendation"] is not None
+    assert all(item.get("prepared_volume_id") is None for item in body["candidates"])
+    assert connector.mutations == []
+
+    stored = PreflightStore(config.queue_db_path).get(body["preflight_id"])
+    assert stored is not None
+    serialized = "\n".join(
+        [response.content.decode("utf-8"), json.dumps(stored, sort_keys=True)]
+    )
+    for forbidden in (
+        local_id,
+        provider_id,
+        "PRIVATE-PROVIDER-SUBSTITUTE",
+        "PRIVATE-PROVIDER-NAME",
+        "PRIVATE-REGION",
+        "PRIVATE-OTHER-REGION",
+        "PRIVATE-TENANT",
+        "PRIVATE-GENERATION",
+        "PRIVATE-CREDENTIAL",
+        "PRIVATE-REGISTRY",
+        "cache.db",
+    ):
+        assert forbidden not in serialized
 
 
 def test_confirmation_policy_settings_are_validated_and_persisted(

@@ -1004,7 +1004,7 @@ def build_partition_preflight(
                         unknowns.append(
                             _issue(
                                 "prepared_volume_unverified",
-                                f"Prepared volume {volume.id} could not be verified ({_safe_error(exc)}).",
+                                f"A prepared storage resource could not be verified ({_safe_error(exc)}).",
                                 action="Verify the prepared volume and run preflight again.",
                             )
                         )
@@ -1024,7 +1024,7 @@ def build_partition_preflight(
                         warnings.append(
                             _issue(
                                 "prepared_volume_unavailable",
-                                f"Prepared volume {volume.id} is absent or in a different region.",
+                                "A prepared storage resource is absent or in a different region.",
                                 action="Repair or remove the prepared volume binding.",
                             )
                         )
@@ -1049,7 +1049,7 @@ def build_partition_preflight(
                         unknowns.append(
                             _issue(
                                 "prepared_region_capacity_unknown",
-                                f"Capacity near prepared volume {volume.id} could not be read ({_safe_error(exc)}).",
+                                f"Capacity near a prepared storage resource could not be read ({_safe_error(exc)}).",
                                 action="Run preflight again or allow a cold fallback.",
                             )
                         )

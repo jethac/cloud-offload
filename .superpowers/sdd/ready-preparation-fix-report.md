@@ -108,3 +108,56 @@ The previous round bound a prepared candidate to the stable local registry id, b
 
 - Legacy hot queue records created before the paired field existed cannot prove their historical provider id; the dispatcher re-proves the current exact provider object and refuses any substitution, while all new preflight-produced records carry the physical id.
 - This is a local/in-process provider-double proof only. No real provider or release proof is claimed. Full Ruff/MyPy baseline diagnostics remain for follow-up.
+
+## Round 5: redact prepared-volume diagnostics
+
+Base: `4d6dfeb80ad5aa50de5131646bc39f9fc4c3ff97` (detached)
+
+### Finding and TDD evidence
+
+The exact-identity checks correctly rejected missing, substituted, misplaced,
+mis-provider, and unbound prepared resources, but their public warning text
+included the private coordinator `volume.id`. The provider-read exception had
+the same leak, and the neighboring prepared-capacity exception interpolated the
+same local id. A real `/api/preflight` endpoint matrix was written first; RED
+was seven failures, each showing a forbidden local id in serialized response
+bytes while the expected diagnostic and cold fallback were otherwise present.
+
+### Implementation
+
+- `cloud_offload/preflight.py`: replace all prepared-resource diagnostic text
+  that named `volume.id` with fixed, actionable storage-resource wording. Safe
+  typed exception names remain available through `_safe_error`; provider
+  payloads, paths, credentials, and registry values are never copied into the
+  report.
+- `tests/test_preflight.py`: add a real public endpoint matrix covering missing
+  storage, provider-id substitution, region drift, provider drift, missing
+  persistent identity, provider-read exceptions, and capacity-read exceptions.
+  It checks HTTP status, diagnostic code/message/action, stable cold fallback,
+  zero provider mutation, the persisted public report, and every serialized
+  response/store byte for private IDs, paths, credentials, and registry data.
+
+### Verification
+
+- RED endpoint privacy matrix: `7 failed` for the expected raw local-id leak.
+- GREEN endpoint privacy matrix: `7 passed`.
+- Focused preflight file: `32 passed in 3.83s`.
+- Affected Cloud suite (plan/protocol/preflight/routes/storage/dispatcher):
+  `275 passed in 19.57s`.
+- Full Cloud Offload suite: `1101 passed, 6 skipped in 184.48s`.
+- Privacy scan found no remaining interpolated prepared-volume identities in
+  `cloud_offload/preflight.py`; persisted public-report and HTTP-byte scans
+  passed for all seven adversarial cases.
+- Ruff on changed source/tests: passed. Full-repository Ruff still reports 15
+  pre-existing errors in unrelated files. Compileall and `git diff --check`:
+  passed.
+- No provider, BWS, RunPod API, network install, or paid mutation was used.
+
+### Concerns
+
+- The public diagnostics intentionally no longer identify which local volume
+  failed; operators can inspect typed internal authority/log evidence and run
+  the repair action, while the response remains safe for users and logs.
+- This remains a local/in-process provider-double proof only. No real-provider
+  or release proof is claimed. Full Ruff/MyPy baseline diagnostics remain for
+  follow-up.
