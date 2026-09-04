@@ -695,13 +695,17 @@ def _revalidate_plan_candidate(
 
 
 def _workflow_placement(candidate: dict[str, Any]) -> dict[str, Any]:
-    """Return only provider-owned placement facts used for authority binding."""
+    """Return provider-owned placement facts present in every readiness report.
+
+    Workflow preflight candidates intentionally do not invent a ``storage``
+    object for an ephemeral offer.  Storage remains bound by the complete
+    normalized candidate digest during submit-time revalidation.
+    """
 
     return {
         "provider": candidate.get("provider"),
         "offer_id": candidate.get("offer_id"),
         "region": candidate.get("region"),
-        "storage": candidate.get("storage"),
     }
 
 
@@ -730,7 +734,7 @@ def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
     selected = next(item for item in candidates if item.get("candidate_id") == selected_id)
     if not isinstance(selected, dict) or not isinstance(execution, dict) or not isinstance(preparation, dict):
         return None
-    if any(field not in selected for field in ("provider", "offer_id", "region", "storage", "prepared_volume_id")):
+    if any(field not in selected for field in ("provider", "offer_id", "region", "prepared_volume_id")):
         return None
     if set(execution) != {"profile", "profile_fingerprint", "image_digest", "gpu_requirement", "container_disk_gb", "residency", "provider", "offer_id", "region", "prepared_volume_id"}:
         return None
@@ -743,8 +747,25 @@ def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
             return None
         if preparation["cached_bytes"] > preparation["required_bytes"] or preparation["missing_bytes"] != preparation["required_bytes"] - preparation["cached_bytes"]:
             return None
-        coverage = float(preparation["coverage_percent"])
+        coverage_raw = preparation["coverage_percent"]
+        if isinstance(coverage_raw, bool) or not isinstance(
+            coverage_raw, (int, float)
+        ):
+            return None
+        coverage = float(coverage_raw)
         if not math.isfinite(coverage) or not 0 <= coverage <= 100:
+            return None
+        expected_coverage = (
+            100.0
+            if preparation["required_bytes"] == 0
+            else round(
+                preparation["cached_bytes"]
+                / preparation["required_bytes"]
+                * 100.0,
+                3,
+            )
+        )
+        if coverage != expected_coverage:
             return None
     except (TypeError, ValueError, OverflowError):
         return None
@@ -753,13 +774,14 @@ def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
     placement = _workflow_placement(selected)
     if any(execution.get(field) != placement[field] for field in ("provider", "offer_id", "region")):
         return None
+    if execution.get("prepared_volume_id") != selected.get("prepared_volume_id"):
+        return None
     storage = selected.get("storage")
-    if (
+    if "storage" in selected and (
         not isinstance(storage, dict)
         or set(storage) - {"region", "persistent", "storage_id"}
         or storage.get("region") != selected.get("region")
         or not isinstance(storage.get("persistent"), bool)
-        or execution.get("prepared_volume_id") != selected.get("prepared_volume_id")
     ):
         return None
     if status == "ready_with_preparation" and preparation["complete"]:
@@ -770,12 +792,23 @@ def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
         "status": status,
         "candidate": selected,
         "placement": placement,
+        "storage": copy.deepcopy(storage) if storage is not None else None,
         "preparation": dict(preparation),
     }
 
 
 def _bind_workflow_candidate(candidate: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any] | None:
     if _workflow_placement(candidate) != authority["placement"]:
+        return None
+    storage = candidate.get("storage")
+    if (
+        not isinstance(storage, dict)
+        or storage.get("region") != candidate.get("region")
+        or not isinstance(storage.get("persistent"), bool)
+    ):
+        return None
+    authoritative_storage = authority.get("storage")
+    if authoritative_storage is not None and storage != authoritative_storage:
         return None
     bound = dict(candidate)
     bound["preparation"] = dict(authority["preparation"])

@@ -506,9 +506,25 @@ def _safe_preparation(value: Any, label: str) -> dict[str, Any]:
     complete = value["complete"]
     if not isinstance(complete, bool) or complete != (result["missing_bytes"] == 0):
         raise PlanError(f"{label}.complete is invalid")
+    expected_coverage = (
+        100.0
+        if result["required_bytes"] == 0
+        else round(result["cached_bytes"] / result["required_bytes"] * 100.0, 3)
+    )
+    if coverage != expected_coverage:
+        raise PlanError(f"{label}.coverage_percent is inconsistent")
     result["coverage_percent"] = coverage
     result["complete"] = complete
     return result
+
+
+def _validate_preflight_status(status: Any, preparation: dict[str, Any], label: str) -> None:
+    """Keep the public status bound to the authoritative preparation state."""
+
+    if status == "ready_with_preparation" and preparation["complete"]:
+        raise PlanError(f"{label} status is inconsistent")
+    if status == "ready" and not preparation["complete"]:
+        raise PlanError(f"{label} status is inconsistent")
 
 
 def _safe_candidate(candidate: Any) -> dict[str, Any]:
@@ -613,6 +629,7 @@ def public_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
             "complete": True,
         }
     result["preparation"] = _safe_preparation(preparation, "preflight preparation")
+    _validate_preflight_status(result["status"], result["preparation"], "preflight")
     if result["status"] == "ready_with_preparation" and (
         "preparation" not in source or "preparation" not in selected_candidate
     ):
@@ -820,7 +837,8 @@ def validate_public_preflight_projection(
             _safe_preparation(candidate["preparation"], "public candidate preparation")
     if candidate_id not in seen:
         raise PlanError("public preflight candidate binding is invalid")
-    _safe_preparation(report.get("preparation"), "public preflight preparation")
+    public_preparation = _safe_preparation(report.get("preparation"), "public preflight preparation")
+    _validate_preflight_status(report.get("status"), public_preparation, "public preflight")
     selected_public = next(item for item in candidates if item.get("candidate_id") == candidate_id)
     if report.get("status") == "ready_with_preparation" and "preparation" not in selected_public:
         raise PlanError("public preparation authority is missing")
@@ -1013,6 +1031,7 @@ def reproject_public_preflight(report: dict[str, Any]) -> dict[str, Any]:
         })),
         "stored preflight preparation",
     )
+    _validate_preflight_status(result["status"], result["preparation"], "stored preflight")
     if report.get("status") == "ready_with_preparation" and (
         "preparation" not in report or "preparation" not in selected
     ):

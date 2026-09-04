@@ -1676,6 +1676,97 @@ def test_workflow_stage_accepts_readiness_with_preparation(
     assert connector.launches == connector.terminations == 0
 
 
+def test_workflow_stage_accepts_real_preflight_readiness_without_fabricated_storage(
+    tmp_path, monkeypatch
+):
+    """The route must accept the production report's ephemeral placement shape."""
+    from tests.test_workflow_capsule import capsule, workflow_config
+
+    config = workflow_config(tmp_path)
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    connector = _PlanOfferConnector(_plan_offer(profile="comfyui"))
+    connector.offer["location"] = "offline-test"
+    connector.offer["provider"] = "runpod"
+    connector.offer["capabilities"] = ["comfyui-partition-v1", "comfyui-workflow"]
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+    observed_reports = []
+    original_authority = server._workflow_readiness_authority
+
+    def observe_authority(report):
+        observed_reports.append(copy.deepcopy(report))
+        return original_authority(report)
+
+    monkeypatch.setattr(server, "_workflow_readiness_authority", observe_authority)
+    value = _plan_with_runner(profile="comfyui")
+    value["stages"][0]["kind"] = "workflow"
+    value["stages"][0]["capsule"] = capsule(
+        inputs=[{"name": "source", "kind": "image"}]
+    )
+    value["stages"][0]["capsule"]["assets"] = [
+        {
+            "category": "checkpoints",
+            "filename": "model.safetensors",
+            "sha256": "b" * 64,
+            "size": 10,
+            "format": "safetensors",
+        }
+    ]
+    value["plan_digest"] = canonical_plan_digest(value)
+    from cloud_offload.cache_registry import CacheRegistry
+    from cloud_offload.preflight import build_workflow_preflight
+    from cloud_offload.storage import create_storage, partition_artifact_key
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"workflow-input")
+    storage = create_storage(config)
+    storage.upload(source, partition_artifact_key("a" * 64))
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"0123456789")
+    storage.upload(model, partition_artifact_key("b" * 64))
+
+    production_report = build_workflow_preflight(
+        config=config,
+        capsule=value["stages"][0]["capsule"],
+        input_artifacts={"source": "sha256:" + "a" * 64},
+        provider="runpod",
+        storage=storage,
+        cache_registry=CacheRegistry(config.queue_db_path),
+        worker_auth_configured=bool(config.worker_token),
+        connector_factory=lambda _provider, _config: connector,
+    )
+    assert production_report["blockers"] == [], json.dumps(
+        production_report, sort_keys=True
+    )
+
+    response = TestClient(server.app).post(
+        "/api/plans/preflight",
+        json={
+            "plan": value,
+            "input_artifacts": {"source": "sha256:" + "a" * 64},
+            "provider": "runpod",
+        },
+    )
+
+    assert observed_reports, f"production readiness was not evaluated: {response.status_code} {response.text}"
+    assert original_authority(observed_reports[0]) is not None, json.dumps(
+        observed_reports[0], sort_keys=True
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ready_with_preparation"
+    assert observed_reports and "storage" not in observed_reports[0]["candidates"][0]
+    assert body["candidates"][0]["storage"] == {
+        "region": body["candidates"][0]["storage"]["region"],
+        "persistent": False,
+    }
+    assert connector.launches == connector.terminations == 0
+
+
 def _readiness_authority_report() -> dict:
     preparation = {
         "required_bytes": 10,
@@ -1719,6 +1810,58 @@ def _readiness_authority_report() -> dict:
         },
         "preparation": preparation,
     }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report["preparation"].update(coverage_percent=1.0),
+        lambda report: report["preparation"].update(coverage_percent=True),
+        lambda report: report["preparation"].update(coverage_percent=float("nan")),
+        lambda report: report["preparation"].update(coverage_percent=101.0),
+        lambda report: report["preparation"].update(complete=True),
+        lambda report: report.update(status="ready"),
+    ],
+)
+def test_workflow_readiness_authority_rejects_arithmetic_and_status_tampering(mutate):
+    report = _readiness_authority_report()
+    mutate(report)
+    assert server._workflow_readiness_authority(report) is None
+
+
+def test_workflow_readiness_authority_defines_zero_requirement_as_complete():
+    report = _readiness_authority_report()
+    preparation = {
+        "required_bytes": 0,
+        "cached_bytes": 0,
+        "missing_bytes": 0,
+        "coverage_percent": 100.0,
+        "complete": True,
+    }
+    report["status"] = "ready"
+    report["preparation"] = preparation
+    report["candidates"][0]["preparation"] = preparation
+    assert server._workflow_readiness_authority(report) is not None
+
+
+def test_cached_workflow_preparation_projection_rejects_status_tampering():
+    from cloud_offload.plan_protocol import PlanError, public_preflight_report, reproject_public_preflight
+
+    report = _readiness_authority_report()
+    report["schema"] = "cloud-offload.plan-preflight.v1"
+    report["candidates"][0].pop("prepared_volume_id")
+    report.update(
+        {
+            "preflight_id": "preflight-cache",
+            "plan_digest": "sha256:" + "a" * 64,
+            "expires_at": "2999-01-01T00:00:00Z",
+        }
+    )
+    cached = public_preflight_report(report)
+    assert reproject_public_preflight(cached)["status"] == "ready_with_preparation"
+    cached["status"] = "ready"
+    with pytest.raises(PlanError):
+        reproject_public_preflight(cached)
 
 
 @pytest.mark.parametrize(
