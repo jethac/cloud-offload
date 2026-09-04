@@ -1767,6 +1767,209 @@ def test_workflow_stage_accepts_real_preflight_readiness_without_fabricated_stor
     assert connector.launches == connector.terminations == 0
 
 
+def test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_and_replay(
+    tmp_path, monkeypatch
+):
+    """The production readiness volume must not collapse to an ephemeral quote."""
+    from types import SimpleNamespace
+
+    from cloud_offload import preflight as production_preflight
+    from cloud_offload.cache_registry import CacheVolume
+    from cloud_offload.preflight import build_workflow_preflight
+    from cloud_offload.storage import create_storage, partition_artifact_key
+    from tests.test_workflow_capsule import capsule, workflow_config
+
+    config = workflow_config(tmp_path)
+    config.prepared_storage = {
+        "enabled": True,
+        "confirmed": True,
+        "provider": "runpod",
+        "policy": "smart",
+        "region": "US-MD-1",
+        "cold_fallback": "allow",
+        "managed_size_gb": 250,
+        "existing_volume_id": "provider-volume",
+        "max_monthly_storage_cost": None,
+        "tenant": "default",
+        "cache_private_assets": False,
+        "shadow_admission": True,
+    }
+    config.__post_init__()
+    volume = CacheVolume(
+        id="volume-1",
+        provider="runpod",
+        provider_volume_id="provider-volume",
+        datacenter_id="US-MD-1",
+        ownership="adopted",
+        status="ready",
+        capacity_bytes=250 * 1024**3,
+        inventory_generation="generation-1",
+        last_verified_at="2026-07-29T00:00:00Z",
+        policy=config.prepared_storage,
+        s3_compatible=True,
+    )
+
+    class Registry:
+        available = True
+
+        def list_volumes(self, status=None):
+            return [volume] if self.available and status in {None, "ready"} else []
+
+        def volume_coverage(self, required, **kwargs):
+            return [{
+                "volume": volume,
+                "cached_bytes": 1024,
+                "required_bytes": 1024,
+                "complete": True,
+                "manifest_ids": ["sha256:" + "d" * 64],
+            }]
+
+    class PreparedConnector(_PlanOfferConnector):
+        def get_storage(self, storage_id):
+            assert storage_id == "provider-volume"
+            return SimpleNamespace(datacenter_id="US-MD-1")
+
+    connector = PreparedConnector(
+        _plan_offer(
+            profile="comfyui",
+            provider="runpod",
+            region="US-MD-1",
+            capabilities=["comfyui-partition-v1", "comfyui-workflow"],
+        )
+    )
+    registry = Registry()
+    monkeypatch.setattr(production_preflight, "_storage_credentials_configured", lambda: True)
+    monkeypatch.setattr(server, "_cache_registry", lambda _config: registry)
+    monkeypatch.setattr(server, "_config", lambda resolve_secrets=True: config)
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+
+    value = _plan_with_runner(profile="comfyui")
+    value["stages"][0]["kind"] = "workflow"
+    value["stages"][0]["capsule"] = capsule(
+        inputs=[{"name": "source", "kind": "image"}]
+    )
+    value["stages"][0]["capsule"]["assets"] = [{
+        "category": "checkpoints",
+        "filename": "model.safetensors",
+        "sha256": "b" * 64,
+        "size": 1024,
+        "format": "safetensors",
+    }]
+    value["plan_digest"] = canonical_plan_digest(value)
+    storage = create_storage(config)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"workflow-input")
+    storage.upload(source, partition_artifact_key("a" * 64))
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"0" * 1024)
+    storage.upload(model, partition_artifact_key("b" * 64))
+
+    production_report = build_workflow_preflight(
+        config=config,
+        capsule=value["stages"][0]["capsule"],
+        input_artifacts={"source": "sha256:" + "a" * 64},
+        provider="runpod",
+        storage=storage,
+        cache_registry=registry,
+        worker_auth_configured=bool(config.worker_token),
+        connector_factory=lambda _provider, _config: connector,
+    )
+    assert production_report["status"] == "ready", json.dumps(production_report, sort_keys=True)
+    assert production_report["preparation"]["required_bytes"] == 1024
+    assert production_report["execution_plan"]["prepared_volume_id"] == "volume-1"
+
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/plans/preflight",
+        json={
+            "plan": value,
+            "input_artifacts": {"source": "sha256:" + "a" * 64},
+            "provider": "runpod",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["candidates"][0]["storage"] == {
+        "region": body["candidates"][0]["region"],
+        "persistent": True,
+        "storage_id": "sha256:" + hashlib.sha256(canonical_bytes("volume-1")).hexdigest(),
+    }
+    payload = {
+        "plan": value,
+        "preflight_id": body["preflight_id"],
+        "plan_digest": value["plan_digest"],
+        "candidate_id": body["candidate_id"],
+        "confirmation_action": "start_now",
+        "client_request_id": "prepared-volume-key",
+        "input_artifacts": {"source": "sha256:" + "a" * 64},
+        "provider": "runpod",
+    }
+    registry.available = False
+    stale_payload = {**payload, "client_request_id": "stale-prepared-volume-key"}
+    stale_submit = client.post(
+        "/api/plans",
+        headers={"Idempotency-Key": "stale-prepared-volume-key"},
+        json=stale_payload,
+    )
+    assert stale_submit.status_code == 409, stale_submit.text
+    JobQueue(config.queue_db_path)
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    registry.available = True
+    submitted = client.post(
+        "/api/plans",
+        headers={"Idempotency-Key": "prepared-volume-key"},
+        json=payload,
+    )
+    assert submitted.status_code == 202, submitted.text
+    replay = client.post(
+        "/api/plans",
+        headers={"Idempotency-Key": "prepared-volume-key"},
+        json=payload,
+    )
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["job_id"] == submitted.json()["job_id"]
+    assert replay.json()["candidate_id"] == submitted.json()["candidate_id"]
+    assert replay.json()["replayed"] is True
+    private = PlanProtocolStore(config.queue_db_path).private(value["plan_digest"])
+    assert private is not None
+    assert private["preflight"]["candidates"][0]["prepared_volume_id"] == "volume-1"
+    assert private["preflight"]["candidates"][0]["storage"] == {
+        "region": "US-MD-1",
+        "persistent": True,
+        "storage_id": "volume-1",
+    }
+    assert connector.launches == connector.terminations == 0
+
+
+def test_workflow_candidate_binding_rejects_mismatched_prepared_volume():
+    report = _readiness_authority_report()
+    report["candidates"][0]["prepared_volume_id"] = "volume-1"
+    report["candidates"][0]["storage"] = {
+        "region": "offline-test",
+        "persistent": True,
+        "storage_id": "volume-1",
+    }
+    report["candidates"][0]["preparation"]["complete"] = True
+    report["candidates"][0]["preparation"].update(
+        cached_bytes=10, missing_bytes=0, coverage_percent=100.0
+    )
+    report["preparation"] = report["candidates"][0]["preparation"]
+    report["execution_plan"]["prepared_volume_id"] = "volume-1"
+    report["status"] = "ready"
+    authority = server._workflow_readiness_authority(report)
+    assert authority is not None, json.dumps(report, sort_keys=True)
+    candidate = {**authority["candidate"], "candidate_id": "current-candidate"}
+    candidate["prepared_volume_id"] = "stale-volume"
+    assert server._bind_workflow_candidate(candidate, authority) is None
+
+
 def _readiness_authority_report() -> dict:
     preparation = {
         "required_bytes": 10,
@@ -1875,6 +2078,7 @@ def test_cached_workflow_preparation_projection_rejects_status_tampering():
         lambda report: report["preparation"].update(missing_bytes=9),
         lambda report: report["candidates"].append(dict(report["candidates"][0], candidate_id="readiness-candidate")),
         lambda report: report["preparation"].update(complete=True, missing_bytes=0),
+        lambda report: report["candidates"][0].pop("prepared_volume_id"),
     ],
 )
 def test_workflow_readiness_authority_fails_closed_on_malformed_or_ambiguous_report(mutate):

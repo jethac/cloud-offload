@@ -522,8 +522,6 @@ def _plan_candidate_from_offer(
     means the offer is well-formed but outside the plan's hard requirements.
     """
 
-    from cloud_offload.plan_protocol import canonical_bytes
-
     if not isinstance(offer, dict):
         raise ValueError("Candidate quote is invalid")
     offer_id_value = offer.get("id") or offer.get("offer_id")
@@ -603,17 +601,12 @@ def _plan_candidate_from_offer(
 
     estimate = hourly_rate * request.timeout_seconds / 3600
     return {
-        "candidate_id": "candidate-"
-        + hashlib.sha256(
-            canonical_bytes(
-                {
-                    "provider": request.provider,
-                    "offer_id": offer_id,
-                    "region": region,
-                    "storage": storage,
-                }
-            )
-        ).hexdigest()[:16],
+        "candidate_id": _plan_candidate_id(
+            provider=request.provider,
+            offer_id=offer_id,
+            region=region,
+            storage=storage,
+        ),
         "provider": request.provider,
         "residency": offer_residency,
         "offer_id": offer_id,
@@ -624,6 +617,25 @@ def _plan_candidate_from_offer(
         "estimate": {"total_job_cost_usd": [max(0.01, estimate), max(0.01, estimate)]},
         "storage": storage,
     }
+
+
+def _plan_candidate_id(
+    *, provider: str, offer_id: str, region: str, storage: dict[str, Any]
+) -> str:
+    """Derive the quote identity from every provider-owned binding."""
+
+    from cloud_offload.plan_protocol import canonical_bytes
+
+    return "candidate-" + hashlib.sha256(
+        canonical_bytes(
+            {
+                "provider": provider,
+                "offer_id": offer_id,
+                "region": region,
+                "storage": storage,
+            }
+        )
+    ).hexdigest()[:16]
 
 
 def _revalidate_plan_candidate(
@@ -706,6 +718,7 @@ def _workflow_placement(candidate: dict[str, Any]) -> dict[str, Any]:
         "provider": candidate.get("provider"),
         "offer_id": candidate.get("offer_id"),
         "region": candidate.get("region"),
+        "prepared_volume_id": candidate.get("prepared_volume_id"),
     }
 
 
@@ -776,12 +789,24 @@ def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
         return None
     if execution.get("prepared_volume_id") != selected.get("prepared_volume_id"):
         return None
+    prepared_volume_id = selected.get("prepared_volume_id")
+    if prepared_volume_id is not None and (
+        not isinstance(prepared_volume_id, str)
+        or not prepared_volume_id.strip()
+        or len(prepared_volume_id) > 128
+    ):
+        return None
+    authoritative_storage = {
+        "region": selected["region"],
+        "persistent": prepared_volume_id is not None,
+    }
+    if prepared_volume_id is not None:
+        authoritative_storage["storage_id"] = prepared_volume_id
     storage = selected.get("storage")
-    if "storage" in selected and (
+    if storage is not None and (
         not isinstance(storage, dict)
         or set(storage) - {"region", "persistent", "storage_id"}
-        or storage.get("region") != selected.get("region")
-        or not isinstance(storage.get("persistent"), bool)
+        or storage != authoritative_storage
     ):
         return None
     if status == "ready_with_preparation" and preparation["complete"]:
@@ -792,25 +817,45 @@ def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
         "status": status,
         "candidate": selected,
         "placement": placement,
-        "storage": copy.deepcopy(storage) if storage is not None else None,
+        "storage": authoritative_storage,
         "preparation": dict(preparation),
     }
 
 
 def _bind_workflow_candidate(candidate: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any] | None:
-    if _workflow_placement(candidate) != authority["placement"]:
+    if not isinstance(authority.get("placement"), dict):
         return None
-    storage = candidate.get("storage")
-    if (
-        not isinstance(storage, dict)
-        or storage.get("region") != candidate.get("region")
-        or not isinstance(storage.get("persistent"), bool)
-    ):
+    authoritative_placement = authority["placement"]
+    candidate_volume = candidate.get("prepared_volume_id")
+    authoritative_volume = authoritative_placement.get("prepared_volume_id")
+    if candidate_volume is not None and candidate_volume != authoritative_volume:
         return None
     authoritative_storage = authority.get("storage")
-    if authoritative_storage is not None and storage != authoritative_storage:
+    if not isinstance(authoritative_storage, dict):
+        return None
+    candidate_storage = candidate.get("storage")
+    if (
+        not isinstance(candidate_storage, dict)
+        or set(candidate_storage) - {"region", "persistent", "storage_id"}
+        or candidate_storage.get("region") != candidate.get("region")
+        or not isinstance(candidate_storage.get("persistent"), bool)
+    ):
+        return None
+    if candidate_storage != authoritative_storage and (
+        candidate_storage.get("persistent") or "storage_id" in candidate_storage
+    ):
         return None
     bound = dict(candidate)
+    bound["prepared_volume_id"] = authoritative_volume
+    bound["storage"] = copy.deepcopy(authoritative_storage)
+    if _workflow_placement(bound) != authoritative_placement:
+        return None
+    bound["candidate_id"] = _plan_candidate_id(
+        provider=str(bound["provider"]),
+        offer_id=str(bound["offer_id"]),
+        region=str(bound["region"]),
+        storage=bound["storage"],
+    )
     bound["preparation"] = dict(authority["preparation"])
     return bound
 

@@ -533,6 +533,7 @@ def _safe_candidate(candidate: Any) -> dict[str, Any]:
     allowed = {
         "candidate_id", "offer_id", "id", "provider", "gpu_type", "gpu_ram_gb",
         "region", "residency", "hourly_rate", "estimate", "storage", "preparation",
+        "prepared_volume_id",
     }
     if set(candidate) - allowed:
         raise PlanError("candidate has unknown fields")
@@ -563,6 +564,15 @@ def _safe_candidate(candidate: Any) -> dict[str, Any]:
         "persistent": storage["persistent"],
         **({"storage_id": _public_opaque(_safe_opaque(storage["storage_id"], "storage_id"))} if "storage_id" in storage else {}),
     }
+    if "prepared_volume_id" in candidate:
+        prepared_volume_id = candidate["prepared_volume_id"]
+        if prepared_volume_id is not None:
+            _safe_opaque(prepared_volume_id, "prepared_volume_id")
+            if (
+                storage.get("persistent") is not True
+                or storage.get("storage_id") != prepared_volume_id
+            ):
+                raise PlanError("candidate prepared volume binding is invalid")
     if "preparation" in candidate:
         result["preparation"] = _safe_preparation(candidate["preparation"], "candidate preparation")
     return result

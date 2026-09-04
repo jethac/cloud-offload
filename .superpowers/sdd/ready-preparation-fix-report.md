@@ -51,3 +51,28 @@ Base: `9b6e0a0f5a14f6e5b746f004479e58f9a0da4a44`
 - No provider, BWS, RunPod API, network install, or paid mutation was used; the RunPod-shaped connector was an in-process test double only.
 
 Remaining concern: this commit requires Sol re-review of the authority/storage binding and cached status semantics. No release or real-provider proof is claimed.
+
+## Round 3: prepared-volume binding fix
+
+Base: `042b3b35b98af66cba7749ec3cb09b413dbdfdfb`
+
+### Finding and TDD evidence
+
+The production workflow builder selected a complete 1,024-byte prepared volume (`volume-1`), but the plan route normalized the provider offer as ephemeral because `_workflow_placement` omitted `prepared_volume_id` and `_bind_workflow_candidate` copied only preparation. The RED full-route regression (`test_real_prepared_workflow_volume_remains_bound_through_preflight_submit_and_replay`) observed `persistent: false`; the mismatched-volume binding regression also covered stale identity. The test uses the production builder, a read-only in-process provider double, local artifacts, and zero provider mutations.
+
+### Implementation
+
+- `cloud_offload/server.py`: include `prepared_volume_id` in workflow placement authority; derive canonical persistent storage (`region`, `persistent`, `storage_id`) from the authoritative selected volume; bind it into normalized candidates, recompute the candidate identity over storage, and reject independent or mismatched storage/volume facts. Cold candidates remain explicitly ephemeral. First submit continues live readiness/offer revalidation before queue mutation; idempotent replay retains the accepted binding.
+- `cloud_offload/plan_protocol.py`: permit the private candidate authority to carry `prepared_volume_id`, validate its exact match to persistent storage, and hash storage identifiers in the public projection.
+- `tests/test_plan_protocol_rescue.py`: real complete prepared-volume builder/full-route test covering public/private projections, successful submit/replay, stale first-submit rejection with zero jobs, and mismatched/missing authority cases.
+
+### Verification
+
+- RED: route regression returned HTTP 200 with ephemeral storage instead of the selected prepared volume (`1 failed, 1 passed` in the initial focused run).
+- GREEN focused prepared-volume/authority gate: `python -m pytest tests/test_plan_protocol_rescue.py -q -k 'real_prepared_workflow_volume_remains_bound or rejects_mismatched_prepared_volume or workflow_readiness_authority_fails_closed_on_malformed_or_ambiguous_report'` -> `11 passed`.
+- Affected Cloud suite: `266 passed in 19.13s`.
+- Full Cloud Offload suite: `1089 passed, 6 skipped in 181.26s`.
+- Ruff, MyPy, compileall, and `git diff --check`: passed.
+- No provider, BWS, RunPod API, network install, or paid mutation was used.
+
+Remaining concern: Sol must re-review the private/public storage identity projection and volume freshness semantics. No release or real-provider proof is claimed.
