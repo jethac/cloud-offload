@@ -8,7 +8,7 @@ from cloud_offload.cache_registry import CacheRegistry
 from cloud_offload.comfyui import ComfyUIWorkflowExecutor
 from cloud_offload.preflight import build_workflow_preflight
 from cloud_offload.queue import JobQueue
-from cloud_offload.storage import LocalStorage
+from cloud_offload.storage import LocalStorage, partition_artifact_key
 from cloud_offload.worker import Worker
 from cloud_offload.workflow_capsule import (
     normalize_workflow_capsule,
@@ -133,6 +133,29 @@ def test_workflow_preflight_and_confirmed_submission_bind_the_capsule(
     assert job.params["preflight"]["capsule_digest"] == report["capsule_digest"]
     assert job.params["container_disk_gb"] >= 1
     assert connector.mutations == []
+
+
+def test_workflow_preflight_accepts_canonical_sha256_input_binding(tmp_path):
+    """Workflow boundary digests use the protocol prefix at storage lookup."""
+    config = workflow_config(tmp_path)
+    storage = LocalStorage(config.storage_path)
+    digest = "a" * 64
+    source = tmp_path / "reference.png"
+    source.write_bytes(b"workflow-input")
+    storage.upload(source, partition_artifact_key(digest))
+
+    report = build_workflow_preflight(
+        config=config,
+        capsule=capsule(inputs=[{"name": "reference.png", "kind": "image"}]),
+        input_artifacts={"reference.png": "sha256:" + digest},
+        provider="runpod",
+        storage=storage,
+        cache_registry=CacheRegistry(config.queue_db_path),
+        connector_factory=lambda *args: ReadOnlyConnector(),
+    )
+
+    assert report["status"] == "ready"
+    assert report["blockers"] == []
 
 
 def test_capsule_worker_uses_cooperative_cancel_and_publishes_artifacts(

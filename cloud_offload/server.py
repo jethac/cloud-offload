@@ -632,6 +632,7 @@ def _revalidate_plan_candidate(
     plan: dict[str, Any],
     config: Any,
     accepted_candidate: dict[str, Any],
+    bound_inputs: dict[str, str] | None = None,
 ) -> None:
     """Require the accepted candidate to remain in the current provider catalog."""
 
@@ -646,6 +647,17 @@ def _revalidate_plan_candidate(
         ) from exc
     if not isinstance(offers, list) or not offers:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    workflow_authority = None
+    if any(stage.get("kind") == "workflow" for stage in plan["stages"]):
+        workflow_authority = _run_plan_workflow_readiness(
+            plan=plan,
+            bound_inputs=bound_inputs or {},
+            request=request,
+            config=config,
+            connector=connector,
+        )
+        if workflow_authority is None:
+            raise HTTPException(status_code=409, detail="No compatible candidate is available")
     try:
         accepted_digest = binding_digest(accepted_candidate)
     except Exception as exc:
@@ -670,12 +682,104 @@ def _revalidate_plan_candidate(
             ) from None
         if current_candidate is None:
             continue
+        if workflow_authority is not None:
+            current_candidate = _bind_workflow_candidate(current_candidate, workflow_authority)
+            if current_candidate is None:
+                continue
         if (
             current_candidate["candidate_id"] == accepted_candidate.get("candidate_id")
             and binding_digest(current_candidate) == accepted_digest
         ):
             return
     raise HTTPException(status_code=409, detail="No compatible candidate is available")
+
+
+def _workflow_placement(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return only provider-owned placement facts used for authority binding."""
+
+    return {
+        "provider": candidate.get("provider"),
+        "offer_id": candidate.get("offer_id"),
+        "region": candidate.get("region"),
+        "storage": candidate.get("storage"),
+    }
+
+
+def _workflow_readiness_authority(report: Any) -> dict[str, Any] | None:
+    """Validate one complete workflow readiness report and select its authority."""
+
+    if not isinstance(report, dict) or report.get("schema") != "cloud-offload.preflight.v1":
+        return None
+    status = report.get("status")
+    if status not in {"ready", "ready_with_preparation"} or report.get("blockers") != []:
+        return None
+    candidates = report.get("candidates")
+    recommendation = report.get("recommendation")
+    execution = report.get("execution_plan")
+    preparation = report.get("preparation")
+    if not isinstance(candidates, list) or not candidates or not isinstance(recommendation, dict):
+        return None
+    if set(recommendation) != {"policy", "candidate_id", "rank", "rationale"}:
+        return None
+    candidate_ids = [item.get("candidate_id") if isinstance(item, dict) else None for item in candidates]
+    if any(not isinstance(item, str) for item in candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
+        return None
+    selected_id = recommendation.get("candidate_id")
+    if not isinstance(selected_id, str) or candidate_ids.count(selected_id) != 1:
+        return None
+    selected = next(item for item in candidates if item.get("candidate_id") == selected_id)
+    if not isinstance(selected, dict) or not isinstance(execution, dict) or not isinstance(preparation, dict):
+        return None
+    if any(field not in selected for field in ("provider", "offer_id", "region", "storage", "prepared_volume_id")):
+        return None
+    if set(execution) != {"profile", "profile_fingerprint", "image_digest", "gpu_requirement", "container_disk_gb", "residency", "provider", "offer_id", "region", "prepared_volume_id"}:
+        return None
+    required_preparation = {"required_bytes", "cached_bytes", "missing_bytes", "coverage_percent", "complete"}
+    if set(preparation) != required_preparation or selected.get("preparation") != preparation:
+        return None
+    try:
+        byte_values = [preparation[field] for field in ("required_bytes", "cached_bytes", "missing_bytes")]
+        if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in byte_values):
+            return None
+        if preparation["cached_bytes"] > preparation["required_bytes"] or preparation["missing_bytes"] != preparation["required_bytes"] - preparation["cached_bytes"]:
+            return None
+        coverage = float(preparation["coverage_percent"])
+        if not math.isfinite(coverage) or not 0 <= coverage <= 100:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not isinstance(preparation["complete"], bool) or preparation["complete"] != (preparation["missing_bytes"] == 0):
+        return None
+    placement = _workflow_placement(selected)
+    if any(execution.get(field) != placement[field] for field in ("provider", "offer_id", "region")):
+        return None
+    storage = selected.get("storage")
+    if (
+        not isinstance(storage, dict)
+        or set(storage) - {"region", "persistent", "storage_id"}
+        or storage.get("region") != selected.get("region")
+        or not isinstance(storage.get("persistent"), bool)
+        or execution.get("prepared_volume_id") != selected.get("prepared_volume_id")
+    ):
+        return None
+    if status == "ready_with_preparation" and preparation["complete"]:
+        return None
+    if status == "ready" and not preparation["complete"]:
+        return None
+    return {
+        "status": status,
+        "candidate": selected,
+        "placement": placement,
+        "preparation": dict(preparation),
+    }
+
+
+def _bind_workflow_candidate(candidate: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any] | None:
+    if _workflow_placement(candidate) != authority["placement"]:
+        return None
+    bound = dict(candidate)
+    bound["preparation"] = dict(authority["preparation"])
+    return bound
 
 
 def _run_plan_workflow_readiness(
@@ -685,17 +789,18 @@ def _run_plan_workflow_readiness(
     request: Any,
     config: Any,
     connector: Any,
-) -> bool:
+) -> dict[str, Any] | None:
     """Run the production workflow readiness engine for every workflow stage."""
 
     workflow_stages = [
         stage for stage in plan["stages"] if stage.get("kind") == "workflow"
     ]
     if not workflow_stages:
-        return True
+        return None
     from cloud_offload.preflight import build_workflow_preflight, finite_report
     from cloud_offload.storage import create_storage
 
+    selected_authority: dict[str, Any] | None = None
     for stage in workflow_stages:
         try:
             report = build_workflow_preflight(
@@ -703,26 +808,36 @@ def _run_plan_workflow_readiness(
                 capsule=stage["capsule"],
                 input_artifacts=bound_inputs,
                 provider=request.provider,
-                recommendation_policy=request.recommendation_policy,
-                max_hourly_rate=request.max_hourly_rate,
-                max_total_job_cost=request.max_total_job_cost,
-                allowed_regions=request.allowed_regions,
+                recommendation_policy=getattr(request, "recommendation_policy", None),
+                max_hourly_rate=getattr(request, "max_hourly_rate", None),
+                max_total_job_cost=getattr(request, "max_total_job_cost", None),
+                allowed_regions=getattr(request, "allowed_regions", None),
                 storage=create_storage(config),
                 cache_registry=_cache_registry(config),
                 worker_auth_configured=_worker_auth_configured(config),
                 connector_factory=lambda _provider, _config: connector,
             )
         except Exception:
-            return False
+            return None
         if not isinstance(report, dict) or not finite_report(report):
-            return False
+            return None
         # A cold but viable offer is ready for user confirmation even when
         # declared model data still needs preparation before launch.
         if report.get("status") not in {"ready", "ready_with_preparation"} or report.get(
             "blockers"
         ):
-            return False
-    return True
+            return None
+        authority = _workflow_readiness_authority(report)
+        if authority is None:
+            return None
+        if selected_authority is not None and (
+            authority["placement"] != selected_authority["placement"]
+            or authority["preparation"] != selected_authority["preparation"]
+            or authority["status"] != selected_authority["status"]
+        ):
+            return None
+        selected_authority = authority
+    return selected_authority
 
 
 def _plan_job_digest(job: Any) -> str | None:
@@ -3892,13 +4007,15 @@ async def preflight_plan(request: PlanPreflightRequest):
         raise HTTPException(status_code=409, detail="No compatible candidate is available") from exc
     if not offers:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
-    if not _run_plan_workflow_readiness(
+    workflow_authority = _run_plan_workflow_readiness(
         plan=plan,
         bound_inputs=bound_inputs,
         request=request,
         config=config,
         connector=connector,
-    ):
+    )
+    has_workflow_stage = any(stage.get("kind") == "workflow" for stage in plan["stages"])
+    if has_workflow_stage and workflow_authority is None:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
     candidates: list[dict[str, Any]] = []
     offer_ids: set[str] = set()
@@ -3920,6 +4037,14 @@ async def preflight_plan(request: PlanPreflightRequest):
             candidates.append(candidate)
     if not candidates:
         raise HTTPException(status_code=409, detail="No compatible candidate is available")
+    if workflow_authority is not None:
+        bound_candidates = [
+            _bind_workflow_candidate(item, workflow_authority)
+            for item in candidates
+        ]
+        candidates = [item for item in bound_candidates if item is not None]
+        if len(candidates) != 1:
+            raise HTTPException(status_code=409, detail="No compatible candidate is available")
     now = datetime.now(timezone.utc)
     expires = now + timedelta(seconds=600)
     selected_candidate: dict[str, Any] | None = None
@@ -3955,13 +4080,20 @@ async def preflight_plan(request: PlanPreflightRequest):
         "schema": "cloud-offload.plan-preflight.v1",
         "preflight_id": str(uuid.uuid4()),
         "plan_digest": plan["plan_digest"],
-        "status": "ready",
+        "status": workflow_authority["status"] if workflow_authority else "ready",
         "created_at": now.isoformat().replace("+00:00", "Z"),
         "expires_at": expires.isoformat().replace("+00:00", "Z"),
         "plan": public_plan_summary(plan),
         "provider": request.provider,
         "candidate_id": candidate_id,
         "candidates": [candidate],
+        "preparation": dict(candidate.get("preparation") or {
+            "required_bytes": 0,
+            "cached_bytes": 0,
+            "missing_bytes": 0,
+            "coverage_percent": 100.0,
+            "complete": True,
+        }),
         "quote": {
             "quote_id": str(uuid.uuid4()),
             "plan_digest": plan["plan_digest"],
@@ -4089,6 +4221,7 @@ async def submit_plan(request: PlanSubmitRequest, http_request: Request):
             plan=private_plan,
             config=config,
             accepted_candidate=accepted_candidate,
+            bound_inputs=bound_inputs,
         )
     queue = JobQueue(config.queue_db_path)
     job_id = str(uuid.uuid4())

@@ -122,6 +122,12 @@ def _safe_error(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _partition_storage_key(digest: str) -> str:
+    """Convert a canonical protocol digest to the strict storage-key input."""
+
+    return partition_artifact_key(str(digest).removeprefix("sha256:"))
+
+
 def _safe_offer(offer: dict[str, Any], provider: str) -> dict[str, Any]:
     datacenter_ids = offer.get("datacenter_ids") or []
     region = (
@@ -696,7 +702,7 @@ def build_partition_preflight(
             )
             continue
         try:
-            artifact_exists = storage.exists(partition_artifact_key(str(artifact_id)))
+            artifact_exists = storage.exists(_partition_storage_key(str(artifact_id)))
         except Exception as exc:  # noqa: BLE001 - a failed proof is a blocker
             blockers.append(
                 _issue(

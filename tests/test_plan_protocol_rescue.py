@@ -307,6 +307,30 @@ def test_public_preflight_hashes_storage_identifier(tmp_path):
     assert "private-storage-id" not in json.dumps(report)
 
 
+def test_public_preflight_rejects_preparation_status_without_bound_facts():
+    from cloud_offload.plan_protocol import public_preflight_report
+
+    with pytest.raises(PlanError):
+        public_preflight_report(
+            {
+                "preflight_id": "missing-preparation",
+                "plan_digest": "sha256:" + "a" * 64,
+                "status": "ready_with_preparation",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "candidates": [
+                    {
+                        "candidate_id": "candidate",
+                        "offer_id": "offer",
+                        "region": "offline-test",
+                        "hourly_rate": 0.01,
+                        "gpu_ram_gb": 40,
+                        "storage": {"region": "offline-test", "persistent": False},
+                    }
+                ],
+            }
+        )
+
+
 def test_closure_reason_is_a_finite_code_not_private_error_text():
     from cloud_offload.plan_protocol import validate_closure_receipt
 
@@ -1592,9 +1616,50 @@ def test_workflow_stage_accepts_readiness_with_preparation(
         production_preflight,
         "build_workflow_preflight",
         lambda **kwargs: {
+            "schema": "cloud-offload.preflight.v1",
             "status": "ready_with_preparation",
             "blockers": [],
             "unknowns": [],
+            "candidates": [{
+                "candidate_id": "readiness-candidate",
+                "provider": "offline",
+                "offer_id": "offer-1",
+                "region": "offline-test",
+                "storage": {"region": "offline-test", "persistent": False},
+                "prepared_volume_id": None,
+                "preparation": {
+                    "required_bytes": 10,
+                    "cached_bytes": 0,
+                    "missing_bytes": 10,
+                    "coverage_percent": 0.0,
+                    "complete": False,
+                },
+            }],
+            "recommendation": {
+                "policy": "balanced",
+                "candidate_id": "readiness-candidate",
+                "rank": 1,
+                "rationale": [],
+            },
+            "execution_plan": {
+                "profile": "comfyui",
+                "profile_fingerprint": "sha256:" + "a" * 64,
+                "image_digest": "sha256:" + "b" * 64,
+                "gpu_requirement": {"requested_type": "any", "minimum_vram_gb": 40},
+                "container_disk_gb": 1,
+                "residency": "cloud",
+                "provider": "offline",
+                "offer_id": "offer-1",
+                "region": "offline-test",
+                "prepared_volume_id": None,
+            },
+            "preparation": {
+                "required_bytes": 10,
+                "cached_bytes": 0,
+                "missing_bytes": 10,
+                "coverage_percent": 0.0,
+                "complete": False,
+            },
         },
     )
     value = _plan_with_runner(profile="comfyui")
@@ -1605,10 +1670,90 @@ def test_workflow_stage_accepts_readiness_with_preparation(
     response = client.post("/api/plans/preflight", json={"plan": value})
 
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == "ready"
+    assert response.json()["status"] == "ready_with_preparation"
     with sqlite3.connect(config.queue_db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 1
     assert connector.launches == connector.terminations == 0
+
+
+def _readiness_authority_report() -> dict:
+    preparation = {
+        "required_bytes": 10,
+        "cached_bytes": 0,
+        "missing_bytes": 10,
+        "coverage_percent": 0.0,
+        "complete": False,
+    }
+    candidate = {
+        "candidate_id": "readiness-candidate",
+        "provider": "offline",
+        "offer_id": "offer-1",
+        "region": "offline-test",
+        "storage": {"region": "offline-test", "persistent": False},
+        "prepared_volume_id": None,
+        "preparation": preparation,
+    }
+    return {
+        "schema": "cloud-offload.preflight.v1",
+        "status": "ready_with_preparation",
+        "blockers": [],
+        "unknowns": [],
+        "candidates": [candidate],
+        "recommendation": {
+            "policy": "balanced",
+            "candidate_id": "readiness-candidate",
+            "rank": 1,
+            "rationale": [],
+        },
+        "execution_plan": {
+            "profile": "comfyui",
+            "profile_fingerprint": "sha256:" + "a" * 64,
+            "image_digest": "sha256:" + "b" * 64,
+            "gpu_requirement": {"requested_type": "any", "minimum_vram_gb": 40},
+            "container_disk_gb": 1,
+            "residency": "cloud",
+            "provider": "offline",
+            "offer_id": "offer-1",
+            "region": "offline-test",
+            "prepared_volume_id": None,
+        },
+        "preparation": preparation,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report["candidates"].clear(),
+        lambda report: report["recommendation"].update(candidate_id="missing"),
+        lambda report: report["candidates"][0].pop("preparation"),
+        lambda report: report["execution_plan"].update(offer_id="other-offer"),
+        lambda report: report["candidates"][0]["storage"].update(region="other-region"),
+        lambda report: report["preparation"].update(missing_bytes=9),
+        lambda report: report["candidates"].append(dict(report["candidates"][0], candidate_id="readiness-candidate")),
+        lambda report: report["preparation"].update(complete=True, missing_bytes=0),
+    ],
+)
+def test_workflow_readiness_authority_fails_closed_on_malformed_or_ambiguous_report(mutate):
+    report = _readiness_authority_report()
+    mutate(report)
+    assert server._workflow_readiness_authority(report) is None
+
+
+@pytest.mark.parametrize("field", ["offer_id", "storage"])
+def test_workflow_candidate_binding_rejects_independent_offer_or_storage(field):
+    report = _readiness_authority_report()
+    authority = server._workflow_readiness_authority(report)
+    assert authority is not None
+    candidate = {
+        **authority["candidate"],
+        "candidate_id": "current-candidate",
+    }
+    if field == "offer_id":
+        candidate[field] = "other-offer"
+    else:
+        candidate[field] = {"region": "offline-test", "persistent": True}
+    assert server._bind_workflow_candidate(candidate, authority) is None
 
 
 @pytest.mark.parametrize(
