@@ -1572,6 +1572,45 @@ def test_workflow_stage_runs_existing_readiness_engine_and_rejects_missing_requi
         assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 0
 
 
+def test_workflow_stage_accepts_readiness_with_preparation(
+    tmp_path, monkeypatch
+):
+    """A viable cold candidate may need model preparation before launch."""
+    from cloud_offload import preflight as production_preflight
+    from tests.test_workflow_capsule import capsule
+
+    client, config = _client(tmp_path, monkeypatch)
+    connector = _PlanOfferConnector(_plan_offer(profile="comfyui"))
+    monkeypatch.setattr(
+        server.app.state,
+        "plan_connector_factory",
+        lambda provider, cfg: connector,
+        raising=False,
+    )
+
+    monkeypatch.setattr(
+        production_preflight,
+        "build_workflow_preflight",
+        lambda **kwargs: {
+            "status": "ready_with_preparation",
+            "blockers": [],
+            "unknowns": [],
+        },
+    )
+    value = _plan_with_runner(profile="comfyui")
+    value["stages"][0]["kind"] = "workflow"
+    value["stages"][0]["capsule"] = capsule()
+    value["plan_digest"] = canonical_plan_digest(value)
+
+    response = client.post("/api/plans/preflight", json={"plan": value})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ready"
+    with sqlite3.connect(config.queue_db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cloud_plans").fetchone()[0] == 1
+    assert connector.launches == connector.terminations == 0
+
+
 @pytest.mark.parametrize(
     "headers",
     [

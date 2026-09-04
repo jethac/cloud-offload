@@ -716,7 +716,11 @@ def _run_plan_workflow_readiness(
             return False
         if not isinstance(report, dict) or not finite_report(report):
             return False
-        if report.get("status") != "ready" or report.get("blockers"):
+        # A cold but viable offer is ready for user confirmation even when
+        # declared model data still needs preparation before launch.
+        if report.get("status") not in {"ready", "ready_with_preparation"} or report.get(
+            "blockers"
+        ):
             return False
     return True
 
